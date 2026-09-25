@@ -1,0 +1,23 @@
+{
+  "chunk_seconds": 5,
+  "ecgh_path": "E:\\New_Qww\\qww_new_holter_code\\src\\recordings\\2026-09-25_10-33-24_Unknown\\recording.ecgh",
+  "events_db_path": "E:\\New_Qww\\qww_new_holter_code\\src\\recordings\\2026-09-25_10-33-24_Unknown\\events.db",
+  "fs": 500,
+  "jsonl_path": "E:\\New_Qww\\qww_new_holter_code\\src\\recordings\\2026-09-25_10-33-24_Unknown\\metrics.jsonl",
+  "output_dir": "E:\\New_Qww\\qww_new_holter_code\\src\\recordings",
+  "patient_info": {},
+  "schema_version": 1,
+  "session_dir": "E:\\New_Qww\\qww_new_holter_code\\src\\recordings\\2026-09-25_10-33-24_Unknown",
+  "status": "stopped",
+  "summary": {
+    "duration_sec": 348.67,
+    "events_db_path": "E:\\New_Qww\\qww_new_holter_code\\src\\recordings\\2026-09-25_10-33-24_Unknown\\events.db",
+    "frames": 174335,
+    "index_path": "E:\\New_Qww\\qww_new_holter_code\\src\\recordings\\2026-09-25_10-33-24_Unknown\\recording_index.json",
+    "jsonl_path": "E:\\New_Qww\\qww_new_holter_code\\src\\recordings\\2026-09-25_10-33-24_Unknown\\metrics.jsonl",
+    "path": "E:\\New_Qww\\qww_new_holter_code\\src\\recordings\\2026-09-25_10-33-24_Unknown\\recording.ecgh",
+    "session_dir": "E:\\New_Qww\\qww_new_holter_code\\src\\recordings\\2026-09-25_10-33-24_Unknown",
+    "session_json_path": "E:\\New_Qww\\qww_new_holter_code\\src\\recordings\\2026-09-25_10-33-24_Unknown\\session.json"
+  },
+  "updated_at": "2026-09-25T05:09:14.029826Z"
+}

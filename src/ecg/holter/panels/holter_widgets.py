@@ -108,12 +108,12 @@ class HolterRRTrendCanvas(QWidget):
     def _nearest_index(self, x_pos: int):
         if not self._points:
             return None
-        rect = self.rect().adjusted(12, 18, -12, -18)
+        rect = self.rect().adjusted(42, 18, -12, 30)
         if rect.width() <= 0:
             return 0
         xs = [p[0] for p in self._points]
-        lo = min(xs)
-        hi = max(xs)
+        lo = 0.0
+        hi = 12.0 * 60.0 * 60.0
         span = max(hi - lo, 1e-9)
         best = None
         best_dist = None
@@ -130,7 +130,9 @@ class HolterRRTrendCanvas(QWidget):
         painter.fillRect(self.rect(), QColor(COL_BLACK))
         painter.setRenderHint(QPainter.Antialiasing, True)
 
-        rect = self.rect().adjusted(12, 18, -12, -18)
+        # Keep the trend comparable across recordings and modes. The replay
+        # chart uses seconds on X, milliseconds (RR) or BPM (HR) on Y.
+        rect = self.rect().adjusted(42, 18, -12, 30)
         painter.setPen(QPen(QColor(COL_GREEN_DRK), 1))
         painter.drawRect(rect)
 
@@ -150,21 +152,34 @@ class HolterRRTrendCanvas(QWidget):
             painter.end()
             return
 
-        xs = [p[0] for p in self._points]
-        ys = [p[1] for p in self._points]
-        x_lo = min(xs)
-        x_hi = max(xs)
-        y_lo = min(ys)
-        y_hi = max(ys)
-        if abs(y_hi - y_lo) < 1e-9:
-            y_hi = y_lo + 1.0
-        if abs(x_hi - x_lo) < 1e-9:
-            x_hi = x_lo + 1.0
+        x_lo = 0.0
+        x_hi = 12.0 * 60.0 * 60.0
+        y_lo = 0.0
+        y_hi = 300.0 if mode == "HR" else 3000.0
 
         def map_xy(x_val, y_val):
             px = rect.left() + ((x_val - x_lo) / (x_hi - x_lo)) * rect.width()
             py = rect.bottom() - ((y_val - y_lo) / (y_hi - y_lo)) * rect.height()
             return int(px), int(py)
+
+        # Draw fixed-axis tick marks so the chart's scale is visible even when
+        # the recording contains only a short or low-variation segment.
+        painter.setFont(QFont("Arial", 8))
+        painter.setPen(QPen(QColor(UI_MUTED), 1))
+        y_ticks = np.arange(y_lo, y_hi + 75.0, 75.0) if mode == "HR" else (0.0, 1500.0, 3000.0)
+        for value in y_ticks:
+            _, py = map_xy(x_lo, value)
+            painter.drawLine(rect.left() - 4, py, rect.left(), py)
+            label = f"{int(value)}"
+            painter.drawText(4, py + 4, label)
+
+        x_ticks = [(0.0, "0h"), (3.0 * 3600.0, "3h"),
+                   (6.0 * 3600.0, "6h"), (9.0 * 3600.0, "9h"),
+                   (12.0 * 3600.0, "12h")]
+        for value, label in x_ticks:
+            px, _ = map_xy(value, y_lo)
+            painter.drawLine(px, rect.bottom(), px, rect.bottom() + 4)
+            painter.drawText(px - 10, rect.bottom() + 17, label)
 
         painter.setPen(QPen(QColor(COL_GREEN_MID), 2))
         for i in range(1, len(self._points)):
@@ -184,7 +199,7 @@ class HolterRRTrendCanvas(QWidget):
                 painter.drawEllipse(px - 2, py - 2, 4, 4)
 
         painter.setPen(QPen(QColor(UI_MUTED)))
-        painter.drawText(rect.left() + 4, rect.bottom() + 12, f"{len(self._points)} points")
+        painter.drawText(rect.right() - 38, rect.bottom() + 17, "Time")
 
 
 HRTrendCanvas = HolterRRTrendCanvas

@@ -3425,7 +3425,29 @@ class HolterToolHandlers:
             dialog.exec_()
         else:
             from PyQt5.QtWidgets import QMessageBox
-            QMessageBox.warning(parent, "No Data", "No valid replay engine found for Full Disclosure.")
+            message_box = QMessageBox(parent)
+            message_box.setIcon(QMessageBox.Warning)
+            message_box.setWindowTitle("No Data")
+            message_box.setText("No valid replay engine found for Full Disclosure.")
+            message_box.setStyleSheet("""
+                QMessageBox {
+                    background-color: #2b2b2b;
+                }
+                QMessageBox QLabel {
+                    color: white;
+                }
+                QMessageBox QPushButton {
+                    color: white;
+                    background-color: #2b2b2b;
+                    border: 1px solid #555555;
+                    padding: 5px 18px;
+                    min-width: 55px;
+                }
+                QMessageBox QPushButton:hover {
+                    background-color: #444444;
+                }
+            """)
+            message_box.exec_()
     
     @staticmethod
     def handle_goto_template(parent):
