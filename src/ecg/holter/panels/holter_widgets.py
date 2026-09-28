@@ -31,6 +31,7 @@ except Exception:
 
 from ..tool_engine import (
     amplitude_mv_from_pixels,
+    caliper_label,
     canonical_tool,
     interval_ms_from_pixels,
     ruler_label,
@@ -806,6 +807,7 @@ class ECGStripCanvas(QWidget):
         self._magnify_locked = False
         self._caliper_line1 = None
         self._caliper_line2 = None
+        self._caliper_y = None
         # Ruler/Measuring ruler state: track start and end points separately
         self._ruler_start = None  # Start point (persists)
         self._ruler_end = None    # End point (current measurement)
@@ -867,6 +869,7 @@ class ECGStripCanvas(QWidget):
         self._magnify_pos = None
         self._caliper_line1 = None
         self._caliper_line2 = None
+        self._caliper_y = None
         self._ruler_start = None
         self._ruler_end = None
         self.update()
@@ -995,6 +998,7 @@ class ECGStripCanvas(QWidget):
                 self._caliper_line2 = None
             else:
                 self._caliper_line2 = event.pos().x()
+            self._caliper_y = event.pos().y()
             self.update()
             return
 
@@ -1040,6 +1044,7 @@ class ECGStripCanvas(QWidget):
             if self._caliper_line1 is not None and self._caliper_line2 is None:
                 # First line is set, show preview of second line as hover
                 self._hover_pos = event.pos()
+                self._caliper_y = event.pos().y()
                 self.update()
             return
         
@@ -1065,6 +1070,14 @@ class ECGStripCanvas(QWidget):
         if self._mode != TOOL_SELECT:
             self._curr_pos = event.pos()
             self.update()
+
+        if self._mode == TOOL_CALIPER and self._caliper_line1 is not None and self._caliper_line2 is None:
+            # Complete Parallel Ruler with a normal press-drag-release.
+            self._caliper_line2 = event.pos().x()
+            self._caliper_y = event.pos().y()
+            self._hover_pos = event.pos()
+            self.update()
+            return
 
         if self._mode == TOOL_RULER and self._ruler_start is not None and self._ruler_end is None:
             # Complete the ruler with a normal press-drag-release gesture.
@@ -1991,8 +2004,8 @@ class ECGStripCanvas(QWidget):
                     painter.setPen(QPen(QColor("#FFFF00")))
                     # Keep labels inside the box so they remain visible on
                     # every lead row and never get clipped by a canvas edge.
-                    painter.drawText(x1 + 5, y1 + 15, f"{dy_uv:.0f} µV")
-                    painter.drawText(max(x1 + 5, x1 + (dx // 2) - 35), max(y1 + 30, y2 - 5), f"{bpm:.0f} bpm")
+                    painter.drawText(x1 + 5, 14, f"{dy_uv:.0f} µV")
+                    painter.drawText(max(x1 + 5, x1 + (dx // 2) - 35), h - 4, f"{bpm:.0f} bpm")
                 elif self._hover_pos is not None:
                     # Preview rectangle while dragging/hovering.
                     pen_preview = QPen(QColor("#00FFFF"), 2, Qt.DashLine)
@@ -2009,31 +2022,35 @@ class ECGStripCanvas(QWidget):
                     dy_mv = amplitude_mv_from_pixels(dy, max(1, h), rng, ADC_TO_MV)
                     dy_uv = dy_mv * 1000.0
                     painter.setPen(QPen(QColor("#FFFF00")))
-                    painter.drawText(x1 + 5, y1 + 15, f"{dy_uv:.0f} µV")
-                    painter.drawText(max(x1 + 5, x1 + (dx // 2) - 35), max(y1 + 30, y2 - 5), f"{bpm:.0f} bpm")
+                    painter.drawText(x1 + 5, 14, f"{dy_uv:.0f} µV")
+                    painter.drawText(max(x1 + 5, x1 + (dx // 2) - 35), h - 4, f"{bpm:.0f} bpm")
         elif self._mode == TOOL_CALIPER:
 
             if self._caliper_line1 is not None:
                 ppen = QPen(QColor("#FFFF00"), 1)
                 painter.setPen(ppen)
                 
-                painter.drawLine(self._caliper_line1, 0, self._caliper_line1, h)
-                
-                
+                line_y = max(12, min(h - 12, int(self._caliper_y if self._caliper_y is not None else h / 2)))
                 if self._caliper_line2 is not None:
-                    painter.drawLine(self._caliper_line2, 0, self._caliper_line2, h)
-                    dx = abs(self._caliper_line2 - self._caliper_line1)
+                    x1 = min(self._caliper_line1, self._caliper_line2)
+                    x2 = max(self._caliper_line1, self._caliper_line2)
+                    painter.drawLine(x1, line_y, x2, line_y)
+                    painter.drawLine(x1, line_y - 5, x1, line_y + 5)
+                    painter.drawLine(x2, line_y - 5, x2, line_y + 5)
+                    dx = x2 - x1
                     ms = interval_ms_from_pixels(dx, max(1, w), len(d), self._fs)
-                    painter.drawText(min(self._caliper_line1, self._caliper_line2) + dx//2, 12, caliper_label(ms))
+                    painter.drawText(x1 + dx // 2 - 55, max(12, line_y - 7), caliper_label(ms))
                 elif self._hover_pos is not None:
-                    
                     pen_preview = QPen(QColor("#FFFF00"), 1, Qt.DashLine)
                     painter.setPen(pen_preview)
                     hover_x = self._hover_pos.x()
-                    painter.drawLine(hover_x, 0, hover_x, h)
+                    x1 = min(self._caliper_line1, hover_x)
+                    x2 = max(self._caliper_line1, hover_x)
+                    painter.drawLine(x1, line_y, x2, line_y)
                     dx = abs(hover_x - self._caliper_line1)
                     ms = interval_ms_from_pixels(dx, max(1, w), len(d), self._fs)
-                    painter.drawText(min(self._caliper_line1, hover_x) + dx//2, 12, caliper_label(ms))
+                    painter.setPen(QPen(QColor("#FFFF00")))
+                    painter.drawText(x1 + dx // 2 - 55, max(12, line_y - 7), caliper_label(ms))
         elif self._mode == TOOL_MAGNIFY:
             host = self._find_magnifier_host()
             if host is not None and hasattr(host, "_magnifier_overlay"):
