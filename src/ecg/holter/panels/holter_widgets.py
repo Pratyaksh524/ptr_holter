@@ -29,7 +29,12 @@ except Exception:
     pg = None
     HAS_PG = False
 
-from ..tool_engine import canonical_tool
+from ..tool_engine import (
+    amplitude_mv_from_pixels,
+    canonical_tool,
+    interval_ms_from_pixels,
+    ruler_label,
+)
 from ..theme import (
     ADC_TO_MV, COL_BEAT_S, COL_BG, COL_BLACK, COL_BTN_ACTIVE_BG, COL_BTN_ACTIVE_TEXT, COL_DARK,
     COL_GRAY, COL_GREEN, COL_GREEN_DRK, COL_GREEN_MID, COL_GRID_MAJOR, COL_GRID_MINOR, COL_RED,
@@ -1061,6 +1066,13 @@ class ECGStripCanvas(QWidget):
             self._curr_pos = event.pos()
             self.update()
 
+        if self._mode == TOOL_RULER and self._ruler_start is not None and self._ruler_end is None:
+            # Complete the ruler with a normal press-drag-release gesture.
+            self._ruler_end = event.pos()
+            self._hover_pos = event.pos()
+            self.update()
+            return
+
     def leaveEvent(self, event):
         if not self._magnify_locked:
             self._hover_pos = None
@@ -1963,27 +1975,42 @@ class ECGStripCanvas(QWidget):
                 end_point = self._ruler_end if self._ruler_end is not None else (self._hover_pos if self._hover_pos else self._ruler_start)
                 
                 if self._ruler_end is not None:
-                    # Final measurement: solid line
-                    painter.drawLine(self._ruler_start, self._ruler_end)
-                    dx = abs(self._ruler_end.x() - self._ruler_start.x())
-                    dy = abs(self._ruler_end.y() - self._ruler_start.y())
+                    # Final measurement: box with time/BPM on the horizontal
+                    # axis and amplitude on the vertical axis.
+                    x1 = min(self._ruler_start.x(), self._ruler_end.x())
+                    x2 = max(self._ruler_start.x(), self._ruler_end.x())
+                    y1 = min(self._ruler_start.y(), self._ruler_end.y())
+                    y2 = max(self._ruler_start.y(), self._ruler_end.y())
+                    painter.drawRect(x1, y1, max(1, x2 - x1), max(1, y2 - y1))
+                    dx = x2 - x1
+                    dy = y2 - y1
                     ms = interval_ms_from_pixels(dx, max(1, w), len(d), self._fs)
                     bpm = 60000 / ms if ms > 0 else 0
                     dy_mv = amplitude_mv_from_pixels(dy, max(1, h), rng, ADC_TO_MV)
-                    painter.setPen(QPen(QColor("#00FFFF")))
-                    painter.drawText(self._ruler_end.x(), max(12, self._ruler_end.y() - 6), ruler_label(ms, dy_mv, bpm))
+                    dy_uv = dy_mv * 1000.0
+                    painter.setPen(QPen(QColor("#FFFF00")))
+                    # Keep labels inside the box so they remain visible on
+                    # every lead row and never get clipped by a canvas edge.
+                    painter.drawText(x1 + 5, y1 + 15, f"{dy_uv:.0f} µV")
+                    painter.drawText(max(x1 + 5, x1 + (dx // 2) - 35), max(y1 + 30, y2 - 5), f"{bpm:.0f} bpm")
                 elif self._hover_pos is not None:
-                    # Preview line while hovering (dashed)
+                    # Preview rectangle while dragging/hovering.
                     pen_preview = QPen(QColor("#00FFFF"), 2, Qt.DashLine)
                     painter.setPen(pen_preview)
-                    painter.drawLine(self._ruler_start, self._hover_pos)
-                    dx = abs(self._hover_pos.x() - self._ruler_start.x())
-                    dy = abs(self._hover_pos.y() - self._ruler_start.y())
+                    x1 = min(self._ruler_start.x(), self._hover_pos.x())
+                    x2 = max(self._ruler_start.x(), self._hover_pos.x())
+                    y1 = min(self._ruler_start.y(), self._hover_pos.y())
+                    y2 = max(self._ruler_start.y(), self._hover_pos.y())
+                    painter.drawRect(x1, y1, max(1, x2 - x1), max(1, y2 - y1))
+                    dx = x2 - x1
+                    dy = y2 - y1
                     ms = interval_ms_from_pixels(dx, max(1, w), len(d), self._fs)
                     bpm = 60000 / ms if ms > 0 else 0
                     dy_mv = amplitude_mv_from_pixels(dy, max(1, h), rng, ADC_TO_MV)
-                    painter.setPen(QPen(QColor("#00FFFF")))
-                    painter.drawText(self._hover_pos.x(), max(12, self._hover_pos.y() - 6), ruler_label(ms, dy_mv, bpm))
+                    dy_uv = dy_mv * 1000.0
+                    painter.setPen(QPen(QColor("#FFFF00")))
+                    painter.drawText(x1 + 5, y1 + 15, f"{dy_uv:.0f} µV")
+                    painter.drawText(max(x1 + 5, x1 + (dx // 2) - 35), max(y1 + 30, y2 - 5), f"{bpm:.0f} bpm")
         elif self._mode == TOOL_CALIPER:
 
             if self._caliper_line1 is not None:

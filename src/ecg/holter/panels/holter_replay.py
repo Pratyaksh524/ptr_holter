@@ -967,7 +967,22 @@ class HolterReplayPanel(QWidget):
         if hasattr(self, "_rr_trend_full"):
             trend_points = [(t, rr) for t, rr, _cls in filtered_points] if len(filtered_points) >= 2 else [(t, rr) for t, rr, _cls in rr_points]
             if self._rr_mode == "HR":
-                trend_points = [(t, (60000.0 / rr) if rr > 0 else 0.0) for t, rr in trend_points]
+                # Keep the trend consistent with the summary card.  Raw RR
+                # data can contain a short, rejected interval (for example
+                # 200 ms -> 300 bpm), while the summary's max HR is based on
+                # cleaned per-beat values. Do not plot those rejected values.
+                valid_hr_max = max(
+                    (float(m.get("hr_max", 0.0) or 0.0) for m in metrics_list),
+                    default=0.0,
+                )
+                hr_points = []
+                for t, rr in trend_points:
+                    if rr <= 0:
+                        continue
+                    hr = 60000.0 / rr
+                    if valid_hr_max <= 0.0 or hr <= valid_hr_max + 0.5:
+                        hr_points.append((t, hr))
+                trend_points = hr_points
             self._rr_trend_full.set_points(trend_points)
             # Only update zoom canvas separately if it's a different widget (OVERVIEW panel has two separate canvases;
             # the REPLAY panel aliases both to the same _hr_trend_canvas -- calling set_points on it twice would
