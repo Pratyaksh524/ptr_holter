@@ -552,6 +552,7 @@ class LorenzCanvas(QWidget):
         if not self._x or not self._y:
             painter.setPen(QPen(QColor(COL_GREEN_DRK)))
             painter.drawText(self.rect(), Qt.AlignCenter, "No RR data")
+            painter.end()
             return
 
         if self._display_mode == "timesharing":
@@ -1092,6 +1093,16 @@ class ECGStripCanvas(QWidget):
         if hasattr(self, '_gain') and self._gain != 1.0:
             center = (mn + rng / 2.0)
             d = center + (d - center) * self._gain
+
+        # Gain is a vertical display magnification, not permission for the
+        # trace to enter the neighbouring lead row. Keep the baseline fixed
+        # and proportionally fit unusually large amplified deflections into
+        # the existing canvas range, preserving their shape without clipping.
+        center = (mn + rng / 2.0)
+        max_deviation = float(np.max(np.abs(d - center))) if d.size else 0.0
+        allowed_deviation = (rng * 0.5) * 0.94
+        if max_deviation > allowed_deviation > 0.0:
+            d = center + (d - center) * (allowed_deviation / max_deviation)
             
         return d, mn, rng
 
@@ -1595,7 +1606,13 @@ class ECGStripCanvas(QWidget):
         n = len(d)
         # Vectorized coordinate computation (numpy) instead of a per-sample Python loop.
         xs = np.arange(n, dtype=np.float64) * x_scale
-        ys = h - (d - mn) / rng * h
+        # Leave a small vertical margin.  At higher gain the transformed
+        # signal can approach the canvas limits; drawing directly against the
+        # edge makes peaks appear clipped or touch the next full-disclosure
+        # lead row.
+        plot_top = 4.0
+        plot_h = max(1.0, float(h) - 8.0)
+        ys = plot_top + plot_h - (d - mn) / rng * plot_h
 
         # Build the whole trace as a single QPainterPath and draw it in one call.
         # This replaces issuing one drawLine() call per sample (extremely slow for
@@ -2472,6 +2489,8 @@ class HistogramCanvas(QWidget):
             painter.setPen(QPen(QColor(UI_MUTED)))
             painter.drawText(left + 110, 14, f'RR Interval Range {min_rr:.0f}-{max_rr:.0f} ms')
 
+        painter.end()
+
 
 # 13a. ST CANVAS
 class STCanvas(QWidget):
@@ -2516,6 +2535,8 @@ class STCanvas(QWidget):
         painter.setPen(QPen(QColor(COL_GREEN_DRK)))
         if len(d) > 0:
             painter.drawText(w - 70, 14, f"{d[min(len(d)//2,len(d)-1)]:.3f}mV")
+
+        painter.end()
 
 
 # 13b. ST/T MARKER CANVAS
@@ -2635,7 +2656,7 @@ class STTMarkerCanvas(QWidget):
                     x2 = int(x * x_scale)
                     y2 = int(y_offset - (lead_data[x] - mn) * y_scale)
                     painter.drawLine(x1, y1, x2, y2)
-        
+
         # Draw markers
         marker_colors = {
             'I': "#FF9900",
@@ -2664,6 +2685,8 @@ class STTMarkerCanvas(QWidget):
                 font.setBold(True)
                 painter.setFont(font)
                 painter.drawText(x + 5, 15, marker_labels[name])
+
+        painter.end()
 
 
 

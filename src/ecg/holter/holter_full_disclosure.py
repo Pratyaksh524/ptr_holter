@@ -189,6 +189,8 @@ class VerticalLineOverlay(QWidget):
             if line_x is not None:
                 painter.drawLine(line_x, 30, line_x, self.height())
 
+        painter.end()
+
 
 class SegmentOverlay(QWidget):
     """
@@ -316,6 +318,8 @@ class SegmentOverlay(QWidget):
                 painter.setFont(t_font)
                 painter.setPen(QPen(QColor("#FFFFFF")))
                 painter.drawText(ex - end_time_w - 4, 20, end_time_str)
+
+        painter.end()
 
 
 
@@ -520,6 +524,8 @@ class HolterFullDisclosureDialog(QDialog):
     # the next row - give higher gains more headroom (paid for by the tightened
     # container/row margins above), and let it be honest about the room a low
     # gain trace actually needs.
+    # Keep the Full Disclosure layout fixed at every gain.  The waveform
+    # renderer fits the amplified trace inside this existing row instead.
     _GAIN_CANVAS_HEIGHT = {0.5: 84, 1.0: 92, 2.0: 108}
 
     def _canvas_height_for_gain(self, gain):
