@@ -2260,6 +2260,7 @@ class HistogramCanvas(QWidget):
                     'rr': float(item.get('rr', 0.0) or 0.0),
                     'hr': float(item.get('hr', 0.0) or 0.0),
                     'rri_ratio': float(item.get('rri_ratio', 1.0) or 1.0),
+                    'hist_value': float(item.get('hist_value', item.get('rr', 0.0)) or 0.0),
                     'label': str(item.get('label', '')),
                 })
             else:
@@ -2284,7 +2285,10 @@ class HistogramCanvas(QWidget):
         # Extract values based on data type
         data_type = getattr(self, '_data_type', 'RR Interval')
         
-        if data_type == 'Heart Rate':
+        if data_type in ('Time (s)', 'Prematurity Ratio', 'Similarity (%)'):
+            values = [float(item.get('hist_value', 0.0) or 0.0)
+                      for item in self._items if float(item.get('hist_value', 0.0) or 0.0) >= 0]
+        elif data_type == 'Heart Rate':
             values = [float(item['hr']) for item in self._items if float(item.get('hr', 0.0) or 0.0) > 0]
         elif data_type == 'RRI Ratio':
             values = [float(item['rri_ratio']) for item in self._items if 0.1 < float(item.get('rri_ratio', 1.0) or 1.0) < 3.0]
@@ -2436,7 +2440,22 @@ class HistogramCanvas(QWidget):
         # Get data type and display appropriate labels
         data_type = getattr(self, '_data_type', 'RR Interval')
         
-        if data_type == 'Heart Rate':
+        if data_type == 'Time (s)':
+            painter.drawText(left, h - 5, f'{min_rr:.1f} s')
+            painter.drawText(w - 70, h - 5, f'{max_rr:.1f} s')
+            painter.setPen(QPen(QColor(UI_MUTED)))
+            painter.drawText(left + 110, 14, f'Time Range {min_rr:.1f}-{max_rr:.1f} s')
+        elif data_type == 'Prematurity Ratio':
+            painter.drawText(left, h - 5, f'{min_rr:.2f}')
+            painter.drawText(w - 70, h - 5, f'{max_rr:.2f}')
+            painter.setPen(QPen(QColor(UI_MUTED)))
+            painter.drawText(left + 110, 14, f'Prematurity Ratio {min_rr:.2f}-{max_rr:.2f}')
+        elif data_type == 'Similarity (%)':
+            painter.drawText(left, h - 5, f'{min_rr:.0f}%')
+            painter.drawText(w - 70, h - 5, f'{max_rr:.0f}%')
+            painter.setPen(QPen(QColor(UI_MUTED)))
+            painter.drawText(left + 110, 14, f'Similarity {min_rr:.0f}-{max_rr:.0f}%')
+        elif data_type == 'Heart Rate':
             painter.drawText(left, h - 5, f'{min_rr:.0f} bpm')
             painter.drawText(w - 70, h - 5, f'{max_rr:.0f} bpm')
             painter.setPen(QPen(QColor(UI_MUTED)))

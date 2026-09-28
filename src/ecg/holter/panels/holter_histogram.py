@@ -206,7 +206,10 @@ class HolterHistogramPanel(QWidget):
         # Get selected histogram type from dropdown
         hist_type = self._type_combo.currentText()
         
-        # Transform data based on histogram type
+        # Build the value that is actually plotted.  Ranking must change the
+        # histogram variable itself; sorting the points alone has no effect
+        # on np.histogram().
+        axis_label = hist_type
         if hist_type == "Heart Rate":
             # Convert RR intervals (ms) to Heart Rate (bpm): HR = 60000 / RR_ms
             for p in points:
@@ -214,17 +217,9 @@ class HolterHistogramPanel(QWidget):
                     p['hr'] = 60000.0 / p['rr']
                 else:
                     p['hr'] = 0.0
-            # Rank by heart rate instead of RR
-            if self._rank_mode == 'time':
-                ranked = sorted(points, key=lambda x: x['t'])
-            elif self._rank_mode == 'prematurity':
-                mean_hr = 60000.0 / mean_rr if mean_rr > 0 else 0.0
-                ranked = sorted(points, key=lambda x: abs(x.get('hr', 0) - mean_hr), reverse=True)
-            elif self._rank_mode == 'similarity':
-                median_hr = 60000.0 / median_rr if median_rr > 0 else 0.0
-                ranked = sorted(points, key=lambda x: abs(x.get('hr', 0) - median_hr))
-            else:
-                ranked = sorted(points, key=lambda x: x.get('hr', 0), reverse=True)
+            for p in points:
+                p['hist_value'] = p['hr']
+            ranked = points
         elif hist_type == "RRI Ratio":
             # RRI Ratio = current RR / previous RR
             for i, p in enumerate(points):
@@ -236,27 +231,37 @@ class HolterHistogramPanel(QWidget):
                         p['rri_ratio'] = 1.0
                 else:
                     p['rri_ratio'] = 1.0
-            # Rank by RRI ratio
-            if self._rank_mode == 'time':
-                ranked = sorted(points, key=lambda x: x['t'])
-            elif self._rank_mode == 'prematurity':
-                ranked = sorted(points, key=lambda x: abs(x.get('rri_ratio', 1.0) - 1.0), reverse=True)
-            elif self._rank_mode == 'similarity':
-                ranked = sorted(points, key=lambda x: abs(x.get('rri_ratio', 1.0) - 1.0))
-            else:
-                ranked = sorted(points, key=lambda x: x.get('rri_ratio', 1.0), reverse=True)
+            for p in points:
+                p['hist_value'] = p['rri_ratio']
+            ranked = points
         else:
             # Default: RR Interval
-            if self._rank_mode == 'time':
-                ranked = sorted(points, key=lambda x: x['t'])
-            elif self._rank_mode == 'prematurity':
-                ranked = sorted(points, key=lambda x: max(0.0, mean_rr - x['rr']), reverse=True)
-            elif self._rank_mode == 'similarity':
-                ranked = sorted(points, key=lambda x: abs(x['rr'] - median_rr))
-            else:
-                ranked = sorted(points, key=lambda x: x['rr'], reverse=True)
+            for p in points:
+                p['hist_value'] = p['rr']
+            ranked = points
 
-        self._hist_canvas.set_histogram_data(ranked, mode=self._rank_mode, data_type=hist_type)
+        if self._rank_mode == 'time':
+            axis_label = 'Time (s)'
+            for p in ranked:
+                p['hist_value'] = max(0.0, float(p['t']))
+        elif self._rank_mode == 'prematurity':
+            # Holter prematurity ratio: current RR / running reference RR.
+            # Values below 1.0 are premature; 1.0 is the reference beat.
+            axis_label = 'Prematurity Ratio'
+            reference = mean_rr if mean_rr > 0 else 1.0
+            for p in ranked:
+                p['hist_value'] = p['rr'] / reference
+        elif self._rank_mode == 'similarity':
+            # No waveform template is carried by the histogram metrics, so
+            # use interval similarity to the median NN interval as the stable
+            # available proxy: 1.0 = identical, approaching 0 = dissimilar.
+            axis_label = 'Similarity (%)'
+            reference = max(median_rr, 1.0)
+            for p in ranked:
+                distance = abs(p['rr'] - reference) / reference
+                p['hist_value'] = 100.0 / (1.0 + distance)
+
+        self._hist_canvas.set_histogram_data(ranked, mode=self._rank_mode, data_type=axis_label)
 
         self._hist_stats['nns'].setText(str(len(rr_arr)))
         self._hist_stats['mean_nn'].setText(f"{rr_arr.mean():.0f} ms")
