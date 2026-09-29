@@ -118,7 +118,7 @@ class HolterEventsPanel(QWidget):
         ]):
             row, col = divmod(i, 2)
             l = QLabel(f"{label}:")
-            l.setStyleSheet(f"color:{COL_GREEN_DRK};font-size:10px;font-weight:bold;border:none;")
+            l.setStyleSheet(f"color:{COL_WHITE};font-size:10px;font-weight:bold;border:none;")
             v = QLabel("-")
             v.setStyleSheet(f"color:{COL_GREEN};font-size:12px;font-weight:bold;border:none;")
             sf_layout.addWidget(l, row * 2, col)

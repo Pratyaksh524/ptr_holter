@@ -215,9 +215,9 @@ def _build_timeline_events(session_dir: str) -> List[Dict[str, object]]:
                 if short_code != 'N':
                     marking_mode = mb.get('marking_mode', 'parallel_single')
                     if marking_mode == 'parallel_multi':
-                        label_text = f"Parallel multiple mark ({lbl})"
+                        label_text = f"Parallel multiple beat marked ({lbl})"
                     else:
-                        label_text = f"Parallel single beat manual marked ({lbl})"
+                        label_text = f"Parallel single beat marked ({lbl})"
                     timeline_events.append({
                         'timestamp': float(mb.get('timestamp', 0.0)),
                         'label': label_text,

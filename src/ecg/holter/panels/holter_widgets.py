@@ -654,7 +654,8 @@ class LorenzCanvas(QWidget):
                 painter.drawEllipse(px - r, py - r, r * 2, r * 2)
 
         # Axis ticks + labels
-        painter.setPen(QPen(QColor(COL_GREEN_DRK)))
+        # High-contrast axis text for the dark Lorenz canvas.
+        painter.setPen(QPen(QColor(COL_WHITE)))
         painter.setFont(QFont("Arial", 8))
         start_tick = int(np.floor(x_min / step) * step)
         end_tick   = int(np.ceil(x_max / step) * step)
@@ -682,7 +683,7 @@ class LorenzCanvas(QWidget):
         # Mode badge
         badge = "DeltaRR" if self._view_mode == "delta_rr" else "Lorenz"
         painter.setFont(QFont("Arial", 7))
-        painter.setPen(QPen(QColor(COL_GREEN_DRK)))
+        painter.setPen(QPen(QColor(COL_WHITE)))
         painter.drawText(left + 4, top + 12, badge)
 
     def _paint_timesharing(self, painter):
@@ -811,6 +812,7 @@ class ECGStripCanvas(QWidget):
         # Ruler/Measuring ruler state: track start and end points separately
         self._ruler_start = None  # Start point (persists)
         self._ruler_end = None    # End point (current measurement)
+        self._ruler_press_pos = None  # Press anchor; a click alone is not a measurement
         self._magnify_pos = None
         self._fs = 500.0
         self._filter_ba = None
@@ -872,6 +874,7 @@ class ECGStripCanvas(QWidget):
         self._caliper_y = None
         self._ruler_start = None
         self._ruler_end = None
+        self._ruler_press_pos = None
         self.update()
 
     def clear_interaction(self):
@@ -962,6 +965,13 @@ class ECGStripCanvas(QWidget):
         
         return intervals
 
+    def _clamp_measurement_point(self, point, right=None):
+        """Keep ruler endpoints inside the portion of the waveform actually plotted."""
+        if point is None:
+            return None
+        max_x = max(0, self.width() - 1) if right is None else max(0, min(self.width() - 1, int(right)))
+        return QPoint(max(0, min(max_x, point.x())), max(0, min(self.height() - 1, point.y())))
+
     def wheelEvent(self, event):
         """Scroll time scrollbar forward/backward on mouse wheel."""
         delta = event.angleDelta().y()
@@ -1004,13 +1014,11 @@ class ECGStripCanvas(QWidget):
 
         # Ruler/Measuring ruler: handle two-click measurement
         if self._mode == TOOL_RULER and event.button() == Qt.LeftButton:
-            if self._ruler_start is None:
-                # First click: set start point
-                self._ruler_start = event.pos()
-                self._ruler_end = None
-            else:
-                # Second click: set end point (keeps start point fixed)
-                self._ruler_end = event.pos()
+            # Wait for an actual drag. A single click must not create a dot or
+            # a one-point ruler.
+            self._ruler_press_pos = self._clamp_measurement_point(event.pos())
+            self._ruler_start = None
+            self._ruler_end = None
             self.update()
             return
 
@@ -1050,9 +1058,17 @@ class ECGStripCanvas(QWidget):
         
         # For ruler tool, show preview of end point while hovering (if start point is set)
         if self._mode == TOOL_RULER:
+            if event.buttons() & Qt.LeftButton and self._ruler_press_pos is not None:
+                point = self._clamp_measurement_point(event.pos())
+                if (point - self._ruler_press_pos).manhattanLength() >= 3:
+                    self._ruler_start = self._ruler_press_pos
+                    self._ruler_end = None
+                    self._hover_pos = point
+                    self.update()
+                    return
             if self._ruler_start is not None and self._ruler_end is None:
                 # Start point is set, show preview of end point as hover
-                self._hover_pos = event.pos()
+                self._hover_pos = self._clamp_measurement_point(event.pos())
                 self.update()
             return
             
@@ -1081,8 +1097,16 @@ class ECGStripCanvas(QWidget):
 
         if self._mode == TOOL_RULER and self._ruler_start is not None and self._ruler_end is None:
             # Complete the ruler with a normal press-drag-release gesture.
-            self._ruler_end = event.pos()
-            self._hover_pos = event.pos()
+            self._ruler_end = self._clamp_measurement_point(event.pos())
+            self._hover_pos = self._ruler_end
+            self._ruler_press_pos = None
+            self.update()
+            return
+        if self._mode == TOOL_RULER and event.button() == Qt.LeftButton:
+            # A click without a drag leaves no ruler artifact.
+            self._ruler_press_pos = None
+            self._ruler_start = None
+            self._ruler_end = None
             self.update()
             return
 
@@ -1372,14 +1396,17 @@ class ECGStripCanvas(QWidget):
             return
         
         # --- Paper speed: control how many samples are visible per screen width ---
-        # At 25mm/s: show all data. At 50mm/s: stretch (show half). At 12.5mm/s: compress (show double).
+        # At 25mm/s: show all data. At 50mm/s: stretch (show half). At 12.5mm/s:
+        # show the complete, expanded time window.  The slow-speed window contains
+        # twice as much data, so applying speed_factor to x_scale would use only
+        # half the canvas and make the remaining data look cropped/blank.
         speed_factor = max(0.25, min(float(self._speed) / 25.0, 4.0))
         n_visible = max(2, int(round(len(d) / speed_factor)))
         if n_visible < len(d):
             d = d[-n_visible:]   # show the most recent n_visible samples (stretched)
-        # (if n_visible >= len(d) we show all data, which appears compressed at slow speed)
-        # Apply speed factor to x_scale so the waveform stretches/compresses visually
-        x_scale = w / max(1, len(d) - 1) * speed_factor
+        # Keep the complete 12.5mm/s window fitted to the canvas.  Higher speeds
+        # retain the existing stretched rendering of their shorter window.
+        x_scale = w / max(1, len(d) - 1) if speed_factor <= 1.0 else w / max(1, len(d) - 1) * speed_factor
         
         # Determine colored intervals based on annotations and structured events
         colored_intervals = []
@@ -1982,18 +2009,25 @@ class ECGStripCanvas(QWidget):
         if self._mode == TOOL_RULER:
             # Draw persistent ruler (start point stays after measurement)
             if self._ruler_start is not None:
+                # The trace may occupy only part of the canvas at some paper
+                # speeds.  Do not let the measurement box extend into the
+                # unused area beyond the plotted waveform.
+                plot_right = min(w - 1, int(round(max(0, len(d) - 1) * x_scale)))
+                ruler_start = self._clamp_measurement_point(self._ruler_start, plot_right)
+                ruler_end = self._clamp_measurement_point(self._ruler_end, plot_right)
+                ruler_hover = self._clamp_measurement_point(self._hover_pos, plot_right)
                 rpen = QPen(QColor("#00FFFF"), 2)
                 painter.setPen(rpen)
                 # Draw line from start point to end point (or hover if end not set yet)
-                end_point = self._ruler_end if self._ruler_end is not None else (self._hover_pos if self._hover_pos else self._ruler_start)
+                end_point = ruler_end if ruler_end is not None else (ruler_hover if ruler_hover else ruler_start)
                 
                 if self._ruler_end is not None:
                     # Final measurement: box with time/BPM on the horizontal
                     # axis and amplitude on the vertical axis.
-                    x1 = min(self._ruler_start.x(), self._ruler_end.x())
-                    x2 = max(self._ruler_start.x(), self._ruler_end.x())
-                    y1 = min(self._ruler_start.y(), self._ruler_end.y())
-                    y2 = max(self._ruler_start.y(), self._ruler_end.y())
+                    x1 = min(ruler_start.x(), ruler_end.x())
+                    x2 = max(ruler_start.x(), ruler_end.x())
+                    y1 = min(ruler_start.y(), ruler_end.y())
+                    y2 = max(ruler_start.y(), ruler_end.y())
                     painter.drawRect(x1, y1, max(1, x2 - x1), max(1, y2 - y1))
                     dx = x2 - x1
                     dy = y2 - y1
@@ -2010,10 +2044,10 @@ class ECGStripCanvas(QWidget):
                     # Preview rectangle while dragging/hovering.
                     pen_preview = QPen(QColor("#00FFFF"), 2, Qt.DashLine)
                     painter.setPen(pen_preview)
-                    x1 = min(self._ruler_start.x(), self._hover_pos.x())
-                    x2 = max(self._ruler_start.x(), self._hover_pos.x())
-                    y1 = min(self._ruler_start.y(), self._hover_pos.y())
-                    y2 = max(self._ruler_start.y(), self._hover_pos.y())
+                    x1 = min(ruler_start.x(), ruler_hover.x())
+                    x2 = max(ruler_start.x(), ruler_hover.x())
+                    y1 = min(ruler_start.y(), ruler_hover.y())
+                    y2 = max(ruler_start.y(), ruler_hover.y())
                     painter.drawRect(x1, y1, max(1, x2 - x1), max(1, y2 - y1))
                     dx = x2 - x1
                     dy = y2 - y1

@@ -547,20 +547,21 @@ class HolterFullDisclosureDialog(QDialog):
     def _recalc_window(self):
         idx = self.time_tabs.currentIndex() if hasattr(self, 'time_tabs') else 0
         text = self.time_tabs.tabText(idx) if hasattr(self, 'time_tabs') else "Full disc"
+        speed_scale = 25.0 / max(1.0, float(self._paper_speed))
         
         if "Full disc" in text:
-            self._window_sec = self._BASE_WIN_SEC * (25.0 / self._paper_speed)
+            self._window_sec = self._BASE_WIN_SEC * speed_scale
         elif "30 Sec" in text:
-            self._window_sec = 30.0
+            self._window_sec = 30.0 * speed_scale
         elif "1 Min" in text:
-            self._window_sec = 60.0
+            self._window_sec = 60.0 * speed_scale
         elif "2 Min" in text:
-            self._window_sec = 120.0
+            self._window_sec = 120.0 * speed_scale
         # elif "5 Min" in text: self._window_sec = 300.0
         # elif "10 Min" in text: self._window_sec = 600.0
         # elif "15 Min" in text: self._window_sec = 900.0
         else:
-            self._window_sec = self._BASE_WIN_SEC * (25.0 / self._paper_speed)
+            self._window_sec = self._BASE_WIN_SEC * speed_scale
 
     def _update_scrollbar_range(self):
         total = max(0.0, self._engine.duration_sec - self._window_sec)
@@ -2751,13 +2752,14 @@ class HolterFullDisclosureDialog(QDialog):
 
     def _on_time_tab_changed(self, index):
         text = self.time_tabs.tabText(index)
-        if "30 Sec" in text: self._window_sec = 30.0
-        elif "1 Min" in text: self._window_sec = 60.0
-        elif "2 Min" in text: self._window_sec = 120.0
+        speed_scale = 25.0 / max(1.0, float(self._paper_speed))
+        if "30 Sec" in text: self._window_sec = 30.0 * speed_scale
+        elif "1 Min" in text: self._window_sec = 60.0 * speed_scale
+        elif "2 Min" in text: self._window_sec = 120.0 * speed_scale
         # elif "5 Min" in text: self._window_sec = 300.0
         # elif "10 Min" in text: self._window_sec = 600.0
         # elif "15 Min" in text: self._window_sec = 900.0
-        else: self._window_sec = self._BASE_WIN_SEC * (25.0 / self._paper_speed)
+        else: self._window_sec = self._BASE_WIN_SEC * speed_scale
         
         # Clear any selected beats and vertical lines when tab changes
         self._drag_start_x = None
@@ -3239,6 +3241,17 @@ class HolterFullDisclosureDialog(QDialog):
         for c in self._canvases:
             if hasattr(c, 'set_mode'):
                 c.set_mode(self._active_tool)
+            if self._active_tool != TOOL_SELECT:
+                # Measurement tools must start cleanly; do not retain the
+                # selection-mode beat marker/vertical line after a tool switch.
+                c._clicked_beat_timestamp = None
+                c._clicked_beat_label = None
+                c._clicked_beat_x_pos = None
+                c._selected_beats = []
+                c.update()
+        if self._active_tool != TOOL_SELECT and hasattr(self, '_vertical_line_overlay'):
+            self._vertical_line_overlay.set_line_positions([])
+            self._clicked_vertical_line_x = None
         # TODO: Show/hide the strip selection overlay based on tool (disabled for now)
         # Show/hide the strip selection overlay based on tool
         # When a measurement tool is active, hide the selection box

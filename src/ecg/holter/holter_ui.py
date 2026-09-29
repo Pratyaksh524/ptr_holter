@@ -1080,7 +1080,7 @@ class HolterMainWindow(QDialog):
             'report table': 'report table',
             'hrv': 'hrv',
             'recordings': 'recordings',
-            'record settings': 'recordings',
+            'record settings': 'record settings',
             'replay': 'replay',
             'lorenz': 'replay',
         }
@@ -1362,7 +1362,9 @@ class HolterMainWindow(QDialog):
             self._focus_tab('REPORT TABLE')
         elif key == 'hrv':
             self._focus_tab('HRV')
-        elif key in {'record settings', 'advance tools'}:
+        elif key == 'record settings':
+            self._focus_tab('RECORD SETTINGS')
+        elif key == 'advance tools':
             self._focus_tab('RECORDINGS')
         elif key == 'print':
             self._generate_report()
@@ -1539,11 +1541,11 @@ class HolterMainWindow(QDialog):
                 color:{UI_MUTED};
                 border:1px solid {UI_BORDER};
                 border-radius:8px;
-                padding:9px 14px;
+                padding:9px 12px;
                 font-size:11px;
                 font-weight:700;
                 margin:6px 6px 8px 0;
-                min-width:96px;
+                min-width:112px;
                 text-align:center;
             }}
             QTabBar::tab:selected {{
@@ -1664,6 +1666,25 @@ class HolterMainWindow(QDialog):
         self._hrv_panel = HolterHRVPanel()
         self._hrv_panel.update_hrv(self._metrics_list, self._summary)
         self._tabs.addTab(self._hrv_panel, "HRV")
+
+        # Record settings
+        settings_panel = QWidget()
+        settings_layout = QVBoxLayout(settings_panel)
+        settings_layout.setContentsMargins(18, 18, 18, 18)
+        settings_layout.setSpacing(10)
+        settings_title = QLabel("Record Settings")
+        settings_title.setStyleSheet(f"font-size:16px;font-weight:700;color:{UI_TEXT};")
+        settings_layout.addWidget(settings_title)
+        settings_info = QLabel(
+            f"Recording duration: {self._duration_hours:g} hours\n"
+            f"Session: {os.path.basename(os.path.normpath(self.session_dir)) if self.session_dir else 'Current session'}"
+        )
+        settings_info.setStyleSheet(f"font-size:13px;color:{UI_MUTED};")
+        settings_info.setWordWrap(True)
+        settings_layout.addWidget(settings_info)
+        settings_layout.addStretch(1)
+        self._record_settings_panel = settings_panel
+        self._tabs.addTab(settings_panel, "RECORD SETTINGS")
 
         # Record browser
         self._record_mgmt_panel = HolterRecordManagementPanel(
