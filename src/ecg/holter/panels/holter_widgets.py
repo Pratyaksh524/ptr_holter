@@ -1513,7 +1513,11 @@ class ECGStripCanvas(QWidget):
                     elif ev_lbl_orig == 'X':
                         active_label = 'X'
 
-                if active_label != 'N':
+                # Automatic arrhythmia regions are represented by the
+                # Full Disclosure segment overlay. Keep this canvas pass for
+                # explicit manual structured markings only, so auto-detected
+                # QRS peaks are not highlighted.
+                if active_label != 'N' and is_manual_structured:
                     # Use color from event if available, otherwise use label_colors
                     color = ev.get('color', label_colors.get(active_label, "#FF3333"))
                     # Calculate overlapping indices
@@ -1607,10 +1611,9 @@ class ECGStripCanvas(QWidget):
                             colored_intervals.append((s_idx, e_idx, color))
 
                 # Only process auto-detected beats — never touch manual beats
-                auto_beats_for_color = [
-                    b for b in self._beat_annotations
-                    if not b.get('is_manual', False)
-                ]
+                # Suppress automatic QRS peak highlighting. Manual beat
+                # coloring is handled by the loop above and is preserved.
+                auto_beats_for_color = []
 
                 if auto_beats_for_color:
                     # Run pattern sequencing to assign rhythm_pattern (Bigeminy, Couplet, VT Run etc.)
@@ -1810,7 +1813,9 @@ class ECGStripCanvas(QWidget):
                 if lead_name == 'I':  # Only print once per refresh
                     print(f"[BADGE DEBUG] Lead={lead_name}, window_beats={len(window_beats)}, window_events={len(window_events)}")
                 
-                badges = get_template_beats_for_badges(window_beats, window_events)
+                # Keep automatic beat badges hidden in Full Disclosure.
+                # Explicit manual badges are still added below.
+                badges = []
                 
                 if lead_name == 'I':  # Only print once per refresh
                     print(f"[BADGE DEBUG] Generated {len(badges)} badges")

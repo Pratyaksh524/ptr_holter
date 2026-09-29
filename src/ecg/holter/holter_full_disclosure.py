@@ -218,10 +218,10 @@ class SegmentOverlay(QWidget):
         self._drag_end_x   = None
         self.update()
 
-    def add_segment(self, start_x, end_x, start_sec, end_sec, label, color, start_time_str='', end_time_str=''):
+    def add_segment(self, start_x, end_x, start_sec, end_sec, label, color, start_time_str='', end_time_str='', auto=False):
         self._segments.append({
             'start_x': start_x, 'end_x': end_x,
-            'start_sec': start_sec, 'end_sec': end_sec,
+            'start_sec': start_sec, 'end_sec': end_sec, 'auto': bool(auto),
             'label': label, 'color': color, 'start_time_str': start_time_str, 'end_time_str': end_time_str
         })
         self.update()
@@ -260,8 +260,10 @@ class SegmentOverlay(QWidget):
                 c = QColor(seg['color'])
             except Exception:
                 c = QColor("#FFFF00")
-            painter.fillRect(sx, 0, ex - sx, h, QColor(c.red(), c.green(), c.blue(), 55))
-            painter.setPen(QPen(c, 1))
+            is_auto = bool(seg.get('auto', False))
+            painter.fillRect(sx, 0, ex - sx, h,
+                             QColor(c.red(), c.green(), c.blue(), 38 if is_auto else 55))
+            painter.setPen(QPen(c, 1, Qt.SolidLine))
             painter.drawRect(sx, 0, ex - sx, h - 1)
 
             mid_x = (sx + ex) // 2
@@ -297,7 +299,7 @@ class SegmentOverlay(QWidget):
 
             # Draw label (y = 20)
             painter.setFont(lbl_font)
-            painter.setPen(QPen(c))
+            painter.setPen(QPen(c, 1))
             painter.drawText(start_text_x, 20, lbl)
 
             # Draw duration string (y = 20, right of label, in white)
@@ -2699,6 +2701,55 @@ class HolterFullDisclosureDialog(QDialog):
         hi = bisect.bisect_right(self._cached_event_ts, end_sec)
         return self._cached_event_list[lo:hi]
 
+    def _add_auto_arrhythmia_segments(self, ref, visible_events, ref_end, span):
+        """Add visual-only auto-arrhythmia regions; manual segments remain separate."""
+        if ref is None or span <= 0:
+            return
+        targets = {
+            'ventricular fibrillation': ('Ventricular Fibrillation', '#FF3333'),
+            'vfib': ('Ventricular Fibrillation', '#FF3333'),
+            'atrial fibrillation': ('Atrial Fibrillation', '#B36BFF'),
+            'afib': ('Atrial Fibrillation', '#B36BFF'),
+            'atrial flutter': ('Atrial Flutter', '#FF69B4'),
+            'aflutter': ('Atrial Flutter', '#FF69B4'),
+        }
+        reader_start = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
+        regions = []
+        for ev in sorted(visible_events or [], key=lambda item: float(item.get('timestamp', 0.0) or 0.0)):
+            label_raw = str(ev.get('label', ev.get('type', '')) or '')
+            label_lower = label_raw.lower()
+            match = next((value for key, value in targets.items() if key in label_lower), None)
+            if match is None:
+                continue
+            start_sec = float(ev.get('timestamp', 0.0) or 0.0)
+            end_sec = float(ev.get('end_timestamp', ev.get('end_ts', start_sec)) or start_sec)
+            if end_sec <= start_sec:
+                continue
+            if regions and regions[-1][2][0] == match[0] and start_sec <= regions[-1][1] + 0.5:
+                regions[-1] = (regions[-1][0], max(regions[-1][1], end_sec), match)
+            else:
+                regions.append((start_sec, end_sec, match))
+
+        for start_sec, end_sec, match in regions:
+            # Clip only for drawing; retain the true event times in the overlay metadata.
+            draw_start = max(start_sec, ref._start_sec)
+            draw_end = min(end_sec, ref_end)
+            if draw_end <= draw_start:
+                continue
+            sx = int(((draw_start - ref._start_sec) / span) * ref.width())
+            ex = int(((draw_end - ref._start_sec) / span) * ref.width())
+            from PyQt5.QtCore import QPoint
+            sx = ref.mapTo(self._canvas_frame, QPoint(sx, 0)).x()
+            ex = ref.mapTo(self._canvas_frame, QPoint(ex, 0)).x()
+            start_time = end_time = ''
+            if reader_start:
+                start_time = datetime.fromtimestamp(reader_start + start_sec).strftime('%H:%M:%S')
+                end_time = datetime.fromtimestamp(reader_start + end_sec).strftime('%H:%M:%S')
+            self._segment_overlay.add_segment(
+                sx, ex, start_sec, end_sec, match[0], match[1],
+                start_time, end_time, auto=True
+            )
+
     def _scroll_throttle_interval(self):
         """Minimum seconds between live redraws while dragging, scaled to window size."""
         win = getattr(self, '_window_sec', self._BASE_WIN_SEC)
@@ -3205,6 +3256,10 @@ class HolterFullDisclosureDialog(QDialog):
                                     sx_global, ex_global, s_sec, e_sec,
                                     seg['label'], seg['color'], seg.get('start_time_str', ''), seg.get('end_time_str', '')
                                 )
+            # Auto-detected fibrillation/flutter regions are visual-only
+            # overlays and never enter the manual segment store.
+            self._add_auto_arrhythmia_segments(ref, visible_structured_events, ref_end, span)
+
             # Ensure overlay is updated after segments are added
             self._segment_overlay.update()
             # Raise overlay to ensure it's visible on top of canvases
