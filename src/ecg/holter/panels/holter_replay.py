@@ -86,8 +86,8 @@ class HolterReplayPanel(QWidget):
         return None
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
 
         self._ribbon_buttons = {}
 
@@ -96,19 +96,27 @@ class HolterReplayPanel(QWidget):
 
         #  "  "  48-hour session summary bar (replaces the two RR trend canvases)  "  " 
         summary_frame = QFrame()
-        summary_frame.setStyleSheet(f"QFrame{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-radius:6px;}}")
-        summary_frame.setFixedHeight(72)
+        summary_frame.setStyleSheet("""
+            QFrame {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #172D4D, stop:0.48 #10213A, stop:1 #080D16);
+                border: 1px solid #315783;
+                border-radius: 8px;
+            }
+        """)
+        summary_frame.setMinimumHeight(76)
         summary_layout = QHBoxLayout(summary_frame)
         summary_layout.setContentsMargins(12, 6, 12, 6)
-        summary_layout.setSpacing(20)
+        summary_layout.setSpacing(0)
         self._summary_labels = {}
         for key, title in [("duration","Duration"),("total_beats","Total Beats"),("avg_hr","Avg HR"),("max_hr","Max HR"),("min_hr","Min HR"),("pauses","Pauses"),("ve","VE Beats"),("sve","SVE Beats"),("sdnn","SDNN"),("rmssd","rMSSD")]:
             col = QVBoxLayout()
+            col.setContentsMargins(12, 0, 12, 0)
             col.setSpacing(2)
             t = QLabel(title)
-            t.setStyleSheet(f"color:{UI_MUTED};font-size:9px;font-weight:600;border:none;")
+            t.setStyleSheet("color:#D5E5F7;font-size:9px;font-weight:700;border:none;")
             v = QLabel("-")
-            v.setStyleSheet(f"color:{UI_TEXT};font-size:13px;font-weight:700;border:none;")
+            v.setStyleSheet("color:#FFFFFF;font-size:13px;font-weight:700;border:none;")
             col.addWidget(t)
             col.addWidget(v)
             self._summary_labels[key] = v
@@ -118,7 +126,7 @@ class HolterReplayPanel(QWidget):
 
         #    HR trend mini-chart (40h-48h of data at a glance)   
         self._hr_trend_canvas = HolterRRTrendCanvas(title="Heart Rate Trend (full recording)")
-        self._hr_trend_canvas.setFixedHeight(120)
+        self._hr_trend_canvas.setFixedHeight(126)
         layout.addWidget(self._hr_trend_canvas)
         # Keep these as dummy attrs so update_lorenz doesn't crash
         self._rr_trend_full = self._hr_trend_canvas
@@ -131,7 +139,7 @@ class HolterReplayPanel(QWidget):
         self._btn_rr = QPushButton("RR")
         self._btn_hr = QPushButton("HR")
         for b in [self._btn_time_whole, self._btn_time_share, self._btn_goto_time]:
-            b.setFixedHeight(28)
+            b.setFixedHeight(30)
             b.setStyleSheet(_style_btn(UI_PANEL_ALT, UI_MUTED, "#1A2C49"))
             time_row.addWidget(b)
         time_row.addStretch()
@@ -156,7 +164,7 @@ class HolterReplayPanel(QWidget):
         top_splitter.setStyleSheet(f"QSplitter{{background:{UI_BG};}} QSplitter::handle{{background:{UI_BORDER};}}")
 
         left_wrap = QFrame()
-        left_wrap.setStyleSheet(f"QFrame{{background:{COL_BLACK};border:1px solid {COL_GREEN_DRK};border-radius:6px;}}")
+        left_wrap.setStyleSheet(f"QFrame{{background:#292D32;border:1px solid {UI_BORDER};border-radius:8px;}}")
         lw_l = QVBoxLayout(left_wrap)
         lw_l.setContentsMargins(4, 4, 4, 4)
         lw_l.setSpacing(6)
@@ -183,7 +191,7 @@ class HolterReplayPanel(QWidget):
         top_splitter.addWidget(left_wrap)
 
         ecg_right = QFrame()
-        ecg_right.setStyleSheet(f"QFrame{{background:{COL_BLACK};border:1px solid {COL_GREEN_DRK};border-radius:6px;}}")
+        ecg_right.setStyleSheet(f"QFrame{{background:#292D32;border:1px solid {UI_BORDER};border-radius:8px;}}")
         ecg_right_layout = QVBoxLayout(ecg_right)
         ecg_right_layout.setContentsMargins(4, 4, 4, 4)
         ecg_right_layout.setSpacing(2)
@@ -194,9 +202,9 @@ class HolterReplayPanel(QWidget):
         leads_scroll.setFrameShape(QFrame.NoFrame)
         leads_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         leads_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        leads_scroll.setStyleSheet(f"QScrollArea{{background:{COL_BLACK};border:none;}}")
+        leads_scroll.setStyleSheet("QScrollArea{background:#25292E;border:none;}")
         leads_container = QWidget()
-        leads_container.setStyleSheet(f"background:{COL_BLACK};")
+        leads_container.setStyleSheet("background:#25292E;")
         leads_vbox = QVBoxLayout(leads_container)
         leads_vbox.setContentsMargins(2, 2, 2, 2)
         leads_vbox.setSpacing(2)
@@ -246,12 +254,12 @@ class HolterReplayPanel(QWidget):
 
 
         ov_frame = QFrame()
-        ov_frame.setStyleSheet(f"QFrame{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-radius:6px;}}")
+        ov_frame.setStyleSheet(f"QFrame{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-radius:8px;}}")
         ov_layout = QVBoxLayout(ov_frame)
         ov_layout.setContentsMargins(6, 6, 6, 6)
         ov_layout.setSpacing(6)
         ov_title = QLabel("Overview")
-        ov_title.setStyleSheet(f"color:{UI_TEXT};font-size:14px;font-weight:700;border:none;")
+        ov_title.setStyleSheet("color:#F4F8FC;font-size:14px;font-weight:700;border:none;")
         ov_layout.addWidget(ov_title)
         self._overview_table = QTableWidget(0, 2)
         self._overview_table.setHorizontalHeaderLabels(["Name", "Value"])
@@ -261,14 +269,32 @@ class HolterReplayPanel(QWidget):
         self._overview_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._overview_table.setSelectionMode(QAbstractItemView.NoSelection)
         self._overview_table.setFocusPolicy(Qt.NoFocus)
-        self._overview_table.setStyleSheet(_table_style())
+        self._overview_table.setStyleSheet(_table_style() + f"""
+            QTableWidget {{
+                background: {UI_PANEL};
+                alternate-background-color: {UI_PANEL_ALT};
+                gridline-color: {UI_BORDER};
+                border: none;
+            }}
+            QHeaderView::section {{
+                background: {UI_PANEL_ALT};
+                color: {UI_TEXT};
+                border: none;
+                border-bottom: 1px solid {UI_BORDER};
+                padding: 7px 6px;
+                font-weight: 700;
+            }}
+            QTableWidget::item {{ padding: 5px 6px; border-bottom: 1px solid {UI_BORDER}; }}
+        """)
         ov_layout.addWidget(self._overview_table, 1)
         top_splitter.addWidget(ov_frame)
-        top_splitter.setSizes([450, 900, 260])
+        top_splitter.setSizes([430, 980, 280])
         layout.addWidget(top_splitter, 2)
 
         # Scrub slider row
         slider_row = QHBoxLayout()
+        slider_row.setContentsMargins(2, 0, 2, 0)
+        slider_row.setSpacing(8)
         self._time_start_label = QLabel("00:00:00")
         self._time_start_label.setStyleSheet(f"color:{COL_TIMESTAMP};font-family:monospace;font-size:12px;border:none;")
         slider_row.addWidget(self._time_start_label)
@@ -292,7 +318,7 @@ class HolterReplayPanel(QWidget):
 
         # Transport + controls row
         ctrl_row = QHBoxLayout()
-        ctrl_row.setSpacing(10)
+        ctrl_row.setSpacing(7)
 
         self._play_btn = QPushButton("Play")
         self._play_btn.setStyleSheet(_style_btn())
@@ -326,24 +352,18 @@ class HolterReplayPanel(QWidget):
 
         ctrl_row.addSpacing(22)
 
-        # Event jump buttons
-        for lbl_txt, ev, d in [("Prev AF","AF","prev"),("Next AF","AF","next"),
-                               ("Prev Brady","Brady","prev"),("Next Brady","Brady","next"),
-                               ("Prev Tachy","Tachy","prev"),("Next Tachy","Tachy","next")]:
-            btn = QPushButton(lbl_txt)
-            btn.setStyleSheet(_style_btn(COL_BLACK, COL_GREEN, COL_GREEN_DRK))
-            btn.setFixedHeight(30)
-            ev_c, d_c = ev, d
-            btn.setMinimumWidth(78)
-            btn.clicked.connect(lambda _, e=ev_c, dd=d_c: self._jump_event(e, dd))
-            ctrl_row.addWidget(btn)
-
         ctrl_row.addStretch()
         layout.addLayout(ctrl_row)
 
         # Bottom toolbar (like reference image)
         toolbar = QFrame()
-        toolbar.setStyleSheet(f"QFrame{{background:{COL_BLACK};border-top:1px solid {COL_GREEN_DRK};}}")
+        toolbar.setStyleSheet(f"""
+            QFrame {{
+                background: #090B0D;
+                border: 1px solid #3A4148;
+                border-radius: 8px;
+            }}
+        """)
         toolbar_layout = QHBoxLayout(toolbar)
         toolbar_layout.setContentsMargins(5, 4, 5, 4)
         toolbar_layout.setSpacing(5)
@@ -361,12 +381,37 @@ class HolterReplayPanel(QWidget):
             "Adjust strip position": 146,
             "Strip Length:10s": 120,
         }
+        tool_button_style = """
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #4A5158, stop:0.5 #292E33, stop:1 #15181B);
+                color: #FFFFFF;
+                border: 1px solid #68727C;
+                border-bottom: 2px solid #101214;
+                border-radius: 5px;
+                padding: 5px 10px;
+                font-size: 10px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #69747E, stop:1 #353C43);
+                color: #FFFFFF;
+                border: 1px solid #AAB4BD;
+            }
+            QPushButton:pressed, QPushButton:checked {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #171A1D, stop:1 #59636C);
+                color: #FFFFFF;
+                border: 1px solid #D0D7DD;
+                padding-top: 6px;
+                padding-bottom: 4px;
+            }
+        """
         for tool in ["Patient information", "Full Disc.", "Goto Template"]:
             tbtn = QPushButton(tool)
-            tbtn.setStyleSheet(f"QPushButton{{background:{COL_DARK};color:{COL_TEXT};border:1px solid {COL_GREEN_DRK};"
-                               f"border-radius:4px;padding:4px 8px;font-size:10px;}}"
-                               f"QPushButton:hover{{background:#202020;color:{COL_WHITE};}}")
-            tbtn.setMinimumHeight(30)
+            tbtn.setStyleSheet(tool_button_style)
+            tbtn.setMinimumHeight(32)
             tbtn.setMinimumWidth(tool_min_widths.get(tool, 110))
             tbtn.clicked.connect(lambda _, t=tool, b=tbtn: self._set_tool_mode(t, b))
             toolbar_layout.addWidget(tbtn)
@@ -374,10 +419,8 @@ class HolterReplayPanel(QWidget):
         for tool in ["Measuring Ruler", "Parallel Ruler", "Magnifying Glass", "Gain Settings",
                      "Paper speed:25mm/s", "Add Event(space)", "Adjust strip position", "Strip Length:10s"]:
             tbtn = QPushButton(tool)
-            tbtn.setStyleSheet(f"QPushButton{{background:{COL_DARK};color:{COL_TEXT};border:1px solid {COL_GREEN_DRK};"
-                               f"border-radius:4px;padding:4px 8px;font-size:10px;}}"
-                               f"QPushButton:hover{{background:#202020;color:{COL_WHITE};}}")
-            tbtn.setMinimumHeight(30)
+            tbtn.setStyleSheet(tool_button_style)
+            tbtn.setMinimumHeight(32)
             tbtn.setMinimumWidth(tool_min_widths.get(tool, 110))
             tbtn.clicked.connect(lambda _, t=tool, b=tbtn: self._set_tool_mode(t, b))
             toolbar_layout.addWidget(tbtn)

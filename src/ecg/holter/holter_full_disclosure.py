@@ -754,7 +754,13 @@ class HolterFullDisclosureDialog(QDialog):
         layout.addWidget(self.time_scrollbar)
 
         bot_bar = QFrame()
-        bot_bar.setStyleSheet(f"background: {COL_DARK}; border-top: 1px solid {COL_GREEN_DRK};")
+        bot_bar.setStyleSheet("""
+            QFrame {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #202B38, stop:0.5 #111A25, stop:1 #080D14);
+                border-top: 1px solid #315783;
+            }
+        """)
         bot_bar.setFixedHeight(40)
         bot_layout = QHBoxLayout(bot_bar)
         bot_layout.setContentsMargins(14, 5, 14, 5)
@@ -764,10 +770,13 @@ class HolterFullDisclosureDialog(QDialog):
             b = QPushButton(text)
             b.setStyleSheet(f"""
                 QPushButton {{
-                    background: #0d1b2a; color: {COL_GREEN};
-                    border: 1px solid {COL_GREEN_DRK}; padding: 5px 14px;
-                    font-size: 13px; font-weight: bold; border-radius: 4px;
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 #394B60, stop:0.5 #213044, stop:1 #101A28);
+                    color: #FFFFFF; border: 1px solid #59738F;
+                    border-bottom: 2px solid #080D14; padding: 5px 14px;
+                    font-size: 12px; font-weight: bold; border-radius: 5px;
                 }}
+                QPushButton:hover {{ background: #45627F; border-color: #8FB7DD; }}
             """)
             return b
 
@@ -788,15 +797,18 @@ class HolterFullDisclosureDialog(QDialog):
             b.setCheckable(True)
             b.setStyleSheet(f"""
                 QPushButton {{
-                    background: #0d1b2a; color: #a0c4e8;
-                    border: 1px solid {COL_GREEN_DRK}; padding: 5px 14px;
-                    font-size: 13px; font-weight: bold; border-radius: 4px;
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 #394B60, stop:0.5 #213044, stop:1 #101A28);
+                    color: #FFFFFF; border: 1px solid #59738F;
+                    border-bottom: 2px solid #080D14; padding: 5px 14px;
+                    font-size: 12px; font-weight: bold; border-radius: 5px;
                 }}
                 QPushButton:checked {{
-                    background: {COL_GREEN_DRK}; color: {COL_GREEN};
-                    border: 1px solid {COL_GREEN};
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 #1B8A5A, stop:1 #0B4B35);
+                    color: #FFFFFF; border: 1px solid #55E39B;
                 }}
-                QPushButton:hover:!checked {{ background: #162a3a; }}
+                QPushButton:hover:!checked {{ background: #45627F; border-color: #8FB7DD; }}
             """)
             b.clicked.connect(lambda checked, t=tool_id, btn=b: self._set_tool_mode(t, btn))
             return b
@@ -969,6 +981,30 @@ class HolterFullDisclosureDialog(QDialog):
         # Let canvas handle left click/drag if a measurement tool is active
         if self._active_tool != TOOL_SELECT:
             return super().eventFilter(obj, event)
+
+        # Smooth horizontal panning for the time-window views. A left drag
+        # moves the recording underneath the cursor instead of jumping between
+        # coarse scrollbar steps; segment selection remains available in its
+        # dedicated segment mode below.
+        if self._selection_mode == 'parallel_single':
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._pan_drag_x = (event.pos().x() if obj == self._canvas_frame
+                                    else obj.mapTo(self._canvas_frame, event.pos()).x())
+                self._pan_drag_start = float(self._current_start)
+                return True
+            if event.type() == QEvent.MouseMove and getattr(self, '_pan_drag_x', None) is not None:
+                current_x = (event.pos().x() if obj == self._canvas_frame
+                             else obj.mapTo(self._canvas_frame, event.pos()).x())
+                frame_width = max(1, self._canvas_frame.width())
+                delta_sec = (self._pan_drag_x - current_x) / frame_width * float(self._window_sec)
+                max_start = max(0.0, float(self._engine.duration_sec) - float(self._window_sec))
+                target = max(0.0, min(max_start, self._pan_drag_start + delta_sec))
+                self.time_scrollbar.setValue(int(round(target * 100.0)))
+                return True
+            if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                self._pan_drag_x = None
+                self._pan_drag_start = None
+                return True
 
         # ----------------------------------------------------------------
         # SEGMENT SELECTION MODE — left button press / move / release

@@ -1390,7 +1390,13 @@ class HolterMainWindow(QDialog):
 
         #  "  "  Top title bar  "  " 
         title_bar = QFrame()
-        title_bar.setStyleSheet(f"QFrame{{background:{UI_PANEL};border-bottom:1px solid {UI_BORDER};}}")
+        title_bar.setStyleSheet("""
+            QFrame {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #07111F, stop:0.55 #102A4A, stop:1 #07111F);
+                border-bottom: 1px solid #315783;
+            }
+        """)
         title_bar.setFixedHeight(52)
         tb_layout = QHBoxLayout(title_bar)
         tb_layout.setContentsMargins(16, 0, 16, 0)
@@ -1433,7 +1439,13 @@ class HolterMainWindow(QDialog):
         main_layout.addWidget(title_bar)
 
         session_bar = QFrame()
-        session_bar.setStyleSheet(f"QFrame{{background:{UI_PANEL_ALT};border-bottom:1px solid {UI_BORDER};}}")
+        session_bar.setStyleSheet("""
+            QFrame {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #111B2B, stop:0.5 #1B3558, stop:1 #111B2B);
+                border-bottom: 1px solid #294B72;
+            }
+        """)
         sb_layout = QHBoxLayout(session_bar)
         sb_layout.setContentsMargins(14, 8, 14, 8)
         sb_layout.setSpacing(10)
@@ -1459,7 +1471,13 @@ class HolterMainWindow(QDialog):
         main_layout.addWidget(session_bar)
 
         action_bar = QFrame()
-        action_bar.setStyleSheet(f"QFrame{{background:{UI_PANEL};border-bottom:1px solid {UI_BORDER};}}")
+        action_bar.setStyleSheet("""
+            QFrame {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #3D444B, stop:0.5 #20252A, stop:1 #0B0D0F);
+                border-bottom: 1px solid #56616B;
+            }
+        """)
         ab_layout = QHBoxLayout(action_bar)
         ab_layout.setContentsMargins(8, 6, 8, 6)
         ab_layout.setSpacing(6)
@@ -1467,7 +1485,16 @@ class HolterMainWindow(QDialog):
         for label in ["Browse", "Search", "Analyse", "View", "Import", "Backup"]:
             btn = QPushButton(label)
             btn.setFixedHeight(30)
-            btn.setStyleSheet(_style_btn())
+            btn.setStyleSheet("""
+                QPushButton {
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 #59636D, stop:0.5 #30363C, stop:1 #171A1D);
+                    color: #FFFFFF; border: 1px solid #78838D;
+                    border-radius: 5px; padding: 5px 13px; font-weight: 700;
+                }
+                QPushButton:hover { background: #657481; border-color: #AEB8C0; }
+                QPushButton:pressed { background: #171B1F; }
+            """)
             self._action_buttons[label] = btn
             ab_layout.addWidget(btn)
         ab_layout.addStretch()
@@ -1475,7 +1502,15 @@ class HolterMainWindow(QDialog):
         for label in ["All", "Today", "Yesterday", "This Week", "This Month", "This Year"]:
             btn = QPushButton(label)
             btn.setFixedHeight(30)
-            btn.setStyleSheet(_style_btn(UI_PANEL_ALT, UI_MUTED, "#1A2C49"))
+            btn.setStyleSheet("""
+                QPushButton {
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 #4B545D, stop:1 #20252A);
+                    color: #FFFFFF; border: 1px solid #68747E;
+                    border-radius: 5px; padding: 5px 11px; font-weight: 600;
+                }
+                QPushButton:hover { background: #5E6A75; color: #FFFFFF; }
+            """)
             self._filter_buttons[label] = btn
             ab_layout.addWidget(btn)
         main_layout.addWidget(action_bar)
@@ -1537,9 +1572,10 @@ class HolterMainWindow(QDialog):
                 border-top:none;
             }}
             QTabBar::tab {{
-                background:{UI_PANEL};
-                color:{UI_MUTED};
-                border:1px solid {UI_BORDER};
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #4B545D, stop:0.5 #282E34, stop:1 #111417);
+                color:#FFFFFF;
+                border:1px solid #68747E;
                 border-radius:8px;
                 padding:9px 12px;
                 font-size:11px;
@@ -1549,13 +1585,13 @@ class HolterMainWindow(QDialog):
                 text-align:center;
             }}
             QTabBar::tab:selected {{
-                color:{UI_TEXT};
+                color:#FFFFFF;
                 background:{UI_ACCENT};
                 border-color:#6EB4FF;
             }}
             QTabBar::tab:hover:!selected {{
-                background:#1A2C49;
-                color:{UI_TEXT};
+                background:#566572;
+                color:#FFFFFF;
             }}
             QGroupBox {{
                 border: none;
