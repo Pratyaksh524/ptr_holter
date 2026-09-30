@@ -34,7 +34,11 @@ def detect_arrhythmias(
     """
     from ecg.arrhythmia_detector import analyze_ecg
     
-    detected_segments = []
+    # Raw 10-second detections are only candidates.  Do not paint them
+    # immediately: one noisy window must not become a complete arrhythmia
+    # segment.  Candidates are confirmed below by comparing them with the
+    # previous overlapping window.
+    candidate_segments = []
     
     # Get sampling rate and duration from reader
     fs = getattr(reader, 'fs', 500)
@@ -92,6 +96,42 @@ def detect_arrhythmias(
                         [float(b.get('rr_ms')) for b in beats if b.get('rr_ms') is not None],
                         dtype=float,
                     )
+                    rate_label = ''
+                    if len(beats) >= 3 and rr_values.size >= 2:
+                        p_present_ratio = float(np.mean([
+                            bool(b.get('p_present')) for b in beats
+                        ]))
+                        qrs_values = np.asarray(
+                            [float(b.get('qrs_ms')) for b in beats
+                             if b.get('qrs_ms') is not None],
+                            dtype=float,
+                        )
+                        pr_values = np.asarray(
+                            [float(b.get('pr_ms')) for b in beats
+                             if b.get('pr_ms') is not None],
+                            dtype=float,
+                        )
+                        organized_qrs = bool(
+                            qrs_values.size >= max(3, len(beats) // 2)
+                            and np.all((qrs_values >= 40.0) & (qrs_values <= 220.0))
+                        )
+                        consistent_pr = bool(
+                            pr_values.size >= max(3, len(beats) // 2)
+                            and np.std(pr_values) <= 80.0
+                        )
+                        sinus_rate_evidence = bool(
+                            p_present_ratio >= 0.60
+                            and organized_qrs
+                            and consistent_pr
+                        )
+                        # Use the requested strict RR rule.  Every valid RR
+                        # interval in the window must satisfy the threshold;
+                        # a mixed-rate window is left unclassified. Rate
+                        # labels require sinus P/QRS evidence.
+                        if sinus_rate_evidence and bool(np.all(rr_values > 1000.0)):
+                            rate_label = 'Sinus Bradycardia'
+                        elif sinus_rate_evidence and bool(np.all(rr_values < 600.0)):
+                            rate_label = 'Sinus Tachycardia'
                     if len(beats) >= 3 and rr_values.size >= 2:
                         p_absent_ratio = float(np.mean([
                             not bool(b.get('p_present')) for b in beats
@@ -105,7 +145,7 @@ def detect_arrhythmias(
                             )
                         )
                     
-                    if arrhythmias or primary_rhythm:
+                    if arrhythmias or primary_rhythm or rate_label:
                         # Map detected arrhythmias to segment labels
                         label_map = {
                             'Asystole': ('X', '#0000FF'),
@@ -113,7 +153,7 @@ def detect_arrhythmias(
                             'Ventricular Tachycardia': ('V', '#FF3333'),
                             'Atrial Fibrillation': ('AF', '#FF00FF'),
                             'Atrial Flutter': ('AF', '#FF00FF'),
-                            'Sinus Bradycardia': ('S', '#00FFFF'),
+                            'Sinus Bradycardia': ('S', '#00BFFF'),
                             'Sinus Tachycardia': ('S', '#00FFFF'),
                             'Normal Sinus Rhythm': ('N', '#00FF00'),
                             'Bradycardia (non-sinus)': ('S', '#00FFFF'),
@@ -142,9 +182,31 @@ def detect_arrhythmias(
                             ),
                             '',
                         )
-                        detected_label = atrial_label or primary_rhythm or (
+                        detected_label = atrial_label or rate_label or primary_rhythm or (
                             arrhythmias[0] if arrhythmias else ''
                         )
+
+                        # Never trust a classifier's Brady/Tachy label when
+                        # the waveform did not satisfy the strong sinus
+                        # P-wave/QRS/PR checks above.
+                        if (not rate_label and str(detected_label).lower()
+                                in {'sinus bradycardia', 'sinus tachycardia',
+                                    'bradycardia (non-sinus)', 'tachycardia (non-sinus)'}):
+                            detected_label = 'Rhythm Undetermined'
+
+                        # Use the beat-to-beat waveform measurement for rate
+                        # segments instead of relying only on a classifier
+                        # label.  A minimum beat count prevents one bad RR
+                        # interval from creating a Brady/Tachy region.
+                        protected_rate_labels = {
+                            'Ventricular Fibrillation',
+                            'Ventricular Tachycardia',
+                            'Atrial Fibrillation',
+                            'Atrial Flutter',
+                        }
+                        if (detected_label not in protected_rate_labels
+                                and rate_label):
+                            detected_label = rate_label
 
                         # Never create an AF segment from the label alone.
                         # The waveform-derived gate above must also pass.
@@ -178,7 +240,7 @@ def detect_arrhythmias(
                             except Exception as e:
                                 print(f"[Auto Arrhythmia Detect] Error formatting time: {e}")
                             
-                            detected_segments.append({
+                            candidate_segments.append({
                                 'start_sec': current_time,
                                 'end_sec': window_end,
                                 'label': detected_label,
@@ -201,28 +263,68 @@ def detect_arrhythmias(
             progress = int((current_time / total_duration) * 100)
             progress_callback(progress)
     
-    # Merge overlapping segments with same label
-    if detected_segments:
-        detected_segments.sort(key=lambda x: x['start_sec'])
-        merged_segments = []
-        
-        for seg in detected_segments:
-            if not merged_segments:
-                merged_segments.append(seg)
-            else:
-                last = merged_segments[-1]
-                # Check if overlapping and same label
-                if (seg['start_sec'] <= last['end_sec'] + 2.0 and 
-                    seg['label'] == last['label']):
-                    # Merge segments
-                    last['end_sec'] = max(last['end_sec'], seg['end_sec'])
-                    last['end_time_str'] = seg['end_time_str']
-                else:
-                    merged_segments.append(seg)
-        
-        detected_segments = merged_segments
-    
-    return detected_segments
+    # ------------------------------------------------------------------
+    # Temporal confirmation
+    # ------------------------------------------------------------------
+    # Windows advance by five seconds and overlap by five seconds.  Therefore
+    # two matching windows represent at least five seconds of persistence in
+    # the same rhythm.  A single candidate is deliberately rejected for the
+    # rhythms most vulnerable to noise (VF/VT/Flutter/AF).
+    if not candidate_segments:
+        return []
+
+    candidate_segments.sort(key=lambda x: x['start_sec'])
+    persistent_labels = {
+        'Ventricular Fibrillation',
+        'Ventricular Tachycardia',
+        'Atrial Fibrillation',
+        'Sinus Bradycardia',
+        'Sinus Tachycardia',
+    }
+    confirmed = []
+    run = []
+
+    def flush_run(items):
+        if not items:
+            return
+        label = items[0]['label']
+        # Require a previous-window match for high-risk/atrial candidate
+        # labels.  Other labels retain the old single-window behavior.
+        if label in persistent_labels and len(items) < 2:
+            return
+        first = dict(items[0])
+        first['end_sec'] = max(item['end_sec'] for item in items)
+        first['end_time_str'] = items[-1].get('end_time_str', first.get('end_time_str', ''))
+        confirmed.append(first)
+
+    for seg in candidate_segments:
+        if not run:
+            run = [seg]
+            continue
+        previous = run[-1]
+        same_label = seg['label'] == previous['label']
+        overlapping = seg['start_sec'] <= previous['end_sec'] + 0.25
+        if same_label and overlapping:
+            run.append(seg)
+        else:
+            flush_run(run)
+            run = [seg]
+    flush_run(run)
+
+    # A confirmed run is already merged, but keep this final pass so adjacent
+    # confirmed runs of the same label become one visual region.
+    merged_segments = []
+    for seg in confirmed:
+        if merged_segments:
+            last = merged_segments[-1]
+            if (seg['label'] == last['label'] and
+                    seg['start_sec'] <= last['end_sec'] + 2.0):
+                last['end_sec'] = max(last['end_sec'], seg['end_sec'])
+                last['end_time_str'] = seg.get('end_time_str', last.get('end_time_str', ''))
+                continue
+        merged_segments.append(seg)
+
+    return merged_segments
 
 
 def convert_to_structured_events(detected_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -243,7 +345,8 @@ def convert_to_structured_events(detected_segments: List[Dict[str, Any]]) -> Lis
             'type': seg['label'],
             'label': seg['label'],
             'end_timestamp': seg['end_sec'],
-            'color': seg['color']
+            'color': seg['color'],
+            'source': 'Auto',
         })
     
     # Sort by timestamp

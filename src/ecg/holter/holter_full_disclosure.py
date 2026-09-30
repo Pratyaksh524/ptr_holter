@@ -531,6 +531,36 @@ class HolterFullDisclosureDialog(QDialog):
                         existing.append(event)
                         existing_keys.add(key)
                         added += 1
+
+                # Collapse duplicate/overlapping automatic regions from the
+                # stored replay metrics and the current waveform detector.
+                # Manual events do not have an end_timestamp and are never
+                # included in this merge.
+                auto_events_all = [
+                    ev for ev in existing
+                    if str(ev.get('source', '')).lower() in {'auto', 'arrhythmia'}
+                    and ev.get('end_timestamp') is not None
+                ]
+                non_auto_events = [
+                    ev for ev in existing if ev not in auto_events_all
+                ]
+                auto_events_all.sort(
+                    key=lambda ev: float(ev.get('timestamp', 0.0) or 0.0)
+                )
+                merged_auto = []
+                for ev in auto_events_all:
+                    label = str(ev.get('label', ev.get('type', ''))).lower()
+                    start = float(ev.get('timestamp', 0.0) or 0.0)
+                    end = float(ev.get('end_timestamp', start) or start)
+                    if merged_auto:
+                        last = merged_auto[-1]
+                        last_label = str(last.get('label', last.get('type', ''))).lower()
+                        last_end = float(last.get('end_timestamp', 0.0) or 0.0)
+                        if label == last_label and start <= last_end + 0.25:
+                            last['end_timestamp'] = max(last_end, end)
+                            continue
+                    merged_auto.append(ev)
+                existing = non_auto_events + merged_auto
                 self._engine._structured_events = sorted(
                     existing,
                     key=lambda ev: float(ev.get('timestamp', 0.0) or 0.0),
@@ -2749,6 +2779,10 @@ class HolterFullDisclosureDialog(QDialog):
             'afib': ('Atrial Fibrillation', '#B36BFF'),
             'atrial flutter': ('Atrial Flutter', '#FF69B4'),
             'aflutter': ('Atrial Flutter', '#FF69B4'),
+            'sinus bradycardia': ('Sinus Bradycardia', '#00BFFF'),
+            'bradycardia': ('Sinus Bradycardia', '#00BFFF'),
+            'sinus tachycardia': ('Sinus Tachycardia', '#00FFFF'),
+            'tachycardia': ('Sinus Tachycardia', '#00FFFF'),
         }
         reader_start = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
         regions = []
@@ -2934,8 +2968,40 @@ class HolterFullDisclosureDialog(QDialog):
                     break
         
         arrhythmia_label = ""
+
+        # Full-disclosure auto regions are the source of truth for the
+        # bottom-right rhythm indicator.  Beat badges alone cannot represent
+        # a Brady/Tachy segment because those rhythms are window-level events.
+        try:
+            active_auto = []
+            for event in getattr(self._engine, '_structured_events', []) or []:
+                source = str(event.get('source', '')).lower()
+                if source not in {'auto', 'arrhythmia'}:
+                    continue
+                event_start = float(event.get('timestamp', 0.0) or 0.0)
+                event_end = float(event.get('end_timestamp', event_start) or event_start)
+                if event_end >= start_sec and event_start <= end_sec:
+                    label = str(event.get('label', event.get('type', '')) or '')
+                    if label.lower() in {
+                        'sinus bradycardia', 'bradycardia',
+                        'sinus tachycardia', 'tachycardia',
+                        'ventricular fibrillation', 'ventricular tachycardia',
+                        'atrial fibrillation', 'atrial flutter',
+                    }:
+                        active_auto.append((event_start, label))
+            if active_auto:
+                event_start, event_label = min(active_auto, key=lambda item: item[0])
+                if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
+                    event_time = datetime.fromtimestamp(
+                        self._engine._reader.start_time + event_start
+                    ).strftime('%H:%M:%S')
+                    arrhythmia_label = f"Arrhythmia: {event_label} at {event_time}"
+                else:
+                    arrhythmia_label = f"Arrhythmia: {event_label}"
+        except Exception as e:
+            print(f"[Full Disclosure] Error updating auto rhythm label: {e}")
         
-        if lead_i_canvas and hasattr(lead_i_canvas, '_beat_annotations'):
+        if not arrhythmia_label and lead_i_canvas and hasattr(lead_i_canvas, '_beat_annotations'):
             # Get beats in current window
             window_beats = [b for b in lead_i_canvas._beat_annotations 
                            if start_sec <= b.get('timestamp', 0.0) <= end_sec]
@@ -2963,16 +3029,42 @@ class HolterFullDisclosureDialog(QDialog):
                     else:
                         arrhythmia_label = f"Arrhythmia: {badge_name}"
                 elif window_beats:
-                    # No arrhythmias detected, show Normal Sinus Rhythm if there are beats in the window
-                    if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
-                        first_beat_ts = window_beats[0].get('timestamp', 0.0)
-                        ts_real = datetime.fromtimestamp(self._engine._reader.start_time + first_beat_ts)
-                        arrhythmia_label = f"Arrhythmia: Normal Sinus Rhythm at {ts_real.strftime('%H:%M:%S')}"
-                    else:
-                        arrhythmia_label = "Arrhythmia: Normal Sinus Rhythm"
+                    # For the remaining organized rhythm, use the visible
+                    # window's RR values and the current scroll position.
+                    window_rr = np.asarray(
+                        [float(b.get('rr_ms')) for b in window_beats
+                         if b.get('rr_ms') is not None],
+                        dtype=float,
+                    )
+                    normal_rr = bool(
+                        window_rr.size == 0
+                        or np.all((window_rr >= 600.0) & (window_rr <= 1000.0))
+                    )
+                    if normal_rr:
+                        if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
+                            # Use start_sec, not the first beat timestamp, so
+                            # the label follows every scroll/drag update.
+                            ts_real = datetime.fromtimestamp(
+                                self._engine._reader.start_time + start_sec
+                            )
+                            arrhythmia_label = f"Arrhythmia: Normal Sinus Rhythm at {ts_real.strftime('%H:%M:%S')}"
+                        else:
+                            arrhythmia_label = "Arrhythmia: Normal Sinus Rhythm"
                         
             except Exception as e:
                 print(f"[Full Disclosure] Error updating arrhythmia label from badges: {e}")
+
+        # At the first canvas refresh beat annotations may not yet be loaded.
+        # If no auto-arrhythmia is active, keep the status label populated with
+        # the current visible time instead of leaving it blank.
+        if not arrhythmia_label:
+            if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
+                current_time = datetime.fromtimestamp(
+                    self._engine._reader.start_time + start_sec
+                ).strftime('%H:%M:%S')
+                arrhythmia_label = f"Arrhythmia: Normal Sinus Rhythm at {current_time}"
+            else:
+                arrhythmia_label = "Arrhythmia: Normal Sinus Rhythm"
                 
         self.lbl_arrhythmia.setText(arrhythmia_label)
 

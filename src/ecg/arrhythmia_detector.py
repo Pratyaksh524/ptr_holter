@@ -130,6 +130,7 @@ def _atrial_flutter_features(
     total_energy = float(np.sum(spectrum[reference_band] ** 2)) + 1e-9
     score = flutter_energy / total_energy
     atrial_rate_bpm = peak_hz * 60.0
+
     is_flutter = bool(0.18 <= score and 240.0 <= atrial_rate_bpm <= 360.0)
     return {
         "is_flutter": is_flutter,
@@ -1285,8 +1286,26 @@ def analyze_ecg(
         }
     # --- VFib Short Circuit ---
     # Even if Pan-Tompkins found "R-peaks", they might be chaotic VFib waves.
-    # We must check this before doing PR/QRS beat measurements which are meaningless in VFib.
-    if is_ventricular_fibrillation(detection_signal, r_peaks, fs):
+    # Validate that the candidate has neither reliable P waves nor an
+    # organized QRS response before accepting the VF label.  Flutter F-waves
+    # are independent of QRS, but Flutter still has organized ventricular
+    # QRS peaks; that distinction prevents spectral Flutter activity from
+    # being confused with VF.
+    vf_candidate = is_ventricular_fibrillation(detection_signal, r_peaks, fs)
+    provisional_beats = [
+        beat for peak in r_peaks
+        for beat in [measure_beat(detection_signal, int(peak), fs)]
+        if beat is not None
+    ]
+    reliable_p_count = sum(bool(beat.get("p_present")) for beat in provisional_beats)
+    organized_qrs_count = sum(
+        40.0 <= float(beat.get("qrs_ms") or 0.0) <= 220.0
+        for beat in provisional_beats
+    )
+    no_reliable_p = reliable_p_count == 0
+    no_organized_qrs = organized_qrs_count < max(3, len(r_peaks) // 2)
+
+    if vf_candidate and no_reliable_p and no_organized_qrs:
         return {
             "heart_rate_bpm": 0.0,
             "rr_ms": 0.0,
@@ -1438,7 +1457,7 @@ def analyze_ecg(
     atrial_fib = (not p_present) and rr_irregular
     flutter_score = float(flutter_features.get("score", 0))
     atrial_flutter = spectral_flutter and (
-        not rr_irregular or flutter_score > 0.35   # strong spectral evidence overrides
+        not rr_irregular or flutter_score > 0.35
     )
     effective_pr_ms = None if (atrial_fib or atrial_flutter) else pr_ms
 
@@ -1550,7 +1569,7 @@ def analyze_ecg(
     except Exception:
         engine_diagnoses = []
 
-    if signal_snr < 0.2: 
+    if signal_snr < 0.2:
         primary = "Poor Signal"
     else:
         primary = engine_diagnoses[0] if engine_diagnoses else ("Normal Sinus Rhythm" if p_present else "Unknown Rhythm")

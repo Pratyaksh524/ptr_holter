@@ -30,6 +30,31 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 
+def _load_auto_segment_events(session_dir: str) -> List[Dict[str, object]]:
+    """Run the same waveform auto-segment detector used by Full Disclosure."""
+    ecgh_path = os.path.join(session_dir, 'recording.ecgh')
+    if not os.path.exists(ecgh_path):
+        return []
+    try:
+        from .file_format import ECGHFileReader
+        from .holter_auto_arrhythmia_detect import detect_arrhythmias
+        reader = ECGHFileReader(ecgh_path)
+        events = []
+        for segment in detect_arrhythmias(reader):
+            events.append({
+                'timestamp': float(segment.get('start_sec', 0.0) or 0.0),
+                'end_timestamp': float(segment.get('end_sec', 0.0) or 0.0),
+                'label': str(segment.get('detected_rhythm', segment.get('label', 'Event'))),
+                'event_type': str(segment.get('label', 'Event')),
+                'source': 'Auto',
+                'confidence': 1.0,
+            })
+        return events
+    except Exception as exc:
+        print(f"[HolterReport] Could not load auto segments: {exc}")
+        return []
+
+
 def generate_holter_report(session_dir: str,
                             patient_info: dict,
                             summary: dict,
@@ -122,6 +147,9 @@ def _build_timeline_events(session_dir: str) -> List[Dict[str, object]]:
     all_beats = []
     auto_events = []
 
+    # Include the exact waveform auto-segments shown in Full Disclosure.
+    auto_events.extend(_load_auto_segment_events(session_dir))
+
     for metric in metrics or []:
         for b in metric.get('all_beats', []) or []:
             if isinstance(b, dict):
@@ -137,7 +165,7 @@ def _build_timeline_events(session_dir: str) -> List[Dict[str, object]]:
                     'timestamp': base_t,
                     'label': lbl,
                     'event_type': lbl,
-                    'source': 'analysis',
+                    'source': 'Auto',
                     'confidence': float(metric.get('quality', 1.0) or 1.0),
                 })
 
@@ -157,7 +185,7 @@ def _build_timeline_events(session_dir: str) -> List[Dict[str, object]]:
                     'timestamp': float(b.get('timestamp', 0.0) or 0.0),
                     'label': badge_name,
                     'event_type': b.get('code', 'Arrhythmia'),
-                    'source': 'analysis',
+                    'source': 'Auto',
                     'confidence': 1.0,
                 })
     except Exception as _badge_e:
@@ -194,7 +222,12 @@ def _build_timeline_events(session_dir: str) -> List[Dict[str, object]]:
                     break
 
         if not should_filter:
-            filtered_events.append(event)
+            normalized_event = dict(event)
+            if str(normalized_event.get('source', '')).lower() in {'analysis', 'arrhythmia'}:
+                normalized_event['source'] = 'Auto'
+            elif not normalized_event.get('source'):
+                normalized_event['source'] = 'Auto'
+            filtered_events.append(normalized_event)
 
     timeline_events = filtered_events
 
@@ -258,6 +291,38 @@ def _build_timeline_events(session_dir: str) -> List[Dict[str, object]]:
                 })
         except Exception as _ms_e:
             print(f"[HolterReport] Could not load manual segments for timeline: {_ms_e}")
+
+    # Keep the timeline label consistent across the full duration of an
+    # automatic segment.  Metric-level NSR rows can otherwise appear inside a
+    # Brady/Tachy/VF/AF segment and contradict the segment overlay.
+    auto_ranges = []
+    for event in timeline_events:
+        if str(event.get('source', '')).lower() != 'auto':
+            continue
+        start = float(event.get('timestamp', 0.0) or 0.0)
+        end = float(event.get('end_timestamp', start) or start)
+        label = str(event.get('label', event.get('event_type', '')) or '')
+        if end > start and label.lower() not in {'normal sinus rhythm', 'sinus rhythm'}:
+            auto_ranges.append((start, end, label))
+
+    if auto_ranges:
+        normalized_timeline = []
+        for event in timeline_events:
+            source = str(event.get('source', '')).lower()
+            if source == 'auto':
+                timestamp = float(event.get('timestamp', 0.0) or 0.0)
+                active_matches = [
+                    (start, label) for start, end, label in auto_ranges
+                    if start <= timestamp <= end
+                ]
+                active = max(active_matches, key=lambda item: item[0])[1] if active_matches else None
+                if active:
+                    event = dict(event)
+                    event['label'] = active
+                    event['event_type'] = active
+                    event['source'] = 'Auto'
+            normalized_timeline.append(event)
+        timeline_events = normalized_timeline
 
     # Sort all events chronologically by timestamp (sort_ts overrides timestamp for manual segment end-rows)
     timeline_events = sorted(timeline_events, key=lambda x: float(x.get("sort_ts", x.get("timestamp", 0.0)) or 0.0))
@@ -459,9 +524,21 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         lbl = seg.get('label', 'Unknown')
         manual_arrhy_counts[lbl] = manual_arrhy_counts.get(lbl, 0) + 1
 
+    auto_segment_events = _load_auto_segment_events(session_dir)
+    auto_segment_counts = {}
+    auto_segment_times = {}
+    for event in auto_segment_events:
+        label = str(event.get('label', 'Unknown'))
+        auto_segment_counts[label] = auto_segment_counts.get(label, 0) + 1
+        auto_segment_times.setdefault(label, []).append(
+            _format_system_time(session_dir, float(event.get('timestamp', 0.0) or 0.0))
+        )
+
     # Merge auto-detected and manual arrhythmia counts
     combined_arrhy_counts = dict(arrhy_counts)
     for label, count in manual_arrhy_counts.items():
+        combined_arrhy_counts[label] = combined_arrhy_counts.get(label, 0) + count
+    for label, count in auto_segment_counts.items():
         combined_arrhy_counts[label] = combined_arrhy_counts.get(label, 0) + count
 
     # Keep the summary focused on clinically significant arrhythmias.  Rhythm
@@ -490,20 +567,26 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         filtered_arrhy_counts[label] = count
 
     if filtered_arrhy_counts:
-        arrhy_data = [['Arrhythmia Type', 'Episodes', 'Burden', 'Source']]
-        total_chunks = max(1, summary.get('chunks_analyzed', 1))
+        arrhy_data = [['Arrhythmia Type', 'Episodes', 'Occurring Time', 'Source']]
         for label, count in sorted(filtered_arrhy_counts.items(), key=lambda x: -x[1]):
-            burden = f"{count / total_chunks * 100:.1f}%"
             # Determine source
             source = []
             if label in arrhy_counts:
                 source.append("Auto")
+            if label in auto_segment_counts:
+                source.append("Auto")
             if label in manual_arrhy_counts:
                 source.append("Manual")
-            source_str = ", ".join(source)
-            arrhy_data.append([label, str(count), burden, source_str])
+            source_str = ", ".join(dict.fromkeys(source))
+            occurring = auto_segment_times.get(label, [])
+            if not occurring and label in manual_arrhy_counts:
+                occurring = [
+                    _format_system_time(session_dir, float(seg.get('start_sec', 0.0) or 0.0))
+                    for seg in manual_segments if str(seg.get('label', '')) == label
+                ]
+            arrhy_data.append([label, str(count), ', '.join(occurring) or '-', source_str])
 
-        arrhy_table = Table(arrhy_data, colWidths=[80*mm, 25*mm, 25*mm, 20*mm])
+        arrhy_table = Table(arrhy_data, colWidths=[65*mm, 20*mm, 60*mm, 25*mm])
         arrhy_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), RED),
             ('TEXTCOLOR',  (0, 0), (-1, 0), colors.white),
