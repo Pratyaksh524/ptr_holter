@@ -3438,6 +3438,18 @@ class HolterFullDisclosureDialog(QDialog):
                     print(f"[Full Disclosure] Canvas not ready: ref_w={ref_w}, data_l={data_l}")
             else:
                 print(f"[Full Disclosure] Canvas ref not available or missing attributes")
+            # The first canvas refresh happens before the segment overlay is
+            # constructed. Re-add visible automatic regions here so they are
+            # visible immediately, without requiring a scroll/drag refresh.
+            if ref and hasattr(ref, '_start_sec') and hasattr(ref, '_data') and hasattr(ref, '_fs'):
+                ref_end = ref._start_sec + len(ref._data) / ref._fs
+                span = ref_end - ref._start_sec
+                self._add_auto_arrhythmia_segments(
+                    ref,
+                    self._structured_events_for_canvas(ref._start_sec, ref_end),
+                    ref_end,
+                    span,
+                )
             self._segment_overlay.update()
         else:
             print(f"[Full Disclosure] _refresh_segment_overlay: overlay or annotations not available")

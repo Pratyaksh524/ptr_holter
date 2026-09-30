@@ -98,39 +98,14 @@ def detect_arrhythmias(
                     )
                     rate_label = ''
                     if len(beats) >= 3 and rr_values.size >= 2:
-                        p_present_ratio = float(np.mean([
-                            bool(b.get('p_present')) for b in beats
-                        ]))
-                        qrs_values = np.asarray(
-                            [float(b.get('qrs_ms')) for b in beats
-                             if b.get('qrs_ms') is not None],
-                            dtype=float,
-                        )
-                        pr_values = np.asarray(
-                            [float(b.get('pr_ms')) for b in beats
-                             if b.get('pr_ms') is not None],
-                            dtype=float,
-                        )
-                        organized_qrs = bool(
-                            qrs_values.size >= max(3, len(beats) // 2)
-                            and np.all((qrs_values >= 40.0) & (qrs_values <= 220.0))
-                        )
-                        consistent_pr = bool(
-                            pr_values.size >= max(3, len(beats) // 2)
-                            and np.std(pr_values) <= 80.0
-                        )
-                        sinus_rate_evidence = bool(
-                            p_present_ratio >= 0.60
-                            and organized_qrs
-                            and consistent_pr
-                        )
                         # Use the requested strict RR rule.  Every valid RR
                         # interval in the window must satisfy the threshold;
-                        # a mixed-rate window is left unclassified. Rate
-                        # labels require sinus P/QRS evidence.
-                        if sinus_rate_evidence and bool(np.all(rr_values > 1000.0)):
+                        # a mixed-rate window is left unclassified. P-wave
+                        # detection remains available for rhythm analysis but
+                        # does not veto this RR-only rate segment.
+                        if bool(np.all(rr_values > 1000.0)):
                             rate_label = 'Sinus Bradycardia'
-                        elif sinus_rate_evidence and bool(np.all(rr_values < 600.0)):
+                        elif bool(np.all(rr_values < 600.0)):
                             rate_label = 'Sinus Tachycardia'
                     if len(beats) >= 3 and rr_values.size >= 2:
                         p_absent_ratio = float(np.mean([
@@ -186,14 +161,6 @@ def detect_arrhythmias(
                             arrhythmias[0] if arrhythmias else ''
                         )
 
-                        # Never trust a classifier's Brady/Tachy label when
-                        # the waveform did not satisfy the strong sinus
-                        # P-wave/QRS/PR checks above.
-                        if (not rate_label and str(detected_label).lower()
-                                in {'sinus bradycardia', 'sinus tachycardia',
-                                    'bradycardia (non-sinus)', 'tachycardia (non-sinus)'}):
-                            detected_label = 'Rhythm Undetermined'
-
                         # Use the beat-to-beat waveform measurement for rate
                         # segments instead of relying only on a classifier
                         # label.  A minimum beat count prevents one bad RR
@@ -217,7 +184,10 @@ def detect_arrhythmias(
                         label_code, color = label_map.get(detected_label, ('X', '#0000FF'))
                         
                         # Only add if not Normal Sinus Rhythm (to avoid clutter)
-                        if detected_label != 'Normal Sinus Rhythm' and detected_label != 'Rhythm Undetermined':
+                        is_normal_rhythm = str(detected_label).strip().lower() in {
+                            'normal sinus rhythm', 'sinus rhythm'
+                        }
+                        if not is_normal_rhythm and detected_label != 'Rhythm Undetermined':
                             # Compute real-world timestamp strings
                             start_time_str = ''
                             end_time_str = ''
@@ -241,6 +211,9 @@ def detect_arrhythmias(
                                 print(f"[Auto Arrhythmia Detect] Error formatting time: {e}")
                             
                             candidate_segments.append({
+                                # Refine the coarse 10-second window using
+                                # the actual R-peak interval that first/last
+                                # satisfies the rate rule.
                                 'start_sec': current_time,
                                 'end_sec': window_end,
                                 'label': detected_label,
@@ -249,6 +222,31 @@ def detect_arrhythmias(
                                 'end_time_str': end_time_str,
                                 'detected_rhythm': detected_label
                             })
+
+                            # The window is only a detection container. Use
+                            # R-peaks to move its visual boundaries closer to
+                            # the real rhythm transition.
+                            local_peaks = np.asarray(results.get('r_peaks') or [], dtype=float)
+                            if local_peaks.size >= 2 and detected_label in {
+                                'Sinus Bradycardia', 'Sinus Tachycardia'
+                            }:
+                                local_rr = np.diff(local_peaks) * 1000.0 / float(fs)
+                                if detected_label == 'Sinus Bradycardia':
+                                    qualifying = local_rr > 1000.0
+                                else:
+                                    qualifying = local_rr < 600.0
+                                qualifying_indices = np.flatnonzero(qualifying)
+                                if qualifying_indices.size:
+                                    first_i = int(qualifying_indices[0])
+                                    last_i = int(qualifying_indices[-1])
+                                    candidate_segments[-1]['start_sec'] = max(
+                                        current_time,
+                                        current_time + local_peaks[first_i] / float(fs),
+                                    )
+                                    candidate_segments[-1]['end_sec'] = min(
+                                        window_end,
+                                        current_time + local_peaks[last_i + 1] / float(fs),
+                                    )
                             
                             print(f"[Auto Arrhythmia Detect] Detected: {detected_label} at {current_time:.1f}s - {window_end:.1f}s")
         
@@ -278,8 +276,6 @@ def detect_arrhythmias(
         'Ventricular Fibrillation',
         'Ventricular Tachycardia',
         'Atrial Fibrillation',
-        'Sinus Bradycardia',
-        'Sinus Tachycardia',
     }
     confirmed = []
     run = []
@@ -311,14 +307,15 @@ def detect_arrhythmias(
             run = [seg]
     flush_run(run)
 
-    # A confirmed run is already merged, but keep this final pass so adjacent
-    # confirmed runs of the same label become one visual region.
+    # A confirmed run is already merged. Only truly overlapping confirmed
+    # regions may be collapsed; do not bridge a gap where NSR or another
+    # rhythm occurred, because that gap represents a separate episode.
     merged_segments = []
     for seg in confirmed:
         if merged_segments:
             last = merged_segments[-1]
             if (seg['label'] == last['label'] and
-                    seg['start_sec'] <= last['end_sec'] + 2.0):
+                    seg['start_sec'] <= last['end_sec'] + 0.25):
                 last['end_sec'] = max(last['end_sec'], seg['end_sec'])
                 last['end_time_str'] = seg.get('end_time_str', last.get('end_time_str', ''))
                 continue
