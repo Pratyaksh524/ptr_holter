@@ -128,6 +128,8 @@ class HolterRecordManagementPanel(QWidget):
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._show_record_context_menu)
         self._table.setVerticalScrollMode(QAbstractItemView.ScrollPerItem)
         self._table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self._table.verticalScrollBar().setSingleStep(1)
@@ -254,6 +256,148 @@ class HolterRecordManagementPanel(QWidget):
 
     def _on_double_click(self, index):
         self._open_row(index.row())
+
+    def _show_record_context_menu(self, position):
+        """Show actions for the recording row under the mouse."""
+        item = self._table.itemAt(position)
+        if item is None:
+            return
+        self._table.selectRow(item.row())
+        menu = QMenu(self)
+        edit_action = menu.addAction("Edit Details")
+        edit_action.triggered.connect(lambda: self._edit_record_details(item.row()))
+        menu.exec_(self._table.viewport().mapToGlobal(position))
+
+    def _edit_record_details(self, row: int):
+        """Edit patient metadata for one completed recording."""
+        item = self._table.item(row, 0)
+        session_dir = item.data(Qt.UserRole) if item else ""
+        if not session_dir:
+            return
+
+        metadata = {}
+        patient_path = os.path.join(session_dir, "patient.json")
+        session_path = os.path.join(session_dir, "session.json")
+        try:
+            if os.path.exists(patient_path):
+                with open(patient_path, "r", encoding="utf-8") as handle:
+                    metadata = json.load(handle) or {}
+            if not metadata and os.path.exists(session_path):
+                with open(session_path, "r", encoding="utf-8") as handle:
+                    session_data = json.load(handle) or {}
+                metadata = dict(session_data.get("patient_info") or {})
+        except Exception as exc:
+            _show_message_box(self, QMessageBox.Warning, "Edit Details", f"Could not read patient details:\n{exc}")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit Recording Details")
+        dialog.setModal(True)
+        dialog.setFixedWidth(390)
+        dialog.setStyleSheet(f"""
+            QDialog {{
+                background-color: {UI_BG};
+                color: {UI_TEXT};
+            }}
+            QLabel {{
+                color: #FFFFFF;
+                font-size: 13px;
+                font-weight: 600;
+            }}
+            QLineEdit, QComboBox {{
+                min-height: 30px;
+                padding: 3px 8px;
+                border: 1px solid {UI_BORDER};
+                border-radius: 4px;
+                background-color: {UI_PANEL_ALT};
+                color: #FFFFFF;
+                selection-background-color: {UI_ACCENT};
+                selection-color: #FFFFFF;
+            }}
+            QLineEdit:focus, QComboBox:focus {{
+                border: 1px solid {UI_ACCENT};
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {UI_PANEL_ALT};
+                color: #FFFFFF;
+                selection-background-color: {UI_ACCENT};
+                selection-color: #FFFFFF;
+            }}
+            QPushButton {{
+                min-width: 82px;
+                min-height: 30px;
+                padding: 4px 14px;
+                border: 1px solid {UI_BORDER};
+                border-radius: 4px;
+                background-color: {UI_PANEL_ALT};
+                color: #FFFFFF;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background-color: {UI_ACCENT_HOVER};
+            }}
+        """)
+        form = QGridLayout(dialog)
+        form.setContentsMargins(18, 18, 18, 14)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+        name_edit = QLineEdit(str(metadata.get("name") or metadata.get("patient_name") or ""))
+        age_edit = QLineEdit(str(metadata.get("age") or ""))
+        gender_edit = QComboBox()
+        gender_edit.addItems(["Select Gender", "Male", "Female", "Other"])
+        current_gender = str(metadata.get("gender") or metadata.get("sex") or "")
+        gender_index = gender_edit.findText(current_gender, Qt.MatchFixedString)
+        if gender_index >= 0:
+            gender_edit.setCurrentIndex(gender_index)
+        form.addWidget(QLabel("Name:"), 0, 0)
+        form.addWidget(name_edit, 0, 1)
+        form.addWidget(QLabel("Age:"), 1, 0)
+        form.addWidget(age_edit, 1, 1)
+        form.addWidget(QLabel("Gender:"), 2, 0)
+        form.addWidget(gender_edit, 2, 1)
+        buttons = QHBoxLayout()
+        save_button = QPushButton("Save")
+        cancel_button = QPushButton("Cancel")
+        save_button.setStyleSheet(f"""
+            QPushButton {{ background-color: {UI_ACCENT}; color: #FFFFFF; border: none; }}
+            QPushButton:hover {{ background-color: {UI_ACCENT_HOVER}; }}
+        """)
+        cancel_button.setStyleSheet(f"""
+            QPushButton {{ background-color: {UI_PANEL}; color: #FFFFFF; }}
+            QPushButton:hover {{ background-color: {UI_PANEL_ALT}; }}
+        """)
+        buttons.addStretch(1)
+        buttons.addWidget(save_button)
+        buttons.addWidget(cancel_button)
+        form.addLayout(buttons, 3, 0, 1, 2)
+        save_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        name = name_edit.text().strip()
+        age = age_edit.text().strip()
+        gender = gender_edit.currentText()
+        if not name or not age or gender == "Select Gender":
+            _show_message_box(self, QMessageBox.Warning, "Edit Details", "Please enter name, age, and gender.")
+            return
+
+        updated = dict(metadata)
+        updated.update({"name": name, "patient_name": name, "age": age, "gender": gender})
+        try:
+            with open(patient_path, "w", encoding="utf-8") as handle:
+                json.dump(updated, handle, indent=2)
+            session_data = {}
+            if os.path.exists(session_path):
+                with open(session_path, "r", encoding="utf-8") as handle:
+                    session_data = json.load(handle) or {}
+            session_data["patient_info"] = dict(updated)
+            with open(session_path, "w", encoding="utf-8") as handle:
+                json.dump(session_data, handle, indent=2)
+            self.refresh_records()
+            _show_message_box(self, QMessageBox.Information, "Edit Details", "Recording details updated successfully.")
+        except Exception as exc:
+            _show_message_box(self, QMessageBox.Warning, "Edit Details", f"Could not save patient details:\n{exc}")
 
     def _sync_selected_session(self):
         rows = self._table.selectionModel().selectedRows() if self._table.selectionModel() else []

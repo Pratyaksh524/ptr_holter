@@ -81,6 +81,29 @@ def detect_arrhythmias(
                     # Get detected arrhythmias
                     arrhythmias = results.get('arrhythmias', [])
                     primary_rhythm = results.get('primary_rhythm', '')
+
+                    # AF segment gate: require absent/insufficient P waves and
+                    # an irregular ventricular rhythm.  This prevents a
+                    # missing-P-wave result caused by noise from becoming an
+                    # AF region by itself.
+                    af_waveform_confirmed = False
+                    beats = [b for b in (results.get('beats') or []) if isinstance(b, dict)]
+                    rr_values = np.asarray(
+                        [float(b.get('rr_ms')) for b in beats if b.get('rr_ms') is not None],
+                        dtype=float,
+                    )
+                    if len(beats) >= 3 and rr_values.size >= 2:
+                        p_absent_ratio = float(np.mean([
+                            not bool(b.get('p_present')) for b in beats
+                        ]))
+                        rr_std_ms = float(np.std(rr_values))
+                        rr_range_ms = float(np.max(rr_values) - np.min(rr_values))
+                        af_waveform_confirmed = bool(
+                            p_absent_ratio > 0.50 and (
+                                rr_std_ms > 80.0
+                                or (p_absent_ratio > 0.70 and rr_range_ms > 120.0)
+                            )
+                        )
                     
                     if arrhythmias or primary_rhythm:
                         # Map detected arrhythmias to segment labels
@@ -106,9 +129,28 @@ def detect_arrhythmias(
                             'ST depression': ('X', '#FFFF00'),
                         }
                         
-                        # Use primary rhythm or first arrhythmia
-                        detected_label = primary_rhythm if primary_rhythm else (arrhythmias[0] if arrhythmias else '')
-                        
+                        # Prefer clinically important atrial rhythm findings
+                        # from the arrhythmia list over a generic primary label
+                        # such as Normal Sinus Rhythm.  Flutter/AF can be a
+                        # secondary finding when the ventricular rate remains
+                        # organized, but it must still create a waveform region.
+                        atrial_label = next(
+                            (
+                                str(label) for label in arrhythmias
+                                if 'atrial fibrillation' in str(label).lower()
+                                or 'atrial flutter' in str(label).lower()
+                            ),
+                            '',
+                        )
+                        detected_label = atrial_label or primary_rhythm or (
+                            arrhythmias[0] if arrhythmias else ''
+                        )
+
+                        # Never create an AF segment from the label alone.
+                        # The waveform-derived gate above must also pass.
+                        if 'atrial fibrillation' in str(detected_label).lower() and not af_waveform_confirmed:
+                            detected_label = 'Rhythm Undetermined'
+
                         # Map to segment label
                         label_code, color = label_map.get(detected_label, ('X', '#0000FF'))
                         

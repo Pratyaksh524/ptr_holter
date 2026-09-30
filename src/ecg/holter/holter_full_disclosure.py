@@ -503,6 +503,43 @@ class HolterFullDisclosureDialog(QDialog):
         except Exception as e:
             print(f"[Full Disclosure] Error loading segment annotations on startup: {e}")
 
+        # Generate automatic rhythm regions for Full Disclosure.  The
+        # detector module is intentionally separate from the replay engine,
+        # so it must be invoked here before the first canvas refresh.
+        try:
+            from .holter_auto_arrhythmia_detect import (
+                detect_arrhythmias,
+                convert_to_structured_events,
+            )
+            reader = getattr(self._engine, '_reader', None)
+            if reader is not None:
+                auto_segments = detect_arrhythmias(reader)
+                auto_events = convert_to_structured_events(auto_segments)
+                existing = getattr(self._engine, '_structured_events', []) or []
+                existing_keys = {
+                    (round(float(ev.get('timestamp', 0.0) or 0.0), 3),
+                     str(ev.get('label', '')).lower())
+                    for ev in existing
+                }
+                added = 0
+                for event in auto_events:
+                    key = (
+                        round(float(event.get('timestamp', 0.0) or 0.0), 3),
+                        str(event.get('label', '')).lower(),
+                    )
+                    if key not in existing_keys:
+                        existing.append(event)
+                        existing_keys.add(key)
+                        added += 1
+                self._engine._structured_events = sorted(
+                    existing,
+                    key=lambda ev: float(ev.get('timestamp', 0.0) or 0.0),
+                )
+                self._event_index_dirty = True
+                print(f"[Full Disclosure] Added {added} automatic rhythm regions.")
+        except Exception as e:
+            print(f"[Full Disclosure] Automatic rhythm detection unavailable: {e}")
+
         self._update_canvases(0.0)
         
         # CRITICAL FIX: Apply the restored selection mode to update button text and UI state

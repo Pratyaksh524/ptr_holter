@@ -464,11 +464,28 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     for label, count in manual_arrhy_counts.items():
         combined_arrhy_counts[label] = combined_arrhy_counts.get(label, 0) + count
 
-    # Filter out Long QT Syndrome, Wide QRS, Frequent PVCs, and Multifocal PVCs from arrhythmia summary
+    # Keep the summary focused on clinically significant arrhythmias.  Rhythm
+    # context and beat/conduction classifications below are intentionally not
+    # included in this table (they may still appear elsewhere in the report).
+    excluded_summary_terms = (
+        'long qt',
+        'wide qrs',
+        'premature ventricular contraction',
+        'pvc',
+        'second-degree',
+        'second degree',
+        'third-degree',
+        'third degree',
+    )
     filtered_arrhy_counts = {}
     for label, count in combined_arrhy_counts.items():
         label_lower = label.lower()
-        if 'long qt' in label_lower or 'wide qrs' in label_lower or 'frequent pvc' in label_lower or 'multifocal pvc' in label_lower:
+        # Retain Normal Sinus Rhythm, but omit the generic Sinus Rhythm label.
+        is_generic_sinus_rhythm = (
+            'sinus rhythm' in label_lower
+            and 'normal sinus rhythm' not in label_lower
+        )
+        if is_generic_sinus_rhythm or any(term in label_lower for term in excluded_summary_terms):
             continue
         filtered_arrhy_counts[label] = count
 
