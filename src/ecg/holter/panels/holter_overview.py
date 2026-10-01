@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import gc
 import json
@@ -235,23 +235,60 @@ class HolterExpertReviewPanel(QWidget):
         body.addWidget(center)
 
         right = QFrame()
-        right.setStyleSheet(f"QFrame{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-radius:8px;}}")
+        right.setStyleSheet(f"""
+            QFrame {{
+                background: #0A0D10;
+                border: 1px solid #1E2832;
+                border-radius: 4px;
+            }}
+        """)
         right_l = QVBoxLayout(right)
-        right_l.setContentsMargins(8, 8, 8, 8)
-        right_l.setSpacing(6)
         ttl = QLabel("Overview")
-        ttl.setStyleSheet(f"color:{UI_TEXT};font-weight:700;font-size:13px;padding:6px;background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};border-radius:6px;")
+        ttl.setStyleSheet("color: #FFFFFF; font-weight: bold; font-size: 13px; padding: 5px 8px; background: #131A22; border: 1px solid #232D38; border-bottom: none; border-top-left-radius: 3px; border-top-right-radius: 3px;")
         right_l.addWidget(ttl)
+
+        # Overview Table matching reference workstation layout
         self._overview = QTableWidget(0, 2)
         self._overview.setHorizontalHeaderLabels(["Name", "Value"])
         self._overview.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self._overview.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self._overview.verticalHeader().setVisible(False)
         self._overview.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._overview.setStyleSheet(_table_style())
+        self._overview.setSelectionMode(QAbstractItemView.NoSelection)
+        self._overview.setFocusPolicy(Qt.NoFocus)
+        self._overview.setShowGrid(True)
+        self._overview.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._overview.horizontalHeader().setFixedHeight(28)
+
+        self._overview.setStyleSheet("""
+            QTableWidget {
+                background-color: #0A0E13;
+                color: #DCE3EA;
+                border: 1px solid #232D38;
+                gridline-color: #1A222C;
+                font-size: 11px;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                outline: none;
+            }
+            QHeaderView::section {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1F2833, stop:1 #131A22);
+                color: #FFFFFF;
+                font-weight: bold;
+                font-size: 11px;
+                padding-left: 8px;
+                border: 1px solid #2A3644;
+                height: 26px;
+            }
+            QTableWidget::item {
+                padding-left: 8px;
+                padding-right: 8px;
+                border-bottom: 1px solid #141C24;
+            }
+        """)
+
         right_l.addWidget(self._overview, 1)
         body.addWidget(right)
-        body.setSizes([360, 760, 300])
+        body.setSizes([360, 760, 310])
         layout.addWidget(body, 1)
 
     def update_from_metrics(self, metrics_list: list, summary: dict):
@@ -360,10 +397,14 @@ class HolterExpertReviewPanel(QWidget):
         ]
         self._overview.setRowCount(len(rows))
         for i, (k, v) in enumerate(rows):
+            self._overview.setRowHeight(i, 24)
             ki = QTableWidgetItem(k)
             vi = QTableWidgetItem(v)
-            ki.setForeground(QColor(UI_MUTED))
-            vi.setForeground(QColor(UI_TEXT))
+            bg_col = QColor("#121822") if i % 2 == 0 else QColor("#0A0D13")
+            ki.setBackground(bg_col)
+            vi.setBackground(bg_col)
+            ki.setForeground(QColor("#FFFFFF"))
+            vi.setForeground(QColor("#FFFFFF"))
             self._overview.setItem(i, 0, ki)
             self._overview.setItem(i, 1, vi)
 

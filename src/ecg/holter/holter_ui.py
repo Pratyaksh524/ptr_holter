@@ -43,8 +43,8 @@ from PyQt5.QtWidgets import (
     QSizePolicy, QScrollArea, QGridLayout, QSpinBox, QMessageBox,
     QFileDialog, QApplication, QProgressBar, QSplitter, QTextEdit, QInputDialog, QDoubleSpinBox,
     QAbstractItemView, QToolButton, QButtonGroup, QMenu, QScrollBar, QStackedWidget)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QPoint, QPointF, QRect, QObject, QEvent
-from PyQt5.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QPixmap, QPainterPath
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QPoint, QPointF, QRect, QObject, QEvent, QSize
+from PyQt5.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QPixmap, QPainterPath, QIcon
 
 try:
     import pyqtgraph as pg
@@ -1564,6 +1564,7 @@ class HolterMainWindow(QDialog):
 
         self._tab_scroller = TabBarScroller(self)
         self._tabs.tabBar().installEventFilter(self._tab_scroller)
+        self._tabs.setIconSize(QSize(18, 18))
 
         self._tabs.setStyleSheet(f"""
             QTabWidget::pane {{
@@ -1577,11 +1578,11 @@ class HolterMainWindow(QDialog):
                 color:#FFFFFF;
                 border:1px solid #68747E;
                 border-radius:8px;
-                padding:9px 12px;
+                padding:8px 10px;
                 font-size:11px;
                 font-weight:700;
                 margin:6px 6px 8px 0;
-                min-width:112px;
+                min-width:115px;
                 text-align:center;
             }}
             QTabBar::tab:selected {{
@@ -1608,11 +1609,208 @@ class HolterMainWindow(QDialog):
             }}
         """)
 
+        def _make_icon(tab_type: str) -> QIcon:
+            pix = QPixmap(24, 24)
+            pix.fill(Qt.transparent)
+            painter = QPainter(pix)
+            painter.setRenderHint(QPainter.Antialiasing)
+            pen = QPen(QColor('#4DB6AC'), 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            painter.setPen(pen)
+
+            if tab_type == "OVERVIEW":
+                # Monitor screen / grid icon
+                painter.drawRect(3, 4, 18, 13)
+                painter.drawLine(8, 20, 16, 20)
+                painter.drawLine(12, 17, 12, 20)
+                path = QPainterPath()
+                path.moveTo(5, 11)
+                path.lineTo(8, 11)
+                path.lineTo(10, 7)
+                path.lineTo(13, 15)
+                path.lineTo(15, 11)
+                path.lineTo(19, 11)
+                painter.setPen(QPen(QColor('#00E676'), 1.8))
+                painter.drawPath(path)
+
+            elif tab_type == "REPLAY":
+                # Play / replay curve icon
+                path = QPainterPath()
+                path.moveTo(6, 12)
+                path.lineTo(9, 12)
+                path.lineTo(11, 7)
+                path.lineTo(13, 17)
+                path.lineTo(15, 12)
+                path.lineTo(19, 12)
+                painter.setPen(QPen(QColor('#FFCA28'), 1.8))
+                painter.drawPath(path)
+                painter.drawEllipse(16, 15, 5, 5)
+
+            elif tab_type == "TEMPLATE":
+                # Beat template pulse
+                path = QPainterPath()
+                path.moveTo(3, 14)
+                path.lineTo(7, 14)
+                path.lineTo(9, 18)
+                path.lineTo(12, 4)
+                path.lineTo(15, 19)
+                path.lineTo(17, 14)
+                path.lineTo(21, 14)
+                painter.setPen(QPen(QColor('#29B6F6'), 2))
+                painter.drawPath(path)
+
+            elif tab_type == "HISTOGRAM":
+                # Bar chart histogram
+                painter.setPen(QPen(QColor('#AB47BC'), 1.8))
+                painter.drawRect(4, 13, 3, 7)
+                painter.drawRect(9, 7, 3, 13)
+                painter.drawRect(14, 10, 3, 10)
+                painter.drawRect(19, 15, 3, 5)
+
+            elif tab_type == "LORENZ":
+                # Scatter plot
+                painter.setPen(QPen(QColor('#26A69A'), 1.8))
+                painter.drawLine(4, 20, 20, 20)
+                painter.drawLine(4, 4, 4, 20)
+                painter.setPen(QPen(QColor('#26C6DA'), 3))
+                painter.drawPoint(8, 16)
+                painter.drawPoint(11, 12)
+                painter.drawPoint(13, 10)
+                painter.drawPoint(16, 7)
+                painter.drawPoint(17, 14)
+
+            elif tab_type == "AF ANALYSIS":
+                # Irregular AF rhythm wave
+                path = QPainterPath()
+                path.moveTo(3, 12)
+                path.lineTo(6, 9)
+                path.lineTo(8, 15)
+                path.lineTo(11, 5)
+                path.lineTo(14, 18)
+                path.lineTo(17, 10)
+                path.lineTo(21, 12)
+                painter.setPen(QPen(QColor('#EF5350'), 1.8))
+                painter.drawPath(path)
+
+            elif tab_type == "EVENTS":
+                # List / warning event icon
+                painter.setPen(QPen(QColor('#FFA726'), 1.8))
+                painter.drawLine(4, 7, 7, 7)
+                painter.drawLine(10, 7, 20, 7)
+                painter.drawLine(4, 12, 7, 12)
+                painter.drawLine(10, 12, 20, 12)
+                painter.drawLine(4, 17, 7, 17)
+                painter.drawLine(10, 17, 20, 17)
+
+            elif tab_type == "ST TENDENCY":
+                # ST elevation trend line
+                painter.setPen(QPen(QColor('#66BB6A'), 1.8))
+                painter.drawLine(3, 17, 8, 17)
+                painter.drawLine(8, 17, 13, 8)
+                painter.drawLine(13, 8, 21, 8)
+
+            elif tab_type == "EDIT EVENT":
+                # Pencil / edit icon
+                painter.setPen(QPen(QColor('#FF7043'), 1.8))
+                painter.drawLine(5, 19, 19, 5)
+                painter.drawLine(15, 5, 19, 9)
+                painter.drawLine(3, 21, 7, 20)
+
+            elif tab_type == "EDIT STRIPS":
+                # Strip scissors / edit
+                painter.setPen(QPen(QColor('#8D6E63'), 1.8))
+                painter.drawRect(4, 6, 16, 12)
+                painter.drawLine(8, 6, 8, 18)
+                painter.drawLine(16, 6, 16, 18)
+
+            elif tab_type == "REPORT TENDENCY":
+                # Report graph line
+                painter.setPen(QPen(QColor('#26C6DA'), 1.8))
+                path = QPainterPath()
+                path.moveTo(4, 16)
+                path.lineTo(9, 10)
+                path.lineTo(14, 14)
+                path.lineTo(19, 6)
+                painter.drawPath(path)
+
+            elif tab_type == "REPORT TABLE":
+                # Grid table icon
+                painter.setPen(QPen(QColor('#7E57C2'), 1.8))
+                painter.drawRect(4, 4, 16, 16)
+                painter.drawLine(4, 10, 20, 10)
+                painter.drawLine(4, 15, 20, 15)
+                painter.drawLine(12, 4, 12, 20)
+
+            elif tab_type == "HRV":
+                # Heart + pulse icon
+                painter.setPen(QPen(QColor('#EC407A'), 1.8))
+                path = QPainterPath()
+                path.moveTo(12, 19)
+                path.cubicTo(6, 14, 3, 10, 6, 6)
+                path.cubicTo(8, 4, 11, 5, 12, 8)
+                path.cubicTo(13, 5, 16, 4, 18, 6)
+                path.cubicTo(21, 10, 18, 14, 12, 19)
+                painter.drawPath(path)
+
+            elif tab_type == "RECORD SETTINGS":
+                # Gear icon
+                painter.setPen(QPen(QColor('#78909C'), 1.8))
+                painter.drawEllipse(7, 7, 10, 10)
+                painter.drawLine(12, 3, 12, 7)
+                painter.drawLine(12, 17, 12, 21)
+                painter.drawLine(3, 12, 7, 12)
+                painter.drawLine(17, 12, 21, 12)
+
+            elif tab_type == "RECORDINGS":
+                # Folder / archive icon
+                painter.setPen(QPen(QColor('#FFA726'), 1.8))
+                painter.drawRect(4, 8, 16, 12)
+                path = QPainterPath()
+                path.moveTo(4, 8)
+                path.lineTo(8, 4)
+                path.lineTo(13, 4)
+                path.lineTo(15, 8)
+                painter.drawPath(path)
+
+            elif tab_type == "PREVIEW":
+                # Eye / document preview
+                painter.setPen(QPen(QColor('#42A5F5'), 1.8))
+                painter.drawRect(6, 4, 12, 16)
+                painter.drawLine(9, 8, 15, 8)
+                painter.drawLine(9, 12, 15, 12)
+                painter.drawLine(9, 16, 13, 16)
+
+            elif tab_type == "PRINT":
+                # Printer icon
+                painter.setPen(QPen(QColor('#9E9E9E'), 1.8))
+                painter.drawRect(6, 9, 12, 8)
+                painter.drawRect(8, 4, 8, 5)
+                painter.drawRect(8, 14, 8, 6)
+
+            elif tab_type == "REANALYSIS":
+                # Refresh / sync icon
+                painter.setPen(QPen(QColor('#26A69A'), 1.8))
+                painter.drawArc(4, 4, 16, 16, 30 * 16, 280 * 16)
+                painter.drawLine(18, 6, 20, 10)
+                painter.drawLine(18, 6, 14, 9)
+
+            elif tab_type == "QUIT":
+                # Power / exit icon
+                painter.setPen(QPen(QColor('#E53935'), 1.8))
+                painter.drawArc(5, 5, 14, 14, -40 * 16, 260 * 16)
+                painter.drawLine(12, 3, 12, 11)
+
+            else:
+                painter.setPen(QPen(QColor('#00E676'), 1.8))
+                painter.drawEllipse(6, 6, 12, 12)
+
+            painter.end()
+            return QIcon(pix)
+
         #  "  "  OVERVIEW tab (12-lead scrollable expert view)  "  " 
         self._expert_panel = HolterExpertReviewPanel()
         self._expert_panel.update_from_metrics(self._metrics_list, self._summary)
         self._expert_panel.seek_requested.connect(self._on_seek_requested)
-        self._tabs.addTab(self._expert_panel, "OVERVIEW")
+        self._tabs.addTab(self._expert_panel, _make_icon("OVERVIEW"), "OVERVIEW")
 
         # Replay
         duration = self._summary.get('duration_sec', self._duration_hours * 3600)
@@ -1624,7 +1822,7 @@ class HolterMainWindow(QDialog):
         self._replay_panel.playback_state_changed.connect(self._set_record_browser_enabled)
         self._replay_panel.update_lorenz(self._metrics_list)
         self._replay_panel.update_summary(self._summary)
-        self._tabs.addTab(self._replay_panel, "REPLAY")
+        self._tabs.addTab(self._replay_panel, _make_icon("REPLAY"), "REPLAY")
         self._lorenz_panel = self._replay_panel
 
         # Beat Templates
@@ -1636,13 +1834,13 @@ class HolterMainWindow(QDialog):
                 pass
         self._template_panel.update_from_metrics(self._metrics_list, self._summary)
         self._template_panel.seek_requested.connect(self._on_seek_requested)
-        self._tabs.addTab(self._template_panel, "TEMPLATE")
+        self._tabs.addTab(self._template_panel, _make_icon("TEMPLATE"), "TEMPLATE")
 
         # Histogram
         self._hist_panel = HolterHistogramPanel()
         self._hist_panel.update_from_metrics(self._metrics_list)
         self._hist_panel.seek_requested.connect(self._on_seek_requested)
-        self._tabs.addTab(self._hist_panel, "HISTOGRAM")
+        self._tabs.addTab(self._hist_panel, _make_icon("HISTOGRAM"), "HISTOGRAM")
 
         # Lorenz
         self._lorenz_tab_panel = HolterLorenzPanel(replay_engine=self._replay_engine)
@@ -1650,13 +1848,13 @@ class HolterMainWindow(QDialog):
         self._lorenz_tab_panel.seek_requested.connect(self._on_seek_requested)
         if self._replay_engine:
             self._lorenz_tab_panel.set_replay_engine(self._replay_engine)
-        self._tabs.addTab(self._lorenz_tab_panel, "LORENZ")
+        self._tabs.addTab(self._lorenz_tab_panel, _make_icon("LORENZ"), "LORENZ")
 
 
         # AF Analysis
         self._af_panel = HolterAFPanel(session_dir=self.session_dir)
         self._af_panel.update_from_metrics(self._metrics_list, duration)
-        self._tabs.addTab(self._af_panel, "AF ANALYSIS")
+        self._tabs.addTab(self._af_panel, _make_icon("AF ANALYSIS"), "AF ANALYSIS")
 
         events = self._build_linked_events()
 
@@ -1665,35 +1863,35 @@ class HolterMainWindow(QDialog):
         self._events_panel.set_session_dir(self.session_dir)
         self._events_panel.load_events(events, self._summary)
         self._events_panel.seek_requested.connect(self._on_seek_requested)
-        self._tabs.addTab(self._events_panel, "EVENTS")
+        self._tabs.addTab(self._events_panel, _make_icon("EVENTS"), "EVENTS")
 
         # ST Tendency
         self._st_panel = HolterSTPanel(replay_engine=self._replay_engine)
         self._st_panel.update_from_metrics(self._metrics_list)
-        self._tabs.addTab(self._st_panel, "ST TENDENCY")
+        self._tabs.addTab(self._st_panel, _make_icon("ST TENDENCY"), "ST TENDENCY")
 
         # Edit Event
         self._edit_event_panel = HolterEditEventPanel()
         self._edit_event_panel.set_session_dir(self.session_dir)
         self._edit_event_panel.load_events(events, self._summary)
         self._edit_event_panel.seek_requested.connect(self._on_seek_requested)
-        self._tabs.addTab(self._edit_event_panel, "EDIT EVENT")
+        self._tabs.addTab(self._edit_event_panel, _make_icon("EDIT EVENT"), "EDIT EVENT")
 
         # Edit Strips
         self._edit_strips_panel = HolterEditStripsPanel()
         self._edit_strips_panel.set_session_dir(self.session_dir)
         self._edit_strips_panel.seek_requested.connect(self._on_seek_requested)
         self._edit_strips_panel.load_events(events, self._summary, self._metrics_list)
-        self._tabs.addTab(self._edit_strips_panel, "EDIT STRIPS")
+        self._tabs.addTab(self._edit_strips_panel, _make_icon("EDIT STRIPS"), "EDIT STRIPS")
 
         # Report Tendency
         self._report_tendency_panel = HolterSTPanel(replay_engine=self._replay_engine)
-        self._tabs.addTab(self._report_tendency_panel, "REPORT TENDENCY")
+        self._tabs.addTab(self._report_tendency_panel, _make_icon("REPORT TENDENCY"), "REPORT TENDENCY")
 
         # Report Table
         self._report_table_panel = HolterReportTablePanel()
         self._report_table_panel.update_from_metrics(self._metrics_list)
-        self._tabs.addTab(self._report_table_panel, "REPORT TABLE")
+        self._tabs.addTab(self._report_table_panel, _make_icon("REPORT TABLE"), "REPORT TABLE")
 
         # Expert Review (OVERVIEW tab) already added as first tab above
         # kept here as comment for clarity   " see OVERVIEW tab creation at top of tabs section
@@ -1701,7 +1899,7 @@ class HolterMainWindow(QDialog):
         # HRV Analysis
         self._hrv_panel = HolterHRVPanel()
         self._hrv_panel.update_hrv(self._metrics_list, self._summary)
-        self._tabs.addTab(self._hrv_panel, "HRV")
+        self._tabs.addTab(self._hrv_panel, _make_icon("HRV"), "HRV")
 
         # Record settings
         settings_panel = QWidget()
@@ -1720,7 +1918,7 @@ class HolterMainWindow(QDialog):
         settings_layout.addWidget(settings_info)
         settings_layout.addStretch(1)
         self._record_settings_panel = settings_panel
-        self._tabs.addTab(settings_panel, "RECORD SETTINGS")
+        self._tabs.addTab(settings_panel, _make_icon("RECORD SETTINGS"), "RECORD SETTINGS")
 
         # Record browser
         self._record_mgmt_panel = HolterRecordManagementPanel(
@@ -1729,7 +1927,7 @@ class HolterMainWindow(QDialog):
         self._record_mgmt_panel.session_selected.connect(self.load_completed_session)
         if self.session_dir:
             self._record_mgmt_panel.set_active_session(self.session_dir)
-        self._tabs.addTab(self._record_mgmt_panel, "RECORDINGS")
+        self._tabs.addTab(self._record_mgmt_panel, _make_icon("RECORDINGS"), "RECORDINGS")
 
         # Report Preview
         scroll_insight = QScrollArea()
@@ -1739,10 +1937,10 @@ class HolterMainWindow(QDialog):
         self._insight_panel = HolterInsightPanel()
         self._insight_panel.update_text(self.patient_info, self._summary)
         scroll_insight.setWidget(self._insight_panel)
-        self._tabs.addTab(scroll_insight, "PREVIEW")
-        self._tabs.addTab(QWidget(), "PRINT")
-        self._tabs.addTab(QWidget(), "REANALYSIS")
-        self._tabs.addTab(QWidget(), "QUIT")
+        self._tabs.addTab(scroll_insight, _make_icon("PREVIEW"), "PREVIEW")
+        self._tabs.addTab(QWidget(), _make_icon("PRINT"), "PRINT")
+        self._tabs.addTab(QWidget(), _make_icon("REANALYSIS"), "REANALYSIS")
+        self._tabs.addTab(QWidget(), _make_icon("QUIT"), "QUIT")
 
         # Track the last active content tab
         self._last_active_tab_name = "OVERVIEW"

@@ -254,13 +254,20 @@ class HolterReplayPanel(QWidget):
 
 
         ov_frame = QFrame()
-        ov_frame.setStyleSheet(f"QFrame{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-radius:8px;}}")
+        ov_frame.setStyleSheet("""
+            QFrame {
+                background: #0A0D10;
+                border: 1px solid #1E2832;
+                border-radius: 4px;
+            }
+        """)
         ov_layout = QVBoxLayout(ov_frame)
-        ov_layout.setContentsMargins(6, 6, 6, 6)
-        ov_layout.setSpacing(6)
+        ov_layout.setContentsMargins(4, 4, 4, 4)
+        ov_layout.setSpacing(0)
         ov_title = QLabel("Overview")
-        ov_title.setStyleSheet("color:#F4F8FC;font-size:14px;font-weight:700;border:none;")
+        ov_title.setStyleSheet("color: #FFFFFF; font-weight: bold; font-size: 13px; padding: 5px 8px; background: #131A22; border: 1px solid #232D38; border-bottom: none; border-top-left-radius: 3px; border-top-right-radius: 3px;")
         ov_layout.addWidget(ov_title)
+
         self._overview_table = QTableWidget(0, 2)
         self._overview_table.setHorizontalHeaderLabels(["Name", "Value"])
         self._overview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
@@ -269,22 +276,34 @@ class HolterReplayPanel(QWidget):
         self._overview_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._overview_table.setSelectionMode(QAbstractItemView.NoSelection)
         self._overview_table.setFocusPolicy(Qt.NoFocus)
-        self._overview_table.setStyleSheet(_table_style() + f"""
-            QTableWidget {{
-                background: {UI_PANEL};
-                alternate-background-color: {UI_PANEL_ALT};
-                gridline-color: {UI_BORDER};
-                border: none;
-            }}
-            QHeaderView::section {{
-                background: {UI_PANEL_ALT};
-                color: {UI_TEXT};
-                border: none;
-                border-bottom: 1px solid {UI_BORDER};
-                padding: 7px 6px;
-                font-weight: 700;
-            }}
-            QTableWidget::item {{ padding: 5px 6px; border-bottom: 1px solid {UI_BORDER}; }}
+        self._overview_table.setShowGrid(True)
+        self._overview_table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._overview_table.horizontalHeader().setFixedHeight(28)
+
+        self._overview_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #0A0E13;
+                color: #FFFFFF;
+                border: 1px solid #232D38;
+                gridline-color: #1A222C;
+                font-size: 11px;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                outline: none;
+            }
+            QHeaderView::section {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1F2833, stop:1 #131A22);
+                color: #FFFFFF;
+                font-weight: bold;
+                font-size: 11px;
+                padding-left: 8px;
+                border: 1px solid #2A3644;
+                height: 26px;
+            }
+            QTableWidget::item {
+                padding-left: 8px;
+                padding-right: 8px;
+                border-bottom: 1px solid #141C24;
+            }
         """)
         ov_layout.addWidget(self._overview_table, 1)
         top_splitter.addWidget(ov_frame)
@@ -1144,10 +1163,14 @@ class HolterReplayPanel(QWidget):
         summary_rows = self._compute_replay_overview(metrics_list, rr_n)
         self._overview_table.setRowCount(len(summary_rows))
         for r, (name, value) in enumerate(summary_rows):
+            self._overview_table.setRowHeight(r, 24)
             n_item = QTableWidgetItem(name)
             v_item = QTableWidgetItem(value)
-            n_item.setForeground(QColor(UI_MUTED))
-            v_item.setForeground(QColor(UI_TEXT))
+            bg_col = QColor("#121822") if r % 2 == 0 else QColor("#0A0D13")
+            n_item.setBackground(bg_col)
+            v_item.setBackground(bg_col)
+            n_item.setForeground(QColor("#FFFFFF"))
+            v_item.setForeground(QColor("#FFFFFF"))
             self._overview_table.setItem(r, 0, n_item)
             self._overview_table.setItem(r, 1, v_item)
 

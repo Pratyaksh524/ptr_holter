@@ -139,18 +139,19 @@ class HolterRRTrendCanvas(QWidget):
         # Keep the trend comparable across recordings and modes. The replay
         # chart uses seconds on X, milliseconds (RR) or BPM (HR) on Y.
         rect = self.rect().adjusted(42, 18, -12, 30)
-        painter.setPen(QPen(QColor(COL_GREEN_DRK), 1))
+        painter.setPen(QPen(QColor("#243242"), 1))
         painter.drawRect(rect)
 
-        painter.setPen(QPen(QColor(COL_GREEN), 1))
-        painter.setFont(QFont("Arial", 9, QFont.Bold))
+        # Title Label styling matching workstation theme
+        painter.setPen(QPen(QColor("#FFFFFF"), 1))
+        painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
         title = self._title
         mode = str(getattr(self, "_mode", "") or "").upper()
         if mode == "RR" and "Heart Rate" in title:
             title = title.replace("Heart Rate", "RR Interval")
         elif mode == "HR" and "RR Interval" in title:
             title = title.replace("RR Interval", "Heart Rate")
-        painter.drawText(12, 12, title)
+        painter.drawText(12, 13, title)
 
         if not self._points:
             painter.setPen(QPen(QColor(UI_MUTED)))
@@ -170,8 +171,8 @@ class HolterRRTrendCanvas(QWidget):
 
         # Draw fixed-axis tick marks so the chart's scale is visible even when
         # the recording contains only a short or low-variation segment.
-        painter.setFont(QFont("Arial", 8))
-        painter.setPen(QPen(QColor(UI_MUTED), 1))
+        painter.setFont(QFont("Segoe UI", 8))
+        painter.setPen(QPen(QColor("#B0BEC5"), 1))
         y_ticks = np.arange(y_lo, y_hi + 75.0, 75.0) if mode == "HR" else (0.0, 1500.0, 3000.0)
         for value in y_ticks:
             _, py = map_xy(x_lo, value)
@@ -204,7 +205,7 @@ class HolterRRTrendCanvas(QWidget):
                 painter.setPen(QPen(QColor(COL_GREEN), 1))
                 painter.drawEllipse(px - 2, py - 2, 4, 4)
 
-        painter.setPen(QPen(QColor(UI_MUTED)))
+        painter.setPen(QPen(QColor("#B0BEC5")))
         painter.drawText(rect.right() - 38, rect.bottom() + 17, "Time")
 
 
