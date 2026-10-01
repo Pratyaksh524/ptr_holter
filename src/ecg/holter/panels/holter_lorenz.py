@@ -40,7 +40,7 @@ from ..holter_helpers import (
     UI_SUCCESS, UI_TEXT, UI_WARNING, _class_matches_filter, _find_latest_completed_session,
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
-    _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _style_active_btn, _style_btn, _style_filter_btn, _table_style, _template_filter_key,
 )
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas, HolterRRTrendCanvas, HRTrendCanvas
@@ -90,6 +90,7 @@ class HolterLorenzPanel(QWidget):
         # Filter buttons matching the Template tab
         btn_row = QHBoxLayout()
         btn_row.setSpacing(4)
+        btn_row.setContentsMargins(0, 4, 0, 4)
         self._filter_btns = {}
         self._current_filter = "all"
         for key, lbl in [
@@ -106,7 +107,8 @@ class HolterLorenzPanel(QWidget):
             btn.setCheckable(True)
             btn.setChecked(key == "all")
             btn.setToolTip(f"Filter by {lbl}")
-            btn.setStyleSheet(_style_active_btn() if key == "all" else _style_btn())
+            btn.setFixedHeight(28)
+            btn.setStyleSheet(_style_filter_btn(active=(key == "all"), fg=COL_GREEN if key != "all" else UI_TEXT))
             btn.clicked.connect(lambda checked=False, k=key: self._set_lorenz_filter(k))
             self._filter_btns[key] = btn
             btn_row.addWidget(btn)
@@ -233,7 +235,7 @@ class HolterLorenzPanel(QWidget):
         for k, btn in self._filter_btns.items():
             is_active = (k == key)
             btn.setChecked(is_active)
-            btn.setStyleSheet(_style_active_btn() if is_active else _style_btn())
+            btn.setStyleSheet(_style_filter_btn(active=is_active, fg=COL_GREEN if not is_active else UI_TEXT))
         self._apply_lorenz_filter()
 
     def _apply_lorenz_filter(self):

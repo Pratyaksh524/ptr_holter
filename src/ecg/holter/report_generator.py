@@ -41,11 +41,19 @@ def _load_auto_segment_events(session_dir: str) -> List[Dict[str, object]]:
         reader = ECGHFileReader(ecgh_path)
         events = []
         for segment in detect_arrhythmias(reader):
+            start_sec = float(segment.get('start_sec', 0.0) or 0.0)
+            end_sec = float(segment.get('end_sec', 0.0) or 0.0)
+            rhythm_lbl = str(segment.get('detected_rhythm', segment.get('label', 'Event')))
             events.append({
-                'timestamp': float(segment.get('start_sec', 0.0) or 0.0),
-                'end_timestamp': float(segment.get('end_sec', 0.0) or 0.0),
-                'label': str(segment.get('detected_rhythm', segment.get('label', 'Event'))),
-                'event_type': str(segment.get('label', 'Event')),
+                'timestamp': start_sec,
+                'start_sec': start_sec,
+                'end_sec': end_sec,
+                'end_timestamp': end_sec,
+                'label': rhythm_lbl,
+                'event_type': rhythm_lbl,
+                'start_time_str': segment.get('start_time_str', ''),
+                'end_time_str': segment.get('end_time_str', ''),
+                'duration': max(0.0, end_sec - start_sec),
                 'source': 'Auto',
                 'confidence': 1.0,
             })
@@ -96,26 +104,29 @@ def generate_holter_report(session_dir: str,
 
 def _build_timeline_events(session_dir: str) -> List[Dict[str, object]]:
     """
-    Builds the event timeline for the report:
+    Builds a clean, streamlined event timeline for the report:
     1. Loads manual markings (manual_segments.json and manual_beats.json) - EXACT MANUAL MARKING LOGIC.
-    2. Loads auto-detected metrics/beats and computes rich Badge labels (get_template_beats_for_badges).
-    3. Retains 'Normal Sinus Rhythm' for auto-detection windows.
-    4. Filters out older/generic auto labels (e.g. raw PAC, Second degree AV, Wide QRS, Long QT, etc.).
-    5. Suppresses auto-detected events if they fall inside manually marked areas.
+    2. Loads auto-detected rhythm segments (Sinus Tachycardia, Sinus Bradycardia, AFib, VFib, VTach, etc.).
+    3. Creates structured start/end markers for rhythm segments.
+    4. Establishes baseline Normal Sinus Rhythm transitions outside segments without repetitive periodic polling spam.
+    5. Loads auto-detected badge events (SVT, VT, Couplet, Bigeminy, PVC, PAC, etc.) outside manual/segment areas.
     6. Appends manual beat and segment markings (unaltered).
-    7. Chronologically sorts all events.
+    7. Chronologically sorts and deduplicates timeline events.
     """
-    # Load manual segments and beats to filter automated events within manually marked areas
+    timeline_events = []
+
+    # 1. Load manual segments (do NOT alter manual marking logic)
     manual_segments = []
     manual_segments_path = os.path.join(session_dir, 'manual_segments.json')
     if os.path.exists(manual_segments_path):
         try:
             with open(manual_segments_path, 'r') as _ms_f:
                 manual_segments = json.load(_ms_f)
-            print(f"[HolterReport] Loaded {len(manual_segments)} manual segments for filtering")
+            print(f"[HolterReport] Loaded {len(manual_segments)} manual segments for timeline")
         except Exception as _ms_e:
-            print(f"[HolterReport] Could not load manual segments for filtering: {_ms_e}")
+            print(f"[HolterReport] Could not load manual segments for timeline: {_ms_e}")
 
+    # 2. Load manual beats (do NOT alter manual marking logic)
     manual_beats = []
     manual_beats_path = os.path.join(session_dir, 'manual_beats.json')
     if os.path.exists(manual_beats_path):
@@ -126,11 +137,14 @@ def _build_timeline_events(session_dir: str) -> List[Dict[str, object]]:
                     mb for mb in loaded_beats 
                     if mb.get('is_manual', False) or (mb.get('marking_mode') is not None) or (mb.get('batch_id') is not None)
                 ]
-            print(f"[HolterReport] Loaded {len(manual_beats)} manual beats for filtering")
+            print(f"[HolterReport] Loaded {len(manual_beats)} manual beats for timeline")
         except Exception as _mb_e:
-            print(f"[HolterReport] Could not load manual beats for filtering: {_mb_e}")
+            print(f"[HolterReport] Could not load manual beats for timeline: {_mb_e}")
 
-    # Load metrics to extract all_beats and auto-detected rhythm (e.g. Normal Sinus Rhythm)
+    # 3. Load auto-detected rhythm segments
+    auto_segments = _load_auto_segment_events(session_dir)
+
+    # 4. Extract all_beats from metrics for badge detection
     metrics = load_metrics(session_dir)
     if not metrics:
         jsonl_path = os.path.join(session_dir, 'metrics.jsonl')
@@ -145,31 +159,74 @@ def _build_timeline_events(session_dir: str) -> List[Dict[str, object]]:
                 print(f"[HolterReport] Could not read metrics.jsonl: {_je}")
 
     all_beats = []
-    auto_events = []
-
-    # Include the exact waveform auto-segments shown in Full Disclosure.
-    auto_events.extend(_load_auto_segment_events(session_dir))
-
     for metric in metrics or []:
         for b in metric.get('all_beats', []) or []:
             if isinstance(b, dict):
                 all_beats.append(b)
 
-        # Keep Normal Sinus Rhythm / Sinus Rhythm from auto detection
-        base_t = float(metric.get('t', 0.0) or 0.0)
-        for label in metric.get('arrhythmias', []) or []:
-            lbl = str(label).strip()
-            lbl_lower = lbl.lower()
-            if 'sinus' in lbl_lower or 'normal' in lbl_lower:
-                auto_events.append({
-                    'timestamp': base_t,
-                    'label': lbl,
-                    'event_type': lbl,
-                    'source': 'Auto',
-                    'confidence': float(metric.get('quality', 1.0) or 1.0),
+    # 5. Build auto segment events (start and end marker rows)
+    # Suppress auto segments if they fall inside manual segments
+    active_segments_ranges = []
+    for seg in manual_segments:
+        s_t = float(seg.get('start_sec', 0.0) or 0.0)
+        e_t = float(seg.get('end_sec', s_t) or s_t)
+        active_segments_ranges.append((s_t, e_t))
+
+    for seg in auto_segments:
+        s_t = float(seg.get('start_sec', seg.get('timestamp', 0.0)) or 0.0)
+        e_t = float(seg.get('end_sec', seg.get('end_timestamp', s_t)) or s_t)
+        lbl = str(seg.get('label', 'Event'))
+
+        # Check if inside manual segment
+        in_manual = any(ms <= s_t <= me or ms <= e_t <= me for ms, me in active_segments_ranges)
+        if in_manual:
+            continue
+
+        active_segments_ranges.append((s_t, e_t))
+
+        timeline_events.append({
+            'timestamp': s_t,
+            'sort_ts': s_t,
+            'label': f"Auto segment marked ({lbl})",
+            'event_type': lbl,
+            'source': 'Auto'
+        })
+        if e_t > s_t + 0.1:
+            timeline_events.append({
+                'timestamp': e_t,
+                'sort_ts': e_t,
+                'label': f"Auto segment marked end ({lbl})",
+                'event_type': lbl,
+                'source': 'Auto'
+            })
+
+    # 6. Baseline rhythm / transition events
+    # Start with baseline Normal Sinus Rhythm at t=0 if recording has data and t=0 is not in a segment
+    if metrics or auto_segments or manual_segments:
+        starts_in_segment = any(ms <= 0.5 and me > 0.0 for ms, me in active_segments_ranges)
+        if not starts_in_segment:
+            timeline_events.append({
+                'timestamp': 0.0,
+                'sort_ts': 0.0,
+                'label': 'Normal Sinus Rhythm',
+                'event_type': 'Normal Sinus Rhythm',
+                'source': 'Auto'
+            })
+
+        # Add baseline return after segments if there's a gap before next segment
+        for ms, me in active_segments_ranges:
+            t_resume = me + 0.05
+            in_another = any(other_s <= t_resume <= other_e for other_s, other_e in active_segments_ranges if (other_s, other_e) != (ms, me))
+            if not in_another:
+                timeline_events.append({
+                    'timestamp': t_resume,
+                    'sort_ts': t_resume,
+                    'label': 'Normal Sinus Rhythm',
+                    'event_type': 'Normal Sinus Rhythm',
+                    'source': 'Auto'
                 })
 
-    # Generate auto-detection badge events (SVT, VT, Couplet, Bigeminy, PVC, PAC, etc.)
+    # 7. Generate auto-detection badge events (SVT, VT, Couplet, Bigeminy, PVC, PAC, etc.)
     try:
         from .holter_summary_calc import get_template_beats_for_badges
         badges = get_template_beats_for_badges(all_beats, [])
@@ -177,12 +234,28 @@ def _build_timeline_events(session_dir: str) -> List[Dict[str, object]]:
             badge_name = b.get('name', '').strip()
             if not badge_name:
                 continue
-            # Filter for arrhythmia badge beats/patterns (V, S, AF, P, runs, couplets, bigeminy, etc.)
+            b_ts = float(b.get('timestamp', 0.0) or 0.0)
+
+            # Check if inside any manual marking
+            in_manual = False
+            for ms, me in [(float(s.get('start_sec', 0.0)), float(s.get('end_sec', 0.0))) for s in manual_segments]:
+                if ms <= b_ts <= me:
+                    in_manual = True
+                    break
+            if not in_manual and manual_beats:
+                for mb in manual_beats:
+                    if abs(b_ts - float(mb.get('timestamp', 0.0))) < 0.15:
+                        in_manual = True
+                        break
+            if in_manual:
+                continue
+
             if (b.get('code') in ['V', 'S', 'AF', 'P'] or 
                 b.get('critical', False) or 
                 any(k in badge_name.lower() for k in ['run', 'couplet', 'bigeminy', 'trigeminy', 'quadrigeminy', 'tachycardia', 'fibrillation', 'flutter'])):
-                auto_events.append({
-                    'timestamp': float(b.get('timestamp', 0.0) or 0.0),
+                timeline_events.append({
+                    'timestamp': b_ts,
+                    'sort_ts': b_ts,
                     'label': badge_name,
                     'event_type': b.get('code', 'Arrhythmia'),
                     'source': 'Auto',
@@ -191,142 +264,65 @@ def _build_timeline_events(session_dir: str) -> List[Dict[str, object]]:
     except Exception as _badge_e:
         print(f"[HolterReport] Error generating badge events: {_badge_e}")
 
-    # Fallback if no beats in metrics: check load_events but keep only NSR
-    if not auto_events and not all_beats:
-        raw_events = load_events(session_dir)
-        for ev in raw_events:
-            ev_lbl = str(ev.get('label', ev.get('event_type', ''))).lower()
-            if 'sinus' in ev_lbl or 'normal' in ev_lbl:
-                auto_events.append(ev)
-
-    # Filter auto-detected events if they fall inside manually marked areas
-    filtered_events = []
-    for event in auto_events:
-        event_ts = float(event.get('timestamp', 0.0))
-        should_filter = False
-
-        # Check segment ranges
-        for seg in manual_segments:
-            start_sec = float(seg.get('start_sec', 0.0))
-            end_sec = float(seg.get('end_sec', 0.0))
-            if start_sec <= event_ts <= end_sec:
-                should_filter = True
-                break
-
-        # Check parallel marking timestamps (within 0.15s tolerance)
-        if not should_filter and manual_beats:
-            for mb in manual_beats:
-                mb_ts = float(mb.get('timestamp', 0.0))
-                if abs(event_ts - mb_ts) < 0.15:
-                    should_filter = True
-                    break
-
-        if not should_filter:
-            normalized_event = dict(event)
-            if str(normalized_event.get('source', '')).lower() in {'analysis', 'arrhythmia'}:
-                normalized_event['source'] = 'Auto'
-            elif not normalized_event.get('source'):
-                normalized_event['source'] = 'Auto'
-            filtered_events.append(normalized_event)
-
-    timeline_events = filtered_events
-
-    # Load manual beats and append non-normal ones to timeline (parallel manual marking)
+    # 8. Load manual beats and append non-normal ones to timeline (parallel manual marking)
     # [EXACT ORIGINAL MANUAL MARKING LOGIC]
-    manual_beats_path = os.path.join(session_dir, 'manual_beats.json')
-    if os.path.exists(manual_beats_path):
-        try:
-            with open(manual_beats_path, 'r') as _mb_f:
-                manual_beats = json.load(_mb_f)
-            for mb in manual_beats:
-                if not (mb.get('is_manual', False) or (mb.get('marking_mode') is not None) or (mb.get('batch_id') is not None)):
-                    continue
-                lbl = mb.get('label', 'N')
-                short_code = lbl
-                if '(' in lbl and ')' in lbl:
-                    short_code = lbl.split('(')[1].split(')')[0]
-                if short_code != 'N':
-                    marking_mode = mb.get('marking_mode', 'parallel_single')
-                    if marking_mode == 'parallel_multi':
-                        label_text = f"Parallel multiple beat marked ({lbl})"
-                    else:
-                        label_text = f"Parallel single beat marked ({lbl})"
-                    timeline_events.append({
-                        'timestamp': float(mb.get('timestamp', 0.0)),
-                        'label': label_text,
-                        'event_type': lbl,
-                        'source': 'Manual'
-                    })
-        except Exception as _mb_e:
-            print(f"[HolterReport] Could not load manual beats for timeline: {_mb_e}")
-
-    # Load manual segments and append to timeline (segment manual marking)
-    # [EXACT ORIGINAL MANUAL MARKING LOGIC]
-    manual_segments_path = os.path.join(session_dir, 'manual_segments.json')
-    if os.path.exists(manual_segments_path):
-        try:
-            with open(manual_segments_path, 'r') as _ms_f:
-                manual_segments = json.load(_ms_f)
-            for seg in manual_segments:
-                lbl = seg.get('label', 'Unknown')
-                start_sec = seg.get('start_sec', 0.0)
-                end_sec = seg.get('end_sec', 0.0)
-                start_time_str = seg.get('start_time_str', '')
-                end_time_str = seg.get('end_time_str', '')
-                # Start-of-segment entry
-                timeline_events.append({
-                    'timestamp': float(start_sec),
-                    'sort_ts': float(start_sec),
-                    'label': f"Segment manual marked ({lbl})",
-                    'event_type': lbl,
-                    'source': 'Manual'
-                })
-                # End-of-segment entry
-                timeline_events.append({
-                    'timestamp': float(end_sec),
-                    'sort_ts': float(start_sec) + 1e-6,
-                    'label': f"Segment manual marked end ({lbl})",
-                    'event_type': lbl,
-                    'source': 'Manual'
-                })
-        except Exception as _ms_e:
-            print(f"[HolterReport] Could not load manual segments for timeline: {_ms_e}")
-
-    # Keep the timeline label consistent across the full duration of an
-    # automatic segment.  Metric-level NSR rows can otherwise appear inside a
-    # Brady/Tachy/VF/AF segment and contradict the segment overlay.
-    auto_ranges = []
-    for event in timeline_events:
-        if str(event.get('source', '')).lower() != 'auto':
+    for mb in manual_beats:
+        if not (mb.get('is_manual', False) or (mb.get('marking_mode') is not None) or (mb.get('batch_id') is not None)):
             continue
-        start = float(event.get('timestamp', 0.0) or 0.0)
-        end = float(event.get('end_timestamp', start) or start)
-        label = str(event.get('label', event.get('event_type', '')) or '')
-        if end > start and label.lower() not in {'normal sinus rhythm', 'sinus rhythm'}:
-            auto_ranges.append((start, end, label))
+        lbl = mb.get('label', 'N')
+        short_code = lbl
+        if '(' in lbl and ')' in lbl:
+            short_code = lbl.split('(')[1].split(')')[0]
+        if short_code != 'N':
+            marking_mode = mb.get('marking_mode', 'parallel_single')
+            if marking_mode == 'parallel_multi':
+                label_text = f"Parallel multiple beat marked ({lbl})"
+            else:
+                label_text = f"Parallel single beat marked ({lbl})"
+            timeline_events.append({
+                'timestamp': float(mb.get('timestamp', 0.0)),
+                'sort_ts': float(mb.get('timestamp', 0.0)),
+                'label': label_text,
+                'event_type': lbl,
+                'source': 'Manual'
+            })
 
-    if auto_ranges:
-        normalized_timeline = []
-        for event in timeline_events:
-            source = str(event.get('source', '')).lower()
-            if source == 'auto':
-                timestamp = float(event.get('timestamp', 0.0) or 0.0)
-                active_matches = [
-                    (start, label) for start, end, label in auto_ranges
-                    if start <= timestamp <= end
-                ]
-                active = max(active_matches, key=lambda item: item[0])[1] if active_matches else None
-                if active:
-                    event = dict(event)
-                    event['label'] = active
-                    event['event_type'] = active
-                    event['source'] = 'Auto'
-            normalized_timeline.append(event)
-        timeline_events = normalized_timeline
+    # 9. Load manual segments and append to timeline (segment manual marking)
+    # [EXACT ORIGINAL MANUAL MARKING LOGIC]
+    for seg in manual_segments:
+        lbl = seg.get('label', 'Unknown')
+        start_sec = seg.get('start_sec', 0.0)
+        end_sec = seg.get('end_sec', 0.0)
+        timeline_events.append({
+            'timestamp': float(start_sec),
+            'sort_ts': float(start_sec),
+            'label': f"Segment manual marked ({lbl})",
+            'event_type': lbl,
+            'source': 'Manual'
+        })
+        timeline_events.append({
+            'timestamp': float(end_sec),
+            'sort_ts': float(end_sec),
+            'label': f"Segment manual marked end ({lbl})",
+            'event_type': lbl,
+            'source': 'Manual'
+        })
 
-    # Sort all events chronologically by timestamp (sort_ts overrides timestamp for manual segment end-rows)
-    timeline_events = sorted(timeline_events, key=lambda x: float(x.get("sort_ts", x.get("timestamp", 0.0)) or 0.0))
-    return timeline_events
+    # 10. Chronologically sort all events
+    timeline_events.sort(key=lambda x: float(x.get("sort_ts", x.get("timestamp", 0.0)) or 0.0))
+
+    # 11. Deduplicate consecutive identical rows
+    deduped_timeline = []
+    for ev in timeline_events:
+        if deduped_timeline:
+            last_ev = deduped_timeline[-1]
+            if last_ev.get('label') == ev.get('label') and abs(float(last_ev.get('timestamp', 0.0)) - float(ev.get('timestamp', 0.0))) < 0.2:
+                continue
+            if last_ev.get('label') == 'Normal Sinus Rhythm' and ev.get('label') == 'Normal Sinus Rhythm':
+                continue
+        deduped_timeline.append(ev)
+
+    return deduped_timeline
 
 
 #    PDF Report                                                                  
@@ -446,46 +442,9 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     ]))
     story.append(stats_table)
 
-    story.append(Paragraph("Clinical Impression", h2_style))
-    arrhy_counts = summary.get('arrhythmia_counts', {})
-    top_events = ", ".join(f"{label} ({count})" for label, count in sorted(arrhy_counts.items(), key=lambda item: -item[1])[:4]) or "No significant arrhythmias detected"
-    avg_quality = summary.get('avg_quality', 0) * 100
-    impression_text = (
-        f"This Comprehensive ECG Analysis study for <b>{pname}</b> covers <b>{dur_h}h {dur_m}m</b> with an average heart rate of "
-        f"<b>{avg_hr:.0f} bpm</b> (minimum <b>{min_hr:.0f} bpm</b>, maximum <b>{max_hr:.0f} bpm</b>). "
-        f"Overall signal quality was <b>{avg_quality:.1f}%</b>. The automated event summary shows: <b>{top_events}</b>."
-    )
-    story.append(Paragraph(impression_text, body_style))
-    
-    auto_conclusion = _auto_conclusion(summary)
-    story.append(Paragraph(auto_conclusion, body_style))
-    story.append(Spacer(1, 10*mm))
-
-    # Signature box
-    sig_data = [
-        ['Reference Report Confirmed by', 'Doctor Name', 'Doctor Sign'],
-        ['', patient_info.get('doctor', ''), ''],
-    ]
-    sig_table = Table(sig_data, colWidths=[70*mm, 50*mm, 60*mm])
-    sig_table.setStyle(TableStyle([
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica'),
-        ('FONTSIZE', (0, 0), (-1, -1), 8),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.lightgrey),
-        ('ROWBACKGROUNDS', (0, 0), (-1, 0), [GRAY]),
-        ('MINROWHEIGHT', (0, 1), (-1, 1), 20*mm),
-        ('PADDING', (0, 0), (-1, -1), 5),
-    ]))
-    story.append(sig_table)
-    
-    #    NUMERICAL SUMMARY TABLE                                         
-    story.append(Spacer(1, 15*mm))
-    story.append(Paragraph("NUMERICAL SUMMARY TABLE", title_style))
-    story.append(HRFlowable(width="100%", thickness=2, color=ORANGE, spaceAfter=4*mm))
-    
-    story.append(Paragraph("2. ARRHYTHMIA SUMMARY", h1_style))
-    story.append(HRFlowable(width="100%", thickness=1, color=ORANGE, spaceAfter=2*mm))
-
-    # Load manual beats and segments to include in arrhythmia summary
+    # -------------------------------------------------------------------------
+    # Compute Arrhythmias (combining auto detection with exact manual markings)
+    # -------------------------------------------------------------------------
     manual_beats = []
     manual_beats_path = os.path.join(session_dir, 'manual_beats.json')
     if os.path.exists(manual_beats_path):
@@ -512,12 +471,10 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         if not (mb.get('is_manual', False) or (mb.get('marking_mode') is not None) or (mb.get('batch_id') is not None)):
             continue
         lbl = mb.get('label', 'N')
-        # Extract short code from full label name (e.g., "Normal(N)" -> "N")
         short_code = lbl
         if '(' in lbl and ')' in lbl:
             short_code = lbl.split('(')[1].split(')')[0]
         if short_code != 'N':
-            # Use full label as key for display
             manual_arrhy_counts[lbl] = manual_arrhy_counts.get(lbl, 0) + 1
 
     for seg in manual_segments:
@@ -530,20 +487,27 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     for event in auto_segment_events:
         label = str(event.get('label', 'Unknown'))
         auto_segment_counts[label] = auto_segment_counts.get(label, 0) + 1
-        auto_segment_times.setdefault(label, []).append(
-            _format_system_time(session_dir, float(event.get('timestamp', 0.0) or 0.0))
-        )
+        s_t = float(event.get('start_sec', event.get('timestamp', 0.0)) or 0.0)
+        e_t = float(event.get('end_sec', event.get('end_timestamp', s_t)) or s_t)
+        s_str = _format_system_time(session_dir, s_t)
+        e_str = _format_system_time(session_dir, e_t)
+        if e_t > s_t + 0.5:
+            auto_segment_times.setdefault(label, []).append(f"{s_str} - {e_str}")
+        else:
+            auto_segment_times.setdefault(label, []).append(s_str)
 
     # Merge auto-detected and manual arrhythmia counts
-    combined_arrhy_counts = dict(arrhy_counts)
+    arrhy_counts = summary.get('arrhythmia_counts', {})
+    combined_arrhy_counts = {}
+    for label, count in arrhy_counts.items():
+        if label not in auto_segment_counts:
+            combined_arrhy_counts[label] = count
+    for label, count in auto_segment_counts.items():
+        combined_arrhy_counts[label] = count
     for label, count in manual_arrhy_counts.items():
         combined_arrhy_counts[label] = combined_arrhy_counts.get(label, 0) + count
-    for label, count in auto_segment_counts.items():
-        combined_arrhy_counts[label] = combined_arrhy_counts.get(label, 0) + count
 
-    # Keep the summary focused on clinically significant arrhythmias.  Rhythm
-    # context and beat/conduction classifications below are intentionally not
-    # included in this table (they may still appear elsewhere in the report).
+    # Filter out noise/conduction terms
     excluded_summary_terms = (
         'long qt',
         'wide qrs',
@@ -557,7 +521,6 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     filtered_arrhy_counts = {}
     for label, count in combined_arrhy_counts.items():
         label_lower = label.lower()
-        # Retain Normal Sinus Rhythm, but omit the generic Sinus Rhythm label.
         is_generic_sinus_rhythm = (
             'sinus rhythm' in label_lower
             and 'normal sinus rhythm' not in label_lower
@@ -566,27 +529,101 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
             continue
         filtered_arrhy_counts[label] = count
 
+    story.append(Paragraph("Clinical Impression", h2_style))
+    top_events = ", ".join(f"{label} ({count} episode{'s' if count > 1 else ''})" for label, count in sorted(filtered_arrhy_counts.items(), key=lambda item: -item[1])[:4]) or "No significant arrhythmias detected"
+    avg_quality = summary.get('avg_quality', 0) * 100
+    impression_text = (
+        f"This Comprehensive ECG Analysis study for <b>{pname}</b> covers <b>{dur_h}h {dur_m}m</b> with an average heart rate of "
+        f"<b>{avg_hr:.0f} bpm</b> (minimum <b>{min_hr:.0f} bpm</b>, maximum <b>{max_hr:.0f} bpm</b>). "
+        f"Overall signal quality was <b>{avg_quality:.1f}%</b>. The rhythm and arrhythmia summary shows: <b>{top_events}</b>."
+    )
+    story.append(Paragraph(impression_text, body_style))
+    
+    auto_conclusion = _auto_conclusion(summary, filtered_arrhy_counts)
+    story.append(Paragraph(auto_conclusion, body_style))
+    story.append(Spacer(1, 10*mm))
+
+    # Signature box
+    sig_data = [
+        ['Reference Report Confirmed by', 'Doctor Name', 'Doctor Sign'],
+        ['', patient_info.get('doctor', ''), ''],
+    ]
+    sig_table = Table(sig_data, colWidths=[70*mm, 50*mm, 60*mm])
+    sig_table.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.lightgrey),
+        ('ROWBACKGROUNDS', (0, 0), (-1, 0), [GRAY]),
+        ('MINROWHEIGHT', (0, 1), (-1, 1), 20*mm),
+        ('PADDING', (0, 0), (-1, -1), 5),
+    ]))
+    story.append(sig_table)
+    
+    # =========================================================================
+    # NUMERICAL SUMMARY TABLE
+    # =========================================================================
+    story.append(Spacer(1, 15*mm))
+    story.append(Paragraph("NUMERICAL SUMMARY TABLE", title_style))
+    story.append(HRFlowable(width="100%", thickness=2, color=ORANGE, spaceAfter=4*mm))
+    
+    story.append(Paragraph("2. ARRHYTHMIA SUMMARY", h1_style))
+    story.append(HRFlowable(width="100%", thickness=1, color=ORANGE, spaceAfter=2*mm))
+
     if filtered_arrhy_counts:
-        arrhy_data = [['Arrhythmia Type', 'Episodes', 'Occurring Time', 'Source']]
+        arrhy_hdr_style = ParagraphStyle('ArrhyHdr', parent=styles['Normal'],
+                                         fontSize=9, leading=11, textColor=colors.white, bold=True)
+        arrhy_hdr_center = ParagraphStyle('ArrhyHdrCenter', parent=styles['Normal'],
+                                          fontSize=9, leading=11, textColor=colors.white, bold=True, alignment=TA_CENTER)
+        arrhy_cell_style = ParagraphStyle('ArrhyCell', parent=styles['Normal'],
+                                          fontSize=8.5, leading=11, textColor=DARK)
+        arrhy_cell_center = ParagraphStyle('ArrhyCellCenter', parent=styles['Normal'],
+                                           fontSize=8.5, leading=11, textColor=DARK, alignment=TA_CENTER)
+
+        arrhy_data = [[
+            Paragraph("Arrhythmia Type", arrhy_hdr_style),
+            Paragraph("Episodes", arrhy_hdr_center),
+            Paragraph("Occurring Time", arrhy_hdr_style),
+            Paragraph("Source", arrhy_hdr_center)
+        ]]
+
         for label, count in sorted(filtered_arrhy_counts.items(), key=lambda x: -x[1]):
             # Determine source
             source = []
-            if label in arrhy_counts:
-                source.append("Auto")
-            if label in auto_segment_counts:
+            if label in arrhy_counts or label in auto_segment_counts:
                 source.append("Auto")
             if label in manual_arrhy_counts:
                 source.append("Manual")
-            source_str = ", ".join(dict.fromkeys(source))
-            occurring = auto_segment_times.get(label, [])
-            if not occurring and label in manual_arrhy_counts:
-                occurring = [
-                    _format_system_time(session_dir, float(seg.get('start_sec', 0.0) or 0.0))
-                    for seg in manual_segments if str(seg.get('label', '')) == label
-                ]
-            arrhy_data.append([label, str(count), ', '.join(occurring) or '-', source_str])
+            source_str = ", ".join(dict.fromkeys(source)) or "Auto"
 
-        arrhy_table = Table(arrhy_data, colWidths=[65*mm, 20*mm, 60*mm, 25*mm])
+            occurring = []
+            if label in auto_segment_times:
+                occurring.extend(auto_segment_times[label])
+            if label in manual_arrhy_counts:
+                for seg in manual_segments:
+                    if str(seg.get('label', '')) == label:
+                        s_t = float(seg.get('start_sec', 0.0) or 0.0)
+                        e_t = float(seg.get('end_sec', s_t) or s_t)
+                        s_str = _format_system_time(session_dir, s_t)
+                        e_str = _format_system_time(session_dir, e_t)
+                        if e_t > s_t + 0.5:
+                            occurring.append(f"{s_str} - {e_str}")
+                        else:
+                            occurring.append(s_str)
+                for mb in manual_beats:
+                    if mb.get('label') == label:
+                        occurring.append(_format_system_time(session_dir, float(mb.get('timestamp', 0.0) or 0.0)))
+
+            # Format each occurring time on its own separate line below the previous one
+            occ_html = "<br/>".join(occurring) if occurring else "-"
+
+            type_para = Paragraph(f"<b>{label}</b>", arrhy_cell_style)
+            episodes_para = Paragraph(str(count), arrhy_cell_center)
+            occ_para = Paragraph(occ_html, arrhy_cell_style)
+            source_para = Paragraph(source_str, arrhy_cell_center)
+
+            arrhy_data.append([type_para, episodes_para, occ_para, source_para])
+
+        arrhy_table = Table(arrhy_data, colWidths=[55*mm, 20*mm, 75*mm, 25*mm])
         arrhy_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), RED),
             ('TEXTCOLOR',  (0, 0), (-1, 0), colors.white),
@@ -594,7 +631,8 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
             ('FONTSIZE',   (0, 0), (-1, -1), 9),
             ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#FFEBEE')]),
             ('GRID', (0, 0), (-1, -1), 0.5, colors.lightgrey),
-            ('PADDING', (0, 0), (-1, -1), 5),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('PADDING', (0, 0), (-1, -1), 4),
         ]))
         story.append(arrhy_table)
     else:
@@ -607,7 +645,11 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     if timeline_events:
         story.append(Spacer(1, 6*mm))
         story.append(Paragraph("2B. EVENT TIMELINE", h2_style))
-        timeline_rows = [["Time", "Label", "Source"]]
+        timeline_rows = [[
+            Paragraph("Time", arrhy_hdr_style),
+            Paragraph("Label", arrhy_hdr_style),
+            Paragraph("Source", arrhy_hdr_center)
+        ]]
         seen_events = set()
         for event in timeline_events:
             t_str = _format_system_time(session_dir, float(event.get("timestamp", 0.0) or 0.0))
@@ -617,10 +659,12 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
             if dedup_key in seen_events:
                 continue
             seen_events.add(dedup_key)
-            timeline_rows.append([t_str, lbl, src])
+            t_para = Paragraph(t_str, arrhy_cell_style)
+            lbl_para = Paragraph(lbl, arrhy_cell_style)
+            src_para = Paragraph(src, arrhy_cell_center)
+            timeline_rows.append([t_para, lbl_para, src_para])
 
-
-        timeline_table = Table(timeline_rows, colWidths=[35*mm, 100*mm, 25*mm],
+        timeline_table = Table(timeline_rows, colWidths=[40*mm, 105*mm, 30*mm],
                                repeatRows=1)          # repeat header on each page
         timeline_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), BLUE),
@@ -629,6 +673,7 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
             ('FONTSIZE',   (0, 0), (-1, -1), 7),     # compact font
             ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F5FAFF')]),
             ('GRID',       (0, 0), (-1, -1), 0.3, colors.lightgrey),
+            ('VALIGN',     (0, 0), (-1, -1), 'MIDDLE'),
             ('PADDING',    (0, 0), (-1, -1), 2),     # tight padding for more rows per page
         ]))
         story.append(timeline_table)
@@ -938,19 +983,19 @@ def _compute_interval_stats(jsonl_path: str) -> dict:
     return stats
 
 
-def _auto_conclusion(summary: dict) -> str:
+def _auto_conclusion(summary: dict, filtered_arrhy_counts: Optional[dict] = None) -> str:
     """
     Generate an auto-summary conclusion text.
     User request: Only show rhythm/arrhythmia findings, nothing extra.
     """
     lines = []
-    arrhy = summary.get('arrhythmia_counts', {})
+    arrhy = filtered_arrhy_counts if filtered_arrhy_counts is not None else summary.get('arrhythmia_counts', {})
 
     if not arrhy:
-        lines.append("Normal sinus rhythm.")
+        lines.append("Normal sinus rhythm throughout the recording with no significant arrhythmias.")
     else:
         # Print detected issues/arrhythmias
-        arrhy_list = ', '.join(f"{k}" for k, v in arrhy.items())
+        arrhy_list = ', '.join(f"{k} ({v} episode{'s' if v > 1 else ''})" for k, v in arrhy.items())
         lines.append(f"Arrhythmias detected: {arrhy_list}.")
 
     return " ".join(lines)
@@ -985,9 +1030,68 @@ def _generate_text_report(session_dir, patient_info, summary, output_path) -> st
         "",
         "ARRHYTHMIAS",
     ]
-    arrhy = summary.get('arrhythmia_counts', {})
-    if arrhy:
-        for label, count in arrhy.items():
+    # Calculate combined and filtered arrhythmia counts
+    auto_segment_events = _load_auto_segment_events(session_dir)
+    auto_segment_counts = {}
+    for event in auto_segment_events:
+        label = str(event.get('label', 'Unknown'))
+        auto_segment_counts[label] = auto_segment_counts.get(label, 0) + 1
+
+    manual_beats = []
+    manual_beats_path = os.path.join(session_dir, 'manual_beats.json')
+    if os.path.exists(manual_beats_path):
+        try:
+            with open(manual_beats_path, 'r') as _mb_f:
+                manual_beats = json.load(_mb_f)
+        except Exception:
+            pass
+
+    manual_segments = []
+    manual_segments_path = os.path.join(session_dir, 'manual_segments.json')
+    if os.path.exists(manual_segments_path):
+        try:
+            with open(manual_segments_path, 'r') as _ms_f:
+                manual_segments = json.load(_ms_f)
+        except Exception:
+            pass
+
+    manual_arrhy_counts = {}
+    for mb in manual_beats:
+        if not (mb.get('is_manual', False) or (mb.get('marking_mode') is not None) or (mb.get('batch_id') is not None)):
+            continue
+        lbl = mb.get('label', 'N')
+        short_code = lbl
+        if '(' in lbl and ')' in lbl:
+            short_code = lbl.split('(')[1].split(')')[0]
+        if short_code != 'N':
+            manual_arrhy_counts[lbl] = manual_arrhy_counts.get(lbl, 0) + 1
+
+    for seg in manual_segments:
+        lbl = seg.get('label', 'Unknown')
+        manual_arrhy_counts[lbl] = manual_arrhy_counts.get(lbl, 0) + 1
+
+    arrhy_counts = summary.get('arrhythmia_counts', {})
+    combined_arrhy_counts = {}
+    for label, count in arrhy_counts.items():
+        if label not in auto_segment_counts:
+            combined_arrhy_counts[label] = count
+    for label, count in auto_segment_counts.items():
+        combined_arrhy_counts[label] = count
+    for label, count in manual_arrhy_counts.items():
+        combined_arrhy_counts[label] = combined_arrhy_counts.get(label, 0) + count
+
+    excluded_summary_terms = (
+        'long qt', 'wide qrs', 'premature ventricular contraction', 'pvc',
+        'second-degree', 'second degree', 'third-degree', 'third degree',
+    )
+    filtered_arrhy_counts = {
+        k: v for k, v in combined_arrhy_counts.items()
+        if not any(term in k.lower() for term in excluded_summary_terms)
+        and not ('sinus rhythm' in k.lower() and 'normal sinus rhythm' not in k.lower())
+    }
+
+    if filtered_arrhy_counts:
+        for label, count in sorted(filtered_arrhy_counts.items(), key=lambda x: -x[1]):
             lines.append(f"  {label}: {count} episode(s)")
     else:
         lines.append("  None detected")

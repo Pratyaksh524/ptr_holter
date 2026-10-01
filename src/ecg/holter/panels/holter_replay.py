@@ -41,7 +41,7 @@ from ..holter_helpers import (
     UI_SUCCESS, UI_TEXT, UI_WARNING, _class_matches_filter, _find_latest_completed_session,
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
-    _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _style_active_btn, _style_btn, _style_filter_btn, _table_style, _template_filter_key,
 )
 
 from ..tool_engine import ECGToolEngine
@@ -172,14 +172,14 @@ class HolterReplayPanel(QWidget):
         lw_l.addWidget(self._lorenz_canvas, 3)
         lorenz_filter_row = QHBoxLayout()
         lorenz_filter_row.setSpacing(4)
+        lorenz_filter_row.setContentsMargins(0, 4, 0, 4)
         self._lorenz_class_btns = {}
         for key, lbl in [("all", "All"), ("N", "N"), ("S", "S"), ("V", "V"), ("P", "P"), ("AF", "AF"), ("X", "X"), ("Other", "Other")]:
             b = QPushButton(lbl)
             b.setCheckable(True)
             b.setToolTip(f"Show {lbl} beats" if key != "all" else "Show all beats")
-            b.setFixedHeight(24)
-            style = _style_btn(COL_DARK, COL_GREEN, COL_GREEN_DRK).replace("padding: 7px 14px;", "padding: 1px 4px;")
-            b.setStyleSheet(style)
+            b.setFixedHeight(28)
+            b.setStyleSheet(_style_filter_btn(active=(key == "all"), fg=COL_GREEN if key != "all" else UI_TEXT))
             b.clicked.connect(lambda checked=False, k=key: self._set_lorenz_class_filter(k))
             self._lorenz_class_btns[key] = b
             lorenz_filter_row.addWidget(b)
@@ -936,8 +936,9 @@ class HolterReplayPanel(QWidget):
             key = "all"
         self._class_filter = key
         for btn_key, btn in self._lorenz_class_btns.items():
-            btn.setChecked(btn_key == key)
-            btn.setStyleSheet(_style_active_btn() if btn_key == key else _style_btn(COL_DARK, COL_GREEN, COL_GREEN_DRK))
+            is_active = (btn_key == key)
+            btn.setChecked(is_active)
+            btn.setStyleSheet(_style_filter_btn(active=is_active, fg=COL_GREEN if not is_active else UI_TEXT))
         if self._last_metrics_list:
             self.update_lorenz(self._last_metrics_list)
 

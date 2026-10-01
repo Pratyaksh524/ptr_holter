@@ -1051,29 +1051,6 @@ class HolterFullDisclosureDialog(QDialog):
         if self._active_tool != TOOL_SELECT:
             return super().eventFilter(obj, event)
 
-        # Smooth horizontal panning for the time-window views. A left drag
-        # moves the recording underneath the cursor instead of jumping between
-        # coarse scrollbar steps; segment selection remains available in its
-        # dedicated segment mode below.
-        if self._selection_mode == 'parallel_single':
-            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-                self._pan_drag_x = (event.pos().x() if obj == self._canvas_frame
-                                    else obj.mapTo(self._canvas_frame, event.pos()).x())
-                self._pan_drag_start = float(self._current_start)
-                return True
-            if event.type() == QEvent.MouseMove and getattr(self, '_pan_drag_x', None) is not None:
-                current_x = (event.pos().x() if obj == self._canvas_frame
-                             else obj.mapTo(self._canvas_frame, event.pos()).x())
-                frame_width = max(1, self._canvas_frame.width())
-                delta_sec = (self._pan_drag_x - current_x) / frame_width * float(self._window_sec)
-                max_start = max(0.0, float(self._engine.duration_sec) - float(self._window_sec))
-                target = max(0.0, min(max_start, self._pan_drag_start + delta_sec))
-                self.time_scrollbar.setValue(int(round(target * 100.0)))
-                return True
-            if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
-                self._pan_drag_x = None
-                self._pan_drag_start = None
-                return True
 
         # ----------------------------------------------------------------
         # SEGMENT SELECTION MODE — left button press / move / release
@@ -1154,11 +1131,16 @@ class HolterFullDisclosureDialog(QDialog):
                 else:
                     click_x = event.pos().x()
                 
-                # Parallel multi mode: if lines already exist, don't reset them
-                if self._selection_mode == 'parallel_multi' and self._multi_line1_x is not None and self._multi_line2_x is not None:
+                # Parallel multi mode: every fresh click resets line1 to click
+                # position and clears line2 (line2 will follow on drag).
+                if self._selection_mode == 'parallel_multi':
+                    self._multi_line1_x = click_x
+                    self._multi_line2_x = None
                     self._drag_start_x = click_x
                     self._drag_current_x = click_x
                     self._is_dragging = False
+                    if hasattr(self, '_vertical_line_overlay'):
+                        self._vertical_line_overlay.set_line_positions([click_x])
                     return True
                 
                 self._drag_start_x = click_x
@@ -1233,22 +1215,19 @@ class HolterFullDisclosureDialog(QDialog):
         
         elif event.type() == QEvent.MouseMove:
             if hasattr(self, '_drag_start_x') and self._drag_start_x is not None and is_canvas_event:
-                # Parallel multi mode: second line follows mouse
+                # Parallel multi mode: line2 follows mouse during drag
                 if self._selection_mode == 'parallel_multi':
-                    if obj in self._canvases:
-                        drag_pos_global = obj.mapTo(self._canvas_frame, event.pos())
-                        drag_x = drag_pos_global.x()
-                    else:
-                        drag_x = event.pos().x()
-                    
-                    self._multi_line2_x = drag_x
-                    if hasattr(self, '_vertical_line_overlay'):
-                        line_positions = []
-                        if self._multi_line1_x is not None:
-                            line_positions.append(self._multi_line1_x)
-                        if self._multi_line2_x is not None and self._multi_line2_x != self._multi_line1_x:
-                            line_positions.append(self._multi_line2_x)
-                        self._vertical_line_overlay.set_line_positions(line_positions)
+                    if self._drag_start_x is not None:
+                        if obj in self._canvases:
+                            drag_x = obj.mapTo(self._canvas_frame, event.pos()).x()
+                        else:
+                            drag_x = event.pos().x()
+                        self._multi_line2_x = drag_x
+                        if hasattr(self, '_vertical_line_overlay'):
+                            line_positions = [self._multi_line1_x] if self._multi_line1_x is not None else []
+                            if self._multi_line2_x is not None and self._multi_line2_x != self._multi_line1_x:
+                                line_positions.append(self._multi_line2_x)
+                            self._vertical_line_overlay.set_line_positions(line_positions)
                     return True
                 
                 # Parallel single mode: disable drag behavior
@@ -1278,18 +1257,12 @@ class HolterFullDisclosureDialog(QDialog):
         
         elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
             if hasattr(self, '_drag_start_x') and is_canvas_event:
-                # Parallel multi mode: keep both lines fixed
-                if self._selection_mode == 'parallel_multi':
-                    # Second line is already fixed at current position from MouseMove
-                    # Clear drag state but keep line positions
-                    self._drag_start_x   = None
-                    self._drag_current_x = None
-                    self._is_dragging    = False
-                else:
-                    # Single mode: clear everything
-                    self._drag_start_x   = None
-                    self._drag_current_x = None
-                    self._is_dragging    = False
+                # Both parallel_multi and parallel_single: clear drag state.
+                # For multi mode the two line positions (_multi_line1_x / _multi_line2_x)
+                # are intentionally preserved so they stay visible on screen.
+                self._drag_start_x   = None
+                self._drag_current_x = None
+                self._is_dragging    = False
                 return True
                 
         return super().eventFilter(obj, event)
@@ -1368,10 +1341,22 @@ class HolterFullDisclosureDialog(QDialog):
             self._pending_segment = None
             if hasattr(self, '_segment_overlay'):
                 self._segment_overlay.clear_drag()
-            # Restore vertical line overlay visibility
+            # Clear multi-mode lines and reset beat selection state
+            self._multi_line1_x = None
+            self._multi_line2_x = None
+            self._drag_start_x = None
+            self._drag_current_x = None
+            self._is_dragging = False
+            for c in self._canvases:
+                c._selected_beats = []
+                c._clicked_beat_timestamp = None
+                c.update()
+            # Clear vertical line overlay (remove any leftover multi lines)
             if hasattr(self, '_vertical_line_overlay'):
+                self._vertical_line_overlay.clear_line()
                 self._vertical_line_overlay.show()
             # DO NOT clear structured events - they should persist across mode switches
+
         elif mode == 'parallel_multi':
             self.btn_sel_mode.setText("▲ Parallel Multi")
             # Clear any pending segment drag
@@ -1381,14 +1366,23 @@ class HolterFullDisclosureDialog(QDialog):
             self._pending_segment = None
             if hasattr(self, '_segment_overlay'):
                 self._segment_overlay.clear_drag()
-            # Clear multi-line state
+            # Clear multi-line state and drag state
             self._multi_line1_x = None
             self._multi_line2_x = None
-            # Restore vertical line overlay visibility
+            self._drag_start_x = None
+            self._drag_current_x = None
+            self._is_dragging = False
+            # Clear single-mode beat selection highlights
+            for c in self._canvases:
+                c._selected_beats = []
+                c._clicked_beat_timestamp = None
+                c.update()
+            # Clear vertical line overlay (remove any leftover single line)
             if hasattr(self, '_vertical_line_overlay'):
                 self._vertical_line_overlay.clear_line()
                 self._vertical_line_overlay.show()
             # DO NOT clear structured events - they should persist across mode switches
+
         else:  # segment mode
             self.btn_sel_mode.setText("▲ Segment Sel.")
             # Clear parallel-mode state

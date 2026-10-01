@@ -40,7 +40,7 @@ from ..holter_helpers import (
     UI_SUCCESS, UI_TEXT, UI_WARNING, _class_matches_filter, _find_latest_completed_session,
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
-    _show_message_box, _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _show_message_box, _style_active_btn, _style_btn, _style_filter_btn, _table_style, _template_filter_key,
 )
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas
@@ -437,7 +437,8 @@ class HolterBeatTemplatePanel(QWidget):
                 "Other": "Show uncategorized templates",
                 "unconfirmed": "Show templates not yet confirmed",
             }.get(key, text))
-            btn.setStyleSheet(_style_btn() if key != "all" else _style_active_btn())
+            btn.setFixedHeight(28)
+            btn.setStyleSheet(_style_filter_btn(active=(key == "all")))
             btn.clicked.connect(lambda checked=False, k=key: self._set_filter(k))
             self._filter_buttons[key] = btn
             filter_row.addWidget(btn)
@@ -688,8 +689,9 @@ class HolterBeatTemplatePanel(QWidget):
         try:
             self._current_filter = key
             for k, btn in self._filter_buttons.items():
-                btn.setChecked(k == key)
-                btn.setStyleSheet(_style_active_btn() if k == key else _style_btn())
+                is_active = (k == key)
+                btn.setChecked(is_active)
+                btn.setStyleSheet(_style_filter_btn(active=is_active))
             self._refresh_stats()
             self._render_cards()
         except Exception as e:

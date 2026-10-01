@@ -153,6 +153,43 @@ def _template_filter_key(label: str) -> str:
     return _normalize_beat_class(label)
 
 
+def _style_filter_btn(active: bool = False, bg: str = UI_PANEL_ALT, fg: str = UI_TEXT, hover: str = "#1A2C49") -> str:
+    if active:
+        return f"""
+            QPushButton {{
+                background: {UI_ACCENT};
+                color: #FFFFFF;
+                border: 1px solid #5EA4FF;
+                border-radius: 6px;
+                padding: 2px 6px;
+                font-size: 11px;
+                font-weight: bold;
+                min-height: 24px;
+                max-height: 28px;
+            }}
+            QPushButton:hover {{ background: {UI_ACCENT_HOVER}; color: #FFFFFF; }}
+        """
+    return f"""
+        QPushButton {{
+            background: {bg};
+            color: {fg};
+            border: 1px solid {UI_BORDER};
+            border-radius: 6px;
+            padding: 2px 6px;
+            font-size: 11px;
+            font-weight: bold;
+            min-height: 24px;
+            max-height: 28px;
+        }}
+        QPushButton:hover {{
+            background: {hover};
+            color: #FFFFFF;
+        }}
+        QPushButton:pressed {{ background: {bg}; border: 1px solid {UI_ACCENT_HOVER}; }}
+        QPushButton:disabled {{ background: #1A2233; color: #5F708A; border: 1px solid #2A3953; }}
+    """
+
+
 def _style_btn(bg=UI_PANEL_ALT, fg=UI_TEXT, hover="#1A2C49"):
     return f"""
         QPushButton {{
