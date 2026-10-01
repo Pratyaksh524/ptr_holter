@@ -18,7 +18,8 @@ def detect_arrhythmias(
     progress_callback: Optional[Callable[[int], None]] = None
 ) -> List[Dict[str, Any]]:
     """
-    Auto-detect arrhythmias from the waveform using arrhythmia_detector.py.
+    Auto-detect arrhythmias and rate-based rhythm segments (Sinus Tachycardia / Sinus Bradycardia)
+    directly from ECG waveforms with beat-exact QRS peak boundary alignment.
     
     Args:
         reader: ECGHFileReader instance with read_range method
@@ -26,302 +27,305 @@ def detect_arrhythmias(
     
     Returns:
         List of detected arrhythmia segments with:
-            - start_sec: Start time in seconds
-            - end_sec: End time in seconds
-            - label: Short label code (V, AF, S, P, X)
+            - start_sec: Start time in seconds (snapped exactly to start QRS peak)
+            - end_sec: End time in seconds (snapped exactly to end QRS peak)
+            - label: Full arrhythmia name
             - color: Color hex code for waveform coloring
+            - start_time_str: Formatted HH:MM:SS string
+            - end_time_str: Formatted HH:MM:SS string
             - detected_rhythm: Full arrhythmia name
     """
     from ecg.arrhythmia_detector import analyze_ecg
-    
-    # Raw 10-second detections are only candidates.  Do not paint them
-    # immediately: one noisy window must not become a complete arrhythmia
-    # segment.  Candidates are confirmed below by comparing them with the
-    # previous overlapping window.
-    candidate_segments = []
-    
+    try:
+        from ecg.pan_tompkins import pan_tompkins
+    except ImportError:
+        from ..pan_tompkins import pan_tompkins
+
     # Get sampling rate and duration from reader
     fs = getattr(reader, 'fs', 500)
     if fs is None or fs <= 0:
         fs = 500
-    
+
     total_duration = getattr(reader, 'duration_sec', 0)
     if total_duration <= 0:
         print("[Auto Arrhythmia Detect] Invalid duration")
         return []
-    
+
     # Get lead names from reader
     lead_names = getattr(reader, 'lead_names', [])
     if not lead_names:
         lead_names = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
-    
-    # Process in 10-second windows with 5-second overlap
-    window_size = 10.0  # seconds
-    overlap = 5.0  # seconds
+
+    # ------------------------------------------------------------------
+    # 1. Detect all R-peaks across the entire recording using best rhythm lead
+    # ------------------------------------------------------------------
+    lead_candidates = [l for l in ['II', 'V5', 'V6', 'V4', 'V1', 'I'] if l in lead_names]
+    if not lead_candidates:
+        lead_candidates = lead_names
+
+    test_chunk = reader.read_range(0.0, min(30.0, total_duration))
+    best_lead_idx = 0
+    best_ptp = 0.0
+    for cand in lead_candidates:
+        idx = lead_names.index(cand)
+        if test_chunk is not None and idx < test_chunk.shape[0]:
+            ptp = float(np.ptp(test_chunk[idx]))
+            if ptp > best_ptp:
+                best_ptp = ptp
+                best_lead_idx = idx
+
+    chunk_len_sec = 60.0
+    all_r_peaks = []
+    t_cursor = 0.0
+
+    while t_cursor < total_duration:
+        t_end = min(t_cursor + chunk_len_sec, total_duration)
+        chunk_data = reader.read_range(t_cursor, t_end)
+        if chunk_data is not None and best_lead_idx < chunk_data.shape[0]:
+            lead_sig = np.asarray(chunk_data[best_lead_idx], dtype=float)
+            if len(lead_sig) > 50:
+                p_indices = pan_tompkins(lead_sig, fs=fs)
+                for p_idx in p_indices:
+                    peak_sec = t_cursor + (float(p_idx) / float(fs))
+                    if not all_r_peaks or (peak_sec - all_r_peaks[-1]) >= 0.20:
+                        all_r_peaks.append(peak_sec)
+        t_cursor += chunk_len_sec
+
+    all_r_peaks = sorted(all_r_peaks)
+
+    # Calculate beat-to-beat RR intervals
+    all_rr_ms = []
+    if len(all_r_peaks) >= 2:
+        for i in range(len(all_r_peaks) - 1):
+            rr = (all_r_peaks[i + 1] - all_r_peaks[i]) * 1000.0
+            all_rr_ms.append(rr)
+
+    detected_segments = []
+
+    def make_time_strs(s_sec, e_sec):
+        s_str = ''
+        e_str = ''
+        try:
+            if hasattr(reader, 'start_time') and reader.start_time is not None:
+                s_real = datetime.fromtimestamp(reader.start_time + s_sec)
+                e_real = datetime.fromtimestamp(reader.start_time + e_sec)
+                s_str = s_real.strftime('%H:%M:%S')
+                e_str = e_real.strftime('%H:%M:%S')
+            else:
+                h = int(s_sec // 3600)
+                m = int((s_sec % 3600) // 60)
+                s = int(s_sec % 60)
+                s_str = f"{h:02d}:{m:02d}:{s:02d}"
+                h = int(e_sec // 3600)
+                m = int((e_sec % 3600) // 60)
+                s = int(e_sec % 60)
+                e_str = f"{h:02d}:{m:02d}:{s:02d}"
+        except Exception:
+            pass
+        return s_str, e_str
+
+    # ------------------------------------------------------------------
+    # 2. Extract Beat-Exact Rate Segments (Sinus Tachycardia & Sinus Bradycardia)
+    # ------------------------------------------------------------------
+    if len(all_rr_ms) >= 3:
+        # A. Sinus Tachycardia: consecutive beats with RR <= 600ms (HR >= 100 bpm)
+        in_tachy = False
+        tachy_start_idx = None
+
+        for i, rr in enumerate(all_rr_ms):
+            is_fast = (rr <= 600.0) or (rr <= 630.0 and in_tachy and i + 1 < len(all_rr_ms) and all_rr_ms[i + 1] <= 600.0)
+            if is_fast:
+                if not in_tachy:
+                    in_tachy = True
+                    tachy_start_idx = i
+            else:
+                if in_tachy:
+                    tachy_end_idx = i
+                    beat_count = tachy_end_idx - tachy_start_idx + 1
+                    dur = all_r_peaks[tachy_end_idx] - all_r_peaks[tachy_start_idx]
+                    if beat_count >= 4 and dur >= 2.0:
+                        s_sec = all_r_peaks[tachy_start_idx]
+                        e_sec = all_r_peaks[tachy_end_idx]
+                        s_str, e_str = make_time_strs(s_sec, e_sec)
+                        detected_segments.append({
+                            'start_sec': s_sec,
+                            'end_sec': e_sec,
+                            'label': 'Sinus Tachycardia',
+                            'color': '#00FFFF',
+                            'start_time_str': s_str,
+                            'end_time_str': e_str,
+                            'detected_rhythm': 'Sinus Tachycardia'
+                        })
+                    in_tachy = False
+                    tachy_start_idx = None
+
+        if in_tachy and tachy_start_idx is not None:
+            tachy_end_idx = len(all_rr_ms)
+            beat_count = tachy_end_idx - tachy_start_idx + 1
+            dur = all_r_peaks[tachy_end_idx] - all_r_peaks[tachy_start_idx]
+            if beat_count >= 4 and dur >= 2.0:
+                s_sec = all_r_peaks[tachy_start_idx]
+                e_sec = all_r_peaks[tachy_end_idx]
+                s_str, e_str = make_time_strs(s_sec, e_sec)
+                detected_segments.append({
+                    'start_sec': s_sec,
+                    'end_sec': e_sec,
+                    'label': 'Sinus Tachycardia',
+                    'color': '#00FFFF',
+                    'start_time_str': s_str,
+                    'end_time_str': e_str,
+                    'detected_rhythm': 'Sinus Tachycardia'
+                })
+
+        # B. Sinus Bradycardia: consecutive beats with RR >= 1050ms (HR < 57.1 bpm)
+        # Note: 60 bpm (1000ms RR) is Normal Sinus Rhythm (NSR: 60-100 bpm), NOT Bradycardia.
+        # True Bradycardia occurs when HR < 60 bpm (RR > 1000ms, e.g. 50 bpm / 1200ms).
+        in_brady = False
+        brady_start_idx = None
+
+        for i, rr in enumerate(all_rr_ms):
+            is_slow = (rr >= 1050.0) or (rr >= 1020.0 and in_brady and i + 1 < len(all_rr_ms) and all_rr_ms[i + 1] >= 1050.0)
+            if is_slow:
+                if not in_brady:
+                    in_brady = True
+                    brady_start_idx = i
+            else:
+                if in_brady:
+                    brady_end_idx = i
+                    beat_count = brady_end_idx - brady_start_idx + 1
+                    dur = all_r_peaks[brady_end_idx] - all_r_peaks[brady_start_idx]
+                    if beat_count >= 3 and dur >= 2.5:
+                        s_sec = all_r_peaks[brady_start_idx]
+                        e_sec = all_r_peaks[brady_end_idx]
+                        s_str, e_str = make_time_strs(s_sec, e_sec)
+                        detected_segments.append({
+                            'start_sec': s_sec,
+                            'end_sec': e_sec,
+                            'label': 'Sinus Bradycardia',
+                            'color': '#00BFFF',
+                            'start_time_str': s_str,
+                            'end_time_str': e_str,
+                            'detected_rhythm': 'Sinus Bradycardia'
+                        })
+                    in_brady = False
+                    brady_start_idx = None
+
+        if in_brady and brady_start_idx is not None:
+            brady_end_idx = len(all_rr_ms)
+            beat_count = brady_end_idx - brady_start_idx + 1
+            dur = all_r_peaks[brady_end_idx] - all_r_peaks[brady_start_idx]
+            if beat_count >= 3 and dur >= 2.5:
+                s_sec = all_r_peaks[brady_start_idx]
+                e_sec = all_r_peaks[brady_end_idx]
+                s_str, e_str = make_time_strs(s_sec, e_sec)
+                detected_segments.append({
+                    'start_sec': s_sec,
+                    'end_sec': e_sec,
+                    'label': 'Sinus Bradycardia',
+                    'color': '#00BFFF',
+                    'start_time_str': s_str,
+                    'end_time_str': e_str,
+                    'detected_rhythm': 'Sinus Bradycardia'
+                })
+
+    # ------------------------------------------------------------------
+    # 3. Detect Morphological Arrhythmias (VFib, VTach, AFib, Flutter, AV Block)
+    # ------------------------------------------------------------------
+    window_size = 10.0
+    overlap = 5.0
     step_size = window_size - overlap
-    
-    # Process each window
     current_time = 0.0
     window_count = 0
-    
+
+    morphological_candidates = []
+
     while current_time < total_duration:
         window_end = min(current_time + window_size, total_duration)
-        
         try:
-            # Read window data from reader
             data_array = reader.read_range(current_time, window_end)
-            
             if data_array is not None and data_array.shape[1] > 0:
-                # Convert to leads dictionary for analyze_ecg
                 window_leads = {}
                 for i, lead_name in enumerate(lead_names):
                     if i < data_array.shape[0]:
                         window_leads[lead_name] = data_array[i, :]
-                
+
                 if window_leads:
-                    # Run arrhythmia detection
                     results = analyze_ecg(window_leads, fs=fs)
-                    
-                    # Get detected arrhythmias
                     arrhythmias = results.get('arrhythmias', [])
-                    primary_rhythm = results.get('primary_rhythm', '')
 
-                    # AF segment gate: require absent/insufficient P waves and
-                    # an irregular ventricular rhythm.  This prevents a
-                    # missing-P-wave result caused by noise from becoming an
-                    # AF region by itself.
-                    af_waveform_confirmed = False
-                    beats = [b for b in (results.get('beats') or []) if isinstance(b, dict)]
-                    rr_values = np.asarray(
-                        [float(b.get('rr_ms')) for b in beats if b.get('rr_ms') is not None],
-                        dtype=float,
-                    )
-                    rate_label = ''
-                    if len(beats) >= 3 and rr_values.size >= 2:
-                        # Use the requested strict RR rule.  Every valid RR
-                        # interval in the window must satisfy the threshold;
-                        # a mixed-rate window is left unclassified. P-wave
-                        # detection remains available for rhythm analysis but
-                        # does not veto this RR-only rate segment.
-                        if bool(np.all(rr_values > 1000.0)):
-                            rate_label = 'Sinus Bradycardia'
-                        elif bool(np.all(rr_values < 600.0)):
-                            rate_label = 'Sinus Tachycardia'
-                    if len(beats) >= 3 and rr_values.size >= 2:
-                        p_absent_ratio = float(np.mean([
-                            not bool(b.get('p_present')) for b in beats
-                        ]))
-                        rr_std_ms = float(np.std(rr_values))
-                        rr_range_ms = float(np.max(rr_values) - np.min(rr_values))
-                        af_waveform_confirmed = bool(
-                            p_absent_ratio > 0.50 and (
-                                rr_std_ms > 80.0
-                                or (p_absent_ratio > 0.70 and rr_range_ms > 120.0)
-                            )
-                        )
-                    
-                    if arrhythmias or primary_rhythm or rate_label:
-                        # Map detected arrhythmias to segment labels
-                        label_map = {
-                            'Asystole': ('X', '#0000FF'),
-                            'Ventricular Fibrillation': ('V', '#FF3333'),
-                            'Ventricular Tachycardia': ('V', '#FF3333'),
-                            'Atrial Fibrillation': ('AF', '#FF00FF'),
-                            'Atrial Flutter': ('AF', '#FF00FF'),
-                            'Sinus Bradycardia': ('S', '#00BFFF'),
-                            'Sinus Tachycardia': ('S', '#00FFFF'),
-                            'Normal Sinus Rhythm': ('N', '#00FF00'),
-                            'Bradycardia (non-sinus)': ('S', '#00FFFF'),
-                            'Tachycardia (non-sinus)': ('S', '#00FFFF'),
-                            '1st-degree AV block': ('P', '#FF00FF'),
-                            '2nd-degree AV block (Mobitz I / Wenckebach)': ('P', '#FF00FF'),
-                            '3rd-degree AV block': ('P', '#FF00FF'),
-                            'Right bundle branch block (RBBB)': ('P', '#FF00FF'),
-                            'Left bundle branch block (LBBB)': ('P', '#FF00FF'),
-                            'Premature ventricular contraction (PVC)': ('V', '#FF3333'),
-                            'Premature atrial contraction (PAC)': ('S', '#00FFFF'),
-                            'ST elevation': ('X', '#FFFF00'),
-                            'ST depression': ('X', '#FFFF00'),
-                        }
-                        
-                        # Prefer clinically important atrial rhythm findings
-                        # from the arrhythmia list over a generic primary label
-                        # such as Normal Sinus Rhythm.  Flutter/AF can be a
-                        # secondary finding when the ventricular rate remains
-                        # organized, but it must still create a waveform region.
-                        atrial_label = next(
-                            (
-                                str(label) for label in arrhythmias
-                                if 'atrial fibrillation' in str(label).lower()
-                                or 'atrial flutter' in str(label).lower()
-                            ),
-                            '',
-                        )
-                        detected_label = atrial_label or rate_label or primary_rhythm or (
-                            arrhythmias[0] if arrhythmias else ''
-                        )
+                    # Look for non-rate morphological arrhythmias
+                    target_morph = None
+                    for arr in arrhythmias:
+                        arr_lower = str(arr).lower()
+                        if 'ventricular fibrillation' in arr_lower or 'vfib' in arr_lower:
+                            target_morph = ('Ventricular Fibrillation', '#FF3333')
+                            break
+                        elif 'ventricular tachycardia' in arr_lower or 'vtach' in arr_lower:
+                            target_morph = ('Ventricular Tachycardia', '#FF3333')
+                            break
+                        elif 'atrial fibrillation' in arr_lower or 'afib' in arr_lower:
+                            target_morph = ('Atrial Fibrillation', '#FF00FF')
+                            break
+                        elif 'atrial flutter' in arr_lower or 'aflutter' in arr_lower:
+                            target_morph = ('Atrial Flutter', '#FF00FF')
+                            break
+                        elif 'av block' in arr_lower:
+                            target_morph = (str(arr), '#FF00FF')
+                            break
 
-                        # Use the beat-to-beat waveform measurement for rate
-                        # segments instead of relying only on a classifier
-                        # label.  A minimum beat count prevents one bad RR
-                        # interval from creating a Brady/Tachy region.
-                        protected_rate_labels = {
-                            'Ventricular Fibrillation',
-                            'Ventricular Tachycardia',
-                            'Atrial Fibrillation',
-                            'Atrial Flutter',
-                        }
-                        if (detected_label not in protected_rate_labels
-                                and rate_label):
-                            detected_label = rate_label
-
-                        # Never create an AF segment from the label alone.
-                        # The waveform-derived gate above must also pass.
-                        if 'atrial fibrillation' in str(detected_label).lower() and not af_waveform_confirmed:
-                            detected_label = 'Rhythm Undetermined'
-
-                        # Map to segment label
-                        label_code, color = label_map.get(detected_label, ('X', '#0000FF'))
-                        
-                        # Only add if not Normal Sinus Rhythm (to avoid clutter)
-                        is_normal_rhythm = str(detected_label).strip().lower() in {
-                            'normal sinus rhythm', 'sinus rhythm'
-                        }
-                        if not is_normal_rhythm and detected_label != 'Rhythm Undetermined':
-                            # Compute real-world timestamp strings
-                            start_time_str = ''
-                            end_time_str = ''
-                            try:
-                                if hasattr(reader, 'start_time') and reader.start_time is not None:
-                                    start_real = datetime.fromtimestamp(reader.start_time + current_time)
-                                    end_real = datetime.fromtimestamp(reader.start_time + window_end)
-                                    start_time_str = start_real.strftime('%H:%M:%S')
-                                    end_time_str = end_real.strftime('%H:%M:%S')
-                                else:
-                                    h = int(current_time // 3600)
-                                    m = int((current_time % 3600) // 60)
-                                    s = int(current_time % 60)
-                                    start_time_str = f"{h:02d}:{m:02d}:{s:02d}"
-                                    
-                                    h = int(window_end // 3600)
-                                    m = int((window_end % 3600) // 60)
-                                    s = int(window_end % 60)
-                                    end_time_str = f"{h:02d}:{m:02d}:{s:02d}"
-                            except Exception as e:
-                                print(f"[Auto Arrhythmia Detect] Error formatting time: {e}")
-                            
-                            candidate_segments.append({
-                                # Refine the coarse 10-second window using
-                                # the actual R-peak interval that first/last
-                                # satisfies the rate rule.
-                                'start_sec': current_time,
-                                'end_sec': window_end,
-                                'label': detected_label,
-                                'color': color,
-                                'start_time_str': start_time_str,
-                                'end_time_str': end_time_str,
-                                'detected_rhythm': detected_label
-                            })
-
-                            # The window is only a detection container. Use
-                            # R-peaks to move its visual boundaries closer to
-                            # the real rhythm transition.
-                            local_peaks = np.asarray(results.get('r_peaks') or [], dtype=float)
-                            if local_peaks.size >= 2 and detected_label in {
-                                'Sinus Bradycardia', 'Sinus Tachycardia'
-                            }:
-                                local_rr = np.diff(local_peaks) * 1000.0 / float(fs)
-                                if detected_label == 'Sinus Bradycardia':
-                                    qualifying = local_rr > 1000.0
-                                else:
-                                    qualifying = local_rr < 600.0
-                                qualifying_indices = np.flatnonzero(qualifying)
-                                if qualifying_indices.size:
-                                    first_i = int(qualifying_indices[0])
-                                    last_i = int(qualifying_indices[-1])
-                                    candidate_segments[-1]['start_sec'] = max(
-                                        current_time,
-                                        current_time + local_peaks[first_i] / float(fs),
-                                    )
-                                    candidate_segments[-1]['end_sec'] = min(
-                                        window_end,
-                                        current_time + local_peaks[last_i + 1] / float(fs),
-                                    )
-                            
-                            print(f"[Auto Arrhythmia Detect] Detected: {detected_label} at {current_time:.1f}s - {window_end:.1f}s")
-        
+                    if target_morph:
+                        s_str, e_str = make_time_strs(current_time, window_end)
+                        morphological_candidates.append({
+                            'start_sec': current_time,
+                            'end_sec': window_end,
+                            'label': target_morph[0],
+                            'color': target_morph[1],
+                            'start_time_str': s_str,
+                            'end_time_str': e_str,
+                            'detected_rhythm': target_morph[0]
+                        })
         except Exception as e:
-            print(f"[Auto Arrhythmia Detect] Error analyzing window {current_time:.1f}s: {e}")
-        
+            print(f"[Auto Arrhythmia Detect] Window error {current_time:.1f}s: {e}")
+
         current_time += step_size
         window_count += 1
-        
-        # Update progress periodically
         if window_count % 10 == 0 and progress_callback:
             progress = int((current_time / total_duration) * 100)
             progress_callback(progress)
-    
-    # ------------------------------------------------------------------
-    # Temporal confirmation
-    # ------------------------------------------------------------------
-    # Windows advance by five seconds and overlap by five seconds.  Therefore
-    # two matching windows represent at least five seconds of persistence in
-    # the same rhythm.  A single candidate is deliberately rejected for the
-    # rhythms most vulnerable to noise (VF/VT/Flutter/AF).
-    if not candidate_segments:
-        return []
 
-    candidate_segments.sort(key=lambda x: x['start_sec'])
-    persistent_labels = {
-        'Ventricular Fibrillation',
-        'Ventricular Tachycardia',
-        'Atrial Fibrillation',
-    }
-    confirmed = []
-    run = []
+    # Merge contiguous morphological candidate windows
+    if morphological_candidates:
+        morphological_candidates.sort(key=lambda x: x['start_sec'])
+        merged_morph = []
+        for m in morphological_candidates:
+            if merged_morph:
+                last = merged_morph[-1]
+                if last['label'] == m['label'] and m['start_sec'] <= last['end_sec'] + 0.25:
+                    last['end_sec'] = max(last['end_sec'], m['end_sec'])
+                    last['end_time_str'] = m['end_time_str']
+                    continue
+            merged_morph.append(m)
+        detected_segments.extend(merged_morph)
 
-    def flush_run(items):
-        if not items:
-            return
-        label = items[0]['label']
-        # Require a previous-window match for high-risk/atrial candidate
-        # labels.  Other labels retain the old single-window behavior.
-        if label in persistent_labels and len(items) < 2:
-            return
-        first = dict(items[0])
-        first['end_sec'] = max(item['end_sec'] for item in items)
-        first['end_time_str'] = items[-1].get('end_time_str', first.get('end_time_str', ''))
-        confirmed.append(first)
+    # Sort all detected segments by start time
+    detected_segments.sort(key=lambda x: x['start_sec'])
 
-    for seg in candidate_segments:
-        if not run:
-            run = [seg]
-            continue
-        previous = run[-1]
-        same_label = seg['label'] == previous['label']
-        overlapping = seg['start_sec'] <= previous['end_sec'] + 0.25
-        if same_label and overlapping:
-            run.append(seg)
-        else:
-            flush_run(run)
-            run = [seg]
-    flush_run(run)
-
-    # A confirmed run is already merged. Only truly overlapping confirmed
-    # regions may be collapsed; do not bridge a gap where NSR or another
-    # rhythm occurred, because that gap represents a separate episode.
-    merged_segments = []
-    for seg in confirmed:
-        if merged_segments:
-            last = merged_segments[-1]
-            if (seg['label'] == last['label'] and
-                    seg['start_sec'] <= last['end_sec'] + 0.25):
+    # Merge adjacent segments of same label
+    final_segments = []
+    for seg in detected_segments:
+        if final_segments:
+            last = final_segments[-1]
+            if last['label'] == seg['label'] and seg['start_sec'] <= last['end_sec'] + 0.50:
                 last['end_sec'] = max(last['end_sec'], seg['end_sec'])
                 last['end_time_str'] = seg.get('end_time_str', last.get('end_time_str', ''))
                 continue
-        merged_segments.append(seg)
+        final_segments.append(seg)
 
-    return merged_segments
+    print(f"[Auto Arrhythmia Detect] Found {len(final_segments)} exact rhythm segments:")
+    for s in final_segments:
+        print(f"  - {s['label']}: {s['start_sec']:.2f}s to {s['end_sec']:.2f}s ({s['start_time_str']} - {s['end_time_str']})")
+
+    return final_segments
 
 
 def convert_to_structured_events(detected_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

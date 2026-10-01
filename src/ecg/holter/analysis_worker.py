@@ -528,7 +528,7 @@ class HolterAnalysisWorker(threading.Thread):
         providing clear visual indication of the VFib arrhythmia across all leads.
         """
         if len(r_peaks) == 0:
-            return {}, [], []
+            return {}, [], [], []
 
         # Check if VFib is detected - if so, suppress other arrhythmia classifications
         vfib_detected = False

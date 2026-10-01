@@ -1738,13 +1738,50 @@ class ECGStripCanvas(QWidget):
                             from ...pan_tompkins import pan_tompkins
 
                         signal = np.asarray(d, dtype=float)
-                        # pan_tompkins() returns sample indices of R-peaks
+                        lead_i_ptp = float(np.ptp(signal)) if signal.size else 0.0
                         peak_indices = pan_tompkins(signal, fs=self._fs)
+
+                        # If Lead I has low voltage or missed beats, check companion rhythm leads (Lead II, V5, V6, V4)
+                        alt_canvases = []
+                        win = self.window()
+                        if hasattr(win, '_canvases') and win._canvases:
+                            alt_canvases = win._canvases
+                        else:
+                            p = self.parent()
+                            while p is not None:
+                                if hasattr(p, '_canvases') and p._canvases:
+                                    alt_canvases = p._canvases
+                                    break
+                                p = p.parent()
+
+                        best_indices = peak_indices
+                        best_count = len(peak_indices)
+                        
+                        for c in alt_canvases:
+                            if c != self and getattr(c, 'lead_name', '') in ('II', 'V5', 'V6', 'V4', 'V3', 'V2', 'aVF'):
+                                alt_d = getattr(c, '_data', None)
+                                if alt_d is not None and len(alt_d) == len(d):
+                                    alt_sig = np.asarray(alt_d, dtype=float)
+                                    alt_ptp = float(np.ptp(alt_sig)) if alt_sig.size else 0.0
+                                    if alt_ptp > lead_i_ptp * 1.3 or best_count <= 2:
+                                        alt_peaks = pan_tompkins(alt_sig, fs=self._fs)
+                                        if len(alt_peaks) > best_count:
+                                            best_indices = alt_peaks
+                                            best_count = len(alt_peaks)
+
+                        peak_indices = best_indices
 
                         # Convert peak indices to timestamps
                         for peak_idx in peak_indices:
                             ts = self._start_sec + (int(peak_idx) / self._fs)
                             detected_peaks.append(ts)
+                        
+                        if len(detected_peaks) == 0 and hasattr(self, '_beat_annotations') and self._beat_annotations:
+                            for b in self._beat_annotations:
+                                b_ts = float(b.get('timestamp', 0.0))
+                                if self._start_sec <= b_ts <= end_sec:
+                                    detected_peaks.append(b_ts)
+                            detected_peaks.sort()
                         
                         # Store detected peaks in parent panel for cross-lead vertical lines
                         parent = self.parent()
@@ -2000,9 +2037,11 @@ class ECGStripCanvas(QWidget):
                     # Position it at mid-height of the waveform, slight offset from top
                     interval_text = f"{int(rr_ms)}"
                     
-                    # Color: yellow for long intervals (>1200ms), orange for short (<600ms), white otherwise
-                    if rr_ms > 1200:
+                    # Color: yellow for pause (>=2000ms), cyan-blue for brady (>=1050ms), orange for tachy (<600ms), light gray otherwise
+                    if rr_ms >= 2000:
                         color = "#FFFF00"  # Yellow for pauses
+                    elif rr_ms >= 1050:
+                        color = "#00BFFF"  # Cyan-blue for bradycardia
                     elif rr_ms < 600:
                         color = "#FFA500"  # Orange for fast beats
                     else:
