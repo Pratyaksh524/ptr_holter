@@ -898,6 +898,7 @@ from .panels.holter_report_table import HolterReportTablePanel
 from .panels.holter_recordings import HolterRecordManagementPanel
 from .panels.holter_preview import HolterInsightPanel
 from .panels.holter_hrv import HolterHRVPanel
+from .panels.holter_record_settings import HolterRecordSettingsPanel
 
 # -----------------------------------------------------------------------------
 # 17. HOLTER MAIN WINDOW  - Orchestrates everything
@@ -1902,23 +1903,13 @@ class HolterMainWindow(QDialog):
         self._tabs.addTab(self._hrv_panel, _make_icon("HRV"), "HRV")
 
         # Record settings
-        settings_panel = QWidget()
-        settings_layout = QVBoxLayout(settings_panel)
-        settings_layout.setContentsMargins(18, 18, 18, 18)
-        settings_layout.setSpacing(10)
-        settings_title = QLabel("Record Settings")
-        settings_title.setStyleSheet(f"font-size:16px;font-weight:700;color:{UI_TEXT};")
-        settings_layout.addWidget(settings_title)
-        settings_info = QLabel(
-            f"Recording duration: {self._duration_hours:g} hours\n"
-            f"Session: {os.path.basename(os.path.normpath(self.session_dir)) if self.session_dir else 'Current session'}"
+        session_name = os.path.basename(os.path.normpath(self.session_dir)) if self.session_dir else 'Current session'
+        self._record_settings_panel = HolterRecordSettingsPanel(
+            duration_hours=self._duration_hours,
+            session_name=session_name
         )
-        settings_info.setStyleSheet(f"font-size:13px;color:{UI_MUTED};")
-        settings_info.setWordWrap(True)
-        settings_layout.addWidget(settings_info)
-        settings_layout.addStretch(1)
-        self._record_settings_panel = settings_panel
-        self._tabs.addTab(settings_panel, _make_icon("RECORD SETTINGS"), "RECORD SETTINGS")
+        self._record_settings_panel.settings_changed.connect(self._on_record_settings_changed)
+        self._tabs.addTab(self._record_settings_panel, _make_icon("RECORD SETTINGS"), "RECORD SETTINGS")
 
         # Record browser
         self._record_mgmt_panel = HolterRecordManagementPanel(
@@ -1938,6 +1929,7 @@ class HolterMainWindow(QDialog):
         self._insight_panel.update_text(self.patient_info, self._summary)
         scroll_insight.setWidget(self._insight_panel)
         self._tabs.addTab(scroll_insight, _make_icon("PREVIEW"), "PREVIEW")
+
         self._tabs.addTab(QWidget(), _make_icon("PRINT"), "PRINT")
         self._tabs.addTab(QWidget(), _make_icon("REANALYSIS"), "REANALYSIS")
         self._tabs.addTab(QWidget(), _make_icon("QUIT"), "QUIT")
@@ -1971,6 +1963,7 @@ class HolterMainWindow(QDialog):
                 f"Focused view: {self._tabs.tabText(idx)}"
             )
         )
+
         action_handlers = {
             "Browse": self._open_recordings_folder,
             "Search": self._search_recordings,
@@ -1990,6 +1983,12 @@ class HolterMainWindow(QDialog):
         main_layout.addWidget(right_frame, 1)
         if hasattr(self, '_analysis_state'):
             self._analysis_state.setText(f"Focused view: {self._tabs.tabText(self._tabs.currentIndex())}")
+
+    def _on_record_settings_changed(self, settings: dict):
+        """Handler called when user applies/ok settings in Record Settings panel."""
+        if hasattr(self, "_replay_panel") and self._replay_panel is not None:
+            if hasattr(self._replay_panel, "apply_record_settings"):
+                self._replay_panel.apply_record_settings(settings)
 
 
     # ----- Callbacks ----------------------------------------------------------------------------

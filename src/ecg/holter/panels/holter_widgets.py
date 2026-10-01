@@ -799,6 +799,7 @@ class ECGStripCanvas(QWidget):
         self._disable_all_coloring = disable_all_coloring  # CRITICAL: Disable ALL coloring (for replay/overview)
         self._gain = 1.0
         self._speed = 25
+        self._inverted = False
         self.setFixedHeight(height)
         self.setStyleSheet(f"background:{COL_BLACK};border:none;")
         self.setMouseTracking(True)
@@ -822,6 +823,13 @@ class ECGStripCanvas(QWidget):
         self._clicked_beat_timestamp = None  # Timestamp of the clicked peak
         self._clicked_beat_label = None  # Label (N, S, V, etc.) of clicked peak
         self._clicked_beat_x_pos = None  # X pixel position of clicked beat
+        
+        # Drag selection: multiple selected beats
+        self._selected_beats = []  # List of timestamps for all selected beats
+
+    def set_invert(self, inverted: bool):
+        self._inverted = bool(inverted)
+        self.update()
         
         # Drag selection: multiple selected beats
         self._selected_beats = []  # List of timestamps for all selected beats
@@ -1143,6 +1151,11 @@ class ECGStripCanvas(QWidget):
         if hasattr(self, '_gain') and self._gain != 1.0:
             center = (mn + rng / 2.0)
             d = center + (d - center) * self._gain
+
+        # Apply waveform inversion around baseline if enabled
+        if getattr(self, '_inverted', False):
+            center = (mn + rng / 2.0)
+            d = center - (d - center)
 
         # Gain is a vertical display magnification, not permission for the
         # trace to enter the neighbouring lead row. Keep the baseline fixed

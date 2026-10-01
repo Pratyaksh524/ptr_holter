@@ -441,6 +441,8 @@ class HolterReplayPanel(QWidget):
             tbtn.setStyleSheet(tool_button_style)
             tbtn.setMinimumHeight(32)
             tbtn.setMinimumWidth(tool_min_widths.get(tool, 110))
+            if tool == "Gain Settings":
+                tbtn.setText("Gain: 10mm/mV")
             tbtn.clicked.connect(lambda _, t=tool, b=tbtn: self._set_tool_mode(t, b))
             toolbar_layout.addWidget(tbtn)
             self._tool_btns[tool] = tbtn
@@ -1156,6 +1158,33 @@ class HolterReplayPanel(QWidget):
                         self._rr_trend_zoom.set_points(rr_points[-400:] if len(rr_points) > 400 else rr_points)
         except Exception:
             pass
+
+    def apply_record_settings(self, settings: dict):
+        """Apply lead gains and invert states from Record Settings to all lead strips."""
+        lead_gains = settings.get("lead_gains", {})
+        lead_inverts = settings.get("lead_inverts", {})
+        for lead, strip in self._lead_strips.items():
+            if lead in lead_gains:
+                # Map gain mm/mV (e.g. 5, 10, 20) to scaling factor (10 mm/mV is 1.0)
+                g_val = lead_gains[lead]
+                scale = float(g_val) / 10.0
+                strip.set_gain(scale)
+            if lead in lead_inverts:
+                strip.set_invert(lead_inverts[lead])
+        if hasattr(self, "_mini_strip"):
+            selected_lead = self._lead_combo.currentText() if hasattr(self, "_lead_combo") else "II"
+            if selected_lead in lead_gains:
+                self._mini_strip.set_gain(float(lead_gains[selected_lead]) / 10.0)
+            if selected_lead in lead_inverts:
+                self._mini_strip.set_invert(lead_inverts[selected_lead])
+        # Update toolbar Gain button text if uniform gain across leads
+        if hasattr(self, "_tool_btns") and "Gain Settings" in self._tool_btns:
+            g_vals = set(lead_gains.values()) if lead_gains else set()
+            if len(g_vals) == 1:
+                val = int(list(g_vals)[0])
+                self._tool_btns["Gain Settings"].setText(f"Gain: {val}mm/mV")
+            else:
+                self._tool_btns["Gain Settings"].setText("Gain: 10mm/mV")
 
     def _update_overview_table(self, metrics_list: list, rr_n: list):
         if not hasattr(self, "_overview_table"):
