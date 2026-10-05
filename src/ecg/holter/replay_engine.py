@@ -164,7 +164,11 @@ class HolterReplayEngine:
             if layered_events:
                 self._structured_events = []
                 self._arrhythmia_events = []
-                for item in layered_events:
+                sorted_items = sorted(
+                    layered_events,
+                    key=lambda it: float(it.get("timestamp", it.get("t", 0.0)) or 0.0),
+                )
+                for idx, item in enumerate(sorted_items):
                     ts = float(item.get("timestamp", item.get("t", 0.0)) or 0.0)
                     label = str(item.get("label", item.get("event_type", "Event")))
                     label_lower = label.lower()
@@ -214,11 +218,49 @@ class HolterReplayEngine:
                         label_code = 'S'
                         color = '#00FFFF'  # Cyan
                     
-                    # Check if item has end_timestamp, otherwise calculate from duration
+                    # Check if item has end_timestamp, otherwise calculate from
+                    # duration -- or, if neither is stored, cap the fallback
+                    # span at the next *chunk-level* snapshot's own start
+                    # time. These rows can be discrete, closely-spaced
+                    # real-time classifier snapshots (e.g. one label every
+                    # ~5s) with no duration field persisted; a flat 60s guess
+                    # made an old snapshot's rendered region balloon far past
+                    # where a newer, later classification already superseded
+                    # it, which then visually collided with a genuinely
+                    # separate, later arrhythmia episode on the Full
+                    # Disclosure timeline.
+                    #
+                    # The same real-time pipeline also logs finer-grained,
+                    # beat-level annotations (e.g. "PVC Candidate") at the
+                    # precise instant that beat occurred, which can be
+                    # anywhere within a chunk-level label's own ~5s window --
+                    # not necessarily close in time to the chunk label itself
+                    # (seen up to ~3s away in practice, so a short minimum-gap
+                    # heuristic isn't reliable). Sorted by timestamp, that
+                    # beat-level row would otherwise get treated as "the next
+                    # chunk", capping the rhythm label's span early and
+                    # leaving the rest of that chunk unrendered. Chunk-level
+                    # rhythm labels are logged on whole-second boundaries
+                    # (105.00, 110.00, ...); beat-level annotations are logged
+                    # at the beat's precise, generally fractional timestamp.
+                    # So the "next" row used for capping is the next one that
+                    # itself looks like a whole-second chunk boundary, not
+                    # simply the next row in sorted order.
                     end_ts = item.get("end_timestamp")
                     if end_ts is None:
-                        duration = float(item.get("duration", 60.0) or 60.0)
-                        end_ts = ts + duration
+                        duration = item.get("duration")
+                        if duration is None:
+                            next_ts = None
+                            for later in sorted_items[idx + 1:]:
+                                later_ts = float(later.get("timestamp", later.get("t", 0.0)) or 0.0)
+                                if later_ts <= ts:
+                                    continue
+                                if abs(later_ts - round(later_ts)) < 0.01:
+                                    next_ts = later_ts
+                                    break
+                            end_ts = next_ts if next_ts is not None and next_ts > ts else ts + 5.0
+                        else:
+                            end_ts = ts + float(duration or 60.0)
                     
                     event_dict = {
                         "timestamp": ts,

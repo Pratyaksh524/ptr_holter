@@ -297,16 +297,27 @@ class SegmentOverlay(QWidget):
             total_w = lbl_w + spacer_w + time_w
             start_text_x = mid_x - (total_w // 2)
 
-            # Draw label (y = 20)
-            painter.setFont(lbl_font)
-            painter.setPen(QPen(c, 1))
-            painter.drawText(start_text_x, 20, lbl)
+            # Only draw the centered label+duration when it actually fits
+            # inside this segment's own on-screen width. A short segment
+            # (e.g. a brief VFib episode) drawn at a wide zoom (Full Disc)
+            # can be only a few pixels across while its label text is 150+
+            # pixels wide; centering it regardless makes the text spill past
+            # the segment's own boundary and visually collide with whatever
+            # label the neighboring segment is drawing -- exactly the garbled
+            # overlapping text seen when zoomed out or mid-scroll. The
+            # colored region still marks the event; the label reappears once
+            # the user zooms in enough for the segment to hold it.
+            if total_w <= (ex - sx):
+                # Draw label (y = 20)
+                painter.setFont(lbl_font)
+                painter.setPen(QPen(c, 1))
+                painter.drawText(start_text_x, 20, lbl)
 
-            # Draw duration string (y = 20, right of label, in white)
-            if time_str:
-                painter.setFont(t_font)
-                painter.setPen(QPen(QColor("#FFFFFF")))
-                painter.drawText(start_text_x + lbl_w + spacer_w, 20, time_str)
+                # Draw duration string (y = 20, right of label, in white)
+                if time_str:
+                    painter.setFont(t_font)
+                    painter.setPen(QPen(QColor("#FFFFFF")))
+                    painter.drawText(start_text_x + lbl_w + spacer_w, 20, time_str)
 
             # Draw start time on left edge of segment (y = 20, in white)
             if start_time_str:
@@ -503,6 +514,65 @@ class HolterFullDisclosureDialog(QDialog):
         except Exception as e:
             print(f"[Full Disclosure] Error loading segment annotations on startup: {e}")
 
+        def _suppress_rate_overlap_in_structured_events(events):
+            """
+            Drop/trim rate-based Sinus Tachycardia/Bradycardia auto events so
+            they never overlap a morphological auto event (VFib, VTach, AFib,
+            Flutter, AV Block). `existing` below can carry auto events from
+            two independent sources -- the real-time recording pipeline
+            (stored replay metrics) and this module's own waveform-based
+            detect_arrhythmias() -- and either source's rate-based labels can
+            predate a detector fix or simply miss a morphological arrhythmia
+            the other source caught. Without this pass, a stale/independent
+            Sinus Tachycardia region keeps rendering on top of a correctly
+            detected Ventricular Fibrillation region.
+            """
+            RATE_LABELS = {'sinus tachycardia', 'sinus bradycardia'}
+
+            def _is_morph(ev):
+                lbl = str(ev.get('label', ev.get('type', ''))).lower()
+                return 'av block' in lbl or lbl in {
+                    'ventricular fibrillation', 'ventricular tachycardia',
+                    'atrial fibrillation', 'atrial flutter',
+                }
+
+            morph_intervals = sorted(
+                (float(ev.get('timestamp', 0.0) or 0.0),
+                 float(ev.get('end_timestamp', ev.get('timestamp', 0.0)) or 0.0))
+                for ev in events if _is_morph(ev)
+            )
+            if not morph_intervals:
+                return events
+
+            result = []
+            for ev in events:
+                label = str(ev.get('label', ev.get('type', ''))).lower()
+                if label not in RATE_LABELS:
+                    result.append(ev)
+                    continue
+                start = float(ev.get('timestamp', 0.0) or 0.0)
+                end = float(ev.get('end_timestamp', start) or start)
+                pieces = [(start, end)]
+                for m_start, m_end in morph_intervals:
+                    next_pieces = []
+                    for p_start, p_end in pieces:
+                        if m_end <= p_start or m_start >= p_end:
+                            next_pieces.append((p_start, p_end))
+                            continue
+                        if m_start > p_start:
+                            next_pieces.append((p_start, m_start))
+                        if m_end < p_end:
+                            next_pieces.append((m_end, p_end))
+                    pieces = next_pieces
+                for p_start, p_end in pieces:
+                    if p_end - p_start < 1.0:
+                        continue
+                    trimmed = dict(ev)
+                    trimmed['timestamp'] = p_start
+                    trimmed['end_timestamp'] = p_end
+                    result.append(trimmed)
+            return result
+
         # Generate automatic rhythm regions for Full Disclosure.  The
         # detector module is intentionally separate from the replay engine,
         # so it must be invoked here before the first canvas refresh.
@@ -527,7 +597,21 @@ class HolterFullDisclosureDialog(QDialog):
                         round(float(event.get('timestamp', 0.0) or 0.0), 3),
                         str(event.get('label', '')).lower(),
                     )
-                    if key not in existing_keys:
+                    # A region-type event (has end_timestamp) is always added
+                    # even if its (timestamp, label) exactly matches an
+                    # existing stored one -- the merge/suppression pass below
+                    # safely reconciles overlapping same-label regions by
+                    # extending coverage, not duplicating it. Skipping it here
+                    # on an exact-key "duplicate" silently discarded this
+                    # detector's properly merged, multi-window region (e.g.
+                    # a continuous 60s Ventricular Fibrillation episode)
+                    # whenever the stored real-time pipeline happened to log
+                    # its own, far more fragmented per-chunk snapshot at that
+                    # same starting instant -- leaving only the fragmented
+                    # version on screen. Point-in-time events (no
+                    # end_timestamp, e.g. manual markers) still dedup as
+                    # before since they don't go through that merge.
+                    if event.get('end_timestamp') is not None or key not in existing_keys:
                         existing.append(event)
                         existing_keys.add(key)
                         added += 1
@@ -535,10 +619,18 @@ class HolterFullDisclosureDialog(QDialog):
                 # Collapse duplicate/overlapping automatic regions from the
                 # stored replay metrics and the current waveform detector.
                 # Manual events do not have an end_timestamp and are never
-                # included in this merge.
+                # included in this merge. Non-manual auto-origin events come
+                # through with several different source labels depending on
+                # which pipeline produced them ('Auto', 'arrhythmia',
+                # 'classified', 'analysis', ...) -- an allow-list here missed
+                # 'analysis'-sourced regions (the layered event store's
+                # default when no source was recorded), letting a stale
+                # Sinus Tachycardia region from that path bypass suppression
+                # and keep rendering on top of a correctly detected VFib
+                # region. Exclude only clearly manual-origin events instead.
                 auto_events_all = [
                     ev for ev in existing
-                    if str(ev.get('source', '')).lower() in {'auto', 'arrhythmia'}
+                    if 'manual' not in str(ev.get('source', '')).lower()
                     and ev.get('end_timestamp') is not None
                 ]
                 non_auto_events = [
@@ -547,19 +639,52 @@ class HolterFullDisclosureDialog(QDialog):
                 auto_events_all.sort(
                     key=lambda ev: float(ev.get('timestamp', 0.0) or 0.0)
                 )
-                merged_auto = []
+                auto_events_all = _suppress_rate_overlap_in_structured_events(auto_events_all)
+                # Merge each label's own timeline independently, not one
+                # single interleaved pass. The stored real-time pipeline logs
+                # several labels at the exact same timestamp (e.g. at t=110:
+                # "Ventricular Fibrillation", "Wide QRS (non-specific)",
+                # "Long QT Syndrome", "PVC Morphology" all together) -- sorted
+                # by timestamp alone, a differently-labeled entry can land
+                # between two same-labeled ones and break the "is this
+                # adjacent to the last entry" check, fragmenting what should
+                # be one continuous region into several, even though nothing
+                # about the underlying rhythm actually changed.
+                by_label = {}
                 for ev in auto_events_all:
                     label = str(ev.get('label', ev.get('type', ''))).lower()
-                    start = float(ev.get('timestamp', 0.0) or 0.0)
-                    end = float(ev.get('end_timestamp', start) or start)
-                    if merged_auto:
-                        last = merged_auto[-1]
-                        last_label = str(last.get('label', last.get('type', ''))).lower()
-                        last_end = float(last.get('end_timestamp', 0.0) or 0.0)
-                        if label == last_label and start <= last_end + 0.25:
-                            last['end_timestamp'] = max(last_end, end)
-                            continue
-                    merged_auto.append(ev)
+                    by_label.setdefault(label, []).append(ev)
+                merged_auto = []
+                for label, group in by_label.items():
+                    group.sort(key=lambda ev: float(ev.get('timestamp', 0.0) or 0.0))
+                    label_merged = []
+                    for ev in group:
+                        start = float(ev.get('timestamp', 0.0) or 0.0)
+                        end = float(ev.get('end_timestamp', start) or start)
+                        ev_source = str(ev.get('source', '')).lower()
+                        if label_merged:
+                            last = label_merged[-1]
+                            last_end = float(last.get('end_timestamp', 0.0) or 0.0)
+                            if start <= last_end + 0.25:
+                                last['end_timestamp'] = max(last_end, end)
+                                # Prefer this waveform detector's own 'auto'/
+                                # 'arrhythmia' source over a stored replay
+                                # source ('analysis', 'classified', ...) once
+                                # merged into the same region. The bottom-
+                                # right rhythm indicator only looks at events
+                                # with source in {'auto','arrhythmia'}
+                                # (_update_time_and_arrhythmia_labels); if the
+                                # merge kept whichever source happened to sort
+                                # first, a region this detector correctly
+                                # identified (e.g. a 60s Ventricular
+                                # Fibrillation episode) could end up
+                                # permanently invisible to that indicator even
+                                # though the segment overlay renders it fine.
+                                if ev_source in {'auto', 'arrhythmia'}:
+                                    last['source'] = ev.get('source')
+                                continue
+                        label_merged.append(ev)
+                    merged_auto.extend(label_merged)
                 existing = non_auto_events + merged_auto
                 self._engine._structured_events = sorted(
                     existing,
@@ -809,12 +934,25 @@ class HolterFullDisclosureDialog(QDialog):
         self.time_scrollbar.setFixedHeight(12)
         self.time_scrollbar.setStyleSheet(f"""
             QScrollBar:horizontal {{
-                background: #0d1b2a; height: 12px; border-radius: 5px; margin: 0 4px;
+                background: #0d1b2a; height: 12px; border-radius: 5px; margin: 0 16px;
             }}
             QScrollBar::handle:horizontal {{
                 background: {COL_GREEN_DRK}; min-width: 24px; border-radius: 5px;
             }}
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+            QScrollBar::add-line:horizontal {{
+                background: #E8EEF4; width: 16px; border-radius: 3px;
+                subcontrol-position: right; subcontrol-origin: margin;
+            }}
+            QScrollBar::sub-line:horizontal {{
+                background: #E8EEF4; width: 16px; border-radius: 3px;
+                subcontrol-position: left; subcontrol-origin: margin;
+            }}
+            QScrollBar::add-line:horizontal:hover, QScrollBar::sub-line:horizontal:hover {{
+                background: #FFFFFF;
+            }}
+            QScrollBar::right-arrow:horizontal, QScrollBar::left-arrow:horizontal {{
+                width: 8px; height: 8px;
+            }}
         """)
         self._update_scrollbar_range()
         self.time_scrollbar.valueChanged.connect(self._on_scrollbar_moved)
@@ -2801,9 +2939,21 @@ class HolterFullDisclosureDialog(QDialog):
         """Add visual-only auto-arrhythmia regions; manual segments remain separate."""
         if ref is None or span <= 0:
             return
+        # Order matters: `next()` below returns the FIRST matching key, and
+        # matching is substring-based ('key in label_lower'). 'ventricular
+        # tachycardia'/'vtach' must be checked before the bare 'tachycardia'
+        # fallback, or a real "Ventricular Tachycardia" event (e.g. from
+        # stored replay analysis) silently matches 'tachycardia' first and
+        # renders as "Sinus Tachycardia" -- a lethal rhythm shown as a benign
+        # rate label. Ventricular Tachycardia is folded into Ventricular
+        # Fibrillation here (not shown as its own label) to match
+        # detect_arrhythmias()'s own VFib rule, regardless of which source
+        # (fresh detection vs. stored replay data) produced the VTach label.
         targets = {
             'ventricular fibrillation': ('Ventricular Fibrillation', '#FF3333'),
             'vfib': ('Ventricular Fibrillation', '#FF3333'),
+            'ventricular tachycardia': ('Ventricular Fibrillation', '#FF3333'),
+            'vtach': ('Ventricular Fibrillation', '#FF3333'),
             'atrial fibrillation': ('Atrial Fibrillation', '#B36BFF'),
             'afib': ('Atrial Fibrillation', '#B36BFF'),
             'atrial flutter': ('Atrial Flutter', '#FF69B4'),

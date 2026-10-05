@@ -251,9 +251,9 @@ def _first_baseline_crossing(signal: np.ndarray, baseline: float, start: int, st
     return min(max(idx, 0), signal.size - 1)
 
 
-def _qrs_bounds(signal: np.ndarray, r_idx: int, fs: float) -> Tuple[int, int, float]:
+def _qrs_bounds(signal: np.ndarray, r_idx: int, fs: float) -> Tuple[int, int, float, bool]:
     if signal.size == 0:
-        return 0, 0, 0.0
+        return 0, 0, 0.0, False
     qrs_left = max(0, r_idx - _ms_to_samples(80, fs))
     qrs_right = min(signal.size - 1, r_idx + _ms_to_samples(80, fs))
     smooth_window = _ensure_odd(min(11, signal.size - (1 - signal.size % 2)))
@@ -265,16 +265,26 @@ def _qrs_bounds(signal: np.ndarray, r_idx: int, fs: float) -> Tuple[int, int, fl
     baseline_threshold = max(0.15 * max(float(np.ptp(signal[qrs_left:qrs_right + 1])), 0.05), 0.015)
     amplitude_threshold = max(0.05 * max(float(np.ptp(signal[qrs_left:qrs_right + 1])), 0.1), 0.02)
 
+    # q_resolved/j_resolved track whether a genuine quiet (isoelectric) boundary
+    # was actually found, as opposed to the search falling through to the raw
+    # +/-80ms window edge. On a chaotic/fibrillatory signal there is no quiet
+    # point anywhere nearby, so both loops fall through and q_onset/j_point
+    # silently default to qrs_left/qrs_right -- producing a fake, perfectly
+    # uniform ~160ms "QRS" on every beat instead of signalling "undetermined".
     q_onset = qrs_left
+    q_resolved = False
     for idx in range(r_idx, qrs_left - 1, -1):
         if abs(slopes[idx]) <= slope_threshold and abs(smoothed[idx] - baseline) <= baseline_threshold:
             q_onset = idx
+            q_resolved = True
             break
 
     j_point = qrs_right
+    j_resolved = False
     for idx in range(r_idx, qrs_right + 1):
         if abs(slopes[idx]) <= slope_threshold and abs(smoothed[idx] - baseline) <= baseline_threshold:
             j_point = idx
+            j_resolved = True
             break
 
     active = np.where(np.abs(smoothed[qrs_left:qrs_right + 1] - baseline) > amplitude_threshold)[0]
@@ -282,7 +292,7 @@ def _qrs_bounds(signal: np.ndarray, r_idx: int, fs: float) -> Tuple[int, int, fl
         q_onset = min(q_onset, qrs_left + int(active[0]))
         j_point = max(j_point, qrs_left + int(active[-1]))
 
-    return int(q_onset), int(j_point), baseline
+    return int(q_onset), int(j_point), baseline, bool(q_resolved and j_resolved)
 
 
 def _detect_p_wave(signal: np.ndarray, r_idx: int, baseline: float, fs: float) -> Dict[str, object]:
@@ -402,7 +412,7 @@ def measure_beat(signal: Sequence[float], r_idx: int, fs: float = DEFAULT_FS) ->
     if signal_arr.size == 0 or r_idx <= 0 or r_idx >= signal_arr.size:
         return None
 
-    q_onset, j_point, baseline = _qrs_bounds(signal_arr, int(r_idx), fs)
+    q_onset, j_point, baseline, qrs_bounds_resolved = _qrs_bounds(signal_arr, int(r_idx), fs)
     qrs_ms = float((j_point - q_onset) * 1000.0 / fs)
 
     beat = {
@@ -411,6 +421,7 @@ def measure_beat(signal: Sequence[float], r_idx: int, fs: float = DEFAULT_FS) ->
         "j_point": int(j_point),
         "baseline": baseline,
         "qrs_ms": qrs_ms,
+        "qrs_bounds_resolved": qrs_bounds_resolved,
         "p_present": False,
         "p_peak": None,
         "p_onset": None,
@@ -823,9 +834,15 @@ def is_ventricular_fibrillation(signal: np.ndarray, r_peaks: List[int], fs: floa
     if score > 0.4:
         print(f" ⚠️ VFib Evaluation -> Score: {score:.2f} | Flags: {debug_flags}")
 
-    # If flutter spectral features are present, reduce amplitude CoV weight
+    # If flutter spectral features are present, reduce amplitude CoV weight.
+    # Only let this veto a BORDERLINE candidate: VF's own chaotic baseline can
+    # concentrate spectral energy in the same 3.5-8Hz band real flutter uses
+    # (confirmed on real chaotic recordings misread as organised flutter), so
+    # a score that has already cleared the VF threshold on rate/irregularity/
+    # amplitude/chaos criteria should not be thrown out on spectral overlap
+    # alone -- genuine flutter does not also present with VF-level RR chaos.
     flutter_check = _atrial_flutter_features(sig, fs, r_peaks=r_peaks)
-    if float(flutter_check.get("score", 0)) > 0.18:
+    if float(flutter_check.get("score", 0)) > 0.18 and score < 0.60:
         # Organised atrial activity = not VFib
         return False
 
@@ -1297,12 +1314,27 @@ def analyze_ecg(
         for beat in [measure_beat(detection_signal, int(peak), fs)]
         if beat is not None
     ]
-    reliable_p_count = sum(bool(beat.get("p_present")) for beat in provisional_beats)
-    organized_qrs_count = sum(
-        40.0 <= float(beat.get("qrs_ms") or 0.0) <= 220.0
+    # A P wave only counts as "reliable" here when its own beat's QRS boundary
+    # was actually resolved (see qrs_bounds_resolved above). An absolute
+    # amplitude cutoff can't do this job: recordings may be stored as raw ADC
+    # counts rather than calibrated mV, so a fixed-unit threshold is either a
+    # no-op (ADC scale) or rejects real P waves (mV scale). A beat whose QRS
+    # window never found a genuine isoelectric boundary is chaotic/noise at
+    # that location, so any "P wave" measured relative to it is noise too --
+    # on a fibrillatory baseline this flags nearly every beat as a false P wave.
+    reliable_p_count = sum(
+        bool(beat.get("p_present")) and bool(beat.get("qrs_bounds_resolved"))
         for beat in provisional_beats
     )
-    no_reliable_p = reliable_p_count == 0
+    # Only count a beat's QRS as "organized" when _qrs_bounds() actually found
+    # a genuine isoelectric onset/offset -- not when both searches fell through
+    # to the raw +/-80ms window edge, which yields a uniform fake ~160ms width
+    # on every beat of a chaotic trace with no real QRS anywhere.
+    organized_qrs_count = sum(
+        bool(beat.get("qrs_bounds_resolved")) and 40.0 <= float(beat.get("qrs_ms") or 0.0) <= 220.0
+        for beat in provisional_beats
+    )
+    no_reliable_p = reliable_p_count <= max(2, len(r_peaks) // 4)
     no_organized_qrs = organized_qrs_count < max(3, len(r_peaks) // 2)
 
     if vf_candidate and no_reliable_p and no_organized_qrs:

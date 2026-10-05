@@ -35,7 +35,7 @@ def detect_arrhythmias(
             - end_time_str: Formatted HH:MM:SS string
             - detected_rhythm: Full arrhythmia name
     """
-    from ecg.arrhythmia_detector import analyze_ecg
+    from ecg.arrhythmia_detector import analyze_ecg, measure_beat
     try:
         from ecg.pan_tompkins import pan_tompkins
     except ImportError:
@@ -123,6 +123,61 @@ def detect_arrhythmias(
         except Exception:
             pass
         return s_str, e_str
+
+    def suppress_rate_overlap(rate_segments, morph_segments):
+        """
+        Morphological rhythms (VFib, VTach, AFib, Flutter, AV Block) are detected
+        from actual QRS/P-wave morphology and take clinical priority over the
+        pure RR-interval-based Sinus Tachycardia/Bradycardia segments above.
+        Pan-Tompkins can mis-fire "R-peaks" on a chaotic VFib/VTach baseline at
+        spacing that happens to look fast or slow, which previously caused
+        Sinus Tachycardia/Bradycardia labels to be drawn on top of a confirmed
+        morphological arrhythmia. Trim (or drop) any rate-based segment so it
+        never overlaps a morphological segment's time range.
+
+        A fixed buffer is added around each morphological interval before
+        checking overlap (not to the interval's own displayed boundaries,
+        only to this comparison). Right at the transition into/out of a
+        chaotic episode, Pan-Tompkins can briefly catch one or two
+        wide-spaced peaks before/after the window that actually crossed the
+        VFib threshold, producing a short "Sinus Bradycardia"/"Sinus
+        Tachycardia" blip that sits immediately next to -- but doesn't
+        strictly overlap -- the morphological region. That blip is a
+        transition artifact, not a real rhythm, so the exclusion zone
+        extends a bit past the morphological region's own edges to catch it.
+        """
+        if not morph_segments:
+            return rate_segments
+        buffer_sec = 5.0
+        morph_intervals = sorted(
+            (max(0.0, m['start_sec'] - buffer_sec), m['end_sec'] + buffer_sec)
+            for m in morph_segments
+        )
+        result = []
+        for seg in rate_segments:
+            pieces = [(seg['start_sec'], seg['end_sec'])]
+            for m_start, m_end in morph_intervals:
+                next_pieces = []
+                for p_start, p_end in pieces:
+                    if m_end <= p_start or m_start >= p_end:
+                        next_pieces.append((p_start, p_end))
+                        continue
+                    if m_start > p_start:
+                        next_pieces.append((p_start, m_start))
+                    if m_end < p_end:
+                        next_pieces.append((m_end, p_end))
+                pieces = next_pieces
+            for p_start, p_end in pieces:
+                if p_end - p_start < 1.0:
+                    continue
+                s_str, e_str = make_time_strs(p_start, p_end)
+                trimmed = dict(seg)
+                trimmed['start_sec'] = p_start
+                trimmed['end_sec'] = p_end
+                trimmed['start_time_str'] = s_str
+                trimmed['end_time_str'] = e_str
+                result.append(trimmed)
+        return result
 
     # ------------------------------------------------------------------
     # 2. Extract Beat-Exact Rate Segments (Sinus Tachycardia & Sinus Bradycardia)
@@ -229,8 +284,60 @@ def detect_arrhythmias(
                 })
 
     # ------------------------------------------------------------------
-    # 3. Detect Morphological Arrhythmias (VFib, VTach, AFib, Flutter, AV Block)
+    # 3. Detect Morphological Arrhythmias (VFib, AFib, Flutter, AV Block)
     # ------------------------------------------------------------------
+    # Ventricular Fibrillation rule (simple, direct -- applied to every
+    # rhythm window the same way): a window is VFib when its beats show
+    # BOTH hallmark absences --
+    #   1. no P wave reliably precedes a QRS (p_onset before q_onset), and
+    #   2. the QRS complex itself is not organized/resolvable (irregular,
+    #      chaotic -- _qrs_bounds() in arrhythmia_detector.py could not find
+    #      a genuine isoelectric boundary for most beats).
+    # Ventricular Tachycardia is intentionally not reported as a separate
+    # label here -- a window this chaotic renders as Ventricular Fibrillation.
+    def _is_vfib_window(window_signal, fs):
+        r_peaks = pan_tompkins(window_signal, fs=fs)
+        if len(r_peaks) < 2:
+            return False
+        beats = [b for b in (measure_beat(window_signal, int(p), fs) for p in r_peaks) if b is not None]
+        if not beats:
+            return False
+
+        # A P wave only counts as reliably preceding QRS when that same
+        # beat's QRS boundary was genuinely resolved. The P-search window is
+        # positioned before q_onset by construction, so on a chaotic/noisy
+        # beat (QRS boundary unresolved) almost any noise bump trivially
+        # satisfies p_onset < q_onset -- that check only means something once
+        # the QRS itself is confirmed real.
+        p_follows_qrs = sum(
+            1 for b in beats
+            if b.get('p_present') and b.get('qrs_bounds_resolved')
+            and b.get('p_onset') is not None and b.get('q_onset') is not None
+            and b['p_onset'] < b['q_onset']
+        )
+        organized_qrs = sum(1 for b in beats if b.get('qrs_bounds_resolved'))
+
+        # The P-wave search window is positioned before q_onset by
+        # construction, so any detected bump -- real or a noise peak on a
+        # chaotic baseline -- almost always trivially satisfies
+        # p_onset < q_onset. Requiring literally zero such beats never fires
+        # on real data; a majority-based threshold (most beats must fail to
+        # show a P-wave reliably preceding QRS) is the meaningful check.
+        no_p_follows_qrs = p_follows_qrs < max(1, len(beats) // 2)
+        no_organized_qrs = organized_qrs < max(1, len(beats) // 2)
+        return no_p_follows_qrs and no_organized_qrs
+
+    # Tried shrinking this to 6s/3s to reduce detection latency; verified
+    # directly against real recordings that it did NOT detect episodes any
+    # earlier (the rhythm's own transition is gradual, not instant -- a
+    # smaller window doesn't see the onset sooner), but it DID shrink each
+    # window to as few as 3 beats, which is too small a sample for the
+    # majority vote below to be stable -- a single PVC or one noisy beat
+    # could flip an otherwise-clear VFib window to "not VFib", fragmenting
+    # one continuous episode into pieces with gaps, and conversely could
+    # flip a single isolated window to "VFib" around an ectopic beat inside
+    # an otherwise organized rhythm. Reverted to 10s/5s, which has enough
+    # beats per window to make that vote statistically meaningful.
     window_size = 10.0
     overlap = 5.0
     step_size = window_size - overlap
@@ -244,46 +351,49 @@ def detect_arrhythmias(
         try:
             data_array = reader.read_range(current_time, window_end)
             if data_array is not None and data_array.shape[1] > 0:
-                window_leads = {}
-                for i, lead_name in enumerate(lead_names):
-                    if i < data_array.shape[0]:
-                        window_leads[lead_name] = data_array[i, :]
+                target_morph = None
 
-                if window_leads:
-                    results = analyze_ecg(window_leads, fs=fs)
-                    arrhythmias = results.get('arrhythmias', [])
+                if best_lead_idx < data_array.shape[0]:
+                    window_signal = np.asarray(data_array[best_lead_idx], dtype=float)
+                    if len(window_signal) > 50 and _is_vfib_window(window_signal, fs):
+                        target_morph = ('Ventricular Fibrillation', '#FF3333')
 
-                    # Look for non-rate morphological arrhythmias
-                    target_morph = None
-                    for arr in arrhythmias:
-                        arr_lower = str(arr).lower()
-                        if 'ventricular fibrillation' in arr_lower or 'vfib' in arr_lower:
-                            target_morph = ('Ventricular Fibrillation', '#FF3333')
-                            break
-                        elif 'ventricular tachycardia' in arr_lower or 'vtach' in arr_lower:
-                            target_morph = ('Ventricular Tachycardia', '#FF3333')
-                            break
-                        elif 'atrial fibrillation' in arr_lower or 'afib' in arr_lower:
-                            target_morph = ('Atrial Fibrillation', '#FF00FF')
-                            break
-                        elif 'atrial flutter' in arr_lower or 'aflutter' in arr_lower:
-                            target_morph = ('Atrial Flutter', '#FF00FF')
-                            break
-                        elif 'av block' in arr_lower:
-                            target_morph = (str(arr), '#FF00FF')
-                            break
+                if target_morph is None:
+                    window_leads = {}
+                    for i, lead_name in enumerate(lead_names):
+                        if i < data_array.shape[0]:
+                            window_leads[lead_name] = data_array[i, :]
 
-                    if target_morph:
-                        s_str, e_str = make_time_strs(current_time, window_end)
-                        morphological_candidates.append({
-                            'start_sec': current_time,
-                            'end_sec': window_end,
-                            'label': target_morph[0],
-                            'color': target_morph[1],
-                            'start_time_str': s_str,
-                            'end_time_str': e_str,
-                            'detected_rhythm': target_morph[0]
-                        })
+                    if window_leads:
+                        results = analyze_ecg(window_leads, fs=fs)
+                        arrhythmias = results.get('arrhythmias', [])
+
+                        # Only the non-VFib morphological arrhythmias are
+                        # looked up here; VFib is decided by the direct rule
+                        # above, applied the same way to every window.
+                        for arr in arrhythmias:
+                            arr_lower = str(arr).lower()
+                            if 'atrial fibrillation' in arr_lower or 'afib' in arr_lower:
+                                target_morph = ('Atrial Fibrillation', '#FF00FF')
+                                break
+                            elif 'atrial flutter' in arr_lower or 'aflutter' in arr_lower:
+                                target_morph = ('Atrial Flutter', '#FF00FF')
+                                break
+                            elif 'av block' in arr_lower:
+                                target_morph = (str(arr), '#FF00FF')
+                                break
+
+                if target_morph:
+                    s_str, e_str = make_time_strs(current_time, window_end)
+                    morphological_candidates.append({
+                        'start_sec': current_time,
+                        'end_sec': window_end,
+                        'label': target_morph[0],
+                        'color': target_morph[1],
+                        'start_time_str': s_str,
+                        'end_time_str': e_str,
+                        'detected_rhythm': target_morph[0]
+                    })
         except Exception as e:
             print(f"[Auto Arrhythmia Detect] Window error {current_time:.1f}s: {e}")
 
@@ -293,18 +403,30 @@ def detect_arrhythmias(
             progress = int((current_time / total_duration) * 100)
             progress_callback(progress)
 
-    # Merge contiguous morphological candidate windows
+    # Merge contiguous morphological candidate windows. The gap tolerance is
+    # one full window_size, not a tiny fraction of a second: each window's
+    # pass/fail is a per-window majority vote over a handful of beats, so a
+    # single borderline window right in the middle of a sustained episode can
+    # narrowly miss the threshold by chance (one or two beats' worth of
+    # noise) even though the episode never actually stopped. A short gap
+    # between two windows that both independently fired as the same
+    # morphological label is almost always that kind of sampling noise, not
+    # a real few-second recovery in the middle of e.g. Ventricular
+    # Fibrillation -- so it gets bridged into one continuous segment.
     if morphological_candidates:
         morphological_candidates.sort(key=lambda x: x['start_sec'])
         merged_morph = []
         for m in morphological_candidates:
             if merged_morph:
                 last = merged_morph[-1]
-                if last['label'] == m['label'] and m['start_sec'] <= last['end_sec'] + 0.25:
+                if last['label'] == m['label'] and m['start_sec'] <= last['end_sec'] + window_size:
                     last['end_sec'] = max(last['end_sec'], m['end_sec'])
                     last['end_time_str'] = m['end_time_str']
                     continue
             merged_morph.append(m)
+        # Morphological arrhythmias take priority: trim/drop any Sinus
+        # Tachycardia/Bradycardia segments that overlap them before merging.
+        detected_segments = suppress_rate_overlap(detected_segments, merged_morph)
         detected_segments.extend(merged_morph)
 
     # Sort all detected segments by start time
