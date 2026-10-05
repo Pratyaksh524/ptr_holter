@@ -1288,6 +1288,41 @@ class HolterFullDisclosureDialog(QDialog):
         # Restore selection box when gain is changed
         self._deactivate_tools()
 
+    def apply_record_settings(self, settings: dict):
+        """Apply lead gains and invert from Record Settings to all Full Disclosure canvases.
+        
+        Since Full Disclosure shows all 12 leads at a uniform gain, we derive
+        the gain from the 'All' uniform value if consistent, otherwise use Lead I.
+        """
+        lead_gains = settings.get("lead_gains", {})
+        # Determine gain: prefer a uniform value across all leads, fallback to Lead I
+        gain_val = None
+        if lead_gains:
+            vals = set(lead_gains.values())
+            if len(vals) == 1:
+                gain_val = float(vals.pop())
+            elif "I" in lead_gains:
+                gain_val = float(lead_gains["I"])
+
+        if gain_val is not None:
+            scale = gain_val / 10.0  # 10mm/mV = 1.0 scale
+            self._gain = scale
+            # Map to closest label
+            label_map = {0.5: "5mm/mV", 1.0: "10mm/mV", 2.0: "20mm/mV"}
+            self._gain_label = label_map.get(scale, f"{int(gain_val)}mm/mV")
+            self.btn_gain.setText(f"Gain: {self._gain_label}")
+            for c in self._canvases:
+                c.set_gain(self._gain)
+                c.update()
+            # Sync the cycling index so first click cycles correctly
+            try:
+                multipliers = [g[0] for g in self._GAIN_STEPS]
+                if scale in multipliers:
+                    self._curr_gain_idx = multipliers.index(scale)
+            except Exception:
+                pass
+
+
     def _cycle_speed(self):
         try:
             idx = self._SPEED_STEPS.index(self._paper_speed)
@@ -3667,6 +3702,10 @@ class HolterToolHandlers:
         if hasattr(parent, "_replay_engine") and parent._replay_engine:
             from .holter_full_disclosure import HolterFullDisclosureDialog
             dialog = HolterFullDisclosureDialog(parent._replay_engine, parent)
+            # Apply record settings (gain/invert) from the replay panel if available
+            record_settings = getattr(parent, "_last_record_settings", None)
+            if record_settings:
+                dialog.apply_record_settings(record_settings)
             dialog.exec_()
         else:
             from PyQt5.QtWidgets import QMessageBox
@@ -3716,6 +3755,16 @@ class HolterToolHandlers:
         
         gains = [g / 10.0 for g in GAINS]
         curr_g = getattr(parent, '_curr_gain_idx', 1)
+        # Check current gain of channel strips if out of sync
+        ch_strips = getattr(parent, "_ch_strips", [])
+        if ch_strips and hasattr(ch_strips[0], '_gain'):
+            try:
+                int_g = int(round(ch_strips[0]._gain * 10))
+                if int_g in GAINS:
+                    curr_g = GAINS.index(int_g)
+            except Exception:
+                pass
+
         next_g = (curr_g + 1) % len(gains)
         parent._curr_gain_idx = next_g
         val = gains[next_g]

@@ -333,14 +333,16 @@ class HolterRecordSettingsPanel(QWidget):
         return scroll
 
     def _on_all_gain_toggled(self, checked: bool, idx: int):
-        """When user selects a gain in the 'All' row, set that gain for all 12 leads above."""
+        """When user selects a gain in the 'All' row, deselect options for all individual leads above."""
         if checked:
             for lead in LEADS:
                 btn_grp = self._gain_btn_groups[lead]
-                for i, r in enumerate(self._gain_radios[lead]):
+                btn_grp.setExclusive(False)
+                for r in self._gain_radios[lead]:
                     r.blockSignals(True)
-                    r.setChecked(i == idx)
+                    r.setChecked(False)
                     r.blockSignals(False)
+                btn_grp.setExclusive(True)
 
     def _on_individual_gain_toggled(self, checked: bool):
         """When user selects a gain on an individual lead row, deselect the 'All' row gain radio."""
@@ -354,11 +356,12 @@ class HolterRecordSettingsPanel(QWidget):
             btn_grp.setExclusive(True)
 
     def _on_all_invert_toggled(self, checked: bool):
-        """When user ticks/unticks 'All' invert checkbox, mirror it to all 12 leads."""
-        for lead in LEADS:
-            self._invert_checks[lead].blockSignals(True)
-            self._invert_checks[lead].setChecked(checked)
-            self._invert_checks[lead].blockSignals(False)
+        """When user ticks 'All' invert checkbox, deselect invert checkboxes for all individual leads above."""
+        if checked:
+            for lead in LEADS:
+                self._invert_checks[lead].blockSignals(True)
+                self._invert_checks[lead].setChecked(False)
+                self._invert_checks[lead].blockSignals(False)
 
     def _on_individual_invert_toggled(self, checked: bool):
         """When user ticks/unticks an individual lead's invert checkbox, uncheck the 'All' invert checkbox."""
@@ -914,11 +917,30 @@ class HolterRecordSettingsPanel(QWidget):
     def get_settings(self) -> Dict[str, Any]:
         lead_gains = {}
         lead_inverts = {}
-        for lead in LEADS:
+
+        # Check if "All" row has a gain selected
+        all_gain = None
+        if "All" in self._gain_radios:
             for idx, val in enumerate(GAIN_VALUES):
-                if self._gain_radios[lead][idx].isChecked():
-                    lead_gains[lead] = float(val)
-            lead_inverts[lead] = self._invert_checks[lead].isChecked()
+                if self._gain_radios["All"][idx].isChecked():
+                    all_gain = float(val)
+                    break
+
+        # Check if "All" row invert is checked
+        all_invert = self._invert_checks.get("All", None) and self._invert_checks["All"].isChecked()
+
+        for lead in LEADS:
+            if all_gain is not None:
+                lead_gains[lead] = all_gain
+            else:
+                for idx, val in enumerate(GAIN_VALUES):
+                    if self._gain_radios[lead][idx].isChecked():
+                        lead_gains[lead] = float(val)
+
+            if all_invert:
+                lead_inverts[lead] = True
+            else:
+                lead_inverts[lead] = self._invert_checks[lead].isChecked()
 
         age_labels = [
             ">= 16 years", "11-15 years", "6-10 years", "4-5 years",

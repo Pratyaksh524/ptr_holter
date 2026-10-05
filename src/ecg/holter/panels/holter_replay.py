@@ -1161,6 +1161,8 @@ class HolterReplayPanel(QWidget):
 
     def apply_record_settings(self, settings: dict):
         """Apply lead gains and invert states from Record Settings to all lead strips."""
+        # Persist so Full Disclosure dialog can read these settings when it opens
+        self._last_record_settings = settings
         lead_gains = settings.get("lead_gains", {})
         lead_inverts = settings.get("lead_inverts", {})
         for lead, strip in self._lead_strips.items():
@@ -1183,8 +1185,15 @@ class HolterReplayPanel(QWidget):
             if len(g_vals) == 1:
                 val = int(list(g_vals)[0])
                 self._tool_btns["Gain Settings"].setText(f"Gain: {val}mm/mV")
+                try:
+                    from ecg.holter.theme import GAINS
+                    if val in GAINS:
+                        self._curr_gain_idx = GAINS.index(val)
+                except Exception:
+                    pass
             else:
                 self._tool_btns["Gain Settings"].setText("Gain: 10mm/mV")
+                self._curr_gain_idx = 1
 
     def _update_overview_table(self, metrics_list: list, rr_n: list):
         if not hasattr(self, "_overview_table"):
