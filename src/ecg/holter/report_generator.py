@@ -226,43 +226,53 @@ def _build_timeline_events(session_dir: str) -> List[Dict[str, object]]:
                     'source': 'Auto'
                 })
 
+    #    Ectopic beat pattern badge events (Single PVC, PVC Couplet, Bigeminy, Trigeminy,
+    #    Quadrigeminy, VT Run, Single PAC, PAC Couplet, SVT Run, AFib from sliding window)
+    #    are intentionally NOT added to the Event Timeline.
+    #    Only auto-segment rhythm events (VF, AFib, AFlutter, Sinus Brady, Sinus Tachy)
+    #    and manual markings are shown in the timeline.
+
     # 7. Generate auto-detection badge events (SVT, VT, Couplet, Bigeminy, PVC, PAC, etc.)
-    try:
-        from .holter_summary_calc import get_template_beats_for_badges
-        badges = get_template_beats_for_badges(all_beats, [])
-        for b in badges:
-            badge_name = b.get('name', '').strip()
-            if not badge_name:
-                continue
-            b_ts = float(b.get('timestamp', 0.0) or 0.0)
-
-            # Check if inside any manual marking
-            in_manual = False
-            for ms, me in [(float(s.get('start_sec', 0.0)), float(s.get('end_sec', 0.0))) for s in manual_segments]:
-                if ms <= b_ts <= me:
-                    in_manual = True
-                    break
-            if not in_manual and manual_beats:
-                for mb in manual_beats:
-                    if abs(b_ts - float(mb.get('timestamp', 0.0))) < 0.15:
-                        in_manual = True
-                        break
-            if in_manual:
-                continue
-
-            if (b.get('code') in ['V', 'S', 'AF', 'P'] or 
-                b.get('critical', False) or 
-                any(k in badge_name.lower() for k in ['run', 'couplet', 'bigeminy', 'trigeminy', 'quadrigeminy', 'tachycardia', 'fibrillation', 'flutter'])):
-                timeline_events.append({
-                    'timestamp': b_ts,
-                    'sort_ts': b_ts,
-                    'label': badge_name,
-                    'event_type': b.get('code', 'Arrhythmia'),
-                    'source': 'Auto',
-                    'confidence': 1.0,
-                })
-    except Exception as _badge_e:
-        print(f"[HolterReport] Error generating badge events: {_badge_e}")
+    # TODO: Baad mein enable karna — abhi Event Timeline mein sirf auto-segment rhythm events
+    #       (VF, AFib, AFlutter, Sinus Brady, Sinus Tachy) aur manual markings dikhne chahiye.
+    #       Ectopic beat pattern labels (Single PVC, Couplet, Bigeminy, VT Run, PAC, SVT Run)
+    #       timeline mein add karne ka kaam baad mein karein.
+    # try:
+    #     from .holter_summary_calc import get_template_beats_for_badges
+    #     badges = get_template_beats_for_badges(all_beats, [])
+    #     for b in badges:
+    #         badge_name = b.get('name', '').strip()
+    #         if not badge_name:
+    #             continue
+    #         b_ts = float(b.get('timestamp', 0.0) or 0.0)
+    #
+    #         # Check if inside any manual marking
+    #         in_manual = False
+    #         for ms, me in [(float(s.get('start_sec', 0.0)), float(s.get('end_sec', 0.0))) for s in manual_segments]:
+    #             if ms <= b_ts <= me:
+    #                 in_manual = True
+    #                 break
+    #         if not in_manual and manual_beats:
+    #             for mb in manual_beats:
+    #                 if abs(b_ts - float(mb.get('timestamp', 0.0))) < 0.15:
+    #                     in_manual = True
+    #                     break
+    #         if in_manual:
+    #             continue
+    #
+    #         if (b.get('code') in ['V', 'S', 'AF', 'P'] or
+    #             b.get('critical', False) or
+    #             any(k in badge_name.lower() for k in ['run', 'couplet', 'bigeminy', 'trigeminy', 'quadrigeminy', 'tachycardia', 'fibrillation', 'flutter'])):
+    #             timeline_events.append({
+    #                 'timestamp': b_ts,
+    #                 'sort_ts': b_ts,
+    #                 'label': badge_name,
+    #                 'event_type': b.get('code', 'Arrhythmia'),
+    #                 'source': 'Auto',
+    #                 'confidence': 1.0,
+    #             })
+    # except Exception as _badge_e:
+    #     print(f"[HolterReport] Error generating badge events: {_badge_e}")
 
     # 8. Load manual beats and append non-normal ones to timeline (parallel manual marking)
     # [EXACT ORIGINAL MANUAL MARKING LOGIC]
