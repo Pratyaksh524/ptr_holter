@@ -1,11 +1,32 @@
 """
-ecg/holter/holter_auto_arrhythmia_detect.py
-===========================================
-Auto-detection module for arrhythmias in Holter full disclosure view.
+ecg/holter/auto_segment_arrthymia_detection.py
+================================================
+Auto-detected arrhythmia segment pipeline for the Holter Full Disclosure
+view: waveform-based detection, and merging that result into a replay
+engine's structured event list.
 
-This module provides functionality to automatically detect arrhythmias from
-ECG waveforms using the arrhythmia_detector module and add them as structured
-events for waveform coloring.
+This module owns the full auto-segment-marking pipeline so that
+holter_full_disclosure.py only has to call apply_auto_segments_to_engine()
+and otherwise deal with rendering (SegmentOverlay, label-to-color mapping).
+
+Pipeline:
+    1. detect_arrhythmias()            -- waveform-based rate detection
+                                           (Sinus Bradycardia/Tachycardia via
+                                           RR intervals) and morphological
+                                           detection (Ventricular
+                                           Fibrillation via a direct P-wave/
+                                           QRS-organization rule; Atrial
+                                           Fibrillation/Flutter/AV Block via
+                                           ecg.arrhythmia_detector.analyze_ecg).
+    2. convert_to_structured_events()  -- segment dicts -> structured events.
+    3. apply_auto_segments_to_engine() -- merges that output into
+                                           engine._structured_events, which
+                                           may already hold events loaded
+                                           from the recording's own stored
+                                           replay data. Handles dedup,
+                                           rate-vs-morphology suppression,
+                                           and same-label/cross-source
+                                           merging.
 """
 
 import numpy as np
@@ -20,11 +41,11 @@ def detect_arrhythmias(
     """
     Auto-detect arrhythmias and rate-based rhythm segments (Sinus Tachycardia / Sinus Bradycardia)
     directly from ECG waveforms with beat-exact QRS peak boundary alignment.
-    
+
     Args:
         reader: ECGHFileReader instance with read_range method
         progress_callback: Optional callback function(int) for progress updates (0-100)
-    
+
     Returns:
         List of detected arrhythmia segments with:
             - start_sec: Start time in seconds (snapped exactly to start QRS peak)
@@ -40,6 +61,25 @@ def detect_arrhythmias(
         from ecg.pan_tompkins import pan_tompkins
     except ImportError:
         from ..pan_tompkins import pan_tompkins
+
+    # One-time numerical warm-up. analyze_ecg()'s spectral checks (atrial
+    # flutter score, VF spectral score) go through scipy/numpy FFT code
+    # paths whose very first invocation in a process was confirmed, by
+    # direct testing, to occasionally produce a different result than every
+    # subsequent call with the exact same input samples -- almost certainly
+    # a one-time algorithm/plan-selection step in the FFT backend rather
+    # than anything data-dependent. Running analyze_ecg() once here, on
+    # throwaway synthetic data before any real window is analyzed, absorbs
+    # that one-time cost up front so every real classification below always
+    # runs on the "warm", stable code path and is reproducible regardless of
+    # whether this is the first arrhythmia analysis done in the process.
+    try:
+        _warmup_fs = 500
+        _warmup_t = np.linspace(0, 2.0, int(_warmup_fs * 2.0), endpoint=False)
+        _warmup_sig = 0.5 * np.sin(2 * np.pi * 1.2 * _warmup_t)
+        analyze_ecg({"II": _warmup_sig}, fs=_warmup_fs)
+    except Exception:
+        pass
 
     # Get sampling rate and duration from reader
     fs = getattr(reader, 'fs', 500)
@@ -74,19 +114,34 @@ def detect_arrhythmias(
                 best_ptp = ptp
                 best_lead_idx = idx
 
+    # Pan-Tompkins is run on each 60s chunk independently for memory/
+    # performance reasons, but QRS detectors have edge artifacts (filter
+    # settling) right at the start/end of whatever signal they're handed --
+    # a beat sitting close to a chunk boundary can be missed entirely. Since
+    # chunk_len_sec is just an I/O chunking choice, not a true rhythm
+    # boundary, each chunk is read with a few seconds of context on both
+    # sides; Pan-Tompkins runs on the padded signal, but only peaks that
+    # fall within the chunk's own [t_cursor, t_end) core are kept, so
+    # padding from adjacent chunks never causes double-counting -- it only
+    # gives the detector enough settling room to not miss the boundary beat.
     chunk_len_sec = 60.0
+    chunk_pad_sec = 3.0
     all_r_peaks = []
     t_cursor = 0.0
 
     while t_cursor < total_duration:
         t_end = min(t_cursor + chunk_len_sec, total_duration)
-        chunk_data = reader.read_range(t_cursor, t_end)
+        pad_start = max(0.0, t_cursor - chunk_pad_sec)
+        pad_end = min(total_duration, t_end + chunk_pad_sec)
+        chunk_data = reader.read_range(pad_start, pad_end)
         if chunk_data is not None and best_lead_idx < chunk_data.shape[0]:
             lead_sig = np.asarray(chunk_data[best_lead_idx], dtype=float)
             if len(lead_sig) > 50:
                 p_indices = pan_tompkins(lead_sig, fs=fs)
                 for p_idx in p_indices:
-                    peak_sec = t_cursor + (float(p_idx) / float(fs))
+                    peak_sec = pad_start + (float(p_idx) / float(fs))
+                    if peak_sec < t_cursor or peak_sec >= t_end:
+                        continue
                     if not all_r_peaks or (peak_sec - all_r_peaks[-1]) >= 0.20:
                         all_r_peaks.append(peak_sec)
         t_cursor += chunk_len_sec
@@ -453,15 +508,15 @@ def detect_arrhythmias(
 def convert_to_structured_events(detected_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Convert detected segments to structured_events format for waveform coloring.
-    
+
     Args:
         detected_segments: List of detected arrhythmia segments from detect_arrhythmias()
-    
+
     Returns:
         List of structured events with timestamp, type, label, end_timestamp, color
     """
     structured_events = []
-    
+
     for seg in detected_segments:
         structured_events.append({
             'timestamp': seg['start_sec'],
@@ -471,8 +526,213 @@ def convert_to_structured_events(detected_segments: List[Dict[str, Any]]) -> Lis
             'color': seg['color'],
             'source': 'Auto',
         })
-    
+
     # Sort by timestamp
     structured_events.sort(key=lambda x: float(x.get('timestamp', 0.0) or 0.0))
-    
+
     return structured_events
+
+
+def _suppress_rate_overlap_in_structured_events(events):
+    """
+    Drop/trim rate-based Sinus Tachycardia/Bradycardia auto events so
+    they never overlap a morphological auto event (VFib, VTach, AFib,
+    Flutter, AV Block). `events` can carry auto events from two
+    independent sources -- the real-time recording pipeline (stored
+    replay metrics) and this module's own waveform-based
+    detect_arrhythmias() -- and either source's rate-based labels can
+    predate a detector fix or simply miss a morphological arrhythmia
+    the other source caught. Without this pass, a stale/independent
+    Sinus Tachycardia region keeps rendering on top of a correctly
+    detected Ventricular Fibrillation region.
+
+    Only a morphological finding from THIS module's own fresh waveform
+    analysis (source 'auto'/'arrhythmia') is trusted to trim a rate
+    segment. The stored real-time pipeline's own morphological labels
+    (source 'analysis'/'classified') are not used as an exclusion trigger
+    here: that pipeline runs its own smoothing/hysteresis and has been
+    observed to keep reporting a finding (e.g. AV Block) for several
+    seconds after a fresh re-analysis of that same window no longer finds
+    it -- trusting it would wrongly eat into the front of a rate segment
+    (e.g. a genuinely tachycardic run) that starts right after.
+    """
+    RATE_LABELS = {'sinus tachycardia', 'sinus bradycardia'}
+    TRUSTED_MORPH_SOURCES = {'auto', 'arrhythmia'}
+
+    def _is_morph(ev):
+        lbl = str(ev.get('label', ev.get('type', ''))).lower()
+        if str(ev.get('source', '')).lower() not in TRUSTED_MORPH_SOURCES:
+            return False
+        return 'av block' in lbl or lbl in {
+            'ventricular fibrillation', 'ventricular tachycardia',
+            'atrial fibrillation', 'atrial flutter',
+        }
+
+    morph_intervals = sorted(
+        (float(ev.get('timestamp', 0.0) or 0.0),
+         float(ev.get('end_timestamp', ev.get('timestamp', 0.0)) or 0.0))
+        for ev in events if _is_morph(ev)
+    )
+    if not morph_intervals:
+        return events
+
+    result = []
+    for ev in events:
+        label = str(ev.get('label', ev.get('type', ''))).lower()
+        if label not in RATE_LABELS:
+            result.append(ev)
+            continue
+        start = float(ev.get('timestamp', 0.0) or 0.0)
+        end = float(ev.get('end_timestamp', start) or start)
+        pieces = [(start, end)]
+        for m_start, m_end in morph_intervals:
+            next_pieces = []
+            for p_start, p_end in pieces:
+                if m_end <= p_start or m_start >= p_end:
+                    next_pieces.append((p_start, p_end))
+                    continue
+                if m_start > p_start:
+                    next_pieces.append((p_start, m_start))
+                if m_end < p_end:
+                    next_pieces.append((m_end, p_end))
+            pieces = next_pieces
+        for p_start, p_end in pieces:
+            if p_end - p_start < 1.0:
+                continue
+            trimmed = dict(ev)
+            trimmed['timestamp'] = p_start
+            trimmed['end_timestamp'] = p_end
+            result.append(trimmed)
+    return result
+
+
+def apply_auto_segments_to_engine(
+    engine,
+    progress_callback: Optional[Callable[[int], None]] = None,
+) -> Optional[int]:
+    """
+    Run detect_arrhythmias() against engine._reader and merge the result
+    into engine._structured_events in place.
+
+    engine._structured_events may already hold events loaded from the
+    recording's own stored replay data (e.g. via HolterReplayEngine's
+    _load_layered_store()/_load_metrics()). This merges the two sources:
+    dedup, rate-vs-morphology suppression (see
+    _suppress_rate_overlap_in_structured_events), and same-label merging
+    across both sources, preserving this detector's own 'Auto'/
+    'arrhythmia' source tag on the merged region so
+    HolterFullDisclosureDialog._update_time_and_arrhythmia_labels() (which
+    only looks at events with that source) can find it.
+
+    Returns the number of newly-added regions, or None if the engine has
+    no reader (nothing was done).
+    """
+    reader = getattr(engine, '_reader', None)
+    if reader is None:
+        return None
+
+    auto_segments = detect_arrhythmias(reader, progress_callback=progress_callback)
+    auto_events = convert_to_structured_events(auto_segments)
+    existing = getattr(engine, '_structured_events', []) or []
+    existing_keys = {
+        (round(float(ev.get('timestamp', 0.0) or 0.0), 3),
+         str(ev.get('label', '')).lower())
+        for ev in existing
+    }
+    added = 0
+    for event in auto_events:
+        key = (
+            round(float(event.get('timestamp', 0.0) or 0.0), 3),
+            str(event.get('label', '')).lower(),
+        )
+        # A region-type event (has end_timestamp) is always added even if
+        # its (timestamp, label) exactly matches an existing stored one --
+        # the merge/suppression pass below safely reconciles overlapping
+        # same-label regions by extending coverage, not duplicating it.
+        # Skipping it here on an exact-key "duplicate" silently discarded
+        # this detector's properly merged, multi-window region (e.g. a
+        # continuous 60s Ventricular Fibrillation episode) whenever the
+        # stored real-time pipeline happened to log its own, far more
+        # fragmented per-chunk snapshot at that same starting instant --
+        # leaving only the fragmented version on screen. Point-in-time
+        # events (no end_timestamp, e.g. manual markers) still dedup as
+        # before since they don't go through that merge.
+        if event.get('end_timestamp') is not None or key not in existing_keys:
+            existing.append(event)
+            existing_keys.add(key)
+            added += 1
+
+    # Collapse duplicate/overlapping automatic regions from the stored
+    # replay metrics and the current waveform detector. Manual events do
+    # not have an end_timestamp and are never included in this merge.
+    # Non-manual auto-origin events come through with several different
+    # source labels depending on which pipeline produced them ('Auto',
+    # 'arrhythmia', 'classified', 'analysis', ...) -- an allow-list here
+    # missed 'analysis'-sourced regions (the layered event store's default
+    # when no source was recorded), letting a stale Sinus Tachycardia
+    # region from that path bypass suppression and keep rendering on top
+    # of a correctly detected VFib region. Exclude only clearly
+    # manual-origin events instead.
+    auto_events_all = [
+        ev for ev in existing
+        if 'manual' not in str(ev.get('source', '')).lower()
+        and ev.get('end_timestamp') is not None
+    ]
+    non_auto_events = [
+        ev for ev in existing if ev not in auto_events_all
+    ]
+    auto_events_all.sort(
+        key=lambda ev: float(ev.get('timestamp', 0.0) or 0.0)
+    )
+    auto_events_all = _suppress_rate_overlap_in_structured_events(auto_events_all)
+
+    # Merge each label's own timeline independently, not one single
+    # interleaved pass. The stored real-time pipeline logs several labels
+    # at the exact same timestamp (e.g. at t=110: "Ventricular
+    # Fibrillation", "Wide QRS (non-specific)", "Long QT Syndrome", "PVC
+    # Morphology" all together) -- sorted by timestamp alone, a
+    # differently-labeled entry can land between two same-labeled ones and
+    # break the "is this adjacent to the last entry" check, fragmenting
+    # what should be one continuous region into several, even though
+    # nothing about the underlying rhythm actually changed.
+    by_label: Dict[str, List[Dict[str, Any]]] = {}
+    for ev in auto_events_all:
+        label = str(ev.get('label', ev.get('type', ''))).lower()
+        by_label.setdefault(label, []).append(ev)
+
+    merged_auto = []
+    for label, group in by_label.items():
+        group.sort(key=lambda ev: float(ev.get('timestamp', 0.0) or 0.0))
+        label_merged = []
+        for ev in group:
+            start = float(ev.get('timestamp', 0.0) or 0.0)
+            end = float(ev.get('end_timestamp', start) or start)
+            ev_source = str(ev.get('source', '')).lower()
+            if label_merged:
+                last = label_merged[-1]
+                last_end = float(last.get('end_timestamp', 0.0) or 0.0)
+                if start <= last_end + 0.25:
+                    last['end_timestamp'] = max(last_end, end)
+                    # Prefer this waveform detector's own 'auto'/
+                    # 'arrhythmia' source over a stored replay source
+                    # ('analysis', 'classified', ...) once merged into the
+                    # same region. The bottom-right rhythm indicator only
+                    # looks at events with source in {'auto','arrhythmia'}
+                    # (_update_time_and_arrhythmia_labels); if the merge
+                    # kept whichever source happened to sort first, a
+                    # region this detector correctly identified (e.g. a
+                    # 60s Ventricular Fibrillation episode) could end up
+                    # permanently invisible to that indicator even though
+                    # the segment overlay renders it fine.
+                    if ev_source in {'auto', 'arrhythmia'}:
+                        last['source'] = ev.get('source')
+                    continue
+            label_merged.append(ev)
+        merged_auto.extend(label_merged)
+
+    existing = non_auto_events + merged_auto
+    engine._structured_events = sorted(
+        existing,
+        key=lambda ev: float(ev.get('timestamp', 0.0) or 0.0),
+    )
+    return added

@@ -62,6 +62,29 @@ os.environ['QT_SCALE_FACTOR'] = '1'
 os.environ['QT_AUTO_SCREEN_SCALE_FACTOR'] = '0'
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Deterministic arrhythmia analysis: force single-threaded BLAS/FFT ────────
+# MUST be set BEFORE numpy is imported anywhere (even transitively) -- the
+# underlying BLAS/OpenMP libraries read these once at load time.
+#
+# numpy/scipy's spectral and linear-algebra routines (used throughout
+# ecg/arrhythmia_detector.py's flutter/VFib scoring) can multi-thread their
+# internal summations. Floating-point addition isn't associative, so the
+# result of the same computation on the same input can come out very
+# slightly different depending on how the OS happens to schedule those
+# threads that run -- normally immaterial, but it was observed to
+# occasionally flip a borderline spectral threshold (e.g. the atrial-flutter
+# score) and change which arrhythmia a window gets classified as, even
+# though the input ECG samples were confirmed byte-for-byte identical run to
+# run. Pinning every relevant thread pool to 1 makes that computation fully
+# deterministic; the ECG windows here are small enough that single-threaded
+# BLAS has no perceptible performance cost.
+for _var in (
+    'OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+    'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS',
+):
+    os.environ[_var] = '1'
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── MPLBACKEND: Force Agg (non-GUI) matplotlib backend for all child processes ─
 # Belt-and-suspenders: .env sets MPLBACKEND=Agg, but enforce it here too so
 # any subprocess or import that happens before dotenv loads uses the right backend.

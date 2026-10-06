@@ -37,7 +37,7 @@ def _load_auto_segment_events(session_dir: str) -> List[Dict[str, object]]:
         return []
     try:
         from .file_format import ECGHFileReader
-        from .holter_auto_arrhythmia_detect import detect_arrhythmias
+        from .auto_segment_arrthymia_detection import detect_arrhythmias
         reader = ECGHFileReader(ecgh_path)
         events = []
         for segment in detect_arrhythmias(reader):
