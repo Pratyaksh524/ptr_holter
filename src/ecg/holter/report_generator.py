@@ -177,8 +177,20 @@ def _build_timeline_events(session_dir: str) -> List[Dict[str, object]]:
         e_t = float(seg.get('end_sec', seg.get('end_timestamp', s_t)) or s_t)
         lbl = str(seg.get('label', 'Event'))
 
-        # Check if inside manual segment
-        in_manual = any(ms <= s_t <= me or ms <= e_t <= me for ms, me in active_segments_ranges)
+        # Check if inside manual segment (or a previously-processed auto
+        # segment -- this list accumulates both). A strict/open-interval
+        # overlap test (ms < e_t and s_t < me), not an inclusive endpoint
+        # check: the inclusive version treated two segments that merely
+        # TOUCH at a shared boundary (e.g. one auto-detected rhythm ending
+        # at the exact same timestamp the next one starts, which is the
+        # normal, correct way adjacent segments now meet) as "overlapping",
+        # silently dropping the second segment from the timeline entirely --
+        # confirmed directly: an Atrial Fibrillation segment starting
+        # exactly where the preceding Ventricular Fibrillation segment
+        # ended never appeared in the Event Timeline at all, even though it
+        # showed correctly in the Arrhythmia Summary above (built
+        # separately, without this check).
+        in_manual = any(ms < e_t and s_t < me for ms, me in active_segments_ranges)
         if in_manual:
             continue
 
@@ -527,6 +539,19 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         'second degree',
         'third-degree',
         'third degree',
+        # Ventricular Tachycardia is intentionally never reported here --
+        # auto_segment_arrthymia_detection.py's own VFib rule folds any
+        # window chaotic enough to be VT into Ventricular Fibrillation by
+        # design (see that module's own comment on the point), so this
+        # detector never produces a "Ventricular Tachycardia" auto segment
+        # with real timing of its own. Without this exclusion, the summary
+        # fell back to the recording's separate, older stored real-time-
+        # pipeline tally for that same label (arrhy_counts further above,
+        # from `summary['arrhythmia_counts']`) purely because it wasn't in
+        # auto_segment_counts -- showing an orphaned "Ventricular
+        # Tachycardia" row with an episode count but no coherent start/end
+        # time (the stored tally has no segment timing of its own to show).
+        'ventricular tachycardia',
     )
     filtered_arrhy_counts = {}
     for label, count in combined_arrhy_counts.items():

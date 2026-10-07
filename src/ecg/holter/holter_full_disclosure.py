@@ -218,11 +218,12 @@ class SegmentOverlay(QWidget):
         self._drag_end_x   = None
         self.update()
 
-    def add_segment(self, start_x, end_x, start_sec, end_sec, label, color, start_time_str='', end_time_str='', auto=False):
+    def add_segment(self, start_x, end_x, start_sec, end_sec, label, color, start_time_str='', end_time_str='', auto=False, true_mid_x=None):
         self._segments.append({
             'start_x': start_x, 'end_x': end_x,
             'start_sec': start_sec, 'end_sec': end_sec, 'auto': bool(auto),
-            'label': label, 'color': color, 'start_time_str': start_time_str, 'end_time_str': end_time_str
+            'label': label, 'color': color, 'start_time_str': start_time_str, 'end_time_str': end_time_str,
+            'true_mid_x': true_mid_x,
         })
         self.update()
 
@@ -251,7 +252,12 @@ class SegmentOverlay(QWidget):
                 painter.drawRect(x1, 0, x2 - x1, h - 1)
 
         # 2. Finalized labeled segments
-        for seg in self._segments:
+        # Drawn in left-to-right pixel order (not insertion order) so the
+        # collision guard below -- which only ever looks at the PREVIOUS
+        # label's right edge -- actually means "the label immediately to
+        # the left", however these segments were added.
+        last_label_right_edge = None
+        for seg in sorted(self._segments, key=lambda s: min(s['start_x'], s['end_x'])):
             sx = min(seg['start_x'], seg['end_x'])
             ex = max(seg['start_x'], seg['end_x'])
             if ex <= sx:
@@ -266,7 +272,12 @@ class SegmentOverlay(QWidget):
             painter.setPen(QPen(c, 1, Qt.SolidLine))
             painter.drawRect(sx, 0, ex - sx, h - 1)
 
-            mid_x = (sx + ex) // 2
+            # Prefer the segment's true time-midpoint (see
+            # _add_auto_arrhythmia_segments) when it was supplied -- manual
+            # segments don't pass one, and fall back to the visible-portion
+            # midpoint they always used.
+            true_mid_x = seg.get('true_mid_x')
+            mid_x = true_mid_x if true_mid_x is not None else (sx + ex) // 2
             lbl = seg.get('label', '')
             start_sec = seg.get('start_sec', 0)
             end_sec = seg.get('end_sec', 0)
@@ -295,29 +306,54 @@ class SegmentOverlay(QWidget):
 
             spacer_w = 4 if time_str else 0
             total_w = lbl_w + spacer_w + time_w
+
+            # The label always draws -- never hidden. It used to be hidden
+            # whenever it didn't fit the segment's pixel width or would
+            # collide with the previous label, but hiding it made it
+            # flicker in and out while scrolling (the fit/collision check
+            # flips pass/fail frame to frame as pixel positions shift
+            # slightly during a drag).
+            #
+            # When a true time-midpoint is available (true_mid_x above),
+            # the label is centered there and deliberately NOT clamped to
+            # this segment's own visible [sx, ex] -- that clamp is what
+            # used to freeze a long segment's label at screen-center for
+            # as long as you stayed scrolled anywhere inside it. Left
+            # unclamped, the label sits at a real fixed point in time: off
+            # past the right edge before that point has scrolled into
+            # view, sliding left across the screen as the recording
+            # scrolls forward through it, then off past the left edge
+            # once it's gone by -- the same motion as the waveform itself.
+            # A short segment with no clamping applied is unaffected: its
+            # true midpoint already sits inside its own [sx, ex].
+            #
+            # For a manual segment (no true_mid_x), the old behavior is
+            # kept as-is: centered on the visible portion, clamped inside
+            # its own [sx, ex].
             start_text_x = mid_x - (total_w // 2)
+            if true_mid_x is None:
+                start_text_x = max(sx, min(start_text_x, ex - total_w)) if ex - sx >= total_w else sx
 
-            # Only draw the centered label+duration when it actually fits
-            # inside this segment's own on-screen width. A short segment
-            # (e.g. a brief VFib episode) drawn at a wide zoom (Full Disc)
-            # can be only a few pixels across while its label text is 150+
-            # pixels wide; centering it regardless makes the text spill past
-            # the segment's own boundary and visually collide with whatever
-            # label the neighboring segment is drawing -- exactly the garbled
-            # overlapping text seen when zoomed out or mid-scroll. The
-            # colored region still marks the event; the label reappears once
-            # the user zooms in enough for the segment to hold it.
-            if total_w <= (ex - sx):
-                # Draw label (y = 20)
-                painter.setFont(lbl_font)
-                painter.setPen(QPen(c, 1))
-                painter.drawText(start_text_x, 20, lbl)
+            # Whichever anchor was used, two labels still must never
+            # visually collide -- nudge this one clear of whatever the
+            # previous (immediately left) label's own right edge reached.
+            # This alone is what actually prevents the garbled
+            # overlapping text seen during scroll/drag, when two adjacent
+            # segments' pixel rectangles can briefly disagree by a few
+            # pixels frame to frame.
+            if last_label_right_edge is not None and start_text_x < last_label_right_edge + 4:
+                start_text_x = last_label_right_edge + 4
 
-                # Draw duration string (y = 20, right of label, in white)
-                if time_str:
-                    painter.setFont(t_font)
-                    painter.setPen(QPen(QColor("#FFFFFF")))
-                    painter.drawText(start_text_x + lbl_w + spacer_w, 20, time_str)
+            painter.setFont(lbl_font)
+            painter.setPen(QPen(c, 1))
+            painter.drawText(start_text_x, 20, lbl)
+
+            if time_str:
+                painter.setFont(t_font)
+                painter.setPen(QPen(QColor("#FFFFFF")))
+                painter.drawText(start_text_x + lbl_w + spacer_w, 20, time_str)
+
+            last_label_right_edge = start_text_x + total_w
 
             # Draw start time on left edge of segment (y = 20, in white)
             if start_time_str:
@@ -2827,13 +2863,30 @@ class HolterFullDisclosureDialog(QDialog):
             from PyQt5.QtCore import QPoint
             sx = ref.mapTo(self._canvas_frame, QPoint(sx, 0)).x()
             ex = ref.mapTo(self._canvas_frame, QPoint(ex, 0)).x()
+
+            # The label is anchored to the segment's own true midpoint in
+            # TIME, not to the midpoint of whatever fraction of it happens
+            # to be visible right now (sx/ex above are clamped to the
+            # current viewport, so a segment longer than one screen would
+            # otherwise freeze its label at screen-center for as long as
+            # you're scrolled anywhere inside it). Mapping the true
+            # midpoint through the same pixel formula WITHOUT that
+            # viewport clamp gives it a real, fixed position in time --
+            # out past either edge while it's not in view yet, sliding in
+            # from the right as the recording scrolls forward through it,
+            # crossing the middle, then sliding out past the left, exactly
+            # like the waveform itself moves.
+            true_mid_sec = (start_sec + end_sec) / 2.0
+            true_mid_x = int(((true_mid_sec - ref._start_sec) / span) * ref.width())
+            true_mid_x = ref.mapTo(self._canvas_frame, QPoint(true_mid_x, 0)).x()
+
             start_time = end_time = ''
             if reader_start:
                 start_time = datetime.fromtimestamp(reader_start + start_sec).strftime('%H:%M:%S')
                 end_time = datetime.fromtimestamp(reader_start + end_sec).strftime('%H:%M:%S')
             self._segment_overlay.add_segment(
                 sx, ex, start_sec, end_sec, match[0], match[1],
-                start_time, end_time, auto=True
+                start_time, end_time, auto=True, true_mid_x=true_mid_x
             )
 
     def _scroll_throttle_interval(self):

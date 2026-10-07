@@ -107,13 +107,30 @@ def detect_arrhythmias(
     test_chunk = reader.read_range(0.0, min(30.0, total_duration))
     best_lead_idx = 0
     best_ptp = 0.0
+    candidate_lead_ptp = []
     for cand in lead_candidates:
         idx = lead_names.index(cand)
         if test_chunk is not None and idx < test_chunk.shape[0]:
             ptp = float(np.ptp(test_chunk[idx]))
+            candidate_lead_ptp.append((idx, ptp))
             if ptp > best_ptp:
                 best_ptp = ptp
                 best_lead_idx = idx
+
+    # The top few candidate leads by this same early-amplitude ranking,
+    # used later by the morphological window loop to detect R-peaks across
+    # more than just best_lead_idx alone -- that single lead is picked once
+    # from the first 30s and stays fixed for the whole recording, so a
+    # stretch later on where it happens to have a transient amplitude dip
+    # can make Pan-Tompkins miss real beats that other leads see just
+    # fine. Confirmed directly: a VFib-labeled stretch in one recording had
+    # 3 beats (~457s, ~460s, ~462s) completely missing from best_lead_idx
+    # while present at normal amplitude on 7 of the other 11 leads.
+    peak_detection_lead_indices = [
+        idx for idx, _ in sorted(candidate_lead_ptp, key=lambda item: item[1], reverse=True)[:3]
+    ]
+    if best_lead_idx not in peak_detection_lead_indices:
+        peak_detection_lead_indices = [best_lead_idx] + peak_detection_lead_indices
 
     # Pan-Tompkins is run on each 60s chunk independently for memory/
     # performance reasons, but QRS detectors have edge artifacts (filter
@@ -351,8 +368,17 @@ def detect_arrhythmias(
     #      a genuine isoelectric boundary for most beats).
     # Ventricular Tachycardia is intentionally not reported as a separate
     # label here -- a window this chaotic renders as Ventricular Fibrillation.
-    def _is_vfib_window(window_signal, fs):
-        r_peaks = pan_tompkins(window_signal, fs=fs)
+    #
+    # r_peaks is supplied by the caller rather than detected here. The
+    # caller reads a couple of seconds of padding on each side of this
+    # window before detecting peaks, purely so Pan-Tompkins has settling
+    # room and doesn't miss or mismeasure a real beat sitting right at this
+    # window's own start/end (the same reason the whole-recording R-peak
+    # pass earlier in this function pads its own chunk reads) -- only
+    # peaks whose own timestamp falls inside this window's true
+    # [start, end) are ever passed in, so this is strictly a detection-
+    # quality fix, never a way to borrow beats from a neighboring window.
+    def _is_vfib_window(window_signal, r_peaks, fs):
         if len(r_peaks) < 2:
             return False
         beats = [b for b in (measure_beat(window_signal, int(p), fs) for p in r_peaks) if b is not None]
@@ -412,9 +438,25 @@ def detect_arrhythmias(
     #         the QRS rate (a regular sawtooth) is Atrial Flutter;
     #       - anything else that still fills the TP segment throughout is
     #         Atrial Fibrillation (irregular fibrillatory f-waves).
-    def _classify_atrial_window(window_signal, fs):
-        r_peaks = pan_tompkins(window_signal, fs=fs)
-        if len(r_peaks) < 3:
+    #
+    # r_peaks is supplied by the caller (padded detection, filtered to this
+    # window's own true [start, end)) for the same detection-quality reason
+    # _is_vfib_window takes it -- see that function's own comment.
+    def _classify_atrial_window(window_signal, r_peaks, fs):
+        # A window needs a real sample of beats before its own majority
+        # vote below means anything. Confirmed directly on a real
+        # recording, right at a genuine VFib-to-AFib transition: a window
+        # with only 5 beats in it (not from missed detection -- the
+        # recording's own beat rate was genuinely still sparse there,
+        # confirmed by re-reading with extra padding and finding the exact
+        # same 5) had 3 resolved, just barely clearing the 2/3-majority
+        # bar below and calling the window AFib several seconds before the
+        # rhythm had actually settled -- every window from there onward
+        # with 6 or more beats was unambiguously organized. At n=5 the
+        # 2/3 rule only demands 3 right answers, which a genuinely
+        # still-chaotic stretch can hand it by chance; requiring a few
+        # more beats first is a direct, simple guard against exactly that.
+        if len(r_peaks) < 6:
             return None
         beats = [measure_beat(window_signal, int(p), fs) for p in r_peaks]
         if any(b is None for b in beats):
@@ -448,6 +490,22 @@ def detect_arrhythmias(
             # Skip past the previous beat's own QRS+T before looking for a
             # quiet TP stretch -- fixed 280ms, or 38% of this RR interval
             # when that's longer (T duration scales with RR, not a constant).
+            #
+            # Tried loosening this (150ms/30%) to recover coverage on a
+            # real accelerating Atrial Flutter episode (RR falling from
+            # 600ms to 400ms) where these stricter numbers left too little
+            # room to score almost any beat once RR dropped below ~700ms,
+            # leaving a genuine organized-QRS Flutter stretch completely
+            # unclassified. That looser version worked for that case, but
+            # directly broke a recording that must stay false-positive-free:
+            # a plain Sinus Tachycardia run started reading as Atrial
+            # Fibrillation/Flutter, because at a fast-but-genuinely-sinus
+            # rate the T and P waves sit just as close together as they do
+            # in real Flutter -- there is no margin value that reliably
+            # tells the two apart from TP-segment room alone. Reverted:
+            # missing a real episode in that one narrow accelerating-rate
+            # case is a smaller problem than false-labeling a clean
+            # recording the detector is specifically required not to touch.
             tp_start = r_prev + max(int(0.28 * fs), int(0.38 * rr_local))
             tp_end = int(p_onset) if (beat.get('p_present') and p_onset is not None) else max(tp_start, q_onset - int(0.15 * fs))
             tp_end = min(tp_end, q_onset)
@@ -464,18 +522,63 @@ def detect_arrhythmias(
             total_waves += len(waves)
             total_active_sec += (tp_end - tp_start) / float(fs)
 
-        if scored == 0:
-            return None
-        if (quiet_count / scored) >= 0.4:
-            return None  # most beats still have a quiet TP segment -- normal baseline
-        if total_active_sec <= 0:
+        # At a fast rate the fixed 280ms blanked straight after each R can
+        # leave no room at all before the next beat's own P-wave onset --
+        # T and P legitimately crowd together with little or no isoelectric
+        # gap between them at high heart rates, which is normal, not
+        # pathological. Most beats then get skipped above ("no room"),
+        # and scored can collapse to just one or two beats that did happen
+        # to have room -- far too small a sample to trust a verdict from.
+        # Confirmed directly: a window of 15 clean 120bpm sinus beats had
+        # only ONE scored (the rest all skipped for exactly this reason),
+        # and that one happened to be a stray artifact right at the
+        # recording's own abrupt end, whose few found "waves" by chance
+        # landed close enough to a flutter ratio to call the window
+        # Atrial Flutter.
+        if scored < 4:
             return None
 
-        atrial_rate = (total_waves / total_active_sec) * 60.0
-        ratio = atrial_rate / ventricular_rate
-        if any(abs(ratio - whole) < 0.5 for whole in (2.0, 3.0, 4.0, 5.0)):
-            return 'Atrial Flutter'
-        return 'Atrial Fibrillation'
+        if (quiet_count / scored) < 0.4 and total_active_sec > 0:
+            atrial_rate = (total_waves / total_active_sec) * 60.0
+            ratio = atrial_rate / ventricular_rate
+            if any(abs(ratio - whole) < 0.5 for whole in (2.0, 3.0, 4.0, 5.0)):
+                return 'Atrial Flutter'
+            return 'Atrial Fibrillation'
+
+        # Most beats read as having a "quiet" TP segment -- but that quiet
+        # reading can itself be fooled: on a genuinely fibrillatory
+        # baseline, the generic P-wave finder often still latches onto one
+        # of the small irregular f-wave bumps sitting right before each
+        # QRS and calls it a P wave, which shrinks the measured TP window
+        # down to nothing and hides the real irregularity from the check
+        # above (confirmed directly: a recording with f-waves measuring
+        # ~230-270 units of amplitude, just under the noise floor used
+        # above for that recording's scale, was missed this way). The
+        # direct check here is the other hallmark of Atrial Fibrillation --
+        # an irregularly irregular RR -- but a plain variability number
+        # (e.g. coefficient of variation) does not actually distinguish
+        # that from a normal, single, organized rhythm whose rate is
+        # simply changing (a Sinus Bradycardia window sliding into a Sinus
+        # Tachycardia one looks just as "variable" over one window; tried
+        # that first and it fired on real Brady/Tachy transition windows).
+        # What actually separates them is the SHAPE of the variability: a
+        # genuine rate change is a handful of beats settling from one
+        # fairly steady RR to another (the big jumps all point the same
+        # way), while true AFib has no settled rate at all -- consecutive
+        # RR intervals keep reversing direction, beat after beat. So: take
+        # only the RR changes big enough to be real (ignore sub-20ms
+        # jitter), and require that most of them flip direction from the
+        # last one, not just that a few big changes exist.
+        rr_diffs = np.diff(rr_ms)
+        significant_diffs = rr_diffs[np.abs(rr_diffs) > 60.0]
+        if significant_diffs.size >= 3:
+            diff_signs = np.sign(significant_diffs)
+            reversals = np.sum(diff_signs[1:] != diff_signs[:-1])
+            reversal_ratio = reversals / (diff_signs.size - 1)
+            if reversal_ratio >= 0.5:
+                return 'Atrial Fibrillation'
+
+        return None  # most beats have a genuinely quiet/consistent baseline -- normal
 
     # Tried shrinking this to 6s/3s to reduce detection latency; verified
     # directly against real recordings that it did NOT detect episodes any
@@ -488,6 +591,17 @@ def detect_arrhythmias(
     # flip a single isolated window to "VFib" around an ectopic beat inside
     # an otherwise organized rhythm. Reverted to 10s/5s, which has enough
     # beats per window to make that vote statistically meaningful.
+    #
+    # Also tried shrinking only the STEP (to 1s, keeping the 10s window) to
+    # pin down a transition boundary more precisely without touching that
+    # per-window vote's own stability. It barely moved any boundary (the
+    # vote itself is what decides the boundary, not how often it's taken),
+    # and it has its own real cost: 5x more windows means 5x more windows
+    # falling through to the analyze_ecg() AV-Block fallback below whenever
+    # neither direct rule above fires -- confirmed directly that this
+    # surfaced false "Third-degree AV Block" calls on a plain Sinus
+    # Tachycardia recording that had never shown them at the 5s step. Not
+    # worth it for no real precision gain; reverted to 5s.
     window_size = 10.0
     overlap = 5.0
     step_size = window_size - overlap
@@ -496,20 +610,68 @@ def detect_arrhythmias(
 
     morphological_candidates = []
 
+    # How far past each window's own edges to read before detecting R-peaks
+    # for it, purely so Pan-Tompkins has settling room and doesn't miss or
+    # mismeasure a real beat sitting right at the window boundary (see
+    # _is_vfib_window's own comment for the real transition this was
+    # confirmed to fix). Only peaks whose own timestamp lands inside the
+    # window's true [current_time, window_end) are ever handed to the
+    # window's classifiers below -- the padding is purely to detect those
+    # edge beats correctly, never to borrow beats from the next window over.
+    morph_pad_sec = 2.0
+
     while current_time < total_duration:
         window_end = min(current_time + window_size, total_duration)
         try:
-            data_array = reader.read_range(current_time, window_end)
-            if data_array is not None and data_array.shape[1] > 0:
+            pad_start = max(0.0, current_time - morph_pad_sec)
+            pad_end = min(total_duration, window_end + morph_pad_sec)
+            padded_array = reader.read_range(pad_start, pad_end)
+            if padded_array is not None and padded_array.shape[1] > 0:
+                # The unpadded core slice, for the AV-Block/analyze_ecg()
+                # fallback below, which wants exactly this window's own
+                # samples -- sliced out of the padded read instead of a
+                # second reader call.
+                core_start_idx = int(round((current_time - pad_start) * fs))
+                core_end_idx = core_start_idx + int(round((window_end - current_time) * fs))
+                data_array = padded_array[:, core_start_idx:core_end_idx]
                 target_morph = None
 
-                if best_lead_idx < data_array.shape[0]:
-                    window_signal = np.asarray(data_array[best_lead_idx], dtype=float)
-                    if len(window_signal) > 50:
-                        if _is_vfib_window(window_signal, fs):
+                if best_lead_idx < padded_array.shape[0]:
+                    padded_signal = np.asarray(padded_array[best_lead_idx], dtype=float)
+                    if len(padded_signal) > 50:
+                        # Union R-peaks detected across the top few
+                        # candidate leads (not just best_lead_idx alone --
+                        # see peak_detection_lead_indices above), merging
+                        # any two detections within 100ms as the same
+                        # physical beat. Each beat is still MEASURED on
+                        # best_lead_idx's own signal below (padded_signal),
+                        # keeping morphology/amplitude comparisons
+                        # consistent on one lead -- only which timestamps
+                        # count as a beat in the first place is made
+                        # robust against one lead's transient dropout.
+                        merge_tol_samples = max(1, int(0.1 * fs))
+                        all_peak_times = []
+                        for lead_idx in peak_detection_lead_indices:
+                            if lead_idx >= padded_array.shape[0]:
+                                continue
+                            lead_sig = np.asarray(padded_array[lead_idx], dtype=float)
+                            if len(lead_sig) <= 50:
+                                continue
+                            all_peak_times.extend(pan_tompkins(lead_sig, fs=fs))
+                        all_peak_times.sort()
+                        all_peaks = []
+                        for p in all_peak_times:
+                            if all_peaks and (p - all_peaks[-1]) < merge_tol_samples:
+                                continue
+                            all_peaks.append(p)
+                        core_r_peaks = [
+                            p for p in all_peaks
+                            if current_time <= pad_start + p / fs < window_end
+                        ]
+                        if _is_vfib_window(padded_signal, core_r_peaks, fs):
                             target_morph = ('Ventricular Fibrillation', '#FF3333')
                         else:
-                            atrial_label = _classify_atrial_window(window_signal, fs)
+                            atrial_label = _classify_atrial_window(padded_signal, core_r_peaks, fs)
                             if atrial_label:
                                 target_morph = (atrial_label, '#FF00FF')
 
@@ -573,29 +735,44 @@ def detect_arrhythmias(
             if _m['label'] not in ('Atrial Fibrillation', 'Atrial Flutter'):
                 _confirmed.append(_m)
                 continue
-            _prev_match = _i > 0 and _sorted_by_time[_i - 1]['label'] == _m['label'] and (_m['start_sec'] - _sorted_by_time[_i - 1]['start_sec']) <= window_size
-            _next_match = _i + 1 < len(_sorted_by_time) and _sorted_by_time[_i + 1]['label'] == _m['label'] and (_sorted_by_time[_i + 1]['start_sec'] - _m['start_sec']) <= window_size
+            # Gap tolerance is 2x window_size here (see the merge step right
+            # below, which uses the same reasoning and the same value) --
+            # confirmed directly against a real recording: a brief
+            # ~10-second Atrial Flutter episode whose conduction rate was
+            # itself accelerating left a couple of windows in the middle
+            # too data-starved (too few beats landed with room to judge
+            # their own TP segment -- see _classify_atrial_window's
+            # min-scored guard) to vote either way, widening the real gap
+            # between two confidently-Flutter windows to about 2 window
+            # lengths even though the episode itself never stopped.
+            _neighbor_tolerance = window_size * 2
+            _prev_match = _i > 0 and _sorted_by_time[_i - 1]['label'] == _m['label'] and (_m['start_sec'] - _sorted_by_time[_i - 1]['start_sec']) <= _neighbor_tolerance
+            _next_match = _i + 1 < len(_sorted_by_time) and _sorted_by_time[_i + 1]['label'] == _m['label'] and (_sorted_by_time[_i + 1]['start_sec'] - _m['start_sec']) <= _neighbor_tolerance
             if _prev_match or _next_match:
                 _confirmed.append(_m)
         morphological_candidates = _confirmed
 
     # Merge contiguous morphological candidate windows. The gap tolerance is
-    # one full window_size, not a tiny fraction of a second: each window's
+    # 2x window_size, not a tiny fraction of a second: each window's
     # pass/fail is a per-window majority vote over a handful of beats, so a
     # single borderline window right in the middle of a sustained episode can
     # narrowly miss the threshold by chance (one or two beats' worth of
-    # noise) even though the episode never actually stopped. A short gap
-    # between two windows that both independently fired as the same
-    # morphological label is almost always that kind of sampling noise, not
-    # a real few-second recovery in the middle of e.g. Ventricular
-    # Fibrillation -- so it gets bridged into one continuous segment.
+    # noise) even though the episode never actually stopped -- and for
+    # Atrial Fibrillation/Flutter specifically, a window can also go
+    # unclassified simply for lacking enough beats with room to judge their
+    # own TP segment (see _classify_atrial_window's min-scored guard),
+    # which is more likely right when a Flutter episode's conduction rate
+    # is itself changing. A short gap between two windows that both
+    # independently fired as the same morphological label is almost always
+    # one of those two things, not a real few-second recovery in the middle
+    # of the episode -- so it gets bridged into one continuous segment.
     if morphological_candidates:
         morphological_candidates.sort(key=lambda x: x['start_sec'])
         merged_morph = []
         for m in morphological_candidates:
             if merged_morph:
                 last = merged_morph[-1]
-                if last['label'] == m['label'] and m['start_sec'] <= last['end_sec'] + window_size:
+                if last['label'] == m['label'] and m['start_sec'] <= last['end_sec'] + window_size * 2:
                     last['end_sec'] = max(last['end_sec'], m['end_sec'])
                     last['end_time_str'] = m['end_time_str']
                     continue
@@ -774,7 +951,60 @@ def apply_auto_segments_to_engine(
 
     auto_segments = detect_arrhythmias(reader, progress_callback=progress_callback)
     auto_events = convert_to_structured_events(auto_segments)
-    existing = getattr(engine, '_structured_events', []) or []
+
+    # This function is not always called just once per engine: the engine
+    # object itself can outlive a single Full Disclosure dialog (e.g. the
+    # main window keeps one engine alive per loaded recording across
+    # close/reopen), and apply_auto_segments_to_engine() is re-invoked on
+    # that same engine each time the dialog opens. Every call used to
+    # simply APPEND this run's fresh detections on top of whatever was
+    # already in engine._structured_events -- including this exact
+    # function's own output from an earlier call, before a fix like the
+    # overlap-trim or min-beat-count changes. The by-label merge below
+    # then fused the OLD (stale) 'Auto'-sourced region together with the
+    # NEW one (same label, close in time), producing a widened/overlapping
+    # ghost segment that a later, corrected detection run could never
+    # actually clear -- it only ever got added to, never replaced. Confirmed
+    # directly: a Ventricular Fibrillation region kept showing a stale
+    # wider boundary indefinitely, surviving across dialog close/reopen
+    # (though not a full process restart, which starts a fresh engine with
+    # an empty _structured_events instead). Dropping this function's own
+    # prior output before adding this run's result makes each call
+    # idempotent -- only genuinely external data (stored replay metrics,
+    # manual annotations) can ever persist from before this call.
+    # Beyond this function's own repeated-call leftovers (just handled
+    # above), the recording's ORIGINAL stored replay data -- loaded by
+    # HolterReplayEngine before this function ever runs, from the live
+    # recording session's own real-time pipeline -- can carry its own
+    # 'analysis'-sourced entries for the exact same morphological labels
+    # this detector directly rules on (Ventricular Fibrillation, Atrial
+    # Fibrillation, Atrial Flutter, AV Block). That real-time pipeline uses
+    # an older, less-reliable scoring approach; this module exists
+    # specifically to replace it as the authority on those labels with a
+    # directly-verified rule. Left in place, the by-label merge below
+    # treats an 'analysis' entry as just another same-label region to fuse
+    # with this run's fresh one -- confirmed directly: on a brand new
+    # engine's very first call (no repeat-call pollution possible yet), a
+    # stored 'analysis' Ventricular Fibrillation entry widened a genuine
+    # 120-240s fresh detection into 120-250s by simple virtue of being
+    # close enough in time to merge with, and did the same to a 455-460s
+    # region, widening it to 455-470s. Entries for any OTHER label (Sinus
+    # Bradycardia/Tachycardia, or anything this detector doesn't itself
+    # classify) are left alone -- only these four morphological categories
+    # are this detector's own territory to decide.
+    _owned_labels = ('ventricular fibrillation', 'atrial fibrillation', 'atrial flutter')
+
+    def _is_owned_label(label_lower):
+        return label_lower in _owned_labels or 'av block' in label_lower
+
+    existing = [
+        ev for ev in (getattr(engine, '_structured_events', []) or [])
+        if str(ev.get('source', '')) != 'Auto'
+        and not (
+            'manual' not in str(ev.get('source', '')).lower()
+            and _is_owned_label(str(ev.get('label', ev.get('type', ''))).lower())
+        )
+    ]
     existing_keys = {
         (round(float(ev.get('timestamp', 0.0) or 0.0), 3),
          str(ev.get('label', '')).lower())
