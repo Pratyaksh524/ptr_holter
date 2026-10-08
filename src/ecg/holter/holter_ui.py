@@ -1144,6 +1144,25 @@ class HolterMainWindow(QDialog):
         if panel and hasattr(panel, '_delete_session'):
             panel._delete_session()
 
+    def _view_selected_recording(self):
+        """Open the currently highlighted row in the RECORDINGS table and jump to its overview."""
+        if self._is_replay_active():
+            return
+        panel = self._recordings_panel()
+        session_path = ""
+        if panel and hasattr(panel, '_selected_path'):
+            session_path = panel._selected_path()
+        if session_path and os.path.isdir(session_path):
+            if os.path.normpath(session_path) != os.path.normpath(self.session_dir or ""):
+                try:
+                    self.load_completed_session(session_path)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+        # Always land on the OVERVIEW tab for the highlighted recording, even if a
+        # panel refresh above raised (so the user is never stuck on RECORDINGS).
+        self._focus_tab('OVERVIEW')
+
     def _is_replay_active(self) -> bool:
         panel = getattr(self, "_replay_panel", None)
         engine = getattr(self, "_replay_engine", None)
@@ -1723,16 +1742,6 @@ class HolterMainWindow(QDialog):
                 painter.drawLine(8, 6, 8, 18)
                 painter.drawLine(16, 6, 16, 18)
 
-            elif tab_type == "REPORT TENDENCY":
-                # Report graph line
-                painter.setPen(QPen(QColor('#26C6DA'), 1.8))
-                path = QPainterPath()
-                path.moveTo(4, 16)
-                path.lineTo(9, 10)
-                path.lineTo(14, 14)
-                path.lineTo(19, 6)
-                painter.drawPath(path)
-
             elif tab_type == "REPORT TABLE":
                 # Grid table icon
                 painter.setPen(QPen(QColor('#7E57C2'), 1.8))
@@ -1890,10 +1899,6 @@ class HolterMainWindow(QDialog):
         self._edit_strips_panel.load_events(events, self._summary, self._metrics_list)
         self._tabs.addTab(self._edit_strips_panel, _make_icon("EDIT STRIPS"), "EDIT STRIPS")
 
-        # Report Tendency
-        self._report_tendency_panel = HolterSTPanel(replay_engine=self._replay_engine)
-        self._tabs.addTab(self._report_tendency_panel, _make_icon("REPORT TENDENCY"), "REPORT TENDENCY")
-
         # Report Table
         self._report_table_panel = HolterReportTablePanel()
         self._report_table_panel.update_from_metrics(self._metrics_list)
@@ -1973,7 +1978,7 @@ class HolterMainWindow(QDialog):
             "Browse": self._open_recordings_folder,
             "Search": self._search_recordings,
             "Analyse": lambda: self._focus_tab("REPLAY"),
-            "View": lambda: self._focus_tab("PREVIEW"),
+            "View": self._view_selected_recording,
             "Import": self._import_recording,
             "Backup": self._backup_recordings,
             "Delete": self._delete_recording,
@@ -2035,7 +2040,7 @@ class HolterMainWindow(QDialog):
         for panel in [getattr(self, p, None) for p in [
             '_replay_panel', '_lorenz_panel', '_hist_panel', '_af_panel',
             '_st_panel', '_edit_event_panel', '_edit_strips_panel', '_events_panel',
-            '_expert_panel', '_template_panel', '_report_tendency_panel', '_hrv_panel',
+            '_expert_panel', '_template_panel', '_hrv_panel',
             '_lorenz_tab_panel'
         ]]:
             if panel and hasattr(panel, 'set_replay_frame'):
