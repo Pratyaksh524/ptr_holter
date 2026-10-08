@@ -778,6 +778,72 @@ def detect_arrhythmias(
                     continue
             merged_morph.append(m)
 
+        # Beat-exact boundary refinement for Ventricular Fibrillation only.
+        # The window vote above locates a VFib region to within one
+        # window/step's own resolution (a whole 10s window either votes for
+        # it or doesn't), but the real disorganized-QRS stretch on the strip
+        # rarely starts and ends exactly on a window edge -- confirmed
+        # directly on this module's own test recording: the window vote
+        # called a 5s VFib region (e.g. 455-460s) while the raw signal's
+        # actual chaotic stretch ran from about 452s to 465s, so 460-465s
+        # was left mislabeled as whatever rhythm follows. Snap each VFib
+        # region's own start/end to the nearest BEAT where organized vs.
+        # disorganized QRS actually flips, by re-measuring individual beats
+        # (not whole windows) out to one window_size past each edge --
+        # requiring two consecutive beats to agree before accepting the
+        # flip, so one noisy/ectopic beat can't drag the boundary.
+        def _beat_is_organized(peak_sec):
+            half = 0.4
+            seg_start = max(0.0, peak_sec - half)
+            seg_end = min(total_duration, peak_sec + half)
+            sig = reader.read_range(seg_start, seg_end)
+            if sig is None or best_lead_idx >= sig.shape[0]:
+                return None
+            lead_sig = np.asarray(sig[best_lead_idx], dtype=float)
+            local_idx = int(round((peak_sec - seg_start) * fs))
+            if local_idx <= 0 or local_idx >= len(lead_sig):
+                return None
+            beat = measure_beat(lead_sig, local_idx, fs)
+            if beat is None:
+                return None
+            return bool(beat.get('qrs_bounds_resolved'))
+
+        def _refine_vfib_edge(boundary_sec, edge):
+            lo, hi = boundary_sec - window_size, boundary_sec + window_size
+            nearby = sorted(float(p) for p in all_r_peaks if lo <= p <= hi)
+            states = [(p, _beat_is_organized(p)) for p in nearby]
+            for i in range(len(states) - 1):
+                ts0, o0 = states[i]
+                _, o1 = states[i + 1]
+                if edge == 'start' and o0 is False and o1 is False:
+                    return ts0
+                if edge == 'end' and o0 is True and o1 is True:
+                    return ts0
+            return boundary_sec
+
+        for idx, region in enumerate(merged_morph):
+            if region['label'] != 'Ventricular Fibrillation':
+                continue
+            try:
+                new_start = _refine_vfib_edge(region['start_sec'], 'start')
+                new_end = _refine_vfib_edge(region['end_sec'], 'end')
+                if new_start < new_end - 0.5:
+                    region['start_sec'], region['end_sec'] = new_start, new_end
+                    region['start_time_str'], region['end_time_str'] = make_time_strs(new_start, new_end)
+                    # Pull the immediate neighbors' own edge in to meet this
+                    # freshly beat-verified boundary too -- otherwise the
+                    # generic overlap-trim pass right below, which always
+                    # cuts back whichever of two overlapping regions comes
+                    # FIRST, would chop this refined (and more trustworthy)
+                    # VFib edge straight back down to the neighbor's own
+                    # unrefined, coarse window edge.
+                    if idx > 0 and merged_morph[idx - 1]['end_sec'] > new_start:
+                        merged_morph[idx - 1]['end_sec'] = new_start
+                    if idx + 1 < len(merged_morph) and merged_morph[idx + 1]['start_sec'] < new_end:
+                        merged_morph[idx + 1]['start_sec'] = new_end
+            except Exception as e:
+                print(f"[Auto Arrhythmia Detect] VFib boundary refine error: {e}")
+
         # The same 50%-overlapping sliding window that lets one episode span
         # several windows also means a transition from one morphological
         # label to another (e.g. Ventricular Fibrillation settling into
@@ -789,12 +855,31 @@ def detect_arrhythmias(
         # earlier segment back to where the next one starts so segments of
         # different labels never overlap -- the boundary is simply where the
         # window-by-window classification actually changed.
+        # The same per-window voting that can leave two different-label
+        # regions overlapping (handled above) can also leave a short GAP
+        # between them: the single window straddling the true transition
+        # often confirms neither the old label (its QRS/TP picture is
+        # already decaying) nor the new one (not chaotic/organized enough
+        # yet to clear that rule's own threshold), or it does vote for the
+        # old label but gets discarded by the isolated-window guard above
+        # once its neighbor on the new-label side stops agreeing. Either
+        # way, that stretch never becomes its own candidate, so without
+        # this pass it renders as a blank, unlabeled strip between two
+        # confirmed episodes even though the recording never actually left
+        # the earlier rhythm until the next one was confirmed. Bridging is
+        # capped at one window length -- that is the largest span a single
+        # ambiguous transition window can account for; any larger gap is a
+        # genuine unclassified stretch, not a transition artifact, and is
+        # left alone.
         for idx in range(len(merged_morph) - 1):
             cur = merged_morph[idx]
             nxt = merged_morph[idx + 1]
             if nxt['start_sec'] < cur['end_sec']:
                 cur['end_sec'] = nxt['start_sec']
                 _, cur['end_time_str'] = make_time_strs(cur['start_sec'], cur['end_sec'])
+            elif 0.0 < (nxt['start_sec'] - cur['end_sec']) <= window_size:
+                cur['end_sec'] = nxt['start_sec']
+                cur['end_time_str'] = nxt['start_time_str']
         merged_morph = [m for m in merged_morph if m['end_sec'] > m['start_sec']]
 
         # Morphological arrhythmias take priority: trim/drop any Sinus

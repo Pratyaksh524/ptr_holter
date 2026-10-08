@@ -1854,6 +1854,11 @@ class HolterMainWindow(QDialog):
 
         # AF Analysis
         self._af_panel = HolterAFPanel(session_dir=self.session_dir)
+        if self._replay_engine:
+            try:
+                self._af_panel.set_replay_engine(self._replay_engine)
+            except Exception:
+                pass
         self._af_panel.update_from_metrics(self._metrics_list, duration)
         self._tabs.addTab(self._af_panel, _make_icon("AF ANALYSIS"), "AF ANALYSIS")
 
@@ -2180,6 +2185,11 @@ class HolterMainWindow(QDialog):
         if hasattr(self, '_lorenz_tab_panel'):
             self._lorenz_tab_panel.update_from_metrics(self._metrics_list)
         if hasattr(self, '_af_panel'):
+            if self._replay_engine:
+                try:
+                    self._af_panel.set_replay_engine(self._replay_engine)
+                except Exception:
+                    pass
             self._af_panel.update_from_metrics(self._metrics_list, self._summary.get('duration_sec', 0))
         if hasattr(self, '_st_panel'):
             self._st_panel.update_from_metrics(self._metrics_list)
