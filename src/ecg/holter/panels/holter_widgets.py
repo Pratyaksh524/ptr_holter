@@ -1795,111 +1795,36 @@ class ECGStripCanvas(QWidget):
 
                         peak_indices = best_indices
 
-                        # A Pan-Tompkins "peak" is just wherever 5-15Hz energy
-                        # crossed threshold -- it says nothing about whether a
-                        # real QRS complex is actually there. On a chaotic/VFib
-                        # trace it fires on fibrillatory wave crests, not beats.
-                        # Reuse the same organized-QRS check the VFib detector
-                        # itself trusts (_qrs_bounds found a genuine isoelectric
-                        # onset/offset, width 40-220ms) so an "N-N interval"
-                        # number is only ever shown between two peaks that are
-                        # each a real, resolved QRS -- not fibrillatory noise.
-                        try:
-                            try:
-                                from ecg.arrhythmia_detector import measure_beat
-                            except ImportError:
-                                from ...arrhythmia_detector import measure_beat
-                        except ImportError:
-                            measure_beat = None
-
-                        # measure_beat()'s _qrs_bounds() runs savgol_filter +
-                        # np.gradient over whatever array it's handed, and
-                        # only ever looks within ~80ms of r_idx (plus ~500ms
-                        # of baseline lookback) -- passing the FULL window
-                        # (tens of thousands of samples on a 1-2 Min view)
-                        # for EVERY peak, on EVERY repaint while dragging,
-                        # was the actual cause of the scrub lag: a 2-Minute
-                        # window re-filters its whole signal ~140 times per
-                        # frame. Slice a small local window around each peak
-                        # instead -- same result, a few hundred samples
-                        # instead of tens of thousands.
-                        def _measure_beat_local(peak_idx):
-                            if measure_beat is None:
-                                return None
-                            margin_before = int(round(0.6 * self._fs))
-                            margin_after = int(round(0.2 * self._fs))
-                            lo = max(0, int(peak_idx) - margin_before)
-                            hi = min(len(signal), int(peak_idx) + margin_after)
-                            try:
-                                return measure_beat(signal[lo:hi], int(peak_idx) - lo, self._fs)
-                            except Exception:
-                                return None
-
-                        organized_ts = set()
-
                         # Convert peak indices to timestamps
                         for peak_idx in peak_indices:
                             ts = self._start_sec + (int(peak_idx) / self._fs)
                             detected_peaks.append(ts)
-                            if measure_beat is not None:
-                                beat = _measure_beat_local(peak_idx)
-                                if beat and beat.get("qrs_bounds_resolved") and 40.0 <= float(beat.get("qrs_ms") or 0.0) <= 220.0:
-                                    organized_ts.add(ts)
-                            else:
-                                # measure_beat unavailable -- do not silently
-                                # suppress every RR number over a missing import.
-                                organized_ts.add(ts)
 
                         if len(detected_peaks) == 0 and hasattr(self, '_beat_annotations') and self._beat_annotations:
-                            # These are explicit annotated/marked beats, not a
-                            # Pan-Tompkins guess, EXCEPT these can themselves
-                            # just be the engine's own earlier batch-detected
-                            # "N" beats (is_manual=False) -- picks nobody ever
-                            # ran a QRS-organization check on, stored beats
-                            # from whatever ran at record time. Only a
-                            # clinician-confirmed mark (is_manual=True) is
-                            # trusted as organized outright; anything else
-                            # still has to pass the same measure_beat check,
-                            # or a VFib window with zero live Pan-Tompkins
-                            # peaks silently falls back to these unvetted
-                            # stored picks and shows numbers again.
                             for b in self._beat_annotations:
                                 b_ts = float(b.get('timestamp', 0.0))
                                 if self._start_sec <= b_ts <= end_sec:
                                     detected_peaks.append(b_ts)
-                                    if b.get('is_manual'):
-                                        organized_ts.add(b_ts)
-                                    elif measure_beat is not None:
-                                        idx = int(round((b_ts - self._start_sec) * self._fs))
-                                        beat = _measure_beat_local(idx)
-                                        if beat and beat.get("qrs_bounds_resolved") and 40.0 <= float(beat.get("qrs_ms") or 0.0) <= 220.0:
-                                            organized_ts.add(b_ts)
-                                    else:
-                                        organized_ts.add(b_ts)
                             detected_peaks.sort()
 
-                        # A peak's own +/-80ms window can resolve "organized"
-                        # by chance even while it sits inside a VFib run --
-                        # VFib is a majority-of-the-window judgement (see
-                        # is_ventricular_fibrillation's own
-                        # "organized_qrs_count < max(3, len(r_peaks)//2)"
-                        # rule), not a per-beat one. Re-derive final organized
-                        # status from a local majority vote over each peak's
-                        # own neighborhood, so an isolated "accidentally
-                        # resolved" peak inside a mostly-chaotic run doesn't
-                        # get treated as organized just because its own tiny
-                        # window happened to resolve.
-                        NEIGHBORHOOD = 5  # peaks on each side
-                        sorted_ts = sorted(detected_peaks)
-                        final_organized_ts = set()
-                        for i, ts in enumerate(sorted_ts):
-                            lo = max(0, i - NEIGHBORHOOD)
-                            hi = min(len(sorted_ts), i + NEIGHBORHOOD + 1)
-                            neighborhood = sorted_ts[lo:hi]
-                            organized_count = sum(1 for t in neighborhood if t in organized_ts)
-                            if organized_count >= max(1, len(neighborhood) // 2):
-                                final_organized_ts.add(ts)
-                        self._organized_peak_ts = final_organized_ts
+                        # Whether a peak's own QRS is "organized" used to be
+                        # judged here per-beat, via measure_beat()'s
+                        # isoelectric-boundary search (the same check the
+                        # VFib detector itself uses). It was removed: that
+                        # search assumes the baseline goes genuinely quiet
+                        # between beats, which is true for sinus rhythm and
+                        # for VFib's own chaos, but NOT for Atrial
+                        # Flutter/Fibrillation -- those have continuous
+                        # sawtooth/fibrillatory baseline activity between
+                        # otherwise completely normal QRS complexes, so the
+                        # search failed on a essentially-random subset of
+                        # genuinely fine beats and blanked their numbers
+                        # (reported as peaks "randomly" missing their RR/HR
+                        # label in a Flutter region). VFib suppression is
+                        # handled entirely by the auto-detected VFib/VTach
+                        # region overlap check below instead, which only
+                        # looks at the window-level rhythm label, not each
+                        # beat's own noisy local baseline.
 
                         # Store detected peaks in parent panel for cross-lead vertical lines
                         parent = self.parent()
@@ -1920,19 +1845,11 @@ class ECGStripCanvas(QWidget):
             
             # Calculate and store RR intervals from detected peaks (always keep for internal use)
             if detected_peaks:
-                # Peak-level organized-QRS flags, cached above whenever peaks
-                # were (re)detected -- cheap set-membership check here, not a
-                # re-run of measure_beat on every repaint.
-                organized_ts = getattr(self, '_organized_peak_ts', None)
                 self._rr_intervals = []
                 for i in range(len(detected_peaks) - 1):
                     curr_ts = detected_peaks[i]
                     next_ts = detected_peaks[i + 1]
                     rr_ms = (next_ts - curr_ts) * 1000.0
-                    # An interval is only a real N-N gap when BOTH peaks that
-                    # bound it are a genuine, resolved QRS -- not fibrillatory/
-                    # chaotic noise Pan-Tompkins mistook for one.
-                    is_organized = (organized_ts is None) or (curr_ts in organized_ts and next_ts in organized_ts)
 
                     self._rr_intervals.append({
                         'start_ts': curr_ts,
@@ -1940,7 +1857,6 @@ class ECGStripCanvas(QWidget):
                         'rr_ms': rr_ms,
                         'start_label': 'N',
                         'end_label': 'N',
-                        'organized': is_organized,
                     })
 
         # Draw beat labels ONLY for:
@@ -2145,18 +2061,18 @@ class ECGStripCanvas(QWidget):
 
             end_sec = self._start_sec + len(d) / self._fs
 
-            # Belt-and-suspenders with the per-peak 'organized' check below.
-            # Real data showed the gap: a beat right at the tail of a VFib
-            # run can be a genuinely resolving, organized QRS on its own
-            # (heart regaining rhythm) and still sit inside the window the
-            # full aggregate detector labeled VFib -- the per-peak check
-            # alone correctly calls that ONE beat organized, but it's still
-            # inside a region a clinician reading this screen sees shaded
-            # VFib, so a number there still reads as a false, misleading N-N
-            # value. Suppress on either condition: the beat's own QRS is
-            # unorganized, OR it falls inside an auto-detected VFib/VTach
-            # region (VTach folded into VFib, same as the rest of the
-            # auto-segment pipeline).
+            # VFib has no organized QRS, so the "R-R interval" Pan-Tompkins
+            # measures across it is noise, not a real beat-to-beat gap --
+            # showing a number there misleads a reviewer into reading it as
+            # a genuine interval. Suppress any RR label whose interval falls
+            # inside an auto-detected VFib/VTach region (VTach folded into
+            # VFib, same as the rest of the auto-segment pipeline). This is
+            # a window-level, rhythm-label check, not a per-beat signal
+            # check -- a per-beat isoelectric-baseline check was tried and
+            # removed, since it also misfired on Atrial Flutter/Fibrillation
+            # (continuous sawtooth/fibrillatory baseline between otherwise
+            # normal QRS complexes), blanking numbers on a random-looking
+            # subset of perfectly fine beats there.
             vfib_regions = []
             for ev in getattr(self, '_structured_events', []) or []:
                 source = str(ev.get('source', '')).lower()
@@ -2177,16 +2093,6 @@ class ECGStripCanvas(QWidget):
                 start_ts = interval['start_ts']
                 end_ts = interval['end_ts']
                 rr_ms = interval['rr_ms']
-
-                # VFib has no organized QRS, so the "R-R interval"
-                # Pan-Tompkins measures across it is noise, not a real
-                # beat-to-beat gap -- showing a number there misleads a
-                # reviewer into reading it as a genuine interval. Don't show
-                # one unless both peaks forming it were actually a resolved,
-                # organized QRS (neighborhood-majority checked, see where
-                # 'organized' gets set, above).
-                if not interval.get('organized', True):
-                    continue
 
                 if vfib_regions and _in_vfib_region(start_ts, end_ts):
                     continue
