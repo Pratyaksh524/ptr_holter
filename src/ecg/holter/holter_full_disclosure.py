@@ -31,16 +31,17 @@ from datetime import datetime
 from PyQt5.QtWidgets import (
     QWidget, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QSpinBox, QScrollBar, QSizePolicy, QApplication, QTabBar,
+    QScrollArea,
 )
 from PyQt5.QtCore import Qt, QEvent, QRect, QTimer
 from PyQt5.QtGui import QPainter, QPen, QColor
 
 try:
-    from .theme import (COL_BLACK, COL_DARK, COL_GREEN, COL_GREEN_DRK, COL_WHITE, COL_GRID_MAJOR,
+    from .theme import (COL_BLACK, COL_DARK, COL_GREEN, COL_GREEN_DRK, COL_WHITE, COL_GRID_MAJOR, COL_GRID_MINOR,
                         TOOL_RULER, TOOL_CALIPER, TOOL_MAGNIFY, TOOL_SELECT)
     from .holter_ui import ECGStripCanvas, MagnifierOverlay
 except ImportError:
-    from ecg.holter.theme import (COL_BLACK, COL_DARK, COL_GREEN, COL_GREEN_DRK, COL_WHITE, COL_GRID_MAJOR,
+    from ecg.holter.theme import (COL_BLACK, COL_DARK, COL_GREEN, COL_GREEN_DRK, COL_WHITE, COL_GRID_MAJOR, COL_GRID_MINOR,
                                    TOOL_RULER, TOOL_CALIPER, TOOL_MAGNIFY, TOOL_SELECT)
     from ecg.holter.holter_ui import ECGStripCanvas, MagnifierOverlay
 
@@ -190,6 +191,60 @@ class VerticalLineOverlay(QWidget):
                 painter.drawLine(line_x, 30, line_x, self.height())
 
         painter.end()
+
+
+class PageGridBackground(QWidget):
+    """
+    Draws the ECG graph-paper grid once across the whole canvas area, sitting
+    behind every per-lead canvas. Same minor/major spacing and colors as
+    ECGStripCanvas's own grid (see panels/holter_widgets.py), just drawn on
+    one widget spanning all 12 leads instead of restarting inside each lead's
+    own small container -- so it reads as one continuous sheet of paper
+    instead of 12 separate patches with the grid resetting at each row.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(COL_BLACK))
+        w, h = self.width(), self.height()
+        minor_pen = QPen(QColor(COL_GRID_MINOR))
+        minor_pen.setWidth(1)
+        major_pen = QPen(QColor(COL_GRID_MAJOR))
+        major_pen.setWidth(1)
+        for gx in range(0, w, 20):
+            painter.setPen(major_pen if gx % 100 == 0 else minor_pen)
+            painter.drawLine(gx, 0, gx, h)
+        for gy in range(0, h, 20):
+            painter.setPen(major_pen if gy % 100 == 0 else minor_pen)
+            painter.drawLine(0, gy, w, gy)
+        painter.end()
+
+
+class HorizontalOnlyScrollArea(QScrollArea):
+    """
+    QScrollArea that never scrolls itself vertically from the mouse wheel --
+    only a manual left-click-drag on its scrollbar moves between leads.
+    Wheel input is always redirected to the dialog's horizontal time
+    scrollbar instead, same as ECGStripCanvas.wheelEvent does, so scrolling
+    anywhere over the lead list (canvas, label, or the gap between rows)
+    scrubs time rather than paging through leads.
+    """
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta != 0:
+            parent = self.parentWidget()
+            while parent is not None:
+                if hasattr(parent, 'time_scrollbar') and parent.time_scrollbar is not None:
+                    step = -1.0 if delta > 0 else 1.0
+                    parent.time_scrollbar.setValue(parent.time_scrollbar.value() + int(step * 100))
+                    break
+                parent = parent.parentWidget()
+        event.accept()
 
 
 class SegmentOverlay(QWidget):
@@ -584,31 +639,56 @@ class HolterFullDisclosureDialog(QDialog):
         QTimer.singleShot(200, self._refresh_segment_overlay)
         # Also raise overlay to ensure it's on top
         QTimer.singleShot(250, lambda: self._segment_overlay.raise_() if hasattr(self, '_segment_overlay') else None)
+        QTimer.singleShot(200, self._sync_leads_scrollbar)
+        # Viewport geometry isn't settled until after the dialog has actually
+        # been laid out/maximized -- same reasoning as the segment-overlay
+        # refresh above.
+        QTimer.singleShot(200, self._sync_row_height_to_viewport)
 
-    # Per-lead row height (px) by gain multiplier. At higher gain the same
-    # mV deflection paints taller, so a fixed 90px row clips QRS peaks against
-    # the next row - give higher gains more headroom (paid for by the tightened
-    # container/row margins above), and let it be honest about the room a low
-    # gain trace actually needs.
-    # Keep the Full Disclosure layout fixed at every gain.  The waveform
-    # renderer fits the amplified trace inside this existing row instead.
-    _GAIN_CANVAS_HEIGHT = {0.5: 84, 1.0: 92, 2.0: 108}
+    # Fallback row height (px) used only for the very first layout pass,
+    # before the dialog has been shown and _sync_row_height_to_viewport()
+    # can measure the real viewport. Overwritten immediately once that runs.
+    _FALLBACK_CANVAS_HEIGHT = 92
 
-    def _canvas_height_for_gain(self, gain):
-        return self._GAIN_CANVAS_HEIGHT.get(gain, 92)
+    # How many lead rows should fill the screen at once. Unlike a fixed pixel
+    # height, this count stays constant across every screen size -- row
+    # height is whatever that screen's available height divided by this
+    # number comes out to (see _sync_row_height_to_viewport), so a bigger
+    # monitor gets taller/easier-to-read rows rather than more rows crammed
+    # in. The remaining leads (12 - this) are always reached by scrolling.
+    _VISIBLE_LEAD_ROWS = 8
 
-    def _apply_canvas_height_for_gain(self):
-        """Resize every lead row to match the current gain's headroom and
-        force a relayout/repaint so peaks stop clipping immediately."""
-        new_height = self._canvas_height_for_gain(self._gain)
+    def _sync_row_height_to_viewport(self):
+        """Derive the per-lead row height from THIS screen/window's actual
+        available height, so _VISIBLE_LEAD_ROWS leads always exactly fill
+        it -- not from gain, and not a hardcoded pixel count. Recomputed on
+        every resize (see eventFilter's canvas_frame Resize handling) so it
+        keeps tracking whatever window size the dialog is currently at."""
+        if not hasattr(self, '_leads_scroll'):
+            return
+        vp_h = self._leads_scroll.viewport().height()
+        if vp_h <= 0:
+            return
+        new_height = max(40, vp_h // self._VISIBLE_LEAD_ROWS)
         if new_height == getattr(self, '_canvas_height', None):
             return
         self._canvas_height = new_height
         for c in getattr(self, '_canvases', []):
             c.setFixedHeight(new_height)
             c.update()
+        self._sync_leads_scrollbar()
         if hasattr(self, 'canvas_layout'):
             self.canvas_layout.activate()
+
+    def _sync_leads_scrollbar(self):
+        """Step the 12-lead list's scrollbar by one row height, so dragging
+        it (or clicking its track) moves through the leads one at a time
+        instead of landing mid-lead."""
+        if not hasattr(self, '_leads_scroll'):
+            return
+        vbar = self._leads_scroll.verticalScrollBar()
+        vbar.setPageStep(self._canvas_height)
+        vbar.setSingleStep(max(1, self._canvas_height // 10))
 
     def _recalc_window(self):
         idx = self.time_tabs.currentIndex() if hasattr(self, 'time_tabs') else 0
@@ -738,16 +818,34 @@ class HolterFullDisclosureDialog(QDialog):
 
         canvas_frame = QFrame()
         canvas_frame.setStyleSheet(f"background: {COL_BLACK};")
+        # Assigned immediately, before any child canvas is constructed below.
+        # Each per-lead canvas gets installEventFilter(self) as soon as it's
+        # built, and Qt can deliver it real events (parent/child-added, etc.)
+        # synchronously during that same construction -- eventFilter() reads
+        # self._canvas_frame on every call regardless of which widget the
+        # event is for, so leaving this assignment for later let those early
+        # events hit an AttributeError (caught by Qt/PyQt and logged, not
+        # fatal, but still noise on every dialog open).
+        self._canvas_frame = canvas_frame
         self.canvas_layout = QVBoxLayout(canvas_frame)
         # Tightened from (4,4,4,4) - reclaim the outer gap so it can go toward
-        # per-lead row height instead (see _canvas_height_for_gain below).
+        # per-lead row height instead (see _sync_row_height_to_viewport below).
         self.canvas_layout.setContentsMargins(2, 2, 2, 2)
         self.canvas_layout.setSpacing(0)
 
+        # Shared page-wide grid, created first so it naturally stacks behind
+        # every lead row added below (siblings paint in creation order unless
+        # explicitly raised/lowered). Geometry is kept in sync with
+        # canvas_frame in eventFilter()'s Resize handling.
+        self._grid_background = PageGridBackground(canvas_frame)
+        self._grid_background.setGeometry(canvas_frame.rect())
+
         self._canvases = []
-        leads = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
-        self._canvas_height = self._canvas_height_for_gain(self._gain)
-        for lead in leads:
+        all_leads = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
+        self._canvas_height = self._FALLBACK_CANVAS_HEIGHT
+
+        def _build_lead_row(lead, row_parent):
+            """One label+canvas row. Returns (QHBoxLayout, canvas)."""
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             # Tightened from 4 - small reclaim from the label/canvas gap too.
@@ -762,18 +860,62 @@ class HolterFullDisclosureDialog(QDialog):
             )
             lbl.setFixedWidth(44)
 
-            canvas = ECGStripCanvas(canvas_frame, height=self._canvas_height, color=COL_GREEN, lead_name=lead, show_annotations=(lead == "I"))
+            canvas = ECGStripCanvas(row_parent, height=self._canvas_height, color=COL_GREEN, lead_name=lead, show_annotations=(lead == "I"), draw_background=False)
             canvas.set_paper_speed(25)
             canvas.set_gain(self._gain)
             canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            
+
             # Install event filter on each canvas to catch mouse clicks
             canvas.installEventFilter(self)
 
             row.addWidget(lbl)
             row.addWidget(canvas, 1)
-            self.canvas_layout.addLayout(row)
+            return row, canvas
+
+        # All 12 leads are one continuous vertical list inside a single
+        # scroll area -- not split into a fixed block plus a separate V1-V6
+        # box. The box fills the whole available page height (whatever that
+        # is on this screen/window size), so however many full rows fit show
+        # at once with no blank leftover space, and the vertical scrollbar
+        # reveals whichever leads don't fit by scrolling the whole list, one
+        # lead at a time, exactly like any normal scrollable list (earlier
+        # leads scroll off the top as later ones enter from the bottom).
+        self._leads_scroll = HorizontalOnlyScrollArea(canvas_frame)
+        self._leads_scroll.setFrameShape(QFrame.NoFrame)
+        # True so the content widget's WIDTH always tracks the viewport
+        # (matches whatever Lead I's canvas width would otherwise be, which
+        # the ruler/segment-overlay pixel<->time math is anchored to).
+        self._leads_scroll.setWidgetResizable(True)
+        self._leads_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._leads_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self._leads_scroll.setStyleSheet(f"""
+            QScrollArea {{ background: transparent; border: none; }}
+            QScrollBar:vertical {{
+                background: #0d1b2a; width: 10px; border-radius: 4px; margin: 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {COL_GREEN_DRK}; min-height: 24px; border-radius: 4px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        """)
+        self._leads_scroll.viewport().setStyleSheet("background: transparent;")
+
+        self._leads_content = QWidget()
+        self._leads_content.setStyleSheet("background: transparent;")
+        leads_content_layout = QVBoxLayout(self._leads_content)
+        leads_content_layout.setContentsMargins(0, 0, 0, 0)
+        leads_content_layout.setSpacing(0)
+
+        for lead in all_leads:
+            row, canvas = _build_lead_row(lead, self._leads_content)
+            leads_content_layout.addLayout(row)
             self._canvases.append(canvas)
+
+        self._leads_scroll.setWidget(self._leads_content)
+        # Stretch factor 1 -- the box fills all of canvas_frame's available
+        # height, so it uses the full page instead of leaving space unused.
+        self.canvas_layout.addWidget(self._leads_scroll, 1)
+        self._sync_leads_scrollbar()
 
         # TODO: Selection box overlay disabled for now
         # self.overlay = FullDisclosureOverlay(canvas_frame)
@@ -797,8 +939,9 @@ class HolterFullDisclosureDialog(QDialog):
         self._segment_overlay.show()
         
         # Install event filter BEFORE adding canvas_frame to layout
+        # (self._canvas_frame was already assigned up top, before any child
+        # canvas was built)
         canvas_frame.installEventFilter(self)
-        self._canvas_frame = canvas_frame
         layout.addWidget(canvas_frame, 1)
 
 
@@ -977,6 +1120,10 @@ class HolterFullDisclosureDialog(QDialog):
     def eventFilter(self, obj, event):
         # Handle resize events for canvas_frame — keep both overlays in sync
         if obj == self._canvas_frame and event.type() == QEvent.Resize:
+            if hasattr(self, '_grid_background'):
+                self._grid_background.setGeometry(obj.rect())
+                self._grid_background.lower()
+            self._sync_row_height_to_viewport()
             if hasattr(self, '_vertical_line_overlay'):
                 self._vertical_line_overlay.setGeometry(obj.rect())
             if hasattr(self, '_segment_overlay'):
@@ -1291,7 +1438,9 @@ class HolterFullDisclosureDialog(QDialog):
         next_step = self._GAIN_STEPS[(idx + 1) % len(self._GAIN_STEPS)]
         self._gain, self._gain_label = next_step
         self.btn_gain.setText(f"Gain: {self._gain_label}")
-        self._apply_canvas_height_for_gain()
+        # Row height is screen-driven (_sync_row_height_to_viewport), not
+        # gain-driven, so changing gain no longer resizes rows -- only the
+        # waveform amplitude inside the existing row changes.
         for c in self._canvases:
             c.set_gain(self._gain)
             c.update()  # Force repaint with new gain
@@ -1769,6 +1918,21 @@ class HolterFullDisclosureDialog(QDialog):
                                     sx_global, ex_global, s_sec, e_sec,
                                     seg['label'], seg['color'], seg.get('start_time_str', ''), seg.get('end_time_str', '')
                                 )
+                    # clear_segments() above wipes BOTH manual and
+                    # auto-detected regions, but the loop just above only
+                    # re-adds manual ones (self._segment_annotations) --
+                    # auto regions (VFib/AFib/etc, drawn from
+                    # _structured_events, never stored in
+                    # _segment_annotations) were silently left out until the
+                    # next scroll/drag happened to call _update_canvases and
+                    # re-add them. Restore them here too, same as
+                    # _refresh_segment_overlay does.
+                    self._add_auto_arrhythmia_segments(
+                        ref,
+                        self._structured_events_for_canvas(ref._start_sec, ref_end),
+                        ref_end,
+                        span,
+                    )
             self._segment_overlay.update()
 
 
