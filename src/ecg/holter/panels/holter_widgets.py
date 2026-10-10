@@ -994,13 +994,19 @@ class ECGStripCanvas(QWidget):
         """Scroll time scrollbar forward/backward on mouse wheel."""
         delta = event.angleDelta().y()
         if delta != 0:
-            step = -1.0 if delta > 0 else 1.0  # Wheel up = scroll forward, wheel down = backward
+            # One standard wheel notch reports angleDelta().y() == 120 (Qt's
+            # own convention) -- normalize by that instead of treating every
+            # wheelEvent() call as exactly one notch. Some mice/trackpads
+            # report a single physical click as a larger delta.
             parent = self.parentWidget()
             while parent is not None:
-                if hasattr(parent, 'time_scrollbar') and parent.time_scrollbar is not None:
-                    curr_val = parent.time_scrollbar.value()
-                    # Step by 100 units (1.0 second) per wheel click
-                    parent.time_scrollbar.setValue(curr_val + int(step * 100))
+                if hasattr(parent, '_consume_wheel_notches'):
+                    # Debounced there too (see _consume_wheel_notches) --
+                    # a trackpad flick confirmed to fire this wheelEvent()
+                    # twice in very quick succession, each a normal,
+                    # correctly-formed single notch on its own, which
+                    # doubled the scroll before the debounce was added.
+                    parent._consume_wheel_notches(delta / 120.0)
                     break
                 parent = parent.parentWidget()
 

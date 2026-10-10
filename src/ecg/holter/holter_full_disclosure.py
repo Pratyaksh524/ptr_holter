@@ -239,9 +239,13 @@ class HorizontalOnlyScrollArea(QScrollArea):
         if delta != 0:
             parent = self.parentWidget()
             while parent is not None:
-                if hasattr(parent, 'time_scrollbar') and parent.time_scrollbar is not None:
-                    step = -1.0 if delta > 0 else 1.0
-                    parent.time_scrollbar.setValue(parent.time_scrollbar.value() + int(step * 100))
+                if hasattr(parent, '_consume_wheel_notches'):
+                    # Normalize by Qt's standard 120-per-notch convention
+                    # instead of treating every wheelEvent() call as exactly
+                    # one notch -- see ECGStripCanvas.wheelEvent for why.
+                    # Debounced there too, so a trackpad flick that fires
+                    # this twice in quick succession still moves one notch.
+                    parent._consume_wheel_notches(delta / 120.0)
                     break
                 parent = parent.parentWidget()
         event.accept()
@@ -448,7 +452,18 @@ class HolterFullDisclosureDialog(QDialog):
         self._selected_duration = None
         self._active_tool = TOOL_SELECT
         self._active_tool_btn = None
-        
+
+        # Debounce state for mouse-wheel time scrubbing (see
+        # _consume_wheel_notches) -- a single trackpad "flick" gesture can
+        # arrive as two separate wheelEvent() calls in very quick
+        # succession (each individually a normal, correctly-formed one
+        # notch), which a standard mouse wheel's physical detents don't
+        # normally do. Coalescing calls that land within a short window of
+        # each other into a single step keeps one flick = 1 second,
+        # regardless of whether the touchpad driver reported it as one
+        # event or two.
+        self._last_wheel_time = 0.0
+
         # Drag selection state (parallel mode)
         self._drag_start_x = None
         self._drag_current_x = None
@@ -689,6 +704,24 @@ class HolterFullDisclosureDialog(QDialog):
         vbar = self._leads_scroll.verticalScrollBar()
         vbar.setPageStep(self._canvas_height)
         vbar.setSingleStep(max(1, self._canvas_height // 10))
+
+    _WHEEL_DEBOUNCE_SEC = 0.12
+
+    def _consume_wheel_notches(self, notches: float):
+        """Apply a wheel-scroll step to the time scrollbar, coalescing any
+        second wheelEvent() that arrives within _WHEEL_DEBOUNCE_SEC of the
+        last one into a no-op. Both ECGStripCanvas.wheelEvent and
+        HorizontalOnlyScrollArea.wheelEvent call this instead of touching
+        time_scrollbar directly, so a single physical scroll (mouse notch
+        or trackpad flick) always moves exactly one notch's worth of time,
+        even if the input device reported it as two back-to-back events."""
+        import time
+        now = time.time()
+        if now - self._last_wheel_time < self._WHEEL_DEBOUNCE_SEC:
+            return
+        self._last_wheel_time = now
+        step = -notches
+        self.time_scrollbar.setValue(self.time_scrollbar.value() + int(step * 100))
 
     def _recalc_window(self):
         idx = self.time_tabs.currentIndex() if hasattr(self, 'time_tabs') else 0
