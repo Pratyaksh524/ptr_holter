@@ -1115,6 +1115,82 @@ def _detect_arrhythmias_uncached(
             except Exception as e:
                 print(f"[Auto Arrhythmia Detect] VFib boundary refine error: {e}")
 
+        # Beat-exact edges for Atrial Fibrillation / Atrial Flutter where they
+        # border normal rhythm (no other morphological region within one
+        # window). The window vote leaves these on the 5s window grid, so a
+        # few seconds of the normal rhythm after AFib ended were drawn as
+        # AFib (seen: last AFib beat 1160.5s, steady 1000ms sinus from
+        # 1161.5s, segment ran to 1165s).
+        #
+        # A beat counts as atrial-active when its TP segment (between the
+        # previous beat's T wave and this beat's P/QRS) carries waves of at
+        # least 0.3x the noise threshold _classify_atrial_window uses. Across
+        # the test recordings AFib beats measured >= 0.57 and Flutter >= 1.14,
+        # Sinus Brady/Tachy <= 0.26. Normal rhythm can occasionally read
+        # higher (fast sinus arrhythmia, P and T crowding the TP segment), so
+        # each edge is searched starting from INSIDE the episode: the end is
+        # the first of two consecutive quiet beats going forward from inside
+        # the last AFib/Flutter window; the start is the beat right after the
+        # first two consecutive quiet beats going backward from inside the
+        # first window. If no such pair exists (e.g. no measurable TP at a
+        # fast rate), the window edge is kept.
+        def _beat_tp_active(prev_sec, peak_sec):
+            seg_start = max(0.0, prev_sec - 0.1)
+            seg_end = min(total_duration, peak_sec + 0.4)
+            sig = reader.read_range(seg_start, seg_end)
+            if sig is None or best_lead_idx >= sig.shape[0]:
+                return None
+            lead_sig = np.asarray(sig[best_lead_idx], dtype=float)
+            prev_idx = int(round((prev_sec - seg_start) * fs))
+            cur_idx = int(round((peak_sec - seg_start) * fs))
+            if cur_idx <= prev_idx or cur_idx >= len(lead_sig):
+                return None
+            beat = measure_beat(lead_sig, cur_idx, fs)
+            if beat is None:
+                return None
+            rr = cur_idx - prev_idx
+            q_onset = int(beat.get('q_onset') or cur_idx)
+            p_onset = beat.get('p_onset')
+            tp_start = prev_idx + max(int(0.28 * fs), int(0.38 * rr))
+            tp_end = int(p_onset) if (beat.get('p_present') and p_onset is not None) else max(tp_start, q_onset - int(0.15 * fs))
+            tp_end = min(tp_end, q_onset)
+            if tp_end - tp_start < int(0.06 * fs):
+                return None
+            noise_threshold = max(0.05, 0.15 * float(beat.get('qrs_amplitude') or 0.1))
+            return float(np.ptp(lead_sig[tp_start:tp_end])) >= 0.3 * noise_threshold
+
+        def _refine_atrial_edge(boundary_sec, edge):
+            lo, hi = boundary_sec - window_size, boundary_sec + window_size
+            peaks = sorted(float(p) for p in all_r_peaks if lo - 5.0 <= p <= hi)
+            states = [
+                (peaks[i], _beat_tp_active(peaks[i - 1], peaks[i]))
+                for i in range(1, len(peaks)) if lo <= peaks[i] <= hi
+            ]
+            if edge == 'end':
+                for i in range(len(states) - 1):
+                    if states[i][1] is False and states[i + 1][1] is False:
+                        return states[i][0]
+            else:
+                for i in range(len(states) - 1, 0, -1):
+                    if states[i][1] is False and states[i - 1][1] is False:
+                        return states[i + 1][0] if i + 1 < len(states) else boundary_sec
+            return boundary_sec
+
+        for idx, region in enumerate(merged_morph):
+            if region['label'] not in ('Atrial Fibrillation', 'Atrial Flutter'):
+                continue
+            try:
+                new_start, new_end = region['start_sec'], region['end_sec']
+                if idx == 0 or region['start_sec'] - merged_morph[idx - 1]['end_sec'] > window_size:
+                    new_start = _refine_atrial_edge(region['start_sec'], 'start')
+                if idx + 1 >= len(merged_morph) or merged_morph[idx + 1]['start_sec'] - region['end_sec'] > window_size:
+                    new_end = _refine_atrial_edge(region['end_sec'], 'end')
+                if new_start < new_end - 0.5:
+                    region['start_sec'], region['end_sec'] = new_start, new_end
+                    region['start_time_str'], region['end_time_str'] = make_time_strs(new_start, new_end)
+            except Exception as e:
+                print(f"[Auto Arrhythmia Detect] Atrial boundary refine error: {e}")
+
         # The same 50%-overlapping sliding window that lets one episode span
         # several windows also means a transition from one morphological
         # label to another (e.g. Ventricular Fibrillation settling into

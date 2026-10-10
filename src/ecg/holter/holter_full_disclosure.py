@@ -25,6 +25,7 @@ Classes:
 import os
 import json
 import copy
+import math
 import numpy as np
 from datetime import datetime
 
@@ -3264,6 +3265,18 @@ class HolterFullDisclosureDialog(QDialog):
         # bottom-right rhythm indicator.  Beat badges alone cannot represent
         # a Brady/Tachy segment because those rhythms are window-level events.
         try:
+            # Whether a segment is still "current" is judged on the wall-clock
+            # SECOND shown on screen, the same truncated HH:MM:SS the segment
+            # overlay prints for its end. Recordings start at a fractional
+            # second (e.g. 12:21:19.87) and scrolling moves in whole seconds
+            # from that start, so comparing raw seconds dropped an AFib ending
+            # at 12:40:41.35 one step early: the label went "AFib at 12:40:40"
+            # -> "NSR at 12:40:41" while the overlay said AFib ended 12:40:41.
+            reader_start = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
+            if reader_start:
+                def _shown_second(sec):
+                    return math.floor(reader_start + sec)
+                view_second = _shown_second(start_sec)
             active_auto = []
             for event in getattr(self._engine, '_structured_events', []) or []:
                 source = str(event.get('source', '')).lower()
@@ -3271,7 +3284,11 @@ class HolterFullDisclosureDialog(QDialog):
                     continue
                 event_start = float(event.get('timestamp', 0.0) or 0.0)
                 event_end = float(event.get('end_timestamp', event_start) or event_start)
-                if event_end >= start_sec and event_start <= end_sec:
+                if reader_start:
+                    still_on = _shown_second(event_end) >= view_second
+                else:
+                    still_on = event_end >= start_sec
+                if still_on and event_start <= end_sec:
                     label = str(event.get('label', event.get('type', '')) or '')
                     if label.lower() in {
                         'sinus bradycardia', 'bradycardia',
