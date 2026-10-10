@@ -29,13 +29,181 @@ Pipeline:
                                            merging.
 """
 
+import copy
+import hashlib
+import json
+import os
 import numpy as np
 from datetime import datetime
 from typing import List, Dict, Any, Callable, Optional
 from scipy.signal import find_peaks
 
 
+# Detection takes ~50s on a 23-minute recording and was being run again by
+# every caller (AF panel on load, Full Disclosure on open, report). Results
+# are cached in memory for this process and on disk next to the recording,
+# keyed on the recording file's size/mtime and a hash of the ecg package's
+# source, so any change to the recording or to detection code recomputes.
+_CACHE_FILENAME = 'auto_segments_cache.json'
+_memory_cache: Dict[str, List[Dict[str, Any]]] = {}
+_code_fingerprint_value: Optional[str] = None
+
+
+def _code_fingerprint() -> str:
+    global _code_fingerprint_value
+    if _code_fingerprint_value is None:
+        ecg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        h = hashlib.sha1()
+        n_files = 0
+        for root, dirs, files in os.walk(ecg_dir):
+            dirs[:] = sorted(d for d in dirs if d != '__pycache__')
+            for name in sorted(files):
+                if not name.endswith('.py'):
+                    continue
+                try:
+                    with open(os.path.join(root, name), 'rb') as f:
+                        h.update(os.path.relpath(os.path.join(root, name), ecg_dir).encode('utf-8'))
+                        h.update(f.read())
+                    n_files += 1
+                except OSError:
+                    continue
+        # No readable sources (e.g. a frozen build): disk cache is skipped,
+        # since there's no way to tell whether a saved result is stale.
+        _code_fingerprint_value = h.hexdigest() if n_files else ''
+    return _code_fingerprint_value
+
+
+def _cache_key(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return f"{os.path.abspath(path)}|{st.st_size}|{st.st_mtime_ns}|{_code_fingerprint()}"
+
+
+def _disk_cache_path(path: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(path)), _CACHE_FILENAME)
+
+
+def get_cached_detection(path: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+    """Cached detect_arrhythmias() result for this recording, or None. Cheap."""
+    key = _cache_key(path)
+    if key is None:
+        return None
+    if key in _memory_cache:
+        return copy.deepcopy(_memory_cache[key])
+    if not _code_fingerprint():
+        return None
+    try:
+        with open(_disk_cache_path(path), 'r', encoding='utf-8') as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if saved.get('key') != key or not isinstance(saved.get('segments'), list):
+        return None
+    _memory_cache[key] = saved['segments']
+    return copy.deepcopy(saved['segments'])
+
+
 def detect_arrhythmias(
+    reader,
+    progress_callback: Optional[Callable[[int], None]] = None
+) -> List[Dict[str, Any]]:
+    """Cached wrapper around _detect_arrhythmias_uncached (see the cache note above)."""
+    path = getattr(reader, 'path', None)
+    key = _cache_key(path)
+    if key is None:
+        return _detect_arrhythmias_uncached(reader, progress_callback)
+
+    cached = get_cached_detection(path)
+    if cached is not None:
+        if progress_callback:
+            progress_callback(100)
+        return cached
+
+    segments = _detect_arrhythmias_uncached(reader, progress_callback)
+    _memory_cache[key] = copy.deepcopy(segments)
+    if _code_fingerprint():
+        cache_path = _disk_cache_path(path)
+        try:
+            tmp_path = cache_path + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump({'key': key, 'segments': segments}, f, default=float)
+            os.replace(tmp_path, cache_path)
+        except (OSError, TypeError, ValueError) as e:
+            print(f"[Auto Arrhythmia Detect] Could not save cache: {e}")
+    return segments
+
+
+# Background detection, so opening a recording / Full Disclosure doesn't
+# block the UI the first time a recording is analysed. One job per recording:
+# a second request while it is running just waits for the same result.
+_async_jobs: Dict[str, Dict[str, Any]] = {}
+
+
+def detect_arrhythmias_async(path: str, on_done: Callable[[List[Dict[str, Any]]], None]) -> None:
+    """Run detect_arrhythmias() for the recording at `path` on a worker
+    thread and call on_done(segments) on the Qt main thread. Must be called
+    from the Qt main thread."""
+    import threading
+    from PyQt5.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
+
+    cached = get_cached_detection(path)
+    if cached is not None:
+        QTimer.singleShot(0, lambda: on_done(cached))
+        return
+
+    key = _cache_key(path) or os.path.abspath(path)
+    job = _async_jobs.get(key)
+    if job is not None:
+        job.callbacks.append(on_done)
+        return
+
+    class _Job(QObject):
+        # Created on the main thread; done is emitted from the worker thread,
+        # so _deliver (a slot of this main-thread object) runs queued on the
+        # main thread.
+        done = pyqtSignal(object)
+
+        def __init__(self):
+            super().__init__()
+            self.callbacks = [on_done]
+            self.done.connect(self._deliver)
+
+        @pyqtSlot(object)
+        def _deliver(self, segments):
+            _async_jobs.pop(key, None)
+            for cb in self.callbacks:
+                try:
+                    cb(copy.deepcopy(segments))
+                except RuntimeError:
+                    pass  # the receiving widget was closed meanwhile
+                except Exception as e:
+                    print(f"[Auto Arrhythmia Detect] Callback error: {e}")
+
+    job = _Job()
+    _async_jobs[key] = job
+    notifier = job
+
+    def _run():
+        try:
+            from .file_format import ECGHFileReader
+            reader = ECGHFileReader(path)
+            try:
+                segments = detect_arrhythmias(reader)
+            finally:
+                reader.close()
+        except Exception as e:
+            print(f"[Auto Arrhythmia Detect] Background detection failed: {e}")
+            segments = []
+        notifier.done.emit(segments)
+
+    threading.Thread(target=_run, name='auto-segment-detection', daemon=True).start()
+
+
+def _detect_arrhythmias_uncached(
     reader,
     progress_callback: Optional[Callable[[int], None]] = None
 ) -> List[Dict[str, Any]]:
@@ -216,16 +384,28 @@ def detect_arrhythmias(
         VFib threshold, producing a short "Sinus Bradycardia"/"Sinus
         Tachycardia" blip that sits immediately next to -- but doesn't
         strictly overlap -- the morphological region. That blip is a
-        transition artifact, not a real rhythm, so the exclusion zone
-        extends a bit past the morphological region's own edges to catch it.
+        transition artifact, not a real rhythm, so a piece that sits entirely
+        within buffer_sec of a morphological edge is dropped.
+
+        The buffer is NOT used for trimming itself: trimming against the
+        buffered interval cut every real rate segment 5s short of the
+        morphological one (a 120 bpm Sinus Tachycardia that ran right up to
+        a VFib onset at 600.2s was cut at 595.2s, leaving an unlabeled gap
+        of steady tachycardia beats). Rate segments are trimmed at the exact
+        morphological edge.
         """
         if not morph_segments:
             return rate_segments
         buffer_sec = 5.0
-        morph_intervals = sorted(
-            (max(0.0, m['start_sec'] - buffer_sec), m['end_sec'] + buffer_sec)
-            for m in morph_segments
-        )
+        morph_intervals = sorted((m['start_sec'], m['end_sec']) for m in morph_segments)
+
+        def _is_transition_blip(p_start, p_end):
+            return any(
+                (p_end <= m_start and p_start >= m_start - buffer_sec)
+                or (p_start >= m_end and p_end <= m_end + buffer_sec)
+                for m_start, m_end in morph_intervals
+            )
+
         result = []
         for seg in rate_segments:
             pieces = [(seg['start_sec'], seg['end_sec'])]
@@ -241,7 +421,7 @@ def detect_arrhythmias(
                         next_pieces.append((m_end, p_end))
                 pieces = next_pieces
             for p_start, p_end in pieces:
-                if p_end - p_start < 1.0:
+                if p_end - p_start < 1.0 or _is_transition_blip(p_start, p_end):
                     continue
                 s_str, e_str = make_time_strs(p_start, p_end)
                 trimmed = dict(seg)
@@ -635,6 +815,7 @@ def detect_arrhythmias(
                 core_end_idx = core_start_idx + int(round((window_end - current_time) * fs))
                 data_array = padded_array[:, core_start_idx:core_end_idx]
                 target_morph = None
+                core_r_peaks = []
 
                 if best_lead_idx < padded_array.shape[0]:
                     padded_signal = np.asarray(padded_array[best_lead_idx], dtype=float)
@@ -682,8 +863,24 @@ def detect_arrhythmias(
                             window_leads[lead_name] = data_array[i, :]
 
                     if window_leads:
-                        results = analyze_ecg(window_leads, fs=fs)
+                        # No hysteresis: each window is judged on its own
+                        # samples (an empty hysteresis_key passes diagnoses
+                        # straight through). Hysteresis here only carried a
+                        # stale diagnosis from earlier windows forward --
+                        # e.g. an earlier "Atrial Fibrillation" outranked a
+                        # real dropped-beat AV block in later windows. False
+                        # AV-block calls are filtered by the direct checks
+                        # below instead.
+                        results = analyze_ecg(window_leads, fs=fs, hysteresis_key="")
                         arrhythmias = results.get('arrhythmias', [])
+
+                        # Ventricular rate of this window, from the same beats
+                        # the rules above used.
+                        window_hr = None
+                        if len(core_r_peaks) >= 2:
+                            mean_rr = float(np.mean(np.diff(core_r_peaks))) / float(fs)
+                            if mean_rr > 0:
+                                window_hr = 60.0 / mean_rr
 
                         # Only AV Block is looked up here. VFib is decided by
                         # its own direct rule above; Atrial Fibrillation /
@@ -692,9 +889,43 @@ def detect_arrhythmias(
                         # analyze_ecg()'s internal spectral/ratio scoring.
                         for arr in arrhythmias:
                             arr_lower = str(arr).lower()
-                            if 'av block' in arr_lower:
-                                target_morph = (str(arr), '#FF00FF')
-                                break
+                            if 'av block' not in arr_lower:
+                                continue
+                            # Third-degree (complete) block means a slow
+                            # escape rhythm. analyze_ecg() calls it from PR
+                            # variability alone, which also happens at fast
+                            # rates when P and T overlap -- seen calling it
+                            # in the middle of a steady 120 bpm Sinus
+                            # Tachycardia.
+                            if ('third' in arr_lower or '3rd' in arr_lower) and \
+                                    (window_hr is None or window_hr >= 60.0):
+                                continue
+                            # Second-degree block means a P wave that isn't
+                            # conducted: a single RR about twice the RR on
+                            # BOTH sides of it (750, 1500, 750). analyze_ecg()
+                            # calls it from any RR spread over 1.4x, which
+                            # fired on smooth respiratory sinus arrhythmia
+                            # (RR swinging 600-1000ms) and on a rate change
+                            # (RR 500 -> 1000ms is a doubling, but the RRs on
+                            # either side differ).
+                            if 'second' in arr_lower or '2nd' in arr_lower:
+                                rr_w = np.diff(np.asarray(core_r_peaks, dtype=float)) * 1000.0 / float(fs)
+                                dropped = any(
+                                    1.8 * rr_w[i - 1] <= rr_w[i] <= 2.2 * rr_w[i - 1]
+                                    and 1.8 * rr_w[i + 1] <= rr_w[i] <= 2.2 * rr_w[i + 1]
+                                    for i in range(1, len(rr_w) - 1)
+                                )
+                                if not dropped:
+                                    continue
+                            # First-degree is a PR measurement; above 100 bpm
+                            # the P wave sits in the previous T wave and PR
+                            # isn't measurable (seen calling it through a
+                            # 160 bpm Sinus Tachycardia).
+                            if ('first' in arr_lower or '1st' in arr_lower) and \
+                                    (window_hr is None or window_hr >= 100.0):
+                                continue
+                            target_morph = (str(arr), '#FF00FF')
+                            break
 
                 if target_morph:
                     s_str, e_str = make_time_strs(current_time, window_end)
@@ -715,6 +946,32 @@ def detect_arrhythmias(
         if window_count % 10 == 0 and progress_callback:
             progress = int((current_time / total_duration) * 100)
             progress_callback(progress)
+
+    # AV conduction can't be graded during Atrial Fibrillation/Flutter --
+    # there are no discrete P waves. Flutter whose conduction ratio changes
+    # (RR 1000 -> 600 -> 400ms) reads as "dropped beats" and analyze_ecg()
+    # calls it Second-degree AV Block, which then split real Flutter
+    # episodes apart. Drop AV-block windows next to AFib/Flutter windows,
+    # before the isolated-window guard below, so they can't make the
+    # surrounding Flutter windows look isolated. Only atrial windows with a
+    # same-label window nearby count -- a lone AFib window at the edge of a
+    # real dropped-beat AV block (dropped by the isolated-window guard
+    # anyway) was wiping out the block itself.
+    _atrial = [
+        m for m in morphological_candidates
+        if m['label'] in ('Atrial Fibrillation', 'Atrial Flutter')
+    ]
+    _atrial_starts = [
+        m['start_sec'] for m in _atrial
+        if any(o is not m and o['label'] == m['label']
+               and abs(o['start_sec'] - m['start_sec']) <= window_size * 2
+               for o in _atrial)
+    ]
+    morphological_candidates = [
+        m for m in morphological_candidates
+        if not ('av block' in m['label'].lower()
+                and any(abs(m['start_sec'] - s) <= window_size * 2 for s in _atrial_starts))
+    ]
 
     # Atrial Fibrillation / Atrial Flutter get one more check here, specific
     # to those two labels: a SINGLE isolated window carrying one of them,
@@ -792,7 +1049,14 @@ def detect_arrhythmias(
         # (not whole windows) out to one window_size past each edge --
         # requiring two consecutive beats to agree before accepting the
         # flip, so one noisy/ectopic beat can't drag the boundary.
-        def _beat_is_organized(peak_sec):
+        # require_narrow: where a VFib edge borders unlabeled (normal) rhythm,
+        # a resolvable QRS boundary alone doesn't mean the beat is organized --
+        # wide (>=120ms) chaotic VFib beats frequently still get a resolved
+        # boundary, which cut a real VFib tail ~10s short on a test recording
+        # (beats stayed 150-160ms wide with wildly irregular RR until the
+        # rhythm genuinely narrowed to ~100ms at a steady 1000ms RR). Not
+        # applied next to AFib/Flutter, whose own beats measure wide here too.
+        def _beat_is_organized(peak_sec, require_narrow=False):
             half = 0.4
             seg_start = max(0.0, peak_sec - half)
             seg_end = min(total_duration, peak_sec + half)
@@ -806,12 +1070,14 @@ def detect_arrhythmias(
             beat = measure_beat(lead_sig, local_idx, fs)
             if beat is None:
                 return None
+            if require_narrow and (beat.get('qrs_ms') or 0.0) >= 120.0:
+                return False
             return bool(beat.get('qrs_bounds_resolved'))
 
-        def _refine_vfib_edge(boundary_sec, edge):
+        def _refine_vfib_edge(boundary_sec, edge, require_narrow=False):
             lo, hi = boundary_sec - window_size, boundary_sec + window_size
             nearby = sorted(float(p) for p in all_r_peaks if lo <= p <= hi)
-            states = [(p, _beat_is_organized(p)) for p in nearby]
+            states = [(p, _beat_is_organized(p, require_narrow)) for p in nearby]
             for i in range(len(states) - 1):
                 ts0, o0 = states[i]
                 _, o1 = states[i + 1]
@@ -825,8 +1091,13 @@ def detect_arrhythmias(
             if region['label'] != 'Ventricular Fibrillation':
                 continue
             try:
-                new_start = _refine_vfib_edge(region['start_sec'], 'start')
-                new_end = _refine_vfib_edge(region['end_sec'], 'end')
+                atrial = ('Atrial Fibrillation', 'Atrial Flutter')
+                prev_atrial = idx > 0 and merged_morph[idx - 1]['label'] in atrial and \
+                    region['start_sec'] - merged_morph[idx - 1]['end_sec'] <= window_size
+                next_atrial = idx + 1 < len(merged_morph) and merged_morph[idx + 1]['label'] in atrial and \
+                    merged_morph[idx + 1]['start_sec'] - region['end_sec'] <= window_size
+                new_start = _refine_vfib_edge(region['start_sec'], 'start', require_narrow=not prev_atrial)
+                new_end = _refine_vfib_edge(region['end_sec'], 'end', require_narrow=not next_atrial)
                 if new_start < new_end - 0.5:
                     region['start_sec'], region['end_sec'] = new_start, new_end
                     region['start_time_str'], region['end_time_str'] = make_time_strs(new_start, new_end)
@@ -1012,6 +1283,7 @@ def _suppress_rate_overlap_in_structured_events(events):
 def apply_auto_segments_to_engine(
     engine,
     progress_callback: Optional[Callable[[int], None]] = None,
+    segments: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[int]:
     """
     Run detect_arrhythmias() against engine._reader and merge the result
@@ -1034,7 +1306,9 @@ def apply_auto_segments_to_engine(
     if reader is None:
         return None
 
-    auto_segments = detect_arrhythmias(reader, progress_callback=progress_callback)
+    # `segments` lets a caller pass a result it already has (e.g. from
+    # detect_arrhythmias_async) instead of running detection here.
+    auto_segments = segments if segments is not None else detect_arrhythmias(reader, progress_callback=progress_callback)
     auto_events = convert_to_structured_events(auto_segments)
 
     # This function is not always called just once per engine: the engine
@@ -1073,14 +1347,31 @@ def apply_auto_segments_to_engine(
     # stored 'analysis' Ventricular Fibrillation entry widened a genuine
     # 120-240s fresh detection into 120-250s by simple virtue of being
     # close enough in time to merge with, and did the same to a 455-460s
-    # region, widening it to 455-470s. Entries for any OTHER label (Sinus
-    # Bradycardia/Tachycardia, or anything this detector doesn't itself
-    # classify) are left alone -- only these four morphological categories
-    # are this detector's own territory to decide.
-    _owned_labels = ('ventricular fibrillation', 'atrial fibrillation', 'atrial flutter')
+    # region, widening it to 455-470s. Sinus Bradycardia/Tachycardia are
+    # owned too: this detector's own RR-interval rule decides them, and the
+    # stored real-time labels for them are not reliable -- confirmed on a
+    # real recording where the live pipeline logged "Sinus Bradycardia" for
+    # three 5s chunks at a steady 60 bpm (RR ~1000ms, brady_beats=0), which
+    # then rendered as a 15s Bradycardia segment over plain sinus rhythm.
+    # Entries for any label this detector doesn't itself classify are left
+    # alone.
+    #
+    # Matched as substrings, the same way Full Disclosure's segment overlay
+    # maps labels to regions: a stored "Ventricular Tachycardia" is drawn as
+    # Ventricular Fibrillation and "Bradycardia (non-sinus)" as Sinus
+    # Bradycardia there. A stored 600.0-605.0s "Ventricular Tachycardia"
+    # merged into a detected VFib starting at 600.23s, so the overlay showed
+    # VFib starting at 12:31:19 while the rhythm label (detector only)
+    # showed 12:31:20.
+    _owned_substrings = (
+        'fibrillation', 'vfib', 'afib', 'flutter',
+        'ventricular tachycardia', 'vtach',
+        'bradycardia', 'tachycardia',
+        'av block',
+    )
 
     def _is_owned_label(label_lower):
-        return label_lower in _owned_labels or 'av block' in label_lower
+        return any(s in label_lower for s in _owned_substrings)
 
     existing = [
         ev for ev in (getattr(engine, '_structured_events', []) or [])

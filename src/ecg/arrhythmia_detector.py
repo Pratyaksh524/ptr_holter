@@ -1201,6 +1201,7 @@ def analyze_ecg(
     patient_gender: str = "M",
     external_metrics: Optional[Dict[str, float]] = None,
     clinical_config: Optional[ClinicalConfig] = None,
+    hysteresis_key: Optional[str] = None,
 ) -> Dict[str, object]:
     clinical_config = clinical_config or _CLINICAL_CONFIG
     fs = float(fs or clinical_config.sampling_rate_hz or DEFAULT_FS)
@@ -1741,7 +1742,15 @@ def analyze_ecg(
             "Confidence": confidence,
         }
         available_leads = list(cleaned_leads.keys())
-        instance_key = str(id(detection_signal)) if detection_signal.size else "default"
+        # The id()-based default key is a memory address that Python reuses
+        # for unrelated arrays, so hysteresis state leaks between windows at
+        # random -- the same window could return a different diagnosis
+        # depending on call history. Callers can pass their own stable
+        # hysteresis_key, or "" to turn hysteresis off.
+        if hysteresis_key is not None:
+            instance_key = hysteresis_key
+        else:
+            instance_key = str(id(detection_signal)) if detection_signal.size else "default"
         dl_result = process_decision_layer(
             instance_id=instance_key,
             raw_signal=detection_signal,

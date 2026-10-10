@@ -55,6 +55,7 @@ class HolterAFPanel(QWidget):
         self._duration_sec = 0.0
         self._af_rows = []
         self._auto_segments_ready_for = None
+        self._auto_segments_pending_for = None
         self._build_ui()
 
     def _find_template_host(self):
@@ -180,12 +181,36 @@ class HolterAFPanel(QWidget):
         if engine is None:
             return segments
         if self._auto_segments_ready_for is not engine:
-            try:
-                from ..auto_segment_arrthymia_detection import apply_auto_segments_to_engine
-                apply_auto_segments_to_engine(engine)
-            except Exception as e:
-                print(f"[HolterAFPanel] Auto segment detection unavailable: {e}")
-            self._auto_segments_ready_for = engine
+            # First analysis of a long recording takes a while, so without a
+            # cached result it runs in the background and the table refreshes
+            # when it's done, instead of blocking the recording from opening.
+            if self._auto_segments_pending_for is not engine:
+                try:
+                    from ..auto_segment_arrthymia_detection import (
+                        apply_auto_segments_to_engine, detect_arrhythmias_async, get_cached_detection,
+                    )
+                    path = getattr(getattr(engine, "_reader", None), "path", None)
+                    cached = get_cached_detection(path) if path else None
+                    if cached is not None or not path:
+                        apply_auto_segments_to_engine(engine, segments=cached)
+                        self._auto_segments_ready_for = engine
+                    else:
+                        self._auto_segments_pending_for = engine
+
+                        def _on_ready(segs, eng=engine):
+                            if self._replay_engine is not eng:
+                                return
+                            apply_auto_segments_to_engine(eng, segments=segs)
+                            self._auto_segments_ready_for = eng
+                            self._auto_segments_pending_for = None
+                            self._refresh_af_events()
+
+                        detect_arrhythmias_async(path, _on_ready)
+                except Exception as e:
+                    print(f"[HolterAFPanel] Auto segment detection unavailable: {e}")
+                    self._auto_segments_ready_for = engine
+            if self._auto_segments_ready_for is not engine:
+                return segments  # still analysing; stored live labels aren't shown meanwhile
         for ev in (getattr(engine, "_structured_events", []) or []):
             if ev.get("end_timestamp") is None:
                 continue

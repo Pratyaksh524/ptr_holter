@@ -30,6 +30,18 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 
+def _detector_owns_label(label: str) -> bool:
+    """Labels decided only by the waveform auto-segment detector. For these,
+    the live recording pipeline's stored tally (summary['arrhythmia_counts'])
+    is not used -- it has logged e.g. Sinus Bradycardia at a steady 60 bpm,
+    which showed up here as episodes with no occurring time."""
+    lower = str(label or '').lower()
+    return lower in {
+        'ventricular fibrillation', 'atrial fibrillation', 'atrial flutter',
+        'sinus bradycardia', 'sinus tachycardia',
+    } or 'av block' in lower
+
+
 def _load_auto_segment_events(session_dir: str) -> List[Dict[str, object]]:
     """Run the same waveform auto-segment detector used by Full Disclosure."""
     ecgh_path = os.path.join(session_dir, 'recording.ecgh')
@@ -522,7 +534,7 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     arrhy_counts = summary.get('arrhythmia_counts', {})
     combined_arrhy_counts = {}
     for label, count in arrhy_counts.items():
-        if label not in auto_segment_counts:
+        if label not in auto_segment_counts and not _detector_owns_label(label):
             combined_arrhy_counts[label] = count
     for label, count in auto_segment_counts.items():
         combined_arrhy_counts[label] = count
@@ -532,6 +544,7 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     # Filter out noise/conduction terms
     excluded_summary_terms = (
         'long qt',
+        'prolonged qt',
         'wide qrs',
         'premature ventricular contraction',
         'pvc',
@@ -1108,7 +1121,7 @@ def _generate_text_report(session_dir, patient_info, summary, output_path) -> st
     arrhy_counts = summary.get('arrhythmia_counts', {})
     combined_arrhy_counts = {}
     for label, count in arrhy_counts.items():
-        if label not in auto_segment_counts:
+        if label not in auto_segment_counts and not _detector_owns_label(label):
             combined_arrhy_counts[label] = count
     for label, count in auto_segment_counts.items():
         combined_arrhy_counts[label] = count
@@ -1116,7 +1129,7 @@ def _generate_text_report(session_dir, patient_info, summary, output_path) -> st
         combined_arrhy_counts[label] = combined_arrhy_counts.get(label, 0) + count
 
     excluded_summary_terms = (
-        'long qt', 'wide qrs', 'premature ventricular contraction', 'pvc',
+        'long qt', 'prolonged qt', 'wide qrs', 'premature ventricular contraction', 'pvc',
         'second-degree', 'second degree', 'third-degree', 'third degree',
     )
     filtered_arrhy_counts = {

@@ -2790,97 +2790,100 @@ def main():
         app.setApplicationName("CardioX")
         app.setApplicationVersion(APP_VERSION)
 
-        # ── Single-instance detection using QLocalSocket/QLocalServer ──
-        # Prevents multiple CardioX instances and allows restoring minimized window
-        SERVER_NAME = "CardioX-SingleInstance"
+        # TODO: Re-enable single-instance detection before release. It is
+        # commented out only so multiple CardioX windows can be opened for
+        # testing. Uncomment the block below to restore it.
+        # # ── Single-instance detection using QLocalSocket/QLocalServer ──
+        # # Prevents multiple CardioX instances and allows restoring minimized window
+        # SERVER_NAME = "CardioX-SingleInstance"
         
-        # Try to connect to existing server (another instance is running)
-        socket = QLocalSocket()
-        socket.connectToServer(SERVER_NAME)
-        if socket.waitForConnected(1000):
-            # Another instance is running - send message to restore it
-            print("[MainApp] CardioX is already running. Sending restore request...")
-            socket.write(b"RESTORE")
-            socket.waitForBytesWritten(1000)
-            socket.disconnectFromServer()
-            sys.exit(0)
+        # # Try to connect to existing server (another instance is running)
+        # socket = QLocalSocket()
+        # socket.connectToServer(SERVER_NAME)
+        # if socket.waitForConnected(1000):
+        #     # Another instance is running - send message to restore it
+        #     print("[MainApp] CardioX is already running. Sending restore request...")
+        #     socket.write(b"RESTORE")
+        #     socket.waitForBytesWritten(1000)
+        #     socket.disconnectFromServer()
+        #     sys.exit(0)
         
-        # Remove any stale server/socket file left behind by a crash
-        QLocalServer.removeServer(SERVER_NAME)
+        # # Remove any stale server/socket file left behind by a crash
+        # QLocalServer.removeServer(SERVER_NAME)
 
-        # No existing instance - create server to listen for future instances
-        local_server = QLocalServer()
-        if not local_server.listen(SERVER_NAME):
-            print(f"[MainApp] Failed to start local server: {local_server.errorString()}")
-            QMessageBox.warning(
-                None,
-                "CardioX Error",
-                f"Failed to initialize single-instance server: {local_server.errorString()}\n\nPlease ensure no other CardioX instances are running."
-            )
-            sys.exit(1)
+        # # No existing instance - create server to listen for future instances
+        # local_server = QLocalServer()
+        # if not local_server.listen(SERVER_NAME):
+        #     print(f"[MainApp] Failed to start local server: {local_server.errorString()}")
+        #     QMessageBox.warning(
+        #         None,
+        #         "CardioX Error",
+        #         f"Failed to initialize single-instance server: {local_server.errorString()}\n\nPlease ensure no other CardioX instances are running."
+        #     )
+        #     sys.exit(1)
         
-        # Store reference to server for restoration
-        _local_server = local_server
+        # # Store reference to server for restoration
+        # _local_server = local_server
         
-        def handle_new_connection():
-            """Called when another instance tries to start - restore this window"""
-            connection = _local_server.nextPendingConnection()
-            connection.readyRead.connect(lambda: on_socket_ready_read(connection))
+        # def handle_new_connection():
+        #     """Called when another instance tries to start - restore this window"""
+        #     connection = _local_server.nextPendingConnection()
+        #     connection.readyRead.connect(lambda: on_socket_ready_read(connection))
         
-        def on_socket_ready_read(socket):
-            """Process incoming message from another instance"""
-            data = socket.readAll()
-            if b"RESTORE" in data:
-                from PyQt5.QtWidgets import QApplication
-                from PyQt5.QtCore import Qt, QTimer
+        # def on_socket_ready_read(socket):
+        #     """Process incoming message from another instance"""
+        #     data = socket.readAll()
+        #     if b"RESTORE" in data:
+        #         from PyQt5.QtWidgets import QApplication
+        #         from PyQt5.QtCore import Qt, QTimer
 
-                def _do_restore():
-                    main_win = None
-                    for widget in QApplication.topLevelWidgets():
-                        if not widget.isWindow() or widget.isHidden():
-                            continue
-                        if widget.objectName() in ["UpdateBanner", "LoadingOverlayDialog"]:
-                            continue
-                        main_win = widget
-                        if widget.__class__.__name__ in ["Dashboard", "DashboardWindow", "LoginRegisterDialog"]:
-                            break
+        #         def _do_restore():
+        #             main_win = None
+        #             for widget in QApplication.topLevelWidgets():
+        #                 if not widget.isWindow() or widget.isHidden():
+        #                     continue
+        #                 if widget.objectName() in ["UpdateBanner", "LoadingOverlayDialog"]:
+        #                     continue
+        #                 main_win = widget
+        #                 if widget.__class__.__name__ in ["Dashboard", "DashboardWindow", "LoginRegisterDialog"]:
+        #                     break
 
-                    if main_win:
-                        # 1. Un-minimize / restore window state
-                        if main_win.isMinimized():
-                            if (main_win.windowState() & Qt.WindowMaximized) or main_win.__class__.__name__ == "Dashboard":
-                                main_win.showMaximized()
-                            else:
-                                main_win.showNormal()
-                        else:
-                            if main_win.__class__.__name__ == "Dashboard":
-                                main_win.showMaximized()
-                            else:
-                                main_win.show()
+        #             if main_win:
+        #                 # 1. Un-minimize / restore window state
+        #                 if main_win.isMinimized():
+        #                     if (main_win.windowState() & Qt.WindowMaximized) or main_win.__class__.__name__ == "Dashboard":
+        #                         main_win.showMaximized()
+        #                     else:
+        #                         main_win.showNormal()
+        #                 else:
+        #                     if main_win.__class__.__name__ == "Dashboard":
+        #                         main_win.showMaximized()
+        #                     else:
+        #                         main_win.show()
 
-                        main_win.raise_()
-                        main_win.activateWindow()
+        #                 main_win.raise_()
+        #                 main_win.activateWindow()
 
-                        # 2. Windows foreground activation bypass
-                        if sys.platform == "win32":
-                            try:
-                                import ctypes
-                                hwnd = int(main_win.winId())
-                                if main_win.isMaximized():
-                                    ctypes.windll.user32.ShowWindow(hwnd, 3)  # SW_SHOWMAXIMIZED (3)
-                                else:
-                                    ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE (9)
-                                ctypes.windll.user32.SetForegroundWindow(hwnd)
-                            except Exception as e:
-                                print(f"[MainApp] Error bringing window to front via win32: {e}")
+        #                 # 2. Windows foreground activation bypass
+        #                 if sys.platform == "win32":
+        #                     try:
+        #                         import ctypes
+        #                         hwnd = int(main_win.winId())
+        #                         if main_win.isMaximized():
+        #                             ctypes.windll.user32.ShowWindow(hwnd, 3)  # SW_SHOWMAXIMIZED (3)
+        #                         else:
+        #                             ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE (9)
+        #                         ctypes.windll.user32.SetForegroundWindow(hwnd)
+        #                     except Exception as e:
+        #                         print(f"[MainApp] Error bringing window to front via win32: {e}")
 
-                QTimer.singleShot(0, _do_restore)
+        #         QTimer.singleShot(0, _do_restore)
 
-            socket.disconnectFromServer()
-            socket.deleteLater()
+        #     socket.disconnectFromServer()
+        #     socket.deleteLater()
         
-        local_server.newConnection.connect(handle_new_connection)
-        # ──────────────────────────────────────────────────────────────
+        # local_server.newConnection.connect(handle_new_connection)
+        # # ──────────────────────────────────────────────────────────────
 
         # Set application icon
         try:

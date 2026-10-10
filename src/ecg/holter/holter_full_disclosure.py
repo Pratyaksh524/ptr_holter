@@ -628,12 +628,26 @@ class HolterFullDisclosureDialog(QDialog):
         # (SegmentOverlay, label-to-color mapping in
         # _add_auto_arrhythmia_segments below). It must be invoked here
         # before the first canvas refresh.
+        #
+        # Detection takes a while on a long recording the first time it is
+        # analysed, so if there's no cached result it runs in the background
+        # and the regions are added when it finishes; the dialog opens
+        # straight away.
+        self._auto_segments_pending = False
         try:
-            from .auto_segment_arrthymia_detection import apply_auto_segments_to_engine
-            added = apply_auto_segments_to_engine(self._engine)
-            if added is not None:
-                self._event_index_dirty = True
-                print(f"[Full Disclosure] Added {added} automatic rhythm regions.")
+            from .auto_segment_arrthymia_detection import (
+                apply_auto_segments_to_engine, detect_arrhythmias_async, get_cached_detection,
+            )
+            reader_path = getattr(getattr(self._engine, '_reader', None), 'path', None)
+            cached = get_cached_detection(reader_path) if reader_path else None
+            if cached is not None or not reader_path:
+                added = apply_auto_segments_to_engine(self._engine, segments=cached)
+                if added is not None:
+                    self._event_index_dirty = True
+                    print(f"[Full Disclosure] Added {added} automatic rhythm regions.")
+            else:
+                self._auto_segments_pending = True
+                detect_arrhythmias_async(reader_path, self._on_auto_segments_ready)
         except Exception as e:
             print(f"[Full Disclosure] Automatic rhythm detection unavailable: {e}")
 
@@ -645,6 +659,20 @@ class HolterFullDisclosureDialog(QDialog):
             # Call _switch_selection_mode to properly initialize the UI for the restored mode
             # But we need to do this AFTER the button is created, so use a short delay
             QTimer.singleShot(50, lambda: self._switch_selection_mode(self._selection_mode))
+
+    def _on_auto_segments_ready(self, segments):
+        """Background auto-segment detection finished (see __init__)."""
+        self._auto_segments_pending = False
+        try:
+            from .auto_segment_arrthymia_detection import apply_auto_segments_to_engine
+            added = apply_auto_segments_to_engine(self._engine, segments=segments)
+            if added is not None:
+                print(f"[Full Disclosure] Added {added} automatic rhythm regions.")
+        except Exception as e:
+            print(f"[Full Disclosure] Automatic rhythm detection unavailable: {e}")
+        self._event_index_dirty = True
+        self._update_canvases(self._current_start)
+        self._refresh_segment_overlay()
 
     def showEvent(self, event):
         """Override showEvent to refresh segment overlay when dialog is shown."""
@@ -3213,8 +3241,6 @@ class HolterFullDisclosureDialog(QDialog):
         self._update_scrollbar_range()
         self.time_scrollbar.setValue(int(self._current_start * 100))
         self._update_canvases(self._current_start)
-        
-        self.lbl_dur.setText(f"Recording: {self._engine._sec_to_hms(self._engine.duration_sec)}")
 
     def _update_time_and_arrhythmia_labels(self, start_sec: float, end_sec: float):
         # Update real-time display
@@ -3253,12 +3279,17 @@ class HolterFullDisclosureDialog(QDialog):
                         'ventricular fibrillation', 'ventricular tachycardia',
                         'atrial fibrillation', 'atrial flutter',
                     }:
-                        active_auto.append((event_start, label))
+                        active_auto.append((event_start, event_end, label))
             if active_auto:
-                event_start, event_label = min(active_auto, key=lambda item: item[0])
+                event_start, event_end, event_label = min(active_auto, key=lambda item: item[0])
                 if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
+                    # Same as the Normal Sinus Rhythm label below: the time
+                    # follows the scroll position, but stays inside this
+                    # segment -- it starts at the segment's own start time and
+                    # stops advancing at its end time.
+                    shown_sec = min(max(start_sec, event_start), event_end)
                     event_time = datetime.fromtimestamp(
-                        self._engine._reader.start_time + event_start
+                        self._engine._reader.start_time + shown_sec
                     ).strftime('%H:%M:%S')
                     arrhythmia_label = f"Arrhythmia: {event_label} at {event_time}"
                 else:
@@ -3330,7 +3361,12 @@ class HolterFullDisclosureDialog(QDialog):
                 arrhythmia_label = f"Arrhythmia: Normal Sinus Rhythm at {current_time}"
             else:
                 arrhythmia_label = "Arrhythmia: Normal Sinus Rhythm"
-                
+
+        # Auto-segment detection is still running in the background: don't
+        # claim a rhythm (the fallbacks above would say Normal Sinus Rhythm).
+        if getattr(self, '_auto_segments_pending', False):
+            arrhythmia_label = "Arrhythmia: Analyzing recording..."
+
         self.lbl_arrhythmia.setText(arrhythmia_label)
 
     def _update_canvases(self, start_sec: float, update_extras: bool = True):
