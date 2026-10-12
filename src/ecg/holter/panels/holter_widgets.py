@@ -1425,18 +1425,14 @@ class ECGStripCanvas(QWidget):
             painter.end()
             return
         
-        # --- Paper speed: control how many samples are visible per screen width ---
-        # At 25mm/s: show all data. At 50mm/s: stretch (show half). At 12.5mm/s:
-        # show the complete, expanded time window.  The slow-speed window contains
-        # twice as much data, so applying speed_factor to x_scale would use only
-        # half the canvas and make the remaining data look cropped/blank.
-        speed_factor = max(0.25, min(float(self._speed) / 25.0, 4.0))
-        n_visible = max(2, int(round(len(d) / speed_factor)))
-        if n_visible < len(d):
-            d = d[-n_visible:]   # show the most recent n_visible samples (stretched)
-        # Keep the complete 12.5mm/s window fitted to the canvas.  Higher speeds
-        # retain the existing stretched rendering of their shorter window.
-        x_scale = w / max(1, len(d) - 1) if speed_factor <= 1.0 else w / max(1, len(d) - 1) * speed_factor
+        # --- Paper speed ---
+        # The caller already sizes the fetched window for the current paper
+        # speed (e.g. 20s at 12.5mm/s, 10s at 25mm/s, 5s at 50mm/s), so `d`
+        # already holds exactly the time span that should fill the canvas
+        # width. Re-cropping/stretching it here by speed again would double
+        # the scaling (e.g. 50mm/s would show only the last 2.5s of its 5s
+        # window, stretched to fill the width), so just fit it as-is.
+        x_scale = w / max(1, len(d) - 1)
         
         # Determine colored intervals based on annotations and structured events
         colored_intervals = []
@@ -2081,8 +2077,14 @@ class ECGStripCanvas(QWidget):
             # subset of perfectly fine beats there.
             vfib_regions = []
             for ev in getattr(self, '_structured_events', []) or []:
+                # Auto-detected VFib/VTach regions can arrive tagged with any
+                # of several source strings depending on which pipeline wrote
+                # them -- 'auto'/'arrhythmia' from the live auto-segment
+                # detector, 'analysis'/'classified' from the recording-time
+                # chunk classifier loaded via replay_engine's layered store.
+                # Only manual annotations should be excluded here.
                 source = str(ev.get('source', '')).lower()
-                if source not in ('auto', 'arrhythmia'):
+                if 'manual' in source:
                     continue
                 ev_lbl = str(ev.get('label', ev.get('type', '')) or '').lower()
                 if 'ventricular fibrillation' in ev_lbl or 'vfib' in ev_lbl or \
