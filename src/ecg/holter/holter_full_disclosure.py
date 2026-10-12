@@ -867,6 +867,17 @@ class HolterFullDisclosureDialog(QDialog):
         self.btn_undo.clicked.connect(self._undo_last_action)
         top_layout.addWidget(self.btn_undo)
 
+        # Pushes the Undo button away from the Frame Time group on the
+        # right, so it sits further left instead of flush against it.
+        top_layout.addStretch()
+
+        # Wave speed / gain readout — mirrors whatever btn_speed/btn_gain
+        # currently show, kept in sync by _update_speed_gain_label() from
+        # every place that changes paper speed or gain.
+        self.lbl_speed_gain = QLabel()
+        self.lbl_speed_gain.setStyleSheet("color: #FFA500; font-weight: bold; font-size: 13px;")
+        top_layout.addWidget(self.lbl_speed_gain)
+
         sep_undo = QFrame()
         sep_undo.setFrameShape(QFrame.VLine)
         sep_undo.setStyleSheet(f"color: {COL_GREEN_DRK};")
@@ -877,6 +888,7 @@ class HolterFullDisclosureDialog(QDialog):
         self.lbl_real_time.setStyleSheet(f"color: {COL_GREEN}; font-weight: bold; font-size: 13px;")
         top_layout.addWidget(self.lbl_real_time)
         layout.addWidget(top_bar)
+        self._update_speed_gain_label()
 
         canvas_frame = QFrame()
         canvas_frame.setStyleSheet(f"background: {COL_BLACK};")
@@ -1491,6 +1503,12 @@ class HolterFullDisclosureDialog(QDialog):
     #     self._strip_length = float(val)
     #     self.overlay.set_strip_length(self._strip_length)
 
+    def _update_speed_gain_label(self):
+        """Keep the top-bar wave speed/gain readout in sync with btn_speed/btn_gain."""
+        speed = self._paper_speed
+        speed_str = f"{int(speed)}" if float(speed).is_integer() else f"{speed}"
+        self.lbl_speed_gain.setText(f"{speed_str}mm/s {self._gain_label}")
+
     def _cycle_gain(self):
         multipliers = [g[0] for g in self._GAIN_STEPS]
         try:
@@ -1500,6 +1518,7 @@ class HolterFullDisclosureDialog(QDialog):
         next_step = self._GAIN_STEPS[(idx + 1) % len(self._GAIN_STEPS)]
         self._gain, self._gain_label = next_step
         self.btn_gain.setText(f"Gain: {self._gain_label}")
+        self._update_speed_gain_label()
         # Row height is screen-driven (_sync_row_height_to_viewport), not
         # gain-driven, so changing gain no longer resizes rows -- only the
         # waveform amplitude inside the existing row changes.
@@ -1532,6 +1551,7 @@ class HolterFullDisclosureDialog(QDialog):
             label_map = {0.5: "5mm/mV", 1.0: "10mm/mV", 2.0: "20mm/mV"}
             self._gain_label = label_map.get(scale, f"{int(gain_val)}mm/mV")
             self.btn_gain.setText(f"Gain: {self._gain_label}")
+            self._update_speed_gain_label()
             for c in self._canvases:
                 c.set_gain(self._gain)
                 c.update()
@@ -1551,6 +1571,7 @@ class HolterFullDisclosureDialog(QDialog):
             idx = 1
         self._paper_speed = self._SPEED_STEPS[(idx + 1) % len(self._SPEED_STEPS)]
         self.btn_speed.setText(f"Speed: {self._paper_speed}mm/s")
+        self._update_speed_gain_label()
         self._recalc_window()
         self._update_scrollbar_range()
         for c in self._canvases:
