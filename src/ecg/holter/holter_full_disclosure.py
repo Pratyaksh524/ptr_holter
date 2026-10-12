@@ -2932,6 +2932,18 @@ class HolterFullDisclosureDialog(QDialog):
         self._cached_event_ts = np.array(
             [float(e.get('timestamp', 0.0) or 0.0) for e in events], dtype=np.float64
         )
+        # Regions longer than _EVENT_REGION_PAD_SEC (e.g. a 20+ min Sinus
+        # Tachycardia run on a multi-hour Holter) start before the padded
+        # lower bound once you scroll past their first 10 minutes, so the
+        # bisect slice in _structured_events_for_canvas drops them and the
+        # colored overlay vanishes mid-segment. Keep them in a small side
+        # list so they can be matched by overlap instead.
+        self._cached_long_events = []
+        for e in events:
+            ev_start = float(e.get('timestamp', 0.0) or 0.0)
+            ev_end = float(e.get('end_timestamp', e.get('end_ts', ev_start)) or ev_start)
+            if ev_end - ev_start > self._EVENT_REGION_PAD_SEC:
+                self._cached_long_events.append((ev_start, ev_end, e))
         self._event_index_dirty = False
 
     def _events_in_window(self, start_sec, end_sec):
@@ -3028,9 +3040,17 @@ class HolterFullDisclosureDialog(QDialog):
         if len(self._cached_event_ts) == 0:
             return []
         import bisect
-        lo = bisect.bisect_left(self._cached_event_ts, start_sec - self._EVENT_REGION_PAD_SEC)
+        padded_start = start_sec - self._EVENT_REGION_PAD_SEC
+        lo = bisect.bisect_left(self._cached_event_ts, padded_start)
         hi = bisect.bisect_right(self._cached_event_ts, end_sec)
-        return self._cached_event_list[lo:hi]
+        window_events = self._cached_event_list[lo:hi]
+        # Long regions that began before the padded bound but still overlap
+        # the visible window (see _rebuild_event_index).
+        long_hits = [e for ev_start, ev_end, e in getattr(self, '_cached_long_events', [])
+                     if ev_start < padded_start and ev_end >= start_sec]
+        if long_hits:
+            return long_hits + window_events  # long_hits all start before window_events
+        return window_events
 
     def _add_auto_arrhythmia_segments(self, ref, visible_events, ref_end, span):
         """Add visual-only auto-arrhythmia regions; manual segments remain separate."""
