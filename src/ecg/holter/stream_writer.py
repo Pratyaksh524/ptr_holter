@@ -26,6 +26,7 @@ from typing import Optional, List, Dict
 
 from .file_format import ECGHFileWriter, LEAD_NAMES
 from .session_store import ensure_events_db, write_session_metadata
+from .sleep_guard import SleepGuard
 
 # Analysis chunk cadence for live Holter updates.
 CHUNK_SECONDS = 5
@@ -122,6 +123,10 @@ class HolterStreamWriter:
         # Flush timer for disk writes
         self._flush_thread: Optional[threading.Thread] = None
 
+        # Blocks OS idle-sleep for as long as the recording runs: a sleeping
+        # PC freezes the process, so frames stop while the wall clock runs on.
+        self._sleep_guard = SleepGuard()
+
     #    Start / Stop                                                           
 
     def start(self) -> str:
@@ -167,6 +172,7 @@ class HolterStreamWriter:
 
         self._start_time = time.time()
         self._running = True
+        self._sleep_guard.acquire()
         self._total_frames = 0
         self._chunk_ptr = 0
         self._display_ptr = 0
@@ -213,6 +219,7 @@ class HolterStreamWriter:
             return {}
 
         self._running = False
+        self._sleep_guard.release()
 
         # Flush partial chunk to analysis queue
         if self._chunk_ptr > 0:
