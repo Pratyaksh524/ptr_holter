@@ -292,15 +292,22 @@ def _detect_arrhythmias_uncached(
     # recording pipeline (SignalQuality.compute_sqi / signal_quality_threshold
     # in config/clinical_config.yaml) so "noisy" means the same thing
     # everywhere in the app, not a second, separately-tuned definition.
+    # The same config also drives _atrial_preproc: 0.5-40 Hz bandpass + mains
+    # notch, applied inside _classify_atrial_window only. Its TP-segment and
+    # P-wave checks were reading the raw .ecgh samples, where 50 Hz mains
+    # ripple alone exceeded the "quiet baseline" threshold on every beat of
+    # a clean, regular NSR recording and got called Atrial Fibrillation.
     try:
-        from .analysis_pipeline import SignalQuality, HolterConfig
+        from .analysis_pipeline import SignalQuality, SignalPreprocessor, HolterConfig
         _sqi_config = HolterConfig.from_clinical_config()
         _signal_quality = SignalQuality(fs=getattr(reader, 'fs', 500) or 500, config=_sqi_config)
         _sqi_min = _sqi_config.sqi_min
+        _atrial_preproc = SignalPreprocessor(fs=getattr(reader, 'fs', 500) or 500, config=_sqi_config)
     except Exception as e:
         print(f"[Auto Arrhythmia Detect] Signal-quality gate unavailable, proceeding without it: {e}")
         _signal_quality = None
         _sqi_min = 0.6
+        _atrial_preproc = None
 
     # One-time numerical warm-up. analyze_ecg()'s spectral checks (atrial
     # flutter score, VF spectral score) go through scipy/numpy FFT code
@@ -709,6 +716,11 @@ def _detect_arrhythmias_uncached(
         # more beats first is a direct, simple guard against exactly that.
         if len(r_peaks) < 6:
             return None
+        if _atrial_preproc is not None:
+            try:
+                window_signal = _atrial_preproc.process(window_signal)
+            except Exception:
+                pass
         beats = [measure_beat(window_signal, int(p), fs) for p in r_peaks]
         if any(b is None for b in beats):
             return None
@@ -794,7 +806,24 @@ def _detect_arrhythmias_uncached(
             ratio = atrial_rate / ventricular_rate
             if any(abs(ratio - whole) < 0.5 for whole in (2.0, 3.0, 4.0, 5.0)):
                 return 'Atrial Flutter'
-            return 'Atrial Fibrillation'
+            # An active baseline alone is no longer enough for AFib -- it
+            # must also pass the P-wave and RR checks below.
+
+        # Atrial Fibrillation means NO organized P wave: the atria fibrillate
+        # instead of depolarizing as one, so no beat has a P wave at a fixed
+        # distance before its QRS. "Organized" = most beats have a P wave AND
+        # their PR intervals agree (sinus conduction). A P-finder that latches
+        # onto a random f-wave bump in real AFib gives scattered PRs, so that
+        # still counts as no organized P. Only AFib is vetoed here -- Flutter
+        # was decided above, and AV blocks (P present, PR varying) fall
+        # through to analyze_ecg() since this returns None for them.
+        pr_values = [float(b['pr_ms']) for b in beats if b.get('p_present') and b.get('pr_ms') is not None]
+        organized_p = (
+            len(pr_values) >= max(3, int(0.6 * len(beats)))
+            and float(np.std(pr_values)) <= 25.0
+        )
+        if organized_p:
+            return None
 
         # Most beats read as having a "quiet" TP segment -- but that quiet
         # reading can itself be fooled: on a genuinely fibrillatory
@@ -1166,10 +1195,17 @@ def _detect_arrhythmias_uncached(
             states = [(p, _beat_is_organized(p, require_narrow)) for p in nearby]
             for i in range(len(states) - 1):
                 ts0, o0 = states[i]
-                _, o1 = states[i + 1]
+                ts1, o1 = states[i + 1]
                 if edge == 'start' and o0 is False and o1 is False:
                     return ts0
-                if edge == 'end' and o0 is True and o1 is True:
+                # Two organized beats only mark the end of VFib if they are
+                # truly back-to-back. Pan-Tompkins often finds no peaks at
+                # all in the chaotic tail of VFib, so a lone, by-chance
+                # "organized" VFib beat and the first real beat after it
+                # can sit seconds apart with chaos in between (seen: 239.4 s
+                # and 243.0 s, 3.6 s apart, which drew AFib starting ~3 s
+                # early over still-chaotic waves).
+                if edge == 'end' and o0 is True and o1 is True and (ts1 - ts0) <= 2.0:
                     return ts0
             return boundary_sec
 
