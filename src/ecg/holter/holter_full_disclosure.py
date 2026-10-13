@@ -646,6 +646,14 @@ class HolterFullDisclosureDialog(QDialog):
         # 'classified') sources are affected.
         self._auto_marking_visible = False
 
+        # If the user already clicked "Auto Arrhythmia Detection" earlier in
+        # this session (persisted flag, see _persist_auto_marking_enabled),
+        # reopening Full Disclosure should show that marking again right
+        # away instead of making them click the button every time -- and
+        # Undo should be ready to hide it again, same as right after the
+        # button click itself.
+        self._restore_auto_marking_if_enabled()
+
         self._update_canvases(0.0)
         
         # CRITICAL FIX: Apply the restored selection mode to update button text and UI state
@@ -733,6 +741,45 @@ class HolterFullDisclosureDialog(QDialog):
                 clear_auto_marking_enabled(os.path.dirname(ecgh_path))
         except Exception as e:
             print(f"[Full Disclosure] Could not clear auto-marking flag: {e}")
+
+    def _restore_auto_marking_if_enabled(self):
+        """Called once from __init__. If the persisted flag says the user
+        already ran "Auto Arrhythmia Detection" for this session (possibly
+        in an earlier open of this same dialog, or even a prior app run --
+        see is_auto_marking_enabled), re-apply the cached detection and
+        flip the marking visible immediately, and push an undo snapshot so
+        the Undo button is ready to hide it again -- mirrors exactly what
+        clicking the button itself does, just without re-running detection.
+        A no-op (and cheap) when the flag isn't set."""
+        try:
+            ecgh_path = getattr(self._engine, 'ecgh_path', None)
+            if not ecgh_path:
+                return
+            from .auto_segment_arrthymia_detection import (
+                apply_auto_segments_to_engine, get_cached_detection, is_auto_marking_enabled,
+            )
+            session_dir = os.path.dirname(ecgh_path)
+            if not is_auto_marking_enabled(session_dir):
+                return
+            self._snapshot_state("Auto Arrhythmia Detection")
+            reader_path = getattr(getattr(self._engine, '_reader', None), 'path', None)
+            cached = get_cached_detection(reader_path) if reader_path else None
+            if cached is not None:
+                # Only re-apply from the on-disk cache (cheap). If it's
+                # missing (e.g. invalidated by a code change), don't fall
+                # back to a fresh detect_arrhythmias() run here -- that's a
+                # slow, synchronous scan and this runs on dialog open/__init__,
+                # which must not block the UI. Whatever's already merged into
+                # self._engine._structured_events from earlier in this same
+                # app run (if any) is still shown; otherwise the user can
+                # just click the button again to redo detection.
+                added = apply_auto_segments_to_engine(self._engine, segments=cached)
+                if added is not None:
+                    print(f"[Full Disclosure] Restored {added} automatic rhythm regions from a prior session.")
+            self._auto_marking_visible = True
+            self._event_index_dirty = True
+        except Exception as e:
+            print(f"[Full Disclosure] Could not restore auto-marking state: {e}")
 
     def showEvent(self, event):
         """Override showEvent to refresh segment overlay when dialog is shown."""
@@ -1119,6 +1166,14 @@ class HolterFullDisclosureDialog(QDialog):
 
         self.time_scrollbar = QScrollBar(Qt.Horizontal)
         self.time_scrollbar.setFixedHeight(12)
+        # QScrollBar::left-arrow/right-arrow don't honor the usual CSS
+        # border-triangle trick (confirmed: it renders as a plain filled
+        # square, not a triangle, unlike QComboBox::down-arrow elsewhere in
+        # this app) -- use real arrow image assets instead, same as
+        # analysis_window.py's combo-box dropdown arrow.
+        _assets_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'assets'))
+        _arrow_left = os.path.join(_assets_dir, 'scrollbar_arrow_left.png').replace('\\', '/')
+        _arrow_right = os.path.join(_assets_dir, 'scrollbar_arrow_right.png').replace('\\', '/')
         self.time_scrollbar.setStyleSheet(f"""
             QScrollBar:horizontal {{
                 background: #0d1b2a; height: 12px; border-radius: 5px; margin: 0 16px;
@@ -1137,8 +1192,11 @@ class HolterFullDisclosureDialog(QDialog):
             QScrollBar::add-line:horizontal:hover, QScrollBar::sub-line:horizontal:hover {{
                 background: #FFFFFF;
             }}
-            QScrollBar::right-arrow:horizontal, QScrollBar::left-arrow:horizontal {{
-                width: 8px; height: 8px;
+            QScrollBar::left-arrow:horizontal {{
+                image: url({_arrow_left}); width: 8px; height: 8px;
+            }}
+            QScrollBar::right-arrow:horizontal {{
+                image: url({_arrow_right}); width: 8px; height: 8px;
             }}
         """)
         self._update_scrollbar_range()

@@ -1441,22 +1441,22 @@ class HolterMainWindow(QDialog):
         )
         tb_layout.addWidget(self._dur_label)
         tb_layout.addStretch()
-        gen_report_btn = QPushButton("Generate Report")
-        gen_report_btn.setStyleSheet(
+        self.gen_report_btn = QPushButton("Generate Report")
+        self.gen_report_btn.setStyleSheet(
             f"QPushButton{{background:{UI_ACCENT};color:{UI_TEXT};border:1px solid #61a8ff;border-radius:8px;padding:8px 14px;font-size:12px;font-weight:700;}}"
             f"QPushButton:hover{{background:{UI_ACCENT_HOVER};}}"
         )
-        gen_report_btn.setFixedHeight(34)
-        gen_report_btn.clicked.connect(self._generate_report)
-        tb_layout.addWidget(gen_report_btn)
-        close_btn = QPushButton("Close")
-        close_btn.setStyleSheet(
+        self.gen_report_btn.setFixedHeight(34)
+        self.gen_report_btn.clicked.connect(self._generate_report)
+        tb_layout.addWidget(self.gen_report_btn)
+        self.close_btn = QPushButton("Close")
+        self.close_btn.setStyleSheet(
             f"QPushButton{{background:{UI_PANEL_ALT};color:{UI_TEXT};border:1px solid {UI_BORDER};border-radius:8px;padding:8px 14px;font-size:12px;font-weight:600;}}"
             "QPushButton:hover{background:#2A3D61;}"
         )
-        close_btn.setFixedHeight(34)
-        close_btn.clicked.connect(self.close)
-        tb_layout.addWidget(close_btn)
+        self.close_btn.setFixedHeight(34)
+        self.close_btn.clicked.connect(self.close)
+        tb_layout.addWidget(self.close_btn)
         main_layout.addWidget(title_bar)
 
         session_bar = QFrame()
@@ -1929,7 +1929,13 @@ class HolterMainWindow(QDialog):
         self._record_mgmt_panel.session_selected.connect(self.load_completed_session)
         if self.session_dir:
             self._record_mgmt_panel.set_active_session(self.session_dir)
-        self._tabs.addTab(self._record_mgmt_panel, _make_icon("RECORDINGS"), "RECORDINGS")
+        _recordings_tab_idx = self._tabs.addTab(self._record_mgmt_panel, _make_icon("RECORDINGS"), "RECORDINGS")
+        # No visible "RECORDINGS" button in the tab bar -- the tab itself
+        # still exists and stays reachable programmatically (View Previous
+        # Recording lands on it via _show_holter_ui(show_record_mgmt=True)
+        # in twelve_lead_test.py, which scans tabText()/setCurrentIndex()),
+        # it's just not offered as something the user clicks into from here.
+        self._tabs.tabBar().setTabVisible(_recordings_tab_idx, False)
 
         # Report Preview
         scroll_insight = QScrollArea()
@@ -1960,10 +1966,19 @@ class HolterMainWindow(QDialog):
                     QTimer.singleShot(0, self.close)
             else:
                 self._last_active_tab_name = tab_name
-                if tab_name == "RECORDINGS":
-                    self._tabs.tabBar().setVisible(False)
-                else:
-                    self._tabs.tabBar().setVisible(True)
+                is_recordings = (tab_name == "RECORDINGS")
+                self._tabs.tabBar().setVisible(not is_recordings)
+                # The record browser (reached via "View Previous Recording",
+                # not by clicking a tab -- that button is hidden, see
+                # setTabVisible above) isn't itself a recording under
+                # review, so it gets neither the "Focused view: ..." label
+                # nor the Generate Report/Close actions that apply to one.
+                if hasattr(self, "_analysis_state"):
+                    self._analysis_state.setVisible(not is_recordings)
+                if hasattr(self, "gen_report_btn"):
+                    self.gen_report_btn.setVisible(not is_recordings)
+                if hasattr(self, "close_btn"):
+                    self.close_btn.setVisible(not is_recordings)
         self._tabs.currentChanged.connect(_on_tab_changed)
         # Ensure initial state is correct
         _on_tab_changed(self._tabs.currentIndex())

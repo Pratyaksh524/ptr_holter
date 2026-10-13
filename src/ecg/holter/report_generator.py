@@ -461,34 +461,262 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     story.append(Paragraph("1. RECORDING SUMMARY", h1_style))
     story.append(HRFlowable(width="100%", thickness=1, color=ORANGE, spaceAfter=2*mm))
 
-    total_beats = summary.get('total_beats', 0)
-    avg_hr      = summary.get('avg_hr', 0)
-    max_hr      = summary.get('max_hr', 0)
-    min_hr      = summary.get('min_hr', 0)
-    pauses      = summary.get('pauses', 0)
-    longest_rr  = summary.get('longest_rr_ms', 0)
+    # ------------------------------------------------------------------
+    # Six-panel clinical summary grid (Brief Summary / Heart Rate / AFib-
+    # Flutter / VE & Rhythm / SVE & Rhythm / HRV). Purely additive: sits
+    # above the existing Parameter/Value table below and doesn't change it.
+    # Loads its own beats/RR intervals locally so it doesn't depend on
+    # anything computed later in this function.
+    # ------------------------------------------------------------------
+    try:
+        from .hrv_metrics import compute_hrv_summary
+        from .holter_summary_calc import label_beat_sequences
 
-    stats_data = [
-        ['Parameter', 'Value', 'Parameter', 'Value'],
-        ['Total Beats', f"{total_beats:,}",      'Avg Heart Rate',    f"{avg_hr:.0f} bpm"],
-        ['Max Heart Rate', f"{max_hr:.0f} bpm",  'Min Heart Rate',    f"{min_hr:.0f} bpm"],
-        ['Longest RR', f"{longest_rr:.0f} ms",   'Pauses (RR>2s)',    str(pauses)],
-        ['Avg Quality', f"{summary.get('avg_quality',1)*100:.0f}%",
-         'Chunks Analyzed', str(summary.get('chunks_analyzed', 0))],
-    ]
-    stats_table = Table(stats_data, colWidths=[45*mm, 35*mm, 45*mm, 35*mm])
-    stats_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), ORANGE),
-        ('TEXTCOLOR',  (0, 0), (-1, 0), colors.white),
-        ('FONTNAME',   (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTNAME',   (0, 1), (0, -1), 'Helvetica-Bold'),
-        ('FONTNAME',   (2, 1), (2, -1), 'Helvetica-Bold'),
-        ('FONTSIZE',   (0, 0), (-1, -1), 9),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, LIGHT]),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.lightgrey),
-        ('PADDING', (0, 0), (-1, -1), 5),
-    ]))
-    story.append(stats_table)
+        _grid_metrics = load_metrics(session_dir) or []
+        _grid_beats = []
+        _grid_rr_ms = []
+        for _m in _grid_metrics:
+            for _b in (_m.get('all_beats') or []):
+                if isinstance(_b, dict):
+                    _grid_beats.append(dict(_b))
+            for _rr in (_m.get('rr_intervals_list') or []):
+                try:
+                    _rr_f = float(_rr)
+                    if _rr_f > 200:
+                        _grid_rr_ms.append(_rr_f)
+                except (TypeError, ValueError):
+                    pass
+        _grid_beats.sort(key=lambda b: float(b.get('timestamp', 0.0) or 0.0))
+        label_beat_sequences(_grid_beats)
+
+        _ve_patterns = {'single': 0, 'couplet': 0, 'bigeminy': 0, 'trigeminy': 0, 'run': 0}
+        _sve_patterns = {'single': 0, 'couplet': 0, 'bigeminy': 0, 'trigeminy': 0, 'run': 0}
+        _ve_total = _sve_total = 0
+        _ve_run_lengths = []
+        _sve_run_lengths = []
+        for _b in _grid_beats:
+            code = _b.get('short_code', '')
+            if code not in ('V', 'S'):
+                continue
+            bucket = _ve_patterns if code == 'V' else _sve_patterns
+            if code == 'V':
+                _ve_total += 1
+            else:
+                _sve_total += 1
+            pl = str(_b.get('rhythm_pattern', '') or '').lower()
+            if 'run' in pl:
+                bucket['run'] += 1
+                (_ve_run_lengths if code == 'V' else _sve_run_lengths).append(int(_b.get('run_length', 0) or 0))
+            elif 'quadrigeminy' in pl or 'trigeminy' in pl:
+                bucket['trigeminy'] += 1
+            elif 'bigeminy' in pl:
+                bucket['bigeminy'] += 1
+            elif 'couplet' in pl:
+                bucket['couplet'] += 1
+            else:
+                bucket['single'] += 1
+
+        _longest_ve_run = max(_ve_run_lengths) if _ve_run_lengths else 0
+        _longest_sve_run = max(_sve_run_lengths) if _sve_run_lengths else 0
+
+        # Paced beats: short_code 'P' (see calculate_summary_metrics(), the
+        # same definition used elsewhere in this module). Instant rate per
+        # paced beat comes from the RR gap to the immediately preceding
+        # beat in the chronologically-sorted list.
+        _paced_total = 0
+        _paced_rates_bpm = []
+        _prev_beat_ts = None
+        for _b in _grid_beats:
+            _ts = float(_b.get('timestamp', 0.0) or 0.0)
+            if _b.get('short_code') == 'P':
+                _paced_total += 1
+                if _prev_beat_ts is not None and _ts > _prev_beat_ts:
+                    _paced_rates_bpm.append(60.0 / (_ts - _prev_beat_ts))
+            _prev_beat_ts = _ts
+
+        def _grid_pct(part, total):
+            return f"{(100.0 * part / total):.1f}%" if total else "0.0%"
+
+        _hrv = compute_hrv_summary(_grid_rr_ms) if _grid_rr_ms else {}
+
+        # AFib/Flutter burden from the auto-segment detector -- same source
+        # as the Arrhythmia Summary table further below, so this only shows
+        # real numbers once "Auto Arrhythmia Detection" has been run for
+        # this session (see _load_auto_segment_events); otherwise "-".
+        def _is_afib_or_aflutter(label: str) -> bool:
+            lbl = str(label or '').lower()
+            # 'fibrillation' alone also matches "Ventricular Fibrillation" --
+            # this panel is atrial-only, so exclude anything ventricular.
+            return ('fibrillation' in lbl or 'flutter' in lbl) and 'ventricular' not in lbl
+
+        _auto_segment_events_all = _load_auto_segment_events(session_dir)
+        _afib_events = [e for e in _auto_segment_events_all if _is_afib_or_aflutter(e.get('label', ''))]
+        _afib_total_sec = sum(
+            max(0.0, float(e.get('end_sec', 0.0) or 0.0) - float(e.get('start_sec', 0.0) or 0.0))
+            for e in _afib_events
+        )
+        _afib_longest_sec = max(
+            (float(e.get('end_sec', 0.0) or 0.0) - float(e.get('start_sec', 0.0) or 0.0) for e in _afib_events),
+            default=0.0,
+        )
+        _rec_dur_sec = float(summary.get('duration_sec', 0.0) or 0.0)
+        _afib_burden_pct = (_afib_total_sec / _rec_dur_sec * 100.0) if _rec_dur_sec > 0 else 0.0
+
+        # AV block episode counts, same auto-segment source as AFib/Flutter
+        # above. The detector only ever distinguishes Mobitz I for 2nd-
+        # degree block (see auto_segment_arrthymia_detection.py / the AV
+        # Block path falling through to analyze_ecg()) -- there is no
+        # Mobitz II detection anywhere in this app, so that row is always
+        # "-" rather than a fabricated count.
+        _av_block_2_1_count = sum(
+            1 for e in _auto_segment_events_all
+            if 'second' in str(e.get('label', '')).lower() and 'av block' in str(e.get('label', '')).lower()
+        )
+        _av_block_3_count = sum(
+            1 for e in _auto_segment_events_all
+            if ('third' in str(e.get('label', '')).lower() or '3rd' in str(e.get('label', '')).lower())
+            and 'av block' in str(e.get('label', '')).lower()
+        )
+
+        def _grid_hms(sec):
+            sec = max(0, int(sec))
+            h, rem = divmod(sec, 3600)
+            m, s = divmod(rem, 60)
+            return f"{h:02d}:{m:02d}:{s:02d}"
+
+        def _grid_wallclock(sec):
+            """MM-DD HH:MM:SS using the recording's real start time, same
+            source _format_system_time reads; falls back to elapsed
+            HH:MM:SS if the index file isn't available."""
+            try:
+                idx_path = os.path.join(session_dir, 'recording_index.json')
+                if os.path.exists(idx_path):
+                    with open(idx_path, 'r') as f:
+                        start_time = json.load(f).get('start_time')
+                    if start_time:
+                        return datetime.fromtimestamp(float(start_time) + sec).strftime('%m-%d %H:%M:%S')
+            except Exception:
+                pass
+            return _grid_hms(sec)
+
+        # Longest RR Interval, with the real date/time it occurred at --
+        # found from whichever chunk's own "longest_rr" matches the overall
+        # summary value, same way max_hr_chunk/min_hr_chunk are found above.
+        _longest_rr_chunk = max(_grid_metrics, key=lambda m: float(m.get('longest_rr', 0) or 0), default={})
+        _longest_rr_ms = float(_longest_rr_chunk.get('longest_rr', 0) or 0) or float(summary.get('longest_rr_ms', 0) or 0)
+        _longest_rr_t = float(_longest_rr_chunk.get('t', 0.0) or 0.0)
+        _longest_rr_str = f"{_longest_rr_ms/1000:.2f}s At {_grid_wallclock(_longest_rr_t)}"
+
+        # Brief Summary as prose, not a table cell -- the same numbers the
+        # grid panel below used to show for this, pulled into one sentence.
+        story.append(Paragraph("Brief Summary", h2_style))
+        _afib_sentence = (
+            f"The atrial fibrillation/flutter burden was <b>{_afib_burden_pct:.2f}%</b> of the recording."
+            if _afib_events else
+            "Atrial fibrillation/flutter burden was not assessed for this recording."
+        )
+        _brief_summary_text = (
+            f"This recording captured a total of <b>{summary.get('total_beats', 0):,}</b> beats, "
+            f"including <b>{_ve_total}</b> ventricular ectopic (VE) beat{'s' if _ve_total != 1 else ''} and "
+            f"<b>{_sve_total}</b> supraventricular ectopic (SVE) beat{'s' if _sve_total != 1 else ''}. "
+            f"{_afib_sentence}"
+        )
+        story.append(Paragraph(_brief_summary_text, body_style))
+        story.append(Spacer(1, 3*mm))
+
+        # Made larger per request -- bigger title/body text, more padding,
+        # and 2 wide columns instead of 3 narrower ones (Brief Summary above
+        # is no longer a panel here, so there are 5 panels left; Heart Rate
+        # Variability, the longest one, spans the full width on its own row).
+        grid_title_style = ParagraphStyle('GridTitle', parent=styles['Normal'], fontSize=12,
+                                           textColor=ORANGE, alignment=TA_CENTER, fontName='Helvetica-Bold',
+                                           spaceAfter=3)
+        grid_body_style = ParagraphStyle('GridBody', parent=styles['Normal'], fontSize=10,
+                                          leading=14, textColor=DARK)
+
+        def _grid_panel(title, rows):
+            lines = "<br/>".join(f"<b>{k}:</b> {v}" for k, v in rows)
+            return [Paragraph(title, grid_title_style), Paragraph(lines, grid_body_style)]
+
+        hr_panel = _grid_panel("Heart Rate (bpm)", [
+            ("Avg", f"{summary.get('avg_hr', 0):.0f}"),
+            ("Max", f"{summary.get('max_hr', 0):.0f} @ {summary.get('max_hr_time', '-')}"),
+            ("Min", f"{summary.get('min_hr', 0):.0f} @ {summary.get('min_hr_time', '-')}"),
+            ("Longest RR Interval", _longest_rr_str),
+            ("Pause (&gt;2.0s)", str(summary.get('pauses', 0))),
+        ])
+        afib_panel = _grid_panel("Atrial Fibrillation/Flutter", [
+            ("Total Event", str(len(_afib_events))),
+            ("Burden (Hour)", f"{_afib_total_sec/3600:.2f}" if _afib_events else "-"),
+            ("Burden (%)", f"{_afib_burden_pct:.2f}%" if _afib_events else "-"),
+            ("Longest", _grid_hms(_afib_longest_sec) if _afib_events else "-"),
+        ])
+        ve_panel = _grid_panel("VE and Rhythm", [
+            ("Single", f"{_ve_patterns['single']} ({_grid_pct(_ve_patterns['single'], _ve_total)})"),
+            ("Couplet", str(_ve_patterns['couplet'])),
+            ("Bigeminy", str(_ve_patterns['bigeminy'])),
+            ("Trigeminy", str(_ve_patterns['trigeminy'])),
+            ("VT run", str(_ve_patterns['run'])),
+            ("Longest VT run", str(_longest_ve_run)),
+            ("Total VE", str(_ve_total)),
+        ])
+        sve_panel = _grid_panel("SVE and Rhythm", [
+            ("Single", f"{_sve_patterns['single']} ({_grid_pct(_sve_patterns['single'], _sve_total)})"),
+            ("Couplet", str(_sve_patterns['couplet'])),
+            ("Bigeminy", str(_sve_patterns['bigeminy'])),
+            ("Trigeminy", str(_sve_patterns['trigeminy'])),
+            ("SVT run", str(_sve_patterns['run'])),
+            ("Longest SVT run", str(_longest_sve_run)),
+            ("Total SVE", str(_sve_total)),
+        ])
+        hrv_panel = _grid_panel("Heart Rate Variability", [
+            ("SDNN (ms)", f"{_hrv.get('sdnn', 0):.1f}" if _hrv else "-"),
+            ("rMSSD (ms)", f"{_hrv.get('rmssd', 0):.1f}" if _hrv else "-"),
+            ("pNN50 (%)", f"{_hrv.get('pnn50', 0):.2f}" if _hrv else "-"),
+            ("Triangular Index", f"{_hrv.get('triangular_index', 0):.2f}" if _hrv else "-"),
+            ("VLF", f"{_hrv.get('vlf', 0):.1f}" if _hrv else "-"),
+            ("LF", f"{_hrv.get('lf', 0):.1f}" if _hrv else "-"),
+            ("HF", f"{_hrv.get('hf', 0):.1f}" if _hrv else "-"),
+            ("LF/HF", f"{_hrv.get('lf_hf_ratio', 0):.2f}" if _hrv else "-"),
+        ])
+        paced_panel = _grid_panel("Paced", [
+            ("Total", str(_paced_total)),
+            ("Max paced rate", f"{max(_paced_rates_bpm):.0f} bpm" if _paced_rates_bpm else "-"),
+            ("Min paced rate", f"{min(_paced_rates_bpm):.0f} bpm" if _paced_rates_bpm else "-"),
+            ("Ave paced rate", f"{sum(_paced_rates_bpm)/len(_paced_rates_bpm):.0f} bpm" if _paced_rates_bpm else "-"),
+        ])
+        others_panel = _grid_panel("Others", [
+            ("2nd deg. AV block type I", str(_av_block_2_1_count) if _auto_segment_events_all else "-"),
+            ("2nd deg. AV block type II", "-"),
+            ("3rd deg. AV block", str(_av_block_3_count) if _auto_segment_events_all else "-"),
+        ])
+
+        grid_table = Table(
+            [[hr_panel, afib_panel],
+             [ve_panel, sve_panel],
+             [hrv_panel, ''],
+             [paced_panel, others_panel]],
+            colWidths=[87*mm, 87*mm],
+        )
+        grid_table.setStyle(TableStyle([
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.lightgrey),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('PADDING', (0, 0), (-1, -1), 8),
+            ('BACKGROUND', (0, 0), (-1, -1), LIGHT),
+            ('SPAN', (0, 2), (1, 2)),
+        ]))
+        story.append(grid_table)
+        story.append(Spacer(1, 4*mm))
+    except Exception as _grid_err:
+        print(f"[HolterReport] Could not build the summary grid panel: {_grid_err}")
+
+    # Parameter/Value table removed per request -- its numbers are now
+    # covered by the summary grid above (Brief Summary text + the 5-panel
+    # grid). avg_hr/min_hr/max_hr are kept as plain variables since they
+    # still feed the Clinical Impression paragraph below.
+    avg_hr = summary.get('avg_hr', 0)
+    max_hr = summary.get('max_hr', 0)
+    min_hr = summary.get('min_hr', 0)
 
     # -------------------------------------------------------------------------
     # Compute Arrhythmias (combining auto detection with exact manual markings)

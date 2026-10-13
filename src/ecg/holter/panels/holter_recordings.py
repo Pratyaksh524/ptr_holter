@@ -230,11 +230,15 @@ class HolterRecordManagementPanel(QWidget):
             if query and not any(query in str(v).lower() for v in row_values): continue
             rows.append((row_values, session_dir))
 
+        active_row = None
         for row_values, session_dir in rows:
             r = self._table.rowCount()
             self._table.insertRow(r)
-            
-            is_active = os.path.normpath(session_dir) == os.path.normpath(self._active_session)
+
+            is_active = bool(self._active_session) and \
+                os.path.normpath(session_dir) == os.path.normpath(self._active_session)
+            if is_active:
+                active_row = r
             for c, v in enumerate(row_values):
                 item = QTableWidgetItem(str(v))
                 item.setForeground(QColor(COL_GREEN if c == 0 else COL_WHITE))
@@ -243,7 +247,11 @@ class HolterRecordManagementPanel(QWidget):
                     item.setBackground(QColor(46, 84, 137, 150))  # Semi-transparent blue highlight
                 self._table.setItem(r, c, item)
         if self._table.rowCount() > 0:
-            self._table.selectRow(0)
+            # Select the recording that is currently open, not just the
+            # newest one, so Browse shows the user where they are.
+            row = active_row if active_row is not None else 0
+            self._table.selectRow(row)
+            self._table.scrollToItem(self._table.item(row, 0))
             self._sync_selected_session()
 
     def _open_row(self, row, _column=0):
