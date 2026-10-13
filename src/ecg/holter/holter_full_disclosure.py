@@ -621,36 +621,30 @@ class HolterFullDisclosureDialog(QDialog):
         except Exception as e:
             print(f"[Full Disclosure] Error loading segment annotations on startup: {e}")
 
-        # Generate automatic rhythm regions for Full Disclosure.  Detection,
-        # merging with whatever the recording's own stored replay data
-        # already populated into _structured_events, and rate-vs-
-        # morphology suppression all live in auto_segment_arrthymia_detection.py --
-        # this dialog only calls into it and otherwise handles rendering
-        # (SegmentOverlay, label-to-color mapping in
-        # _add_auto_arrhythmia_segments below). It must be invoked here
-        # before the first canvas refresh.
-        #
-        # Detection takes a while on a long recording the first time it is
-        # analysed, so if there's no cached result it runs in the background
-        # and the regions are added when it finishes; the dialog opens
-        # straight away.
+        # Automatic rhythm-region detection, merging with whatever the
+        # recording's own stored replay data already populated into
+        # _structured_events, and rate-vs-morphology suppression all live in
+        # auto_segment_arrthymia_detection.py -- this dialog only calls into
+        # it and otherwise handles rendering (SegmentOverlay, label-to-color
+        # mapping in _add_auto_arrhythmia_segments below). It no longer runs
+        # automatically on open: it's triggered on demand by the "Auto
+        # Arrhythmia Detection" button (see _run_auto_arrhythmia_detection),
+        # so opening a long recording's Full Disclosure doesn't always pay
+        # for detection up front.
         self._auto_segments_pending = False
-        try:
-            from .auto_segment_arrthymia_detection import (
-                apply_auto_segments_to_engine, detect_arrhythmias_async, get_cached_detection,
-            )
-            reader_path = getattr(getattr(self._engine, '_reader', None), 'path', None)
-            cached = get_cached_detection(reader_path) if reader_path else None
-            if cached is not None or not reader_path:
-                added = apply_auto_segments_to_engine(self._engine, segments=cached)
-                if added is not None:
-                    self._event_index_dirty = True
-                    print(f"[Full Disclosure] Added {added} automatic rhythm regions.")
-            else:
-                self._auto_segments_pending = True
-                detect_arrhythmias_async(reader_path, self._on_auto_segments_ready)
-        except Exception as e:
-            print(f"[Full Disclosure] Automatic rhythm detection unavailable: {e}")
+
+        # Gates ALL auto-sourced rhythm marking (the segment-overlay tint/
+        # boxes via _structured_events_for_canvas, and the bottom-right
+        # rhythm label in _update_time_and_arrhythmia_labels) off until the
+        # "Auto Arrhythmia Detection" button is clicked. Without this, the
+        # recording's own stored replay/real-time classification (loaded
+        # into self._engine._structured_events by HolterReplayEngine itself,
+        # tagged source='arrhythmia'/'analysis') would already paint the
+        # strips before the button is ever pressed, making the button look
+        # like it does nothing. Manual beat/segment markings are never
+        # gated by this -- only non-manual ('auto'/'arrhythmia'/'analysis'/
+        # 'classified') sources are affected.
+        self._auto_marking_visible = False
 
         self._update_canvases(0.0)
         
@@ -661,19 +655,84 @@ class HolterFullDisclosureDialog(QDialog):
             # But we need to do this AFTER the button is created, so use a short delay
             QTimer.singleShot(50, lambda: self._switch_selection_mode(self._selection_mode))
 
+    def _run_auto_arrhythmia_detection(self):
+        """"Auto Arrhythmia Detection" button: run (or apply the cached
+        result of) auto rhythm-region detection and redraw the strips with
+        it. Mirrors what used to run automatically on dialog open -- see
+        the comment above self._auto_segments_pending in __init__."""
+        if self._auto_segments_pending:
+            return
+        try:
+            from .auto_segment_arrthymia_detection import (
+                apply_auto_segments_to_engine, detect_arrhythmias_async, get_cached_detection,
+            )
+            reader_path = getattr(getattr(self._engine, '_reader', None), 'path', None)
+            cached = get_cached_detection(reader_path) if reader_path else None
+            if cached is not None or not reader_path:
+                self._snapshot_state("Auto Arrhythmia Detection")
+                added = apply_auto_segments_to_engine(self._engine, segments=cached)
+                if added is not None:
+                    print(f"[Full Disclosure] Added {added} automatic rhythm regions.")
+                self._auto_marking_visible = True
+                self._persist_auto_marking_enabled()
+                self._event_index_dirty = True
+                self._update_canvases(self._current_start)
+                self._refresh_segment_overlay()
+            else:
+                self._auto_segments_pending = True
+                if hasattr(self, 'btn_auto_arrhythmia'):
+                    self.btn_auto_arrhythmia.setEnabled(False)
+                    self.btn_auto_arrhythmia.setText("⏳ Detecting...")
+                detect_arrhythmias_async(reader_path, self._on_auto_segments_ready)
+        except Exception as e:
+            print(f"[Full Disclosure] Automatic rhythm detection unavailable: {e}")
+
     def _on_auto_segments_ready(self, segments):
-        """Background auto-segment detection finished (see __init__)."""
+        """Background auto-segment detection finished (see
+        _run_auto_arrhythmia_detection)."""
         self._auto_segments_pending = False
+        if hasattr(self, 'btn_auto_arrhythmia'):
+            self.btn_auto_arrhythmia.setEnabled(True)
+            self.btn_auto_arrhythmia.setText("⚡ Auto Arrhythmia Detection")
         try:
             from .auto_segment_arrthymia_detection import apply_auto_segments_to_engine
+            self._snapshot_state("Auto Arrhythmia Detection")
             added = apply_auto_segments_to_engine(self._engine, segments=segments)
             if added is not None:
                 print(f"[Full Disclosure] Added {added} automatic rhythm regions.")
         except Exception as e:
             print(f"[Full Disclosure] Automatic rhythm detection unavailable: {e}")
+        self._auto_marking_visible = True
+        self._persist_auto_marking_enabled()
         self._event_index_dirty = True
         self._update_canvases(self._current_start)
         self._refresh_segment_overlay()
+
+    def _persist_auto_marking_enabled(self):
+        """Record on disk that auto arrhythmia marking was enabled for this
+        session, so generate_holter_report() (which loads fresh from disk,
+        not this live dialog) includes the same rule-based regions instead
+        of defaulting to plain NSR. See is_auto_marking_enabled."""
+        try:
+            from .auto_segment_arrthymia_detection import set_auto_marking_enabled
+            ecgh_path = getattr(self._engine, 'ecgh_path', None)
+            if ecgh_path:
+                set_auto_marking_enabled(os.path.dirname(ecgh_path))
+        except Exception as e:
+            print(f"[Full Disclosure] Could not persist auto-marking flag: {e}")
+
+    def _clear_auto_marking_enabled(self):
+        """Undo counterpart to _persist_auto_marking_enabled() -- called
+        only when the "Auto Arrhythmia Detection" action itself is undone
+        (see _undo_last_action), so report generation goes back to plain
+        NSR too."""
+        try:
+            from .auto_segment_arrthymia_detection import clear_auto_marking_enabled
+            ecgh_path = getattr(self._engine, 'ecgh_path', None)
+            if ecgh_path:
+                clear_auto_marking_enabled(os.path.dirname(ecgh_path))
+        except Exception as e:
+            print(f"[Full Disclosure] Could not clear auto-marking flag: {e}")
 
     def showEvent(self, event):
         """Override showEvent to refresh segment overlay when dialog is shown."""
@@ -870,6 +929,45 @@ class HolterFullDisclosureDialog(QDialog):
         # Pushes the Undo button away from the Frame Time group on the
         # right, so it sits further left instead of flush against it.
         top_layout.addStretch()
+
+        # Auto Arrhythmia Detection — left of the speed/gain readout. Styled
+        # as a solid, raised accent button (unlike the flat bordered Undo/
+        # label chrome around it) so it visibly reads as a clickable action,
+        # not just another status readout.
+        self.btn_auto_arrhythmia = QPushButton("⚡ Auto Arrhythmia Detection")
+        self.btn_auto_arrhythmia.setCursor(Qt.PointingHandCursor)
+        self.btn_auto_arrhythmia.setToolTip(
+            "Run rule-based arrhythmia detection and draw the rhythm markings for this recording"
+        )
+        self.btn_auto_arrhythmia.setStyleSheet(f"""
+            QPushButton {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #2FA868, stop:0.5 #1B7A4B, stop:1 #0E4A2E);
+                color: #FFFFFF;
+                border: 1px solid #55E39B; border-bottom: 2px solid #06200F;
+                padding: 5px 16px; font-size: 13px; font-weight: bold;
+                border-radius: 5px;
+            }}
+            QPushButton:hover:enabled {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #3FC97F, stop:0.5 #25945C, stop:1 #125B38);
+                border-color: #8CFFC2;
+            }}
+            QPushButton:pressed:enabled {{
+                background: #0E4A2E; border-bottom: 1px solid #06200F;
+                padding-top: 6px;
+            }}
+            QPushButton:disabled {{
+                background: #1A2420; color: #6a7a72; border: 1px solid #2a3a30;
+            }}
+        """)
+        self.btn_auto_arrhythmia.clicked.connect(self._run_auto_arrhythmia_detection)
+        top_layout.addWidget(self.btn_auto_arrhythmia)
+
+        sep_auto = QFrame()
+        sep_auto.setFrameShape(QFrame.VLine)
+        sep_auto.setStyleSheet(f"color: {COL_GREEN_DRK};")
+        top_layout.addWidget(sep_auto)
 
         # Wave speed / gain readout — mirrors whatever btn_speed/btn_gain
         # currently show, kept in sync by _update_speed_gain_label() from
@@ -1737,6 +1835,15 @@ class HolterFullDisclosureDialog(QDialog):
         if snapshot['structured_events'] is not None:
             self._engine._structured_events = snapshot['structured_events']
             self._event_index_dirty = True
+
+        # Undoing the "Auto Arrhythmia Detection" click itself additionally
+        # hides all non-manual rhythm marking again (plain wave, no tint, no
+        # auto rhythm label -- same as before the button was ever clicked)
+        # and un-persists the report-visibility flag. Manual beat/segment
+        # undos never touch this.
+        if snapshot.get('action') == "Auto Arrhythmia Detection":
+            self._auto_marking_visible = False
+            self._clear_auto_marking_enabled()
 
         # Persist the reverted state to disk so it stays consistent with
         # report generation and future reloads.
@@ -3070,9 +3177,15 @@ class HolterFullDisclosureDialog(QDialog):
         # the visible window (see _rebuild_event_index).
         long_hits = [e for ev_start, ev_end, e in getattr(self, '_cached_long_events', [])
                      if ev_start < padded_start and ev_end >= start_sec]
-        if long_hits:
-            return long_hits + window_events  # long_hits all start before window_events
-        return window_events
+        combined = (long_hits + window_events) if long_hits else window_events
+
+        # Hide every non-manual (auto-detected) region until the "Auto
+        # Arrhythmia Detection" button has been clicked (see
+        # self._auto_marking_visible in __init__). Manual markings always
+        # pass through untouched.
+        if not self._auto_marking_visible:
+            combined = [e for e in combined if 'manual' in str(e.get('source', '')).lower()]
+        return combined
 
     def _add_auto_arrhythmia_segments(self, ref, visible_events, ref_end, span):
         """Add visual-only auto-arrhythmia regions; manual segments remain separate."""
@@ -3319,9 +3432,13 @@ class HolterFullDisclosureDialog(QDialog):
                     return math.floor(reader_start + sec)
                 view_second = _shown_second(start_sec)
             active_auto = []
-            for event in getattr(self._engine, '_structured_events', []) or []:
+            # Same gate as _structured_events_for_canvas: no auto-detected
+            # rhythm label until "Auto Arrhythmia Detection" has been
+            # clicked (self._auto_marking_visible, see __init__).
+            events_for_label = getattr(self._engine, '_structured_events', []) or [] if self._auto_marking_visible else []
+            for event in events_for_label:
                 source = str(event.get('source', '')).lower()
-                if source not in {'auto', 'arrhythmia'}:
+                if 'manual' in source:
                     continue
                 event_start = float(event.get('timestamp', 0.0) or 0.0)
                 event_end = float(event.get('end_timestamp', event_start) or event_start)
@@ -3433,10 +3550,12 @@ class HolterFullDisclosureDialog(QDialog):
         self._current_start = start_sec
         end_sec = start_sec + self._window_sec
 
-        # The time label is cheap (string format only) so keep it live every
-        # frame; the arrhythmia/event label rebuild involves gathering and
-        # sorting events and is gated by update_extras (see _process_scroll_update).
-        self.lbl_time.setText(f"Time:  {self._engine._sec_to_hms(start_sec)}")
+        # Top-left "Time" shows the TOTAL recording length (not the scroll
+        # position -- that is what "Capture Frame Time" already shows), so
+        # it no longer changes while scrolling. The arrhythmia/event label
+        # rebuild involves gathering and sorting events and is gated by
+        # update_extras (see _process_scroll_update).
+        self.lbl_time.setText(f"Time:  {self._engine._sec_to_hms(eff_dur)}")
         self._update_time_and_arrhythmia_labels(start_sec, end_sec)
 
         read_end_sec = min(end_sec, eff_dur)

@@ -679,7 +679,7 @@ class HolterReplayPanel(QWidget):
             m = (sec % 3600) // 60
             s = sec % 60
             if h > 0:
-                return f"{h}h {m:02d}m"
+                return f"{h}h {m:02d}m {s:02d}s"
             if m > 0:
                 return f"{m}m {s:02d}s"
             return f"{s}s"
@@ -873,7 +873,8 @@ class HolterReplayPanel(QWidget):
             dur = summary.get('duration_sec', 0)
             h = int(dur // 3600)
             m = int((dur % 3600) // 60)
-            set_lbl("duration", f"{h:02d}h {m:02d}m")
+            s = int(dur % 60)
+            set_lbl("duration", f"{h:02d}h {m:02d}m {s:02d}s")
             set_lbl("total_beats", summary.get('total_beats', 0))
             set_lbl("avg_hr", f"{summary.get('avg_hr', 0)} bpm")
             set_lbl("max_hr", f"{summary.get('max_hr', 0)} bpm")

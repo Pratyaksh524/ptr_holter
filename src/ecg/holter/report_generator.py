@@ -43,9 +43,22 @@ def _detector_owns_label(label: str) -> bool:
 
 
 def _load_auto_segment_events(session_dir: str) -> List[Dict[str, object]]:
-    """Run the same waveform auto-segment detector used by Full Disclosure."""
+    """Run the same waveform auto-segment detector used by Full Disclosure.
+
+    Only does anything if the user actually clicked "Auto Arrhythmia
+    Detection" in Full Disclosure for this recording (see
+    is_auto_marking_enabled / set_auto_marking_enabled) -- otherwise the
+    report shows plain NSR, same as Full Disclosure does before that click.
+    """
     ecgh_path = os.path.join(session_dir, 'recording.ecgh')
     if not os.path.exists(ecgh_path):
+        return []
+    try:
+        from .auto_segment_arrthymia_detection import is_auto_marking_enabled
+        if not is_auto_marking_enabled(session_dir):
+            return []
+    except Exception as exc:
+        print(f"[HolterReport] Could not check auto-marking flag: {exc}")
         return []
     try:
         from .file_format import ECGHFileReader
@@ -413,12 +426,13 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     # Patient info table
     dur_h = int(summary.get('duration_sec', 0) // 3600)
     dur_m = int((summary.get('duration_sec', 0) % 3600) // 60)
+    dur_s = int(summary.get('duration_sec', 0) % 60)
     pname = patient_info.get('name', patient_info.get('patient_name', 'Unknown'))
     
     st_time_str, end_time_str = _get_recording_start_end(session_dir, float(summary.get('duration_sec', 0)))
     
     pinfo_data = [
-        ['Patient Name', pname,              'Recording Duration', f"{dur_h}h {dur_m}m"],
+        ['Patient Name', pname,              'Recording Duration', f"{dur_h}h {dur_m}m {dur_s}s"],
         ['Age / Gender', f"{patient_info.get('age','--')} / {patient_info.get('gender','--')}",
          'Report Date', datetime.now().strftime('%Y-%m-%d %H:%M')],
         ['Doctor',       patient_info.get('doctor', '--'),
@@ -581,7 +595,7 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     top_events = ", ".join(f"{label} ({count} episode{'s' if count > 1 else ''})" for label, count in sorted(filtered_arrhy_counts.items(), key=lambda item: -item[1])[:4]) or "No significant arrhythmias detected"
     avg_quality = summary.get('avg_quality', 0) * 100
     impression_text = (
-        f"This Comprehensive ECG Analysis study for <b>{pname}</b> covers <b>{dur_h}h {dur_m}m</b> with an average heart rate of "
+        f"This Comprehensive ECG Analysis study for <b>{pname}</b> covers <b>{dur_h}h {dur_m}m {dur_s}s</b> with an average heart rate of "
         f"<b>{avg_hr:.0f} bpm</b> (minimum <b>{min_hr:.0f} bpm</b>, maximum <b>{max_hr:.0f} bpm</b>). "
         f"Overall signal quality was <b>{avg_quality:.1f}%</b>. The rhythm and arrhythmia summary shows: <b>{top_events}</b>."
     )

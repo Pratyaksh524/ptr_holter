@@ -87,6 +87,55 @@ def _disk_cache_path(path: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(path)), _CACHE_FILENAME)
 
 
+# Whether the user has actually clicked "Auto Arrhythmia Detection" in Full
+# Disclosure for this recording, persisted next to the recording so that
+# generate_holter_report() -- which loads a session fresh from disk and never
+# touches the live dialog's engine -- can tell. Without this, the report
+# unconditionally ran detect_arrhythmias() and showed every auto-detected
+# region regardless of whether the button was ever pressed, which is exactly
+# what the button is meant to gate (see holter_full_disclosure.py's
+# _auto_marking_visible). Report generation reports plain NSR for a session
+# this flag isn't set on.
+_MARKING_ENABLED_FILENAME = 'auto_arrhythmia_marking_enabled.json'
+
+
+def _marking_enabled_path(session_dir: str) -> str:
+    return os.path.join(session_dir, _MARKING_ENABLED_FILENAME)
+
+
+def is_auto_marking_enabled(session_dir: str) -> bool:
+    """True once set_auto_marking_enabled() has been called for this
+    session (i.e. the user clicked the button at least once)."""
+    try:
+        with open(_marking_enabled_path(session_dir), 'r', encoding='utf-8') as f:
+            return bool(json.load(f).get('enabled'))
+    except (OSError, ValueError):
+        return False
+
+
+def set_auto_marking_enabled(session_dir: str) -> None:
+    """Record that auto arrhythmia marking has been enabled for this
+    session. Called once the button's detection result has been applied."""
+    try:
+        os.makedirs(session_dir, exist_ok=True)
+        with open(_marking_enabled_path(session_dir), 'w', encoding='utf-8') as f:
+            json.dump({'enabled': True}, f)
+    except OSError as e:
+        print(f"[Auto Arrhythmia Detect] Could not persist marking-enabled flag: {e}")
+
+
+def clear_auto_marking_enabled(session_dir: str) -> None:
+    """Undo counterpart to set_auto_marking_enabled() -- called when the
+    user undoes the "Auto Arrhythmia Detection" click itself, so report
+    generation goes back to reporting plain NSR for this session."""
+    try:
+        path = _marking_enabled_path(session_dir)
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as e:
+        print(f"[Auto Arrhythmia Detect] Could not clear marking-enabled flag: {e}")
+
+
 def get_cached_detection(path: Optional[str]) -> Optional[List[Dict[str, Any]]]:
     """Cached detect_arrhythmias() result for this recording, or None. Cheap."""
     key = _cache_key(path)
@@ -230,6 +279,28 @@ def _detect_arrhythmias_uncached(
         from ecg.pan_tompkins import pan_tompkins
     except ImportError:
         from ..pan_tompkins import pan_tompkins
+
+    # Noise/artifact gate for the morphological rules below (VFib, AFib,
+    # Atrial Flutter, AV Block). Those rules are judged purely off waveform
+    # shape -- e.g. VFib is "no P wave + no organized QRS for most beats" --
+    # which a genuinely chaotic but non-physiological signal (motion
+    # artifact, a loose/falling-off electrode, EMG noise) satisfies just as
+    # well as real Ventricular Fibrillation does. There was no independent
+    # check that the window is even a usable ECG signal before classifying
+    # it, so sustained noise could get auto-marked as a lethal arrhythmia.
+    # Reuses the exact same SQI scoring and 0.6 cutoff as the real-time
+    # recording pipeline (SignalQuality.compute_sqi / signal_quality_threshold
+    # in config/clinical_config.yaml) so "noisy" means the same thing
+    # everywhere in the app, not a second, separately-tuned definition.
+    try:
+        from .analysis_pipeline import SignalQuality, HolterConfig
+        _sqi_config = HolterConfig.from_clinical_config()
+        _signal_quality = SignalQuality(fs=getattr(reader, 'fs', 500) or 500, config=_sqi_config)
+        _sqi_min = _sqi_config.sqi_min
+    except Exception as e:
+        print(f"[Auto Arrhythmia Detect] Signal-quality gate unavailable, proceeding without it: {e}")
+        _signal_quality = None
+        _sqi_min = 0.6
 
     # One-time numerical warm-up. analyze_ecg()'s spectral checks (atrial
     # flutter score, VF spectral score) go through scipy/numpy FFT code
@@ -817,7 +888,22 @@ def _detect_arrhythmias_uncached(
                 target_morph = None
                 core_r_peaks = []
 
-                if best_lead_idx < padded_array.shape[0]:
+                # Skip morphological classification entirely for a window
+                # whose own (unpadded) signal doesn't look like a usable
+                # ECG -- same SQI/0.6 cutoff used everywhere else in the
+                # app (see the comment above _signal_quality near the top
+                # of this function). A noisy window simply produces no
+                # morphological label here, same as if nothing matched.
+                window_is_noisy = False
+                if _signal_quality is not None and best_lead_idx < data_array.shape[0]:
+                    try:
+                        core_signal = np.asarray(data_array[best_lead_idx], dtype=float)
+                        if core_signal.size > 0:
+                            window_is_noisy = _signal_quality.compute_sqi(core_signal) < _sqi_min
+                    except Exception:
+                        window_is_noisy = False
+
+                if not window_is_noisy and best_lead_idx < padded_array.shape[0]:
                     padded_signal = np.asarray(padded_array[best_lead_idx], dtype=float)
                     if len(padded_signal) > 50:
                         # Union R-peaks detected across the top few
@@ -856,7 +942,7 @@ def _detect_arrhythmias_uncached(
                             if atrial_label:
                                 target_morph = (atrial_label, '#FF00FF')
 
-                if target_morph is None:
+                if target_morph is None and not window_is_noisy:
                     window_leads = {}
                     for i, lead_name in enumerate(lead_names):
                         if i < data_array.shape[0]:

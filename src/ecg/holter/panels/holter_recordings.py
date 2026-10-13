@@ -218,7 +218,7 @@ class HolterRecordManagementPanel(QWidget):
                         m = int((dur_sec % 3600) // 60)
                         s = int(dur_sec % 60)
                         if h > 0:
-                            dur_str = f"{h}h {m:02d}m"
+                            dur_str = f"{h}h {m:02d}m {s:02d}s"
                         elif m > 0:
                             dur_str = f"{m}m {s:02d}s"
                         else:

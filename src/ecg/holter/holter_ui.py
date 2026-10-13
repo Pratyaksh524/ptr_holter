@@ -1433,7 +1433,8 @@ class HolterMainWindow(QDialog):
         dur_text = self._summary.get('duration_sec', 0)
         dur_h = int(dur_text // 3600)
         dur_m = int((dur_text % 3600) // 60)
-        self._dur_label = QLabel(f"{dur_h:02d}h {dur_m:02d}m")
+        dur_s = int(dur_text % 60)
+        self._dur_label = QLabel(f"{dur_h:02d}h {dur_m:02d}m {dur_s:02d}s")
         self._dur_label.setStyleSheet(
             f"color:{UI_TEXT};font-size:13px;font-weight:700;background:{UI_PANEL_ALT};"
             f"padding:7px 12px;border-radius:8px;border:1px solid {UI_BORDER};"
@@ -2243,8 +2244,9 @@ class HolterMainWindow(QDialog):
         dur = self._summary.get('duration_sec', 0)
         dur_h = int(dur // 3600)
         dur_m = int((dur % 3600) // 60)
+        dur_s = int(dur % 60)
         if hasattr(self, '_dur_label'):
-            self._dur_label.setText(f"{dur_h:02d}h {dur_m:02d}m")
+            self._dur_label.setText(f"{dur_h:02d}h {dur_m:02d}m {dur_s:02d}s")
         if hasattr(self, '_patient_chip'):
             patient_name = self.patient_info.get("patient_name") or self.patient_info.get("name") or "Unknown Patient"
             self._patient_chip.setText(f"Patient: {patient_name}")
