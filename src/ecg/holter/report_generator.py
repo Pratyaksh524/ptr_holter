@@ -997,18 +997,21 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     for _ in range(max(0, 24 - _detail_hours)):
         _detail_rows.append([''] * 18)
 
+    # Widened to use the full page width (was 169mm of the 180mm available
+    # inside the 15mm margins) and given bigger font/padding so the hourly
+    # grid reads clearly instead of looking cramped.
     _detail_table = Table(
         _detail_rows,
-        colWidths=[19*mm, 10*mm, 8*mm, 8*mm, 8*mm,
-                   8*mm, 9*mm, 9*mm, 8*mm, 9*mm, 8*mm,
-                   8*mm, 9*mm, 9*mm, 8*mm, 9*mm, 8*mm, 14*mm],
+        colWidths=[20.2*mm, 10.7*mm, 8.5*mm, 8.5*mm, 8.5*mm,
+                   8.5*mm, 9.6*mm, 9.6*mm, 8.5*mm, 9.6*mm, 8.5*mm,
+                   8.5*mm, 9.6*mm, 9.6*mm, 8.5*mm, 9.6*mm, 8.5*mm, 14.9*mm],
         repeatRows=2,
     )
     _detail_table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 1), GRAY),
         ('TEXTCOLOR', (0, 0), (-1, 1), DARK),
         ('FONTNAME', (0, 0), (-1, 1), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 6.4),
+        ('FONTSIZE', (0, 0), (-1, -1), 7.5),
         ('GRID', (0, 0), (-1, -1), 0.4, BORDER),
         ('SPAN', (0, 0), (0, 1)),
         ('SPAN', (1, 0), (1, 1)),
@@ -1019,7 +1022,7 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ('ROWBACKGROUNDS', (0, 2), (-1, -1), [colors.white, GRAY]),
-        ('PADDING', (0, 0), (-1, -1), 3),
+        ('PADDING', (0, 0), (-1, -1), 4.5),
     ]))
     story.append(Spacer(1, 4*mm))
     story.append(_detail_table)
@@ -1819,24 +1822,44 @@ def _sec_to_hms(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+# Called once per event/beat row while building the report (easily
+# thousands of times on a long recording) -- caches recording_index.json's
+# start_time per session_dir instead of re-reading and re-parsing that file
+# (a per-second index, multiple MB on a 14h recording) on every call. Safe:
+# the file is written once by ECGHFileWriter.finalize() and never changes
+# for a completed session; the mtime check only guards a stale cache across
+# repeated finalize()/reopen cycles within the same process.
+_report_system_time_start_cache: dict = {}
+
+
+def _report_recording_start_time(session_dir: str):
+    index_path = os.path.join(session_dir, 'recording_index.json')
+    try:
+        mtime = os.path.getmtime(index_path)
+    except OSError:
+        return None
+    cached = _report_system_time_start_cache.get(session_dir)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    try:
+        with open(index_path, 'r') as f:
+            start_time = json.load(f).get('start_time')
+    except Exception as e:
+        print(f"[HolterReport] Error reading system time: {e}")
+        start_time = None
+    _report_system_time_start_cache[session_dir] = (mtime, start_time)
+    return start_time
+
+
 def _format_system_time(session_dir: str, chunk_timestamp: float) -> str:
     """
     Convert chunk timestamp to system recording time.
     Reads start_time from recording.ecgh index and adds chunk timestamp.
     """
-    try:
-        import json
-        index_path = os.path.join(session_dir, 'recording_index.json')
-        if os.path.exists(index_path):
-            with open(index_path, 'r') as f:
-                index_data = json.load(f)
-            start_time = index_data.get('start_time')
-            if start_time:
-                from datetime import datetime
-                system_time = datetime.fromtimestamp(start_time + chunk_timestamp)
-                return system_time.strftime('%H:%M:%S')
-    except Exception as e:
-        print(f"[HolterReport] Error reading system time: {e}")
+    start_time = _report_recording_start_time(session_dir)
+    if start_time:
+        system_time = datetime.fromtimestamp(start_time + chunk_timestamp)
+        return system_time.strftime('%H:%M:%S')
     # Fallback to chunk time in HH:MM:SS format
     return _sec_to_hms(chunk_timestamp)
 

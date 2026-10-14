@@ -296,21 +296,46 @@ def _sec_to_hms(s: float) -> str:
     return f"{h:02d}:{m:02d}:{sec:02d}"
 
 
+# _format_system_time() is called once per row by the Events/Edit Event/Edit
+# Strips tables -- thousands of times for a long recording (10k+ rows on a
+# 14h session). It used to re-open and re-json.load() recording_index.json
+# (a per-second index: ~3MB/50k entries for 14h) on every single call, which
+# alone accounted for most of the multi-minute UI freeze when opening a long
+# session. recording_index.json is only ever written once, by
+# ECGHFileWriter.finalize() (file_format.py) -- a completed session's copy
+# never changes -- so caching start_time per session_dir is always safe; the
+# mtime check below only exists to tolerate a stale cache across repeated
+# live-recording finalize()/reopen cycles within the same process.
+_system_time_start_cache: dict = {}
+
+
+def _recording_start_time(session_dir: str):
+    index_path = os.path.join(session_dir, "recording_index.json")
+    try:
+        mtime = os.path.getmtime(index_path)
+    except OSError:
+        return None
+    cached = _system_time_start_cache.get(session_dir)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            start_time = json.load(f).get("start_time")
+    except Exception as e:
+        print(f"[HolterUI] Error reading system time: {e}")
+        start_time = None
+    _system_time_start_cache[session_dir] = (mtime, start_time)
+    return start_time
+
+
 def _format_system_time(session_dir: str, chunk_timestamp: float) -> str:
     """Convert relative timestamp to actual system wall-clock time."""
     if not session_dir:
         return _sec_to_hms(chunk_timestamp)
-    try:
-        index_path = os.path.join(session_dir, "recording_index.json")
-        if os.path.exists(index_path):
-            with open(index_path, "r", encoding="utf-8") as f:
-                index_data = json.load(f)
-            start_time = index_data.get("start_time")
-            if start_time:
-                system_time = datetime.fromtimestamp(start_time + chunk_timestamp)
-                return system_time.strftime("%H:%M:%S")
-    except Exception as e:
-        print(f"[HolterUI] Error reading system time: {e}")
+    start_time = _recording_start_time(session_dir)
+    if start_time:
+        system_time = datetime.fromtimestamp(start_time + chunk_timestamp)
+        return system_time.strftime("%H:%M:%S")
     return _sec_to_hms(chunk_timestamp)
 
 

@@ -1234,7 +1234,19 @@ class HolterReplayPanel(QWidget):
         tachy_pct = (tachy_chunks / total_chunks) * 100.0
         brady_pct = (brady_chunks / total_chunks) * 100.0
         af_dur_str = f"{(af_chunks * chunk_dur) / 60.0:.1f} m"
-        
+
+        # ST Elevation/Depression: the single real per-chunk ST measurement
+        # ('st_mv', Lead II -- same field report_generator.py averages into
+        # 'avg_st_mv') has no per-channel breakdown stored anywhere in
+        # metrics.jsonl, so this reports the worst real value seen, not a
+        # fabricated multi-channel reading. "-" when no chunk ever went
+        # elevated/depressed, same as every other unmeasured row in this app.
+        st_vals = [float(m.get('st_mv', 0.0) or 0.0) for m in metrics_list]
+        st_elev_vals = [v for v in st_vals if v > 0]
+        st_dep_vals = [v for v in st_vals if v < 0]
+        st_elevation_str = f"{max(st_elev_vals):.2f} mV" if st_elev_vals else "-"
+        st_depression_str = f"{min(st_dep_vals):.2f} mV" if st_dep_vals else "-"
+
         return [
             ("Total NNs", str(total_beats)),
             ("AVG HR", f"{avg_hr:.0f} bpm"),
@@ -1247,6 +1259,8 @@ class HolterReplayPanel(QWidget):
             ("AF Duration", af_dur_str),
             ("V Total", str(ve)),
             ("S Total", str(sve)),
+            ("ST Elevation", st_elevation_str),
+            ("ST Depression", st_depression_str),
         ]
 
 

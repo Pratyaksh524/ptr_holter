@@ -566,11 +566,40 @@ def _detect_arrhythmias_uncached(
         # B. Sinus Bradycardia: consecutive beats with RR >= 1050ms (HR < 57.1 bpm)
         # Note: 60 bpm (1000ms RR) is Normal Sinus Rhythm (NSR: 60-100 bpm), NOT Bradycardia.
         # True Bradycardia occurs when HR < 60 bpm (RR > 1000ms, e.g. 50 bpm / 1200ms).
+        #
+        # An RR this "slow" must also stay under a ceiling, or a stretch
+        # where Pan-Tompkins simply finds no peaks at all -- because the
+        # rhythm has degenerated into chaos, e.g. a VFib onset -- reads as
+        # one single multi-second "RR interval" and clears the >=1050ms bar
+        # easily, mislabelling the start of VFib as Sinus Bradycardia.
+        # Confirmed directly: a real recording had a 6.7s gap with zero
+        # detected peaks right where VFib began, reported as a ~7s Sinus
+        # Bradycardia episode because nothing capped how slow "slow" was
+        # allowed to be.
+        #
+        # The app's own pause_threshold_ms (2000ms, used for "RRI
+        # (>=2.0s)"/pause counting elsewhere) is NOT the right ceiling here
+        # -- tried first and confirmed wrong directly: a different real
+        # recording has genuine, sustained 30 bpm Sinus Bradycardia (RR
+        # steady at ~2000ms for 2 straight minutes), which that cutoff
+        # fragmented into disconnected ~4s pieces since roughly half its
+        # real beats landed right at/above 2000ms. 4000ms (15 bpm) instead:
+        # comfortably above any genuinely still-beating sinus rhythm a
+        # Holter would ever report as "Bradycardia" rather than a pause,
+        # while still well under the 6.7s chaos gap above.
+        _brady_max_rr_ms = 4000.0
         in_brady = False
         brady_start_idx = None
 
         for i, rr in enumerate(all_rr_ms):
-            is_slow = (rr >= 1050.0) or (rr >= 1020.0 and in_brady and i + 1 < len(all_rr_ms) and all_rr_ms[i + 1] >= 1050.0)
+            next_rr = all_rr_ms[i + 1] if i + 1 < len(all_rr_ms) else None
+            is_slow = (
+                (1050.0 <= rr < _brady_max_rr_ms)
+                or (
+                    1020.0 <= rr < _brady_max_rr_ms and in_brady
+                    and next_rr is not None and 1050.0 <= next_rr < _brady_max_rr_ms
+                )
+            )
             if is_slow:
                 if not in_brady:
                     in_brady = True
@@ -1189,6 +1218,26 @@ def _detect_arrhythmias_uncached(
                 return False
             return bool(beat.get('qrs_bounds_resolved'))
 
+        _sorted_peaks = sorted(float(p) for p in all_r_peaks)
+
+        # Pan-Tompkins often finds no peaks at all in the first seconds of
+        # VFib, so the first detected beat after the last real beat can sit
+        # seconds later with chaos in between (seen: 302.18 s -> 308.86 s,
+        # 120.39 s -> 126.06 s, and a 452.1 s -> 465.9 s burst inside Atrial
+        # Flutter with no peak at all), leaving that chaos unlabeled. If the
+        # beat before such a silent gap is organized and the gap is much
+        # longer than that rhythm's own RR, VFib started right after it.
+        def _silent_gap_start(after_ts, require_narrow):
+            prev_peaks = [p for p in _sorted_peaks if p < after_ts]
+            if not prev_peaks:
+                return None
+            prev_ts = prev_peaks[-1]
+            prior_rr = np.diff(prev_peaks[-5:])
+            threshold = max(2.0, 1.5 * float(np.median(prior_rr))) if prior_rr.size else 2.0
+            if (after_ts - prev_ts) > threshold and _beat_is_organized(prev_ts, require_narrow) is True:
+                return prev_ts
+            return None
+
         def _refine_vfib_edge(boundary_sec, edge, require_narrow=False):
             lo, hi = boundary_sec - window_size, boundary_sec + window_size
             nearby = sorted(float(p) for p in all_r_peaks if lo <= p <= hi)
@@ -1197,7 +1246,8 @@ def _detect_arrhythmias_uncached(
                 ts0, o0 = states[i]
                 ts1, o1 = states[i + 1]
                 if edge == 'start' and o0 is False and o1 is False:
-                    return ts0
+                    gap_start = _silent_gap_start(ts0, require_narrow)
+                    return gap_start if gap_start is not None else ts0
                 # Two organized beats only mark the end of VFib if they are
                 # truly back-to-back. Pan-Tompkins often finds no peaks at
                 # all in the chaotic tail of VFib, so a lone, by-chance
@@ -1207,6 +1257,24 @@ def _detect_arrhythmias_uncached(
                 # early over still-chaotic waves).
                 if edge == 'end' and o0 is True and o1 is True and (ts1 - ts0) <= 2.0:
                     return ts0
+            if edge == 'start':
+                # No two chaotic beats detected at all -- the whole burst
+                # may sit in one silent gap. Use that gap if it spans the
+                # window-vote boundary.
+                # Also the gap right after the last organized beat before the
+                # boundary, even if a stray chaotic beat follows it (seen:
+                # last sinus beat 100.44 s, one wide VFib beat 104.45 s, then
+                # nothing until past the 105.0 s window edge).
+                candidates = [p for p in _sorted_peaks if p > boundary_sec][:1]
+                organized_before = [s[0] for s in states if s[0] <= boundary_sec and s[1] is True]
+                if organized_before:
+                    later = [p for p in _sorted_peaks if p > organized_before[-1]]
+                    if later:
+                        candidates.append(later[0])
+                for after_ts in candidates:
+                    gap_start = _silent_gap_start(after_ts, require_narrow)
+                    if gap_start is not None and gap_start <= boundary_sec:
+                        return gap_start
             return boundary_sec
 
         for idx, region in enumerate(merged_morph):
@@ -1312,6 +1380,62 @@ def _detect_arrhythmias_uncached(
                     region['start_time_str'], region['end_time_str'] = make_time_strs(new_start, new_end)
             except Exception as e:
                 print(f"[Auto Arrhythmia Detect] Atrial boundary refine error: {e}")
+
+        # Beat-exact edge between ADJACENT Atrial Fibrillation and Atrial
+        # Flutter regions. The window vote put this edge up to ~4 s early
+        # (seen: last AFib beat 319.15 s, Flutter called from 315.0 s). Each
+        # RR interval is judged on its own: Flutter's sawtooth F waves repeat
+        # at a steady ~200 ms (atrial rate ~240-350/min), so the interval's
+        # autocorrelation has a clear peak at a 170-250 ms lag; AFib f-waves
+        # are irregular (measured <= 0.27 at that lag on the test
+        # recordings, Flutter >= 0.47). Intervals too short to judge (fast
+        # 2:1 Flutter) count as unknown and never move the edge.
+        def _interval_is_flutter(prev_sec, peak_sec):
+            s_sec, e_sec = prev_sec + 0.12, peak_sec - 0.08
+            if e_sec - s_sec < 0.4:
+                return None
+            sig = reader.read_range(s_sec, e_sec)
+            if sig is None or best_lead_idx >= sig.shape[0]:
+                return None
+            seg = np.asarray(sig[best_lead_idx], dtype=float)
+            n = np.arange(len(seg))
+            seg = seg - np.polyval(np.polyfit(n, seg, 1), n)
+            ac = np.correlate(seg, seg, 'full')[len(seg) - 1:]
+            if ac[0] <= 0:
+                return None
+            ac = ac / ac[0]
+            lo_lag, hi_lag = int(0.15 * fs), int(0.35 * fs)
+            lag = lo_lag + int(np.argmax(ac[lo_lag:hi_lag]))
+            return bool(ac[lag] >= 0.4 and 0.17 * fs <= lag <= 0.25 * fs)
+
+        _atrial_labels = ('Atrial Fibrillation', 'Atrial Flutter')
+        for idx in range(len(merged_morph) - 1):
+            cur, nxt = merged_morph[idx], merged_morph[idx + 1]
+            if cur['label'] not in _atrial_labels or nxt['label'] not in _atrial_labels \
+                    or cur['label'] == nxt['label'] \
+                    or nxt['start_sec'] - cur['end_sec'] > window_size:
+                continue
+            try:
+                boundary = nxt['start_sec']
+                lo = max(cur['start_sec'], boundary - window_size)
+                hi = min(nxt['end_sec'], max(boundary, cur['end_sec']) + window_size)
+                peaks = [p for p in _sorted_peaks if lo <= p <= hi]
+                states = [(peaks[i - 1], _interval_is_flutter(peaks[i - 1], peaks[i]))
+                          for i in range(1, len(peaks))]
+                # Two consecutive intervals in the NEW rhythm mark the switch;
+                # it happened right after the beat that opens the first one.
+                want = nxt['label'] == 'Atrial Flutter'
+                new_edge = None
+                for i in range(len(states) - 1):
+                    if states[i][1] is want and states[i + 1][1] is want:
+                        new_edge = states[i][0]
+                        break
+                if new_edge is not None and cur['start_sec'] + 0.5 < new_edge < nxt['end_sec'] - 0.5:
+                    cur['end_sec'] = nxt['start_sec'] = new_edge
+                    _, cur['end_time_str'] = make_time_strs(cur['start_sec'], new_edge)
+                    nxt['start_time_str'], _ = make_time_strs(new_edge, nxt['end_sec'])
+            except Exception as e:
+                print(f"[Auto Arrhythmia Detect] AFib/Flutter boundary refine error: {e}")
 
         # The same 50%-overlapping sliding window that lets one episode span
         # several windows also means a transition from one morphological
