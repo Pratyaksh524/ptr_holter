@@ -897,6 +897,112 @@ def _detect_arrhythmias_uncached(
             return flutter_label
         return _classify_atrial_fibrillation_window(context)
 
+    # Atrial Tachycardia rule (own function, checked only after the VFib and
+    # AFib/Flutter rules found nothing). Textbook picture: a regular narrow-
+    # complex rhythm at 100-250/min, QRS complexes the same shape as the
+    # sinus beats, and the P waves superimposed on the T waves of the
+    # preceding beats. That last point is what separates it from Sinus
+    # Tachycardia, which has the same rate and the same QRS: in sinus
+    # tachycardia the T wave and the next P wave are still two separate
+    # waves with the signal dipping back between them (measured on every
+    # Sinus Tachycardia test recording, 105-160 bpm: two humps between
+    # beats in 100% of intervals), whereas in Atrial Tachycardia they merge
+    # into a single hump.
+    #   1. at least 6 beats, rate 100-250/min;
+    #   2. regular RR (coefficient of variation <= 0.08) -- rules out AFib,
+    #      and variable-conduction Flutter (measured CV 0.19-0.47);
+    #   3. organized QRS on >= 80% of beats, all of one shape (median
+    #      correlation to the window's own QRS template >= 0.9);
+    #   4. P on T: between each beat's QRS end (J point) and the next beat's
+    #      QRS onset there is only ONE wave (T and P fused) in >= 70% of the
+    #      judged intervals. A wave counts when its prominence is >= 30% of
+    #      that stretch's own range, so a notch on the fused wave doesn't
+    #      split it in two. Both polarities are tried (inverted T/P leads).
+    # QRS width from measure_beat is not used: on these recordings it reads
+    # >= 120 ms even for clearly narrow sinus beats.
+    def _is_atrial_tachycardia_window(window_signal, r_peaks, fs):
+        if len(r_peaks) < 6:
+            return False
+        if _atrial_preproc is not None:
+            try:
+                window_signal = _atrial_preproc.process(window_signal)
+            except Exception:
+                pass
+        sig = np.asarray(window_signal, dtype=float)
+        beats = [measure_beat(sig, int(p), fs) for p in r_peaks]
+        if any(b is None for b in beats):
+            return False
+
+        rr_ms = np.diff(np.asarray(r_peaks, dtype=float)) * 1000.0 / float(fs)
+        rr_mean = float(np.mean(rr_ms))
+        if rr_mean <= 0:
+            return False
+        rate = 60000.0 / rr_mean
+        if not (100.0 <= rate <= 250.0):
+            return False
+        if float(np.std(rr_ms)) / rr_mean > 0.08:
+            return False
+
+        organized = sum(1 for b in beats if b.get('qrs_bounds_resolved'))
+        if organized < 0.8 * len(beats):
+            return False
+
+        half = int(0.05 * fs)
+        qrs_shapes = [sig[int(p) - half:int(p) + half] for p in r_peaks
+                      if int(p) - half >= 0 and int(p) + half <= len(sig)]
+        if len(qrs_shapes) < 3:
+            return False
+        qrs_shapes = np.array([q - np.mean(q) for q in qrs_shapes])
+        template = np.median(qrs_shapes, axis=0)
+        if not np.any(template):
+            return False
+        corrs = [float(np.corrcoef(q, template)[0, 1]) for q in qrs_shapes if np.any(q)]
+        if not corrs or float(np.median(corrs)) < 0.9:
+            return False
+
+        # The stretch between beats is cut at fixed distances from the R
+        # peaks, not at measure_beat's own q_onset/j_point: when the P wave
+        # sits close to its QRS, q_onset can land on the P wave itself,
+        # which then drops out of the stretch and leaves only the T wave --
+        # reading sinus tachycardia as "one fused wave" (seen on a test
+        # waveform with q_onset 80 ms before R).
+        edge = int(0.06 * fs)
+        fused = 0
+        judged = 0
+        for i in range(1, len(beats)):
+            seg_start = max(int(r_peaks[i - 1]) + edge, int(beats[i - 1].get('j_point') or 0))
+            seg_end = int(r_peaks[i]) - edge
+            if seg_end - seg_start < int(0.12 * fs):
+                continue
+            segment = sig[seg_start:seg_end]
+            seg_range = float(np.ptp(segment))
+            if seg_range <= 0:
+                continue
+            waves = max(
+                len(find_peaks(pol * segment, prominence=0.3 * seg_range, distance=max(1, int(0.06 * fs)))[0])
+                for pol in (1.0, -1.0)
+            )
+            judged += 1
+            if waves <= 1:
+                fused += 1
+        # At HR >= 180 the P-on-T fusion test above gets unreliable on its
+        # own merits: the TP stretch shrinks to almost nothing, so a wave
+        # finder has very little room to tell "one fused hump" from "two
+        # waves crowded together" -- the same ambiguity that separates
+        # Sinus Tachycardia from Atrial Tachycardia in the first place, per
+        # the textbook criteria this rule is built from. Practically,
+        # resting sinus tachycardia this fast and sustained is not
+        # physiological for an adult Holter recording; once rate, QRS shape,
+        # and RR regularity (gates 1-3 above) already match, a sustained
+        # rate >= 180 bpm is itself the deciding factor, independent of how
+        # the fused-wave count happens to land.
+        if rate >= 180.0:
+            return True
+
+        if judged < 4:
+            return False
+        return fused / judged >= 0.7
+
     # Tried shrinking this to 6s/3s to reduce detection latency; verified
     # directly against real recordings that it did NOT detect episodes any
     # earlier (the rhythm's own transition is gradual, not instant -- a
@@ -1007,6 +1113,8 @@ def _detect_arrhythmias_uncached(
                             atrial_label = _classify_atrial_window(padded_signal, core_r_peaks, fs)
                             if atrial_label:
                                 target_morph = (atrial_label, '#FF00FF')
+                            elif _is_atrial_tachycardia_window(padded_signal, core_r_peaks, fs):
+                                target_morph = ('Atrial Tachycardia', '#FFA500')
 
                 if target_morph is None and not window_is_noisy:
                     window_leads = {}
@@ -1119,9 +1227,13 @@ def _detect_arrhythmias_uncached(
                and abs(o['start_sec'] - m['start_sec']) <= window_size * 2
                for o in _atrial)
     ]
+    # Atrial Tachycardia windows next to AFib/Flutter are dropped the same
+    # way: 2:1 Atrial Flutter at 150/min is regular with one F wave visible
+    # between beats, which reads exactly like P-on-T (seen: one such window
+    # inside a Flutter episode).
     morphological_candidates = [
         m for m in morphological_candidates
-        if not ('av block' in m['label'].lower()
+        if not (('av block' in m['label'].lower() or m['label'] == 'Atrial Tachycardia')
                 and any(abs(m['start_sec'] - s) <= window_size * 2 for s in _atrial_starts))
     ]
 
@@ -1137,11 +1249,13 @@ def _detect_arrhythmias_uncached(
     # not a separate rhythm. The genuine Atrial Flutter test recording never
     # had this problem: every true episode showed many consecutive windows
     # agreeing, never a lone one. VFib's own rule is untouched by this.
+    # Atrial Tachycardia goes through the same guard: one lone window is
+    # not an episode.
     if morphological_candidates:
         _sorted_by_time = sorted(morphological_candidates, key=lambda x: x['start_sec'])
         _confirmed = []
         for _i, _m in enumerate(_sorted_by_time):
-            if _m['label'] not in ('Atrial Fibrillation', 'Atrial Flutter'):
+            if _m['label'] not in ('Atrial Fibrillation', 'Atrial Flutter', 'Atrial Tachycardia'):
                 _confirmed.append(_m)
                 continue
             # Gap tolerance is 2x window_size here (see the merge step right
@@ -1445,6 +1559,43 @@ def _detect_arrhythmias_uncached(
             except Exception as e:
                 print(f"[Auto Arrhythmia Detect] AFib/Flutter boundary refine error: {e}")
 
+        # Beat-exact edges for Atrial Tachycardia. Its onset and end are
+        # abrupt (textbook: "after three sinus beats, atrial tachycardia
+        # develops"), so the edge is simply where the RR enters / leaves the
+        # episode's own rate: the first beat that opens two consecutive RR
+        # intervals within +/-15% of the episode's median RR, and the last
+        # beat that closes two such intervals. Searched out to one window
+        # past each window-vote edge, since that edge sits on the 5 s grid.
+        def _at_rr_in_band(a, b, median_rr):
+            return 0.85 * median_rr <= (b - a) <= 1.15 * median_rr
+
+        for region in merged_morph:
+            if region['label'] != 'Atrial Tachycardia':
+                continue
+            try:
+                inside = [p for p in _sorted_peaks if region['start_sec'] <= p <= region['end_sec']]
+                if len(inside) < 3:
+                    continue
+                median_rr = float(np.median(np.diff(inside)))
+                near = [p for p in _sorted_peaks
+                        if region['start_sec'] - window_size <= p <= region['end_sec'] + window_size]
+                new_start = new_end = None
+                for i in range(len(near) - 2):
+                    if _at_rr_in_band(near[i], near[i + 1], median_rr) and \
+                            _at_rr_in_band(near[i + 1], near[i + 2], median_rr):
+                        new_start = near[i]
+                        break
+                for i in range(len(near) - 1, 1, -1):
+                    if _at_rr_in_band(near[i - 1], near[i], median_rr) and \
+                            _at_rr_in_band(near[i - 2], near[i - 1], median_rr):
+                        new_end = near[i]
+                        break
+                if new_start is not None and new_end is not None and new_start < new_end - 0.5:
+                    region['start_sec'], region['end_sec'] = new_start, new_end
+                    region['start_time_str'], region['end_time_str'] = make_time_strs(new_start, new_end)
+            except Exception as e:
+                print(f"[Auto Arrhythmia Detect] Atrial Tachycardia boundary refine error: {e}")
+
         # The same 50%-overlapping sliding window that lets one episode span
         # several windows also means a transition from one morphological
         # label to another (e.g. Ventricular Fibrillation settling into
@@ -1569,7 +1720,7 @@ def _suppress_rate_overlap_in_structured_events(events):
             return False
         return 'av block' in lbl or lbl in {
             'ventricular fibrillation', 'ventricular tachycardia',
-            'atrial fibrillation', 'atrial flutter',
+            'atrial fibrillation', 'atrial flutter', 'atrial tachycardia',
         }
 
     morph_intervals = sorted(

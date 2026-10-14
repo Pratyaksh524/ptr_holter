@@ -1511,6 +1511,8 @@ class ECGStripCanvas(QWidget):
                     active_label = 'S'
                 elif 'sinus tachycardia' in ev_lbl:
                     active_label = 'S'
+                elif 'atrial tachycardia' in ev_lbl:
+                    active_label = 'S'
                 elif 'bradycardia (non-sinus)' in ev_lbl:
                     active_label = 'S'
                 elif 'tachycardia (non-sinus)' in ev_lbl:

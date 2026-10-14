@@ -38,7 +38,7 @@ def _detector_owns_label(label: str) -> bool:
     lower = str(label or '').lower()
     return lower in {
         'ventricular fibrillation', 'atrial fibrillation', 'atrial flutter',
-        'sinus bradycardia', 'sinus tachycardia',
+        'atrial tachycardia', 'sinus bradycardia', 'sinus tachycardia',
     } or 'av block' in lower
 
 

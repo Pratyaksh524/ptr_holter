@@ -656,12 +656,16 @@ class HolterAnalysisWorker(threading.Thread):
 
     @staticmethod
     def _label_beat(rr_prev_ms: float, rr_median_ms: float, qrs_width_ms: float) -> str:
-        if rr_prev_ms > 2000:
-            return 'Pause'
+        # Keep per-beat rate labels aligned with the beat-exact rate rules in
+        # auto_segment_arrthymia_detection.py.  Rate-based beats must be
+        # classified before the premature/QRS-width checks below; otherwise
+        # a slow or fast beat can be incorrectly marked as PVC/PAC.
         hr_prev = 60000.0 / max(rr_prev_ms, 1.0)
-        if hr_prev < 50:
+        if rr_prev_ms >= 4000.0:
+            return 'Pause'
+        if 15.0 <= hr_prev <= (60000.0 / 1050.0):
             return 'Brady'
-        if hr_prev > 130:
+        if hr_prev >= 100.0:
             return 'Tachy'
         # Classify as V (Ventricular) if wide QRS and premature
         if qrs_width_ms >= 120 and rr_prev_ms <= rr_median_ms * 0.95:
