@@ -729,7 +729,7 @@ def _detect_arrhythmias_uncached(
     # r_peaks is supplied by the caller (padded detection, filtered to this
     # window's own true [start, end)) for the same detection-quality reason
     # _is_vfib_window takes it -- see that function's own comment.
-    def _classify_atrial_window(window_signal, r_peaks, fs):
+    def _prepare_atrial_window_context(window_signal, r_peaks, fs):
         # A window needs a real sample of beats before its own majority
         # vote below means anything. Confirmed directly on a real
         # recording, right at a genuine VFib-to-AFib transition: a window
@@ -830,22 +830,43 @@ def _detect_arrhythmias_uncached(
         if scored < 4:
             return None
 
+        return {
+            'beats': beats,
+            'rr_ms': rr_ms,
+            'ventricular_rate': ventricular_rate,
+            'quiet_count': quiet_count,
+            'scored': scored,
+            'total_waves': total_waves,
+            'total_active_sec': total_active_sec,
+        }
+
+    def _classify_atrial_flutter_window(context):
+        """Apply only the existing Atrial Flutter rule."""
+        quiet_count = context['quiet_count']
+        scored = context['scored']
+        total_active_sec = context['total_active_sec']
+        total_waves = context['total_waves']
+        ventricular_rate = context['ventricular_rate']
+
         if (quiet_count / scored) < 0.4 and total_active_sec > 0:
             atrial_rate = (total_waves / total_active_sec) * 60.0
             ratio = atrial_rate / ventricular_rate
             if any(abs(ratio - whole) < 0.5 for whole in (2.0, 3.0, 4.0, 5.0)):
                 return 'Atrial Flutter'
-            # An active baseline alone is no longer enough for AFib -- it
-            # must also pass the P-wave and RR checks below.
+        return None
+
+    def _classify_atrial_fibrillation_window(context):
+        """Apply only the existing Atrial Fibrillation rule."""
+        beats = context['beats']
+        rr_ms = context['rr_ms']
 
         # Atrial Fibrillation means NO organized P wave: the atria fibrillate
         # instead of depolarizing as one, so no beat has a P wave at a fixed
         # distance before its QRS. "Organized" = most beats have a P wave AND
         # their PR intervals agree (sinus conduction). A P-finder that latches
         # onto a random f-wave bump in real AFib gives scattered PRs, so that
-        # still counts as no organized P. Only AFib is vetoed here -- Flutter
-        # was decided above, and AV blocks (P present, PR varying) fall
-        # through to analyze_ecg() since this returns None for them.
+        # still counts as no organized P. AV blocks (P present, PR varying)
+        # fall through to analyze_ecg() since this returns None for them.
         pr_values = [float(b['pr_ms']) for b in beats if b.get('p_present') and b.get('pr_ms') is not None]
         organized_p = (
             len(pr_values) >= max(3, int(0.6 * len(beats)))
@@ -854,30 +875,6 @@ def _detect_arrhythmias_uncached(
         if organized_p:
             return None
 
-        # Most beats read as having a "quiet" TP segment -- but that quiet
-        # reading can itself be fooled: on a genuinely fibrillatory
-        # baseline, the generic P-wave finder often still latches onto one
-        # of the small irregular f-wave bumps sitting right before each
-        # QRS and calls it a P wave, which shrinks the measured TP window
-        # down to nothing and hides the real irregularity from the check
-        # above (confirmed directly: a recording with f-waves measuring
-        # ~230-270 units of amplitude, just under the noise floor used
-        # above for that recording's scale, was missed this way). The
-        # direct check here is the other hallmark of Atrial Fibrillation --
-        # an irregularly irregular RR -- but a plain variability number
-        # (e.g. coefficient of variation) does not actually distinguish
-        # that from a normal, single, organized rhythm whose rate is
-        # simply changing (a Sinus Bradycardia window sliding into a Sinus
-        # Tachycardia one looks just as "variable" over one window; tried
-        # that first and it fired on real Brady/Tachy transition windows).
-        # What actually separates them is the SHAPE of the variability: a
-        # genuine rate change is a handful of beats settling from one
-        # fairly steady RR to another (the big jumps all point the same
-        # way), while true AFib has no settled rate at all -- consecutive
-        # RR intervals keep reversing direction, beat after beat. So: take
-        # only the RR changes big enough to be real (ignore sub-20ms
-        # jitter), and require that most of them flip direction from the
-        # last one, not just that a few big changes exist.
         rr_diffs = np.diff(rr_ms)
         significant_diffs = rr_diffs[np.abs(rr_diffs) > 60.0]
         if significant_diffs.size >= 3:
@@ -887,7 +884,18 @@ def _detect_arrhythmias_uncached(
             if reversal_ratio >= 0.5:
                 return 'Atrial Fibrillation'
 
-        return None  # most beats have a genuinely quiet/consistent baseline -- normal
+        return None
+
+    def _classify_atrial_window(window_signal, r_peaks, fs):
+        """Preserve the original Flutter-then-AFib classification order."""
+        context = _prepare_atrial_window_context(window_signal, r_peaks, fs)
+        if context is None:
+            return None
+
+        flutter_label = _classify_atrial_flutter_window(context)
+        if flutter_label is not None:
+            return flutter_label
+        return _classify_atrial_fibrillation_window(context)
 
     # Tried shrinking this to 6s/3s to reduce detection latency; verified
     # directly against real recordings that it did NOT detect episodes any
