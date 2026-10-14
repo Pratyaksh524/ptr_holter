@@ -508,6 +508,13 @@ class HolterFullDisclosureDialog(QDialog):
         self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint)
         self.setWindowState(Qt.WindowMaximized)
 
+        # Do not paint the fallback canvas layout during construction. The
+        # final row height depends on the maximized viewport and is not known
+        # until showEvent(); painting early caused a brief squeezed 12-lead
+        # layout flash before the proper Full Disclosure layout appeared.
+        self._initial_layout_pending = True
+        self.setUpdatesEnabled(False)
+
         screen = QApplication.primaryScreen()
         if screen:
             self.resize(screen.availableGeometry().size())
@@ -784,6 +791,14 @@ class HolterFullDisclosureDialog(QDialog):
     def showEvent(self, event):
         """Override showEvent to refresh segment overlay when dialog is shown."""
         super().showEvent(event)
+        if getattr(self, '_initial_layout_pending', False):
+            # At this point the maximized viewport has its real geometry.
+            # Synchronize before enabling updates so the first visible frame
+            # is already the final Full Disclosure layout.
+            self._sync_row_height_to_viewport()
+            self._update_canvases(self._current_start)
+            self._initial_layout_pending = False
+            self.setUpdatesEnabled(True)
         # Refresh segment overlay to ensure loaded segments are visible
         # Use longer delay to ensure canvas geometry is fully initialized
         QTimer.singleShot(200, self._refresh_segment_overlay)
