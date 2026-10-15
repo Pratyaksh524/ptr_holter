@@ -992,6 +992,32 @@ class HolterFullDisclosureDialog(QDialog):
         # right, so it sits further left instead of flush against it.
         top_layout.addStretch()
 
+        # TODO(testing-only): PR interval / QRS duration readout, computed
+        # live from Lead II for whatever is currently on screen. Added so a
+        # tester can scroll Full Disclosure and directly compare
+        # measure_beat()'s PR/QRS numbers (the same ones the VFib/AFib/
+        # Flutter/Atrial Tachycardia rules in
+        # auto_segment_arrthymia_detection.py read) against the Lead II
+        # waveform, rhythm by rhythm, without a separate script. Not a
+        # clinical display value, not wired into any detection or report
+        # logic -- updated only by _update_pr_qrs_label() below. Remove this
+        # once the rule-based detectors are fully validated against real
+        # recordings (or promote it to a supported feature if it turns out
+        # useful beyond testing).
+        self.lbl_pr_qrs = QLabel("PR: -- ms   QRS: -- ms")
+        self.lbl_pr_qrs.setStyleSheet("color: #FFD966; font-weight: bold; font-size: 13px;")
+        self.lbl_pr_qrs.setToolTip(
+            "TESTING ONLY -- PR interval / QRS duration measured from Lead II's own\n"
+            "beats in the current visible window, via the same measure_beat() the\n"
+            "auto-segment rules use. Not a clinical readout."
+        )
+        top_layout.addWidget(self.lbl_pr_qrs)
+
+        sep_pr_qrs = QFrame()
+        sep_pr_qrs.setFrameShape(QFrame.VLine)
+        sep_pr_qrs.setStyleSheet(f"color: {COL_GREEN_DRK};")
+        top_layout.addWidget(sep_pr_qrs)
+
         # Auto Arrhythmia Detection — left of the speed/gain readout. Styled
         # as a solid, raised accent button (unlike the flat bordered Undo/
         # label chrome around it) so it visibly reads as a clickable action,
@@ -3473,7 +3499,169 @@ class HolterFullDisclosureDialog(QDialog):
         self.time_scrollbar.setValue(int(self._current_start * 100))
         self._update_canvases(self._current_start)
 
+    def _update_pr_qrs_label(self, start_sec: float, end_sec: float):
+        """TODO(testing-only): recompute PR interval / QRS duration from
+        Lead II's own beats in the currently visible window, purely so a
+        tester can verify measure_beat()'s numbers directly against the
+        on-screen waveform while scrolling -- not used by any detection or
+        report logic. See the comment on lbl_pr_qrs's creation (top bar
+        setup) for the removal/promotion plan. Called from
+        _update_time_and_arrhythmia_labels() on every scroll/window change,
+        so it keeps following Lead II's current rhythm pattern as the user
+        scrolls horizontally."""
+        if not hasattr(self, 'lbl_pr_qrs'):
+            return
+        try:
+            from ecg.pan_tompkins import pan_tompkins
+            from ecg.arrhythmia_detector import measure_beat
+
+            # Use the Lead-II canvas that is currently visible as the
+            # primary source.  It is the exact waveform the user is looking
+            # at after a horizontal scroll, so it cannot disagree with the
+            # displayed recording because of a stale dialog reader or a
+            # refresh race.  The reader path below is only an initial-load
+            # fallback, before the canvas has received its data.
+            lead_ii_canvas = next(
+                (c for c in getattr(self, '_canvases', [])
+                 if getattr(c, 'lead_name', '') == 'II'),
+                None,
+            )
+            canvas_data = getattr(lead_ii_canvas, '_data', None) if lead_ii_canvas is not None else None
+            canvas_start = getattr(lead_ii_canvas, '_start_sec', None) if lead_ii_canvas is not None else None
+            canvas_fs = getattr(lead_ii_canvas, '_fs', None) if lead_ii_canvas is not None else None
+
+            if canvas_data is not None and len(canvas_data) >= 50 \
+                    and canvas_start is not None and canvas_fs:
+                sig = np.asarray(canvas_data, dtype=float)
+                fs = float(canvas_fs)
+                source_start = float(canvas_start)
+            else:
+                reader = getattr(getattr(self, '_engine', None), '_reader', None)
+                if reader is None:
+                    reader = getattr(self, '_reader', None)
+                if reader is None:
+                    self.lbl_pr_qrs.setText("PR: -- ms   QRS: -- ms")
+                    return
+                lead_names = list(getattr(reader, 'lead_names', []) or [])
+                if 'II' not in lead_names:
+                    self.lbl_pr_qrs.setText("PR: --   QRS: -- ")
+                    return
+                lead_idx = lead_names.index('II')
+                fs = getattr(reader, 'fs', None) or getattr(self._engine, 'fs', 500) or 500
+                total_duration = getattr(self._engine, 'duration_sec', end_sec)
+                pad_start = max(0.0, start_sec - 1.0)
+                pad_end = min(total_duration, end_sec + 1.0)
+                chunk = reader.read_range(pad_start, pad_end)
+                if chunk is None or lead_idx >= chunk.shape[0] or chunk.shape[1] < 50:
+                    self.lbl_pr_qrs.setText("PR: -- ms   QRS: -- ms")
+                    return
+                sig = np.asarray(chunk[lead_idx], dtype=float)
+                source_start = pad_start
+
+            peaks = [
+                p for p in pan_tompkins(sig, fs=fs)
+                if start_sec <= source_start + p / fs < end_sec
+            ]
+
+            # AF/Flutter have no consistently identifiable sinus P wave, so
+            # the generic beat measurer's PR candidate is not meaningful in
+            # those auto-marked regions. This is display-only suppression;
+            # auto-segment detection and its thresholds are unchanged.
+            atrial_arrhythmia_active = False
+            ventricular_fibrillation_active = False
+            if getattr(self, '_auto_marking_visible', False):
+                # Persisted event stores can contain legacy/non-dict entries
+                # after reopening a recording. One malformed entry must not
+                # abort the independent Lead-II measurement and blank both
+                # PR/QRS values.
+                for event in getattr(self._engine, '_structured_events', []) or []:
+                    if not isinstance(event, dict):
+                        continue
+                    try:
+                        event_label = str(event.get('label', event.get('type', '')) or '').lower()
+                        event_start = float(event.get('timestamp', 0.0) or 0.0)
+                        event_end = float(event.get('end_timestamp', event_start) or event_start)
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+                    if event_start > end_sec or event_end < start_sec:
+                        continue
+                    if event_label in {'atrial fibrillation', 'atrial flutter'}:
+                        atrial_arrhythmia_active = True
+                    elif event_label in {'ventricular fibrillation', 'vfib'} \
+                            or 'ventricular fibrillation' in event_label:
+                        ventricular_fibrillation_active = True
+
+            pr_values, qrs_values = [], []
+            for p in peaks:
+                beat = measure_beat(sig, int(p), fs, strict_pr=True)
+                if not beat:
+                    continue
+
+                # Broad-complex runs can have no isoelectric point around an
+                # individual beat. measure_beat() then returns the bounded
+                # wide-QRS estimate (typically 160 ms from the +/-80 ms
+                # search window) with qrs_bounds_resolved=False. Do not let
+                # that make the Full Disclosure header say "--" when the
+                # measured width is clearly in the wide-QRS range. This is a
+                # display/measurement fallback only; auto segment detection
+                # still requires resolved QRS boundaries exactly as before.
+                qrs_ms = float(beat.get('qrs_ms') or 0.0)
+                qrs_resolved = bool(beat.get('qrs_bounds_resolved'))
+                # VFib has no organized, measurable QRS complex. Keep the
+                # display as '--' for an active VFib segment even when the
+                # bounded +/-80 ms fallback happens to return 160 ms. The
+                # fallback remains available for organized wide-complex
+                # rhythms (for example VT/wide-QRS tachycardia).
+                if not ventricular_fibrillation_active and (qrs_resolved or 120.0 <= qrs_ms <= 220.0):
+                    qrs_values.append(qrs_ms)
+                # VFib has no organized atrial-to-ventricular conduction.
+                # Any PR candidate inside its chaotic baseline is only a
+                # coincidental noise-to-wave distance, never a clinical PR
+                # interval. Suppress it for the complete visible VFib
+                # window, just as the QRS readout above is suppressed.
+                if not atrial_arrhythmia_active and not ventricular_fibrillation_active \
+                        and beat.get('pr_ms') is not None:
+                    pr_values.append(beat['pr_ms'])
+
+            # PR candidates can occasionally contain one incorrectly picked
+            # P onset (for example 80/194 ms beside a true 150-170 ms PR).
+            # A plain standard-deviation gate lets those isolated candidates
+            # hide the valid window-wide PR. Use a robust median/MAD majority
+            # filter instead: the median is the center, MAD estimates normal
+            # beat-to-beat spread, and the clinical display tolerance keeps a
+            # minimum 25 ms band. This affects only the visible readout; the
+            # sinus-conduction gate used by auto classification remains
+            # unchanged.
+            if ventricular_fibrillation_active:
+                pr_txt = "--"
+            elif len(pr_values) >= 2:
+                # ``pr_values`` is collected as a Python list. Convert it
+                # before vector arithmetic; otherwise every multi-beat
+                # window raises ``TypeError`` and the outer fallback blanks
+                # both PR and QRS as ``--``.
+                pr_array = np.asarray(pr_values, dtype=float)
+                pr_center = float(np.median(pr_array))
+                pr_mad = float(np.median(np.abs(pr_array - pr_center)))
+                pr_tolerance = max(25.0, 3.0 * pr_mad)
+                pr_inliers = pr_array[np.abs(pr_array - pr_center) <= pr_tolerance]
+                if len(pr_inliers) >= max(2, int(np.ceil(len(pr_values) * 0.5))):
+                    pr_txt = f"{float(np.median(pr_inliers)):.0f} ms"
+                else:
+                    pr_txt = "--"
+            elif len(pr_values) == 1:
+                pr_txt = f"{float(pr_values[0]):.0f} ms"
+            else:
+                pr_txt = "--"
+            qrs_txt = f"{float(np.median(qrs_values)):.0f} ms" if qrs_values else "--"
+            self.lbl_pr_qrs.setText(f"PR: {pr_txt}   QRS: {qrs_txt} ")
+        except Exception as e:
+            print(f"[Full Disclosure] PR/QRS testing label error: {e}")
+            self.lbl_pr_qrs.setText("PR: -- ms   QRS: -- ms")
+
     def _update_time_and_arrhythmia_labels(self, start_sec: float, end_sec: float):
+        # TODO(testing-only): see _update_pr_qrs_label()'s own docstring.
+        self._update_pr_qrs_label(start_sec, end_sec)
+
         # Update real-time display
         if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
             start_real = datetime.fromtimestamp(self._engine._reader.start_time + start_sec)
@@ -3522,7 +3710,17 @@ class HolterFullDisclosureDialog(QDialog):
                     still_on = _shown_second(event_end) >= view_second
                 else:
                     still_on = event_end >= start_sec
-                if still_on and event_start <= end_sec:
+                # Do not activate an event merely because its start falls
+                # somewhere in the *future* part of the visible 10-second
+                # frame.  NSR is the display fallback (it is not stored as
+                # an auto event), so using ``event_start <= end_sec`` made a
+                # Brady/Tachy event appear to end the preceding NSR early:
+                # the current frame could still be before the event while
+                # its right edge touched the event start.  Activate the
+                # event only once the scroll position reaches its actual
+                # timestamp.  This is display-boundary reconciliation only;
+                # no arrhythmia detector or segment boundary is changed.
+                if still_on and event_start <= start_sec:
                     label = str(event.get('label', event.get('type', '')) or '')
                     if label.lower() in {
                         'sinus bradycardia', 'bradycardia',
@@ -3908,6 +4106,15 @@ class HolterFullDisclosureDialog(QDialog):
                 c.set_data(x, np.asarray(d_i, dtype=np.float32), beat_annotations=beat_annotations, start_sec=start_sec, structured_events=visible_structured_events, fast_preview=not update_extras)
             else:
                 c.set_data(x, np.zeros(expected_len, dtype=np.float32), beat_annotations=beat_annotations, start_sec=start_sec, structured_events=visible_structured_events, fast_preview=not update_extras)
+
+        # Refresh the measurement header after the current waveform has been
+        # installed on every canvas.  The status/header update runs earlier
+        # in this method so it can briefly see the previous reader/window
+        # state during a horizontal scroll; that left valid PR/QRS values at
+        # the initial '--' text even though the waveform and RR labels had
+        # already moved.  This is display synchronization only; the same
+        # Lead-II measurement path and all arrhythmia rules remain unchanged.
+        self._update_pr_qrs_label(start_sec, end_sec)
 
         # Clear and repopulate segment overlay with only visible segments.
         # CRITICAL FIX: ALWAYS update segment positions on scroll, not just when update_extras=True

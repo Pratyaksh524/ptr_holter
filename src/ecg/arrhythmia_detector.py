@@ -287,15 +287,48 @@ def _qrs_bounds(signal: np.ndarray, r_idx: int, fs: float) -> Tuple[int, int, fl
             j_resolved = True
             break
 
-    active = np.where(np.abs(smoothed[qrs_left:qrs_right + 1] - baseline) > amplitude_threshold)[0]
-    if active.size:
-        q_onset = min(q_onset, qrs_left + int(active[0]))
-        j_point = max(j_point, qrs_left + int(active[-1]))
+    # Widen q_onset/j_point to cover any genuinely active (non-baseline)
+    # samples the slope+baseline loops above undershot -- meant for a
+    # pathological/notched QRS where that search finds a "quiet" point too
+    # early, while real QRS activity continues past it.
+    #
+    # This must only widen through a CONTIGUOUS active run starting at
+    # r_idx, not jump to the first/last active sample anywhere in the whole
+    # +/-80ms window: at a fast heart rate (RR short enough that the
+    # previous beat's T wave or the next beat's P wave falls inside this
+    # beat's own +/-80ms search window), the far edges of that window are
+    # "active" too, for a different wave entirely -- confirmed directly on
+    # a real recording where this walked q_onset/j_point all the way out to
+    # the full +/-80ms span (qrs_left/qrs_right) on every fast-rate beat,
+    # reading a uniform, fake 160ms "QRS" where the true QRS, measured at a
+    # slower rate on the exact same lead moments earlier, was ~90ms. QRS
+    # duration is a property of ventricular conduction, not heart rate --
+    # it does not legitimately change between a slow and fast stretch of
+    # the same rhythm. Walking outward from r_idx and stopping at the first
+    # non-active sample keeps this widening local to the beat's own QRS,
+    # the same way it would if there were no neighboring wave in range.
+    active_mask = np.abs(smoothed[qrs_left:qrs_right + 1] - baseline) > amplitude_threshold
+    if active_mask.size:
+        r_rel = r_idx - qrs_left
+        left_rel = r_rel
+        while left_rel > 0 and active_mask[left_rel - 1]:
+            left_rel -= 1
+        right_rel = r_rel
+        while right_rel < active_mask.size - 1 and active_mask[right_rel + 1]:
+            right_rel += 1
+        q_onset = min(q_onset, qrs_left + left_rel)
+        j_point = max(j_point, qrs_left + right_rel)
 
     return int(q_onset), int(j_point), baseline, bool(q_resolved and j_resolved)
 
 
-def _detect_p_wave(signal: np.ndarray, r_idx: int, baseline: float, fs: float) -> Dict[str, object]:
+def _detect_p_wave(
+    signal: np.ndarray,
+    r_idx: int,
+    baseline: float,
+    fs: float,
+    strict_selection: bool = False,
+) -> Dict[str, object]:
     result = {
         "p_present": False,
         "p_peak": None,
@@ -311,35 +344,67 @@ def _detect_p_wave(signal: np.ndarray, r_idx: int, baseline: float, fs: float) -
 
     window = signal[p_start:p_end]
     prominence = max(0.04, 0.18 * max(float(np.ptp(window)), 0.05))
-    peaks, props = find_peaks(window, prominence=prominence)
-    if peaks.size == 0:
-        peak_rel = int(np.argmax(window))
-        if window[peak_rel] - baseline < max(0.05, 0.2 * np.ptp(window)):
+
+    if strict_selection:
+        # For the on-screen PR measurement, search both polarities and choose
+        # the valid candidate closest to QRS. The older detector-wide rule
+        # selected the preceding T wave in sinus tachycardia.
+        positive, positive_props = find_peaks(window, prominence=prominence)
+        negative, negative_props = find_peaks(-window, prominence=prominence)
+        candidates = []
+        for peak, prom in zip(positive, positive_props.get("prominences", [])):
+            candidates.append((int(peak), float(prom)))
+        for peak, prom in zip(negative, negative_props.get("prominences", [])):
+            candidates.append((int(peak), float(prom)))
+        latest_p_rel = max(0, (r_idx - _ms_to_samples(50, fs)) - p_start)
+        earliest_p_rel = max(0, (r_idx - _ms_to_samples(300, fs)) - p_start)
+        candidates = [
+            (peak, prom) for peak, prom in candidates
+            if earliest_p_rel <= peak <= latest_p_rel
+        ]
+        if not candidates:
             return result
+        peak_rel = max(peak for peak, _ in candidates)
     else:
-        prominences = props.get("prominences", np.zeros(peaks.size))
-        peak_rel = int(peaks[int(np.argmax(prominences))])
+        # Preserve the detector's established P-wave behavior for rhythm
+        # classification. The strict candidate selection above is a display
+        # measurement heuristic and must not change brady/tachy segmentation.
+        peaks, props = find_peaks(window, prominence=prominence)
+        if peaks.size == 0:
+            peak_rel = int(np.argmax(window))
+            if window[peak_rel] - baseline < max(0.05, 0.2 * np.ptp(window)):
+                return result
+        else:
+            prominences = props.get("prominences", np.zeros(peaks.size))
+            peak_rel = int(peaks[int(np.argmax(prominences))])
 
     p_peak = p_start + peak_rel
-    amplitude = float(signal[p_peak] - baseline)
+    # In fast rhythms the older QRS-centered baseline window can contain the
+    # preceding T wave, shifting the baseline toward the T peak. The P wave
+    # is then visibly present but its measured amplitude becomes near-zero
+    # and the PR result disappears. For strict PR/P gating, use the local
+    # pre-QRS search window's robust median instead; keep the established
+    # detector-wide baseline path unchanged.
+    p_baseline = float(np.median(window)) if strict_selection else baseline
+    amplitude = float(signal[p_peak] - p_baseline)
     # Threshold lowered from 0.08 → 0.04 mV: small but real P waves (common in
     # standard single-lead recordings) were being rejected, causing NSR to be
     # misclassified as "Rhythm Undetermined".
-    if amplitude < 0.04:
+    if abs(amplitude) < 0.04:
         return result
     boundary_threshold = max(0.02, 0.2 * abs(amplitude))
 
     p_onset = p_peak
     left_limit = max(p_start, p_peak - _ms_to_samples(120, fs))
     for idx in range(p_peak, left_limit - 1, -1):
-        if abs(signal[idx] - baseline) <= boundary_threshold:
+        if abs(signal[idx] - p_baseline) <= boundary_threshold:
             p_onset = idx
             break
 
     p_finish = p_peak
     right_limit = min(p_end - 1, p_peak + _ms_to_samples(120, fs))
     for idx in range(p_peak, right_limit + 1):
-        if abs(signal[idx] - baseline) <= boundary_threshold:
+        if abs(signal[idx] - p_baseline) <= boundary_threshold:
             p_finish = idx
             break
 
@@ -407,7 +472,12 @@ def _beat_noise_flags(signal: np.ndarray, q_onset: int, j_point: int, baseline: 
     return bool(reasons), reasons, qrs_amplitude
 
 
-def measure_beat(signal: Sequence[float], r_idx: int, fs: float = DEFAULT_FS) -> Optional[Dict[str, object]]:
+def measure_beat(
+    signal: Sequence[float],
+    r_idx: int,
+    fs: float = DEFAULT_FS,
+    strict_pr: bool = False,
+) -> Optional[Dict[str, object]]:
     signal_arr = _safe_array(signal)
     if signal_arr.size == 0 or r_idx <= 0 or r_idx >= signal_arr.size:
         return None
@@ -444,8 +514,13 @@ def measure_beat(signal: Sequence[float], r_idx: int, fs: float = DEFAULT_FS) ->
         beat["noise_reasons"] = ["qrs_out_of_range"]
         return beat
 
-    beat.update(_detect_p_wave(signal_arr, int(r_idx), baseline, fs))
-    if beat["p_present"] and beat["p_onset"] is not None:
+    beat.update(_detect_p_wave(signal_arr, int(r_idx), baseline, fs, strict_selection=strict_pr))
+    if (
+        beat["p_present"]
+        and beat["p_onset"] is not None
+        and (qrs_bounds_resolved or not strict_pr)
+        and int(beat.get("p_end") or 0) < int(q_onset)
+    ):
         pr_ms = float((int(q_onset) - int(beat["p_onset"])) * 1000.0 / fs)
         if 80.0 <= pr_ms <= 400.0:
             beat["pr_ms"] = pr_ms
@@ -1493,6 +1568,11 @@ def analyze_ecg(
         not rr_irregular or flutter_score > 0.35
     )
     effective_pr_ms = None if (atrial_fib or atrial_flutter) else pr_ms
+    # AF/Flutter do not have a consistently identifiable sinus P wave, so a
+    # P-to-QRS interval found by the generic beat measurer is not a valid PR
+    # measurement. Keep the internal raw value available for rhythm logic, but
+    # expose the rhythm-aware value to UI/API consumers.
+    display_pr_ms = effective_pr_ms or 0.0
 
     # Fix 2: PR Series for Mobitz I
     pr_series = [float(b.get("pr_ms")) for b in beats if b.get("pr_ms")]
@@ -1679,7 +1759,7 @@ def analyze_ecg(
             "P waves present" if p_present else "No P waves"
         ],
         "Intervals": {
-            "PR": round(float(pr_ms or 0.0)),
+            "PR": round(float(display_pr_ms)),
             "QRS": round(float(qrs_ms or 0.0)),
             "QT/QTc": f"{int(qt_ms)}/{int(qtc_bazett)}"
         },
@@ -1687,7 +1767,7 @@ def analyze_ecg(
         "Confidence": round(float(confidence), 2),
         # Legacy/Extra bindings
         "rr_ms": float(rate_info["rr_mean_ms"]),
-        "pr_ms": float(pr_ms or 0.0),
+        "pr_ms": float(display_pr_ms),
         "qrs_ms": float(qrs_ms or 0.0),
         "qt_ms": float(qt_ms),
         "qtc_bazett": float(qtc_bazett),
@@ -1735,7 +1815,7 @@ def analyze_ecg(
         }
         dl_metrics = {
             "heart_rate_bpm": heart_rate,
-            "pr_ms": pr_ms or 0.0,
+            "pr_ms": display_pr_ms,
             "qrs_ms": qrs_ms or 0.0,
             "qt_ms": qt_ms,
             "qtc_bazett": qtc_bazett,

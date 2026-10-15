@@ -2152,13 +2152,6 @@ class ECGStripCanvas(QWidget):
                 if vfib_regions and _in_vfib_region(start_ts, end_ts):
                     continue
 
-                # Neither detected "peak" either side of this interval has a
-                # resolvable QRS shape -- this is chaotic noise/artifact, not
-                # a real beat-to-beat gap. See organized_map above for why
-                # this only fires when BOTH ends agree.
-                if interval.get('no_clean_qrs'):
-                    continue
-
                 # Check if interval is within visible window
                 if (self._start_sec <= start_ts <= end_sec) or (self._start_sec <= end_ts <= end_sec):
                     # Calculate x coordinates for start and end
