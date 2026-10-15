@@ -38,7 +38,7 @@ def _detector_owns_label(label: str) -> bool:
     lower = str(label or '').lower()
     return lower in {
         'ventricular fibrillation', 'atrial fibrillation', 'atrial flutter',
-        'atrial tachycardia', 'sinus bradycardia', 'sinus tachycardia',
+        'supraventricular tachycardia (svt)', 'sinus bradycardia', 'sinus tachycardia',
     } or 'av block' in lower
 
 
@@ -207,8 +207,6 @@ def _build_timeline_events(session_dir: str,
         s_t = float(seg.get('start_sec', seg.get('timestamp', 0.0)) or 0.0)
         e_t = float(seg.get('end_sec', seg.get('end_timestamp', s_t)) or s_t)
         lbl = str(seg.get('label', 'Event'))
-        if lbl.strip().lower() == 'atrial tachycardia':
-            lbl = 'Supraventricular Tachycardia (SVT)'
 
         # Check if inside manual segment (or a previously-processed auto
         # segment -- this list accumulates both). A strict/open-interval
@@ -826,8 +824,6 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     auto_segment_times = {}
     for event in auto_segment_events:
         label = str(event.get('label', 'Unknown'))
-        if label.strip().lower() == 'atrial tachycardia':
-            label = 'Supraventricular Tachycardia (SVT)'
         auto_segment_counts[label] = auto_segment_counts.get(label, 0) + 1
         s_t = float(event.get('start_sec', event.get('timestamp', 0.0)) or 0.0)
         e_t = float(event.get('end_sec', event.get('end_timestamp', s_t)) or s_t)

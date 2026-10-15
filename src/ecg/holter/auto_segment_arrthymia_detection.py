@@ -1143,7 +1143,7 @@ def _detect_arrhythmias_uncached(
             return flutter_label
         return _classify_atrial_fibrillation_window(context)
 
-    # Atrial Tachycardia rule (own function, checked only after the VFib and
+    # Supraventricular Tachycardia (SVT) rule (own function, checked only after the VFib and
     # AFib/Flutter rules found nothing). Textbook picture: a regular narrow-
     # complex rhythm at 100-250/min, QRS complexes the same shape as the
     # sinus beats, and the P waves superimposed on the T waves of the
@@ -1152,7 +1152,7 @@ def _detect_arrhythmias_uncached(
     # tachycardia the T wave and the next P wave are still two separate
     # waves with the signal dipping back between them (measured on every
     # Sinus Tachycardia test recording, 105-160 bpm: two humps between
-    # beats in 100% of intervals), whereas in Atrial Tachycardia they merge
+    # beats in 100% of intervals), whereas in Supraventricular Tachycardia they merge
     # into a single hump.
     #   1. at least 6 beats, rate 100-250/min;
     #   2. regular RR (coefficient of variation <= 0.08) -- rules out AFib,
@@ -1235,7 +1235,7 @@ def _detect_arrhythmias_uncached(
         # own merits: the TP stretch shrinks to almost nothing, so a wave
         # finder has very little room to tell "one fused hump" from "two
         # waves crowded together" -- the same ambiguity that separates
-        # Sinus Tachycardia from Atrial Tachycardia in the first place, per
+        # Sinus Tachycardia from Supraventricular Tachycardia in the first place, per
         # the textbook criteria this rule is built from. Practically,
         # resting sinus tachycardia this fast and sustained is not
         # physiological for an adult Holter recording; once rate, QRS shape,
@@ -1358,7 +1358,7 @@ def _detect_arrhythmias_uncached(
                         # regular monomorphic VT window look like VFib.
                         if _is_ventricular_tachycardia_window(padded_signal, core_r_peaks, fs):
                             # Burnt orange distinguishes organized VT from
-                            # VFib red and atrial tachycardia orange.
+                            # VFib red and Supraventricular Tachycardia orange.
                             target_morph = ('Ventricular Tachycardia', '#E67E22')
                         elif _is_vfib_window(padded_signal, core_r_peaks, fs):
                             target_morph = ('Ventricular Fibrillation', '#FF3333')
@@ -1367,7 +1367,7 @@ def _detect_arrhythmias_uncached(
                             if atrial_label:
                                 target_morph = (atrial_label, '#FF00FF')
                             elif _is_atrial_tachycardia_window(padded_signal, core_r_peaks, fs):
-                                target_morph = ('Atrial Tachycardia', '#FFA500')
+                                target_morph = ('Supraventricular Tachycardia (SVT)', '#FFA500')
 
                 if target_morph is None and not window_is_noisy:
                     window_leads = {}
@@ -1494,13 +1494,13 @@ def _detect_arrhythmias_uncached(
                and abs(o['start_sec'] - m['start_sec']) <= window_size * 2
                for o in _atrial)
     ]
-    # Atrial Tachycardia windows next to AFib/Flutter are dropped the same
+    # Supraventricular Tachycardia (SVT) windows next to AFib/Flutter are dropped the same
     # way: 2:1 Atrial Flutter at 150/min is regular with one F wave visible
     # between beats, which reads exactly like P-on-T (seen: one such window
     # inside a Flutter episode).
     morphological_candidates = [
         m for m in morphological_candidates
-        if not (('av block' in m['label'].lower() or m['label'] == 'Atrial Tachycardia')
+        if not (('av block' in m['label'].lower() or m['label'] == 'Supraventricular Tachycardia (SVT)')
                 and any(abs(m['start_sec'] - s) <= window_size * 2 for s in _atrial_starts))
     ]
 
@@ -1533,13 +1533,13 @@ def _detect_arrhythmias_uncached(
     # not a separate rhythm. The genuine Atrial Flutter test recording never
     # had this problem: every true episode showed many consecutive windows
     # agreeing, never a lone one. VFib's own rule is untouched by this.
-    # Atrial Tachycardia goes through the same guard: one lone window is
+    # Supraventricular Tachycardia (SVT) goes through the same guard: one lone window is
     # not an episode.
     if morphological_candidates:
         _sorted_by_time = sorted(morphological_candidates, key=lambda x: x['start_sec'])
         _confirmed = []
         for _i, _m in enumerate(_sorted_by_time):
-            if _m['label'] not in ('Atrial Fibrillation', 'Atrial Flutter', 'Atrial Tachycardia'):
+            if _m['label'] not in ('Atrial Fibrillation', 'Atrial Flutter', 'Supraventricular Tachycardia (SVT)'):
                 _confirmed.append(_m)
                 continue
             # Gap tolerance is 2x window_size here (see the merge step right
@@ -1864,8 +1864,8 @@ def _detect_arrhythmias_uncached(
             except Exception as e:
                 print(f"[Auto Arrhythmia Detect] AFib/Flutter boundary refine error: {e}")
 
-        # Beat-exact edges for Atrial Tachycardia. Its onset and end are
-        # abrupt (textbook: "after three sinus beats, atrial tachycardia
+        # Beat-exact edges for Supraventricular Tachycardia (SVT). Its onset and end are
+        # abrupt (textbook: "after three sinus beats, Supraventricular Tachycardia develops"),
         # develops"), so the edge is simply where the RR enters / leaves the
         # episode's own rate: the first beat that opens two consecutive RR
         # intervals within +/-15% of the episode's median RR, and the last
@@ -1875,7 +1875,7 @@ def _detect_arrhythmias_uncached(
             return 0.85 * median_rr <= (b - a) <= 1.15 * median_rr
 
         for region in merged_morph:
-            if region['label'] != 'Atrial Tachycardia':
+            if region['label'] != 'Supraventricular Tachycardia (SVT)':
                 continue
             try:
                 inside = [p for p in _sorted_peaks if region['start_sec'] <= p <= region['end_sec']]
@@ -1899,7 +1899,7 @@ def _detect_arrhythmias_uncached(
                     region['start_sec'], region['end_sec'] = new_start, new_end
                     region['start_time_str'], region['end_time_str'] = make_time_strs(new_start, new_end)
             except Exception as e:
-                print(f"[Auto Arrhythmia Detect] Atrial Tachycardia boundary refine error: {e}")
+                print(f"[Auto Arrhythmia Detect] Supraventricular Tachycardia (SVT) boundary refine error: {e}")
 
         # The same 50%-overlapping sliding window that lets one episode span
         # several windows also means a transition from one morphological
@@ -2034,7 +2034,7 @@ def _suppress_rate_overlap_in_structured_events(events):
         # the sinus-rate pipeline is being validated independently.
         return lbl in {
             'ventricular fibrillation', 'ventricular tachycardia',
-            'atrial fibrillation', 'atrial flutter', 'atrial tachycardia',
+            'atrial fibrillation', 'atrial flutter', 'supraventricular tachycardia (svt)',
         }
 
     morph_intervals = sorted(

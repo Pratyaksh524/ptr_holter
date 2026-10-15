@@ -996,7 +996,7 @@ class HolterFullDisclosureDialog(QDialog):
         # live from Lead II for whatever is currently on screen. Added so a
         # tester can scroll Full Disclosure and directly compare
         # measure_beat()'s PR/QRS numbers (the same ones the VFib/AFib/
-        # Flutter/Atrial Tachycardia rules in
+        # Flutter/Supraventricular Tachycardia rules in
         # auto_segment_arrthymia_detection.py read) against the Lead II
         # waveform, rhythm by rhythm, without a separate script. Not a
         # clinical display value, not wired into any detection or report
@@ -3310,7 +3310,7 @@ class HolterFullDisclosureDialog(QDialog):
             'aflutter': ('Atrial Flutter', '#FF69B4'),
             # Before the bare 'tachycardia' fallback below, which would
             # otherwise draw it as Sinus Tachycardia.
-            'atrial tachycardia': ('Supraventricular Tachycardia (SVT)', '#FFA500'),
+            'supraventricular tachycardia (svt)': ('Supraventricular Tachycardia (SVT)', '#FFA500'),
             'sinus bradycardia': ('Sinus Bradycardia', '#00BFFF'),
             'bradycardia': ('Sinus Bradycardia', '#00BFFF'),
             'sinus tachycardia': ('Sinus Tachycardia', '#00FFFF'),
@@ -3726,7 +3726,7 @@ class HolterFullDisclosureDialog(QDialog):
                         'sinus tachycardia', 'tachycardia',
                         'ventricular fibrillation', 'ventricular tachycardia',
                         'atrial fibrillation', 'atrial flutter',
-                        'atrial tachycardia',
+                        'supraventricular tachycardia (svt)',
                     }:
                         active_auto.append((event_start, event_end, label))
             if active_auto:
@@ -3740,18 +3740,10 @@ class HolterFullDisclosureDialog(QDialog):
                     event_time = datetime.fromtimestamp(
                         self._engine._reader.start_time + shown_sec
                     ).strftime('%H:%M:%S')
-                    display_event_label = (
-                        'Supraventricular Tachycardia (SVT)'
-                        if event_label.lower() == 'atrial tachycardia'
-                        else event_label
-                    )
+                    display_event_label = event_label
                     arrhythmia_label = f"Arrhythmia: {display_event_label} at {event_time}"
                 else:
-                    display_event_label = (
-                        'Supraventricular Tachycardia (SVT)'
-                        if event_label.lower() == 'atrial tachycardia'
-                        else event_label
-                    )
+                    display_event_label = event_label
                     arrhythmia_label = f"Arrhythmia: {display_event_label}"
         except Exception as e:
             print(f"[Full Disclosure] Error updating auto rhythm label: {e}")
