@@ -207,6 +207,8 @@ def _build_timeline_events(session_dir: str,
         s_t = float(seg.get('start_sec', seg.get('timestamp', 0.0)) or 0.0)
         e_t = float(seg.get('end_sec', seg.get('end_timestamp', s_t)) or s_t)
         lbl = str(seg.get('label', 'Event'))
+        if lbl.strip().lower() == 'atrial tachycardia':
+            lbl = 'Supraventricular Tachycardia (SVT)'
 
         # Check if inside manual segment (or a previously-processed auto
         # segment -- this list accumulates both). A strict/open-interval
@@ -246,6 +248,27 @@ def _build_timeline_events(session_dir: str,
     # 6. Baseline rhythm / transition events
     # Start with baseline Normal Sinus Rhythm at t=0 if recording has data and t=0 is not in a segment
     if metrics or auto_segments or manual_segments:
+        # Do not append a trailing NSR marker when the preceding segment
+        # reaches the recording end.  There is no post-segment data from
+        # which to establish a return to sinus rhythm; adding one here made
+        # the report show a false final NSR row after VFib/VT.
+        recording_end_sec = 0.0
+        try:
+            recording_end_sec = max(
+                float(metric.get('timestamp', 0.0) or 0.0)
+                + float(metric.get('duration_sec', metric.get('duration', 0.0)) or 0.0)
+                for metric in (metrics or [])
+                if isinstance(metric, dict)
+            )
+        except Exception:
+            recording_end_sec = 0.0
+        if recording_end_sec <= 0.0:
+            recording_end_sec = max(
+                [float(seg.get('end_sec', seg.get('end_timestamp', 0.0)) or 0.0)
+                 for seg in auto_segments]
+                + [float(seg.get('end_sec', 0.0) or 0.0) for seg in manual_segments]
+                + [0.0]
+            )
         starts_in_segment = any(ms <= 0.5 and me > 0.0 for ms, me in active_segments_ranges)
         if not starts_in_segment:
             timeline_events.append({
@@ -259,6 +282,8 @@ def _build_timeline_events(session_dir: str,
         # Add baseline return after segments if there's a gap before next segment
         for ms, me in active_segments_ranges:
             t_resume = me + 0.05
+            if recording_end_sec > 0.0 and t_resume >= recording_end_sec - 0.05:
+                continue
             in_another = any(other_s <= t_resume <= other_e for other_s, other_e in active_segments_ranges if (other_s, other_e) != (ms, me))
             if not in_another:
                 timeline_events.append({
@@ -801,6 +826,8 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     auto_segment_times = {}
     for event in auto_segment_events:
         label = str(event.get('label', 'Unknown'))
+        if label.strip().lower() == 'atrial tachycardia':
+            label = 'Supraventricular Tachycardia (SVT)'
         auto_segment_counts[label] = auto_segment_counts.get(label, 0) + 1
         s_t = float(event.get('start_sec', event.get('timestamp', 0.0)) or 0.0)
         e_t = float(event.get('end_sec', event.get('end_timestamp', s_t)) or s_t)
