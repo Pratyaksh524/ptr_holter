@@ -2114,8 +2114,9 @@ class ECGStripCanvas(QWidget):
             # measures across it is noise, not a real beat-to-beat gap --
             # showing a number there misleads a reviewer into reading it as
             # a genuine interval. Suppress any RR label whose interval falls
-            # inside an auto-detected VFib/VTach region (VTach folded into
-            # VFib, same as the rest of the auto-segment pipeline). This is
+            # inside an auto-detected VFib region. VT has organized,
+            # measurable ventricular complexes, so its RR/HR labels remain
+            # visible. This is
             # a window-level, rhythm-label check, not a per-beat signal
             # check -- a per-beat isoelectric-baseline check was tried and
             # removed, since it also misfired on Atrial Flutter/Fibrillation
@@ -2124,7 +2125,7 @@ class ECGStripCanvas(QWidget):
             # subset of perfectly fine beats there.
             vfib_regions = []
             for ev in getattr(self, '_structured_events', []) or []:
-                # Auto-detected VFib/VTach regions can arrive tagged with any
+                # Auto-detected VFib regions can arrive tagged with any
                 # of several source strings depending on which pipeline wrote
                 # them -- 'auto'/'arrhythmia' from the live auto-segment
                 # detector, 'analysis'/'classified' from the recording-time
@@ -2134,8 +2135,7 @@ class ECGStripCanvas(QWidget):
                 if 'manual' in source:
                     continue
                 ev_lbl = str(ev.get('label', ev.get('type', '')) or '').lower()
-                if 'ventricular fibrillation' in ev_lbl or 'vfib' in ev_lbl or \
-                   'ventricular tachycardia' in ev_lbl or 'vtach' in ev_lbl:
+                if 'ventricular fibrillation' in ev_lbl or 'vfib' in ev_lbl:
                     v_start = float(ev.get('timestamp', 0.0) or 0.0)
                     v_end = float(ev.get('end_timestamp', ev.get('end_ts', v_start)) or v_start)
                     if v_end > v_start:

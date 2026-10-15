@@ -787,7 +787,7 @@ def _detect_arrhythmias_uncached(
                 })
 
     # ------------------------------------------------------------------
-    # 3. Detect Morphological Arrhythmias (VFib, AFib, Flutter, AV Block)
+    # 3. Detect Morphological Arrhythmias (VFib, VT, AFib, Flutter, AV Block)
     # ------------------------------------------------------------------
     # Ventricular Fibrillation rule (simple, direct -- applied to every
     # rhythm window the same way): a window is VFib when its beats show
@@ -796,8 +796,10 @@ def _detect_arrhythmias_uncached(
     #   2. the QRS complex itself is not organized/resolvable (irregular,
     #      chaotic -- _qrs_bounds() in arrhythmia_detector.py could not find
     #      a genuine isoelectric boundary for most beats).
-    # Ventricular Tachycardia is intentionally not reported as a separate
-    # label here -- a window this chaotic renders as Ventricular Fibrillation.
+    # Ventricular Tachycardia is evaluated separately below. It must not be
+    # confused with VFib: VT has an organized, usually regular ventricular
+    # rhythm with consistently wide QRS complexes, while VFib has no
+    # resolvable/organized QRS.
     #
     # r_peaks is supplied by the caller rather than detected here. The
     # caller reads a couple of seconds of padding on each side of this
@@ -838,6 +840,107 @@ def _detect_arrhythmias_uncached(
         no_p_follows_qrs = p_follows_qrs < max(1, len(beats) // 2)
         no_organized_qrs = organized_qrs < max(1, len(beats) // 2)
         return no_p_follows_qrs and no_organized_qrs
+
+    def _is_ventricular_tachycardia_window(window_signal, r_peaks, fs):
+        """Detect an organized fast wide-complex ventricular run."""
+        if len(r_peaks) < 4:
+            return False
+        beats = [
+            b for b in (measure_beat(window_signal, int(p), fs) for p in r_peaks)
+            if b is not None
+        ]
+        if len(beats) < 4:
+            return False
+
+        rr_ms = np.diff(np.asarray(r_peaks, dtype=float)) * 1000.0 / float(fs)
+        if rr_ms.size < 3 or np.any(rr_ms <= 0.0):
+            return False
+        # A window can straddle the onset of VT and contain a few preceding
+        # transition beats. Do not let those mixed intervals reject the
+        # stable ventricular rhythm that follows. Find the longest contiguous
+        # RR run around the dominant (median) cycle and evaluate only that
+        # rhythm core; transition beats are deliberately excluded.
+        median_rr = float(np.median(rr_ms))
+        stable_intervals = np.abs(rr_ms - median_rr) <= (0.15 * median_rr)
+        best_start = best_end = None
+        run_start = None
+        for interval_idx, is_stable in enumerate(stable_intervals):
+            if is_stable and run_start is None:
+                run_start = interval_idx
+            if (not is_stable or interval_idx == len(stable_intervals) - 1) and run_start is not None:
+                run_end = interval_idx if is_stable and interval_idx == len(stable_intervals) - 1 else interval_idx - 1
+                if best_start is None or (run_end - run_start) > (best_end - best_start):
+                    best_start, best_end = run_start, run_end
+                run_start = None
+        if best_start is None or (best_end - best_start + 1) < 3:
+            return False
+        core_beats = beats[best_start:best_end + 2]
+        core_rr_ms = rr_ms[best_start:best_end + 1]
+        median_rr = float(np.median(core_rr_ms))
+        if median_rr <= 0.0 or (60000.0 / median_rr) < 100.0:
+            return False
+        # Regular VT; irregular/chaotic ventricular activity remains outside
+        # this rule and can be handled by the VFib/no-label paths.
+        if float(np.std(core_rr_ms) / median_rr) > 0.12:
+            return False
+        if float(np.median(np.abs(core_rr_ms - median_rr)) / median_rr) > 0.10:
+            return False
+
+        # A bounded 160 ms estimate is still useful for VT when the broad
+        # complex has no clean isoelectric S-offset. Do not relabel the beat
+        # as globally "resolved"; use this controlled fallback only after
+        # the independent VT regularity and P/PR gates have passed.
+        wide_beats = [
+            b for b in core_beats
+            if b.get('qrs_ms') is not None
+            and 120.0 <= float(b['qrs_ms']) <= 220.0
+        ]
+        if len(wide_beats) < max(3, int(np.ceil(0.75 * len(core_beats)))):
+            return False
+        qrs_ms = np.asarray([float(b['qrs_ms']) for b in wide_beats], dtype=float)
+        if float(np.std(qrs_ms)) > 25.0:
+            return False
+
+        p_present = sum(
+            1 for b in core_beats
+            if b.get('p_present') and b.get('p_onset') is not None
+            and b.get('q_onset') is not None and b['p_onset'] < b['q_onset']
+        )
+        valid_pr = sum(1 for b in core_beats if b.get('pr_ms') is not None)
+        # Incidental noise bumps or dissociated atrial activity are tolerated;
+        # only an organized P/PR majority means the rhythm is
+        # supraventricular, not VT.  Wide VT recordings can make the generic
+        # P-finder report a few coincidental bumps before QRS.
+        return p_present <= 0.50 * len(core_beats) and valid_pr <= 0.50 * len(core_beats)
+
+    def _ventricular_tachycardia_core_start(r_peaks, fs):
+        """Return the first beat of the dominant regular VT run.
+
+        The VT classifier may inspect a window that begins during a mixed
+        transition.  Segment drawing must start at the stable ventricular
+        run, not at the window boundary.
+        """
+        peaks = np.asarray(r_peaks, dtype=float)
+        if peaks.size < 4:
+            return None
+        rr_ms = np.diff(peaks) * 1000.0 / float(fs)
+        if rr_ms.size < 3 or np.any(rr_ms <= 0.0):
+            return None
+        median_rr = float(np.median(rr_ms))
+        stable = np.abs(rr_ms - median_rr) <= (0.15 * median_rr)
+        best_start = best_end = None
+        run_start = None
+        for idx, is_stable in enumerate(stable):
+            if is_stable and run_start is None:
+                run_start = idx
+            if (not is_stable or idx == len(stable) - 1) and run_start is not None:
+                run_end = idx if is_stable and idx == len(stable) - 1 else idx - 1
+                if best_start is None or (run_end - run_start) > (best_end - best_start):
+                    best_start, best_end = run_start, run_end
+                run_start = None
+        if best_start is None or (best_end - best_start + 1) < 3:
+            return None
+        return float(peaks[best_start]) / float(fs)
 
     # Atrial Fibrillation / Atrial Flutter rule (simple, direct -- same style
     # as the VFib rule above, and completely independent of the Sinus/Brady/
@@ -1250,7 +1353,14 @@ def _detect_arrhythmias_uncached(
                             p for p in all_peaks
                             if current_time <= pad_start + p / fs < window_end
                         ]
-                        if _is_vfib_window(padded_signal, core_r_peaks, fs):
+                        # Resolve the organized-wide-complex overlap first:
+                        # the same unresolved QRS flag can otherwise make a
+                        # regular monomorphic VT window look like VFib.
+                        if _is_ventricular_tachycardia_window(padded_signal, core_r_peaks, fs):
+                            # Burnt orange distinguishes organized VT from
+                            # VFib red and atrial tachycardia orange.
+                            target_morph = ('Ventricular Tachycardia', '#E67E22')
+                        elif _is_vfib_window(padded_signal, core_r_peaks, fs):
                             target_morph = ('Ventricular Fibrillation', '#FF3333')
                         else:
                             atrial_label = _classify_atrial_window(padded_signal, core_r_peaks, fs)
@@ -1331,9 +1441,23 @@ def _detect_arrhythmias_uncached(
                             break
 
                 if target_morph:
-                    s_str, e_str = make_time_strs(current_time, window_end)
+                    # A VT classifier window can include onset-transition
+                    # beats before the stable wide-complex run.  Align only
+                    # VT's visual/event boundary to that run; all classifier
+                    # gates and the other rhythm boundaries remain unchanged.
+                    candidate_start = current_time
+                    if target_morph[0] == 'Ventricular Tachycardia':
+                        core_start_rel = _ventricular_tachycardia_core_start(
+                            core_r_peaks, fs
+                        )
+                        if core_start_rel is not None:
+                            candidate_start = max(
+                                current_time,
+                                min(window_end, pad_start + core_start_rel),
+                            )
+                    s_str, e_str = make_time_strs(candidate_start, window_end)
                     morphological_candidates.append({
-                        'start_sec': current_time,
+                        'start_sec': candidate_start,
                         'end_sec': window_end,
                         'label': target_morph[0],
                         'color': target_morph[1],

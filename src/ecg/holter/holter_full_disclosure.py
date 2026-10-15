@@ -3296,15 +3296,14 @@ class HolterFullDisclosureDialog(QDialog):
         # fallback, or a real "Ventricular Tachycardia" event (e.g. from
         # stored replay analysis) silently matches 'tachycardia' first and
         # renders as "Sinus Tachycardia" -- a lethal rhythm shown as a benign
-        # rate label. Ventricular Tachycardia is folded into Ventricular
-        # Fibrillation here (not shown as its own label) to match
-        # detect_arrhythmias()'s own VFib rule, regardless of which source
-        # (fresh detection vs. stored replay data) produced the VTach label.
+        # rate label. Keep Ventricular Tachycardia visually distinct from
+        # Ventricular Fibrillation; this function only maps an existing event
+        # to its display label/color and does not classify the waveform.
         targets = {
             'ventricular fibrillation': ('Ventricular Fibrillation', '#FF3333'),
             'vfib': ('Ventricular Fibrillation', '#FF3333'),
-            'ventricular tachycardia': ('Ventricular Fibrillation', '#FF3333'),
-            'vtach': ('Ventricular Fibrillation', '#FF3333'),
+            'ventricular tachycardia': ('Ventricular Tachycardia', '#E67E22'),
+            'vtach': ('Ventricular Tachycardia', '#E67E22'),
             'atrial fibrillation': ('Atrial Fibrillation', '#B36BFF'),
             'afib': ('Atrial Fibrillation', '#B36BFF'),
             'atrial flutter': ('Atrial Flutter', '#FF69B4'),
