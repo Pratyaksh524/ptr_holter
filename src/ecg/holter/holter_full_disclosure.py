@@ -3310,7 +3310,7 @@ class HolterFullDisclosureDialog(QDialog):
             'aflutter': ('Atrial Flutter', '#FF69B4'),
             # Before the bare 'tachycardia' fallback below, which would
             # otherwise draw it as Sinus Tachycardia.
-            'atrial tachycardia': ('Atrial Tachycardia', '#FFA500'),
+            'atrial tachycardia': ('Supraventricular Tachycardia (SVT)', '#FFA500'),
             'sinus bradycardia': ('Sinus Bradycardia', '#00BFFF'),
             'bradycardia': ('Sinus Bradycardia', '#00BFFF'),
             'sinus tachycardia': ('Sinus Tachycardia', '#00FFFF'),
@@ -3740,9 +3740,19 @@ class HolterFullDisclosureDialog(QDialog):
                     event_time = datetime.fromtimestamp(
                         self._engine._reader.start_time + shown_sec
                     ).strftime('%H:%M:%S')
-                    arrhythmia_label = f"Arrhythmia: {event_label} at {event_time}"
+                    display_event_label = (
+                        'Supraventricular Tachycardia (SVT)'
+                        if event_label.lower() == 'atrial tachycardia'
+                        else event_label
+                    )
+                    arrhythmia_label = f"Arrhythmia: {display_event_label} at {event_time}"
                 else:
-                    arrhythmia_label = f"Arrhythmia: {event_label}"
+                    display_event_label = (
+                        'Supraventricular Tachycardia (SVT)'
+                        if event_label.lower() == 'atrial tachycardia'
+                        else event_label
+                    )
+                    arrhythmia_label = f"Arrhythmia: {display_event_label}"
         except Exception as e:
             print(f"[Full Disclosure] Error updating auto rhythm label: {e}")
         
