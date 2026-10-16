@@ -65,10 +65,35 @@ def _load_auto_segment_events(session_dir: str) -> List[Dict[str, object]]:
         from .auto_segment_arrthymia_detection import detect_arrhythmias
         reader = ECGHFileReader(ecgh_path)
         events = []
+
+        # Load any auto segments that the user deleted in Full Disclosure
+        deleted_segments = []
+        del_path = os.path.join(session_dir, 'deleted_auto_segments.json')
+        if os.path.exists(del_path):
+            try:
+                with open(del_path, 'r', encoding='utf-8') as df:
+                    deleted_segments = json.load(df)
+            except Exception as e:
+                print(f"[HolterReport] Error reading deleted_auto_segments: {e}")
+
+        def _is_deleted(start_s, end_s, lbl):
+            lbl_lower = lbl.strip().lower()
+            for ds in deleted_segments:
+                ds_start = float(ds.get('start_sec', 0.0) or 0.0)
+                ds_end = float(ds.get('end_sec', ds_start) or ds_start)
+                ds_lbl = str(ds.get('label', '')).strip().lower()
+                overlap = max(0.0, min(end_s, ds_end) - max(start_s, ds_start))
+                if overlap > 0.5 or (abs(start_s - ds_start) < 1.0 and abs(end_s - ds_end) < 1.0):
+                    if ds_lbl in lbl_lower or lbl_lower in ds_lbl:
+                        return True
+            return False
+
         for segment in detect_arrhythmias(reader):
             start_sec = float(segment.get('start_sec', 0.0) or 0.0)
             end_sec = float(segment.get('end_sec', 0.0) or 0.0)
             rhythm_lbl = str(segment.get('detected_rhythm', segment.get('label', 'Event')))
+            if _is_deleted(start_sec, end_sec, rhythm_lbl):
+                continue
             events.append({
                 'timestamp': start_sec,
                 'start_sec': start_sec,

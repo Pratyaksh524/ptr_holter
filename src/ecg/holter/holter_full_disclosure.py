@@ -677,6 +677,17 @@ class HolterFullDisclosureDialog(QDialog):
         the comment above self._auto_segments_pending in __init__."""
         if self._auto_segments_pending:
             return
+        # Clear deleted auto segments file so report includes all detected segments again
+        try:
+            ecgh_p = getattr(self._engine, 'ecgh_path', None)
+            if ecgh_p:
+                session_dir = os.path.dirname(ecgh_p)
+                del_path = os.path.join(session_dir, 'deleted_auto_segments.json')
+                if os.path.exists(del_path):
+                    os.remove(del_path)
+                    print(f"[Full Disclosure] Cleared {del_path} as auto detection was re-run")
+        except Exception as e:
+            print(f"[Full Disclosure] Error clearing deleted auto segments: {e}")
         try:
             from .auto_segment_arrthymia_detection import (
                 apply_auto_segments_to_engine, detect_arrhythmias_async, get_cached_detection,
@@ -709,6 +720,16 @@ class HolterFullDisclosureDialog(QDialog):
         if hasattr(self, 'btn_auto_arrhythmia'):
             self.btn_auto_arrhythmia.setEnabled(True)
             self.btn_auto_arrhythmia.setText("⚡ Auto Arrhythmia Detection")
+        # Clear deleted auto segments file
+        try:
+            ecgh_p = getattr(self._engine, 'ecgh_path', None)
+            if ecgh_p:
+                session_dir = os.path.dirname(ecgh_p)
+                del_path = os.path.join(session_dir, 'deleted_auto_segments.json')
+                if os.path.exists(del_path):
+                    os.remove(del_path)
+        except Exception:
+            pass
         try:
             from .auto_segment_arrthymia_detection import apply_auto_segments_to_engine
             self._snapshot_state("Auto Arrhythmia Detection")
@@ -783,6 +804,34 @@ class HolterFullDisclosureDialog(QDialog):
                 added = apply_auto_segments_to_engine(self._engine, segments=cached)
                 if added is not None:
                     print(f"[Full Disclosure] Restored {added} automatic rhythm regions from a prior session.")
+            # If any auto segments were deleted in this session, keep them deleted
+            del_path = os.path.join(session_dir, 'deleted_auto_segments.json')
+            if os.path.exists(del_path):
+                try:
+                    with open(del_path, 'r', encoding='utf-8') as df:
+                        del_list = json.load(df)
+                    if del_list:
+                        def _is_deleted_item(ev):
+                            if 'manual' in str(ev.get('source', '')).lower():
+                                return False
+                            ev_start = float(ev.get('timestamp', 0.0) or 0.0)
+                            ev_end = float(ev.get('end_timestamp', ev.get('end_ts', ev_start)) or ev_start)
+                            ev_lbl = str(ev.get('label', ev.get('type', ''))).strip().lower()
+                            for ds in del_list:
+                                ds_start = float(ds.get('start_sec', 0.0) or 0.0)
+                                ds_end = float(ds.get('end_sec', ds_start) or ds_start)
+                                ds_lbl = str(ds.get('label', '')).strip().lower()
+                                overlap = max(0.0, min(ev_end, ds_end) - max(ev_start, ds_start))
+                                if overlap > 0.5 or (abs(ev_start - ds_start) < 1.0 and abs(ev_end - ds_end) < 1.0):
+                                    if ds_lbl in ev_lbl or ev_lbl in ds_lbl:
+                                        return True
+                            return False
+                        self._engine._structured_events = [
+                            ev for ev in (getattr(self._engine, '_structured_events', []) or [])
+                            if not _is_deleted_item(ev)
+                        ]
+                except Exception as _de:
+                    print(f"[Full Disclosure] Error applying deleted auto segments filter on restore: {_de}")
             self._auto_marking_visible = True
             self._event_index_dirty = True
         except Exception as e:
@@ -1437,15 +1486,25 @@ class HolterFullDisclosureDialog(QDialog):
                     click_x_local = max(0, min(w, click_x_local))
                     click_sec = ref._start_sec + (click_x_local / w) * (ref_end_sec - ref._start_sec)
 
-            # Check if clicked inside an existing segment
+            # Check if clicked inside an existing segment (manual or auto)
             clicked_segment = None
-            if self._selection_mode == 'segment' and hasattr(self, '_segment_annotations'):
+            if hasattr(self, '_segment_annotations'):
                 for seg in self._segment_annotations:
                     s_sec = min(seg['start_sec'], seg['end_sec'])
                     e_sec = max(seg['start_sec'], seg['end_sec'])
                     if s_sec <= click_sec <= e_sec:
                         clicked_segment = seg
                         break
+
+            # If no manual segment found, check if clicked inside an auto-detected segment
+            if clicked_segment is None and hasattr(self, '_segment_overlay') and getattr(self, '_auto_marking_visible', False):
+                for seg in getattr(self._segment_overlay, '_segments', []):
+                    if seg.get('auto'):
+                        s_sec = min(seg.get('start_sec', 0.0), seg.get('end_sec', 0.0))
+                        e_sec = max(seg.get('start_sec', 0.0), seg.get('end_sec', 0.0))
+                        if s_sec <= click_sec <= e_sec:
+                            clicked_segment = seg
+                            break
 
             if self._selection_mode == 'segment':
                 if clicked_segment is not None:
@@ -1470,8 +1529,8 @@ class HolterFullDisclosureDialog(QDialog):
                     # In segment mode: show labeling menu for pending segment
                     self._show_segment_context_menu(event.globalPos())
             else:
-                # In parallel mode (single or multi): original beat-level context menu
-                self._show_beat_context_menu(click_x, event.globalPos())
+                # In parallel mode (single or multi): original beat-level context menu with segment option if on a segment
+                self._show_beat_context_menu(click_x, event.globalPos(), clicked_segment=clicked_segment)
             return True  # Consume the event
 
 
@@ -1892,12 +1951,25 @@ class HolterFullDisclosureDialog(QDialog):
             if hasattr(c, '_beat_annotations') and c._beat_annotations is not None:
                 beat_annotations_by_lead[c.lead_name] = copy.deepcopy(c._beat_annotations)
 
+        del_auto_snapshot = []
+        try:
+            ecgh_p = getattr(self._engine, 'ecgh_path', None)
+            if ecgh_p:
+                session_dir = os.path.dirname(ecgh_p)
+                del_path = os.path.join(session_dir, 'deleted_auto_segments.json')
+                if os.path.exists(del_path):
+                    with open(del_path, 'r', encoding='utf-8') as f:
+                        del_auto_snapshot = json.load(f)
+        except Exception:
+            del_auto_snapshot = []
+
         snapshot = {
             'action': action_label,
             'segment_annotations': copy.deepcopy(getattr(self, '_segment_annotations', [])),
             'beat_annotations_by_lead': beat_annotations_by_lead,
             'engine_metrics': copy.deepcopy(getattr(self._engine, '_metrics', None)),
             'structured_events': copy.deepcopy(getattr(self._engine, '_structured_events', None)),
+            'deleted_auto_segments': del_auto_snapshot,
         }
         self._undo_stack.append(snapshot)
         if len(self._undo_stack) > self._UNDO_STACK_LIMIT:
@@ -1934,6 +2006,20 @@ class HolterFullDisclosureDialog(QDialog):
         if snapshot['structured_events'] is not None:
             self._engine._structured_events = snapshot['structured_events']
             self._event_index_dirty = True
+
+        if 'deleted_auto_segments' in snapshot:
+            try:
+                ecgh_p = getattr(self._engine, 'ecgh_path', None)
+                if ecgh_p:
+                    session_dir = os.path.dirname(ecgh_p)
+                    del_path = os.path.join(session_dir, 'deleted_auto_segments.json')
+                    if snapshot['deleted_auto_segments']:
+                        with open(del_path, 'w', encoding='utf-8') as df:
+                            json.dump(snapshot['deleted_auto_segments'], df, indent=2)
+                    elif os.path.exists(del_path):
+                        os.remove(del_path)
+            except Exception as e:
+                print(f"[Full Disclosure] Error restoring deleted_auto_segments on undo: {e}")
 
         # Undoing the "Auto Arrhythmia Detection" click itself additionally
         # hides all non-manual rhythm marking again (plain wave, no tint, no
@@ -2154,29 +2240,95 @@ class HolterFullDisclosureDialog(QDialog):
             self._segment_overlay.clear_drag()
 
     def _delete_segment(self, segment):
-        """Remove a finalized segment from annotations and the overlay."""
+        """Remove a finalized segment (manual or auto-detected) from annotations and the overlay."""
         self._snapshot_state('delete_segment')
-        if segment in self._segment_annotations:
-            self._segment_annotations.remove(segment)
-        
-        # Remove from JSON file as well
-        try:
-            session_dir = os.path.dirname(self._engine.ecgh_path)
-            segments_path = os.path.join(session_dir, 'manual_segments.json')
-            if os.path.exists(segments_path):
-                with open(segments_path, 'r') as f:
-                    segments_data = json.load(f)
-                # Remove the segment by matching start_sec, end_sec, and label
-                segments_data = [s for s in segments_data if not (
-                    abs(s.get('start_sec', 0) - segment.get('start_sec', 0)) < 0.01 and
-                    abs(s.get('end_sec', 0) - segment.get('end_sec', 0)) < 0.01 and
-                    s.get('label') == segment.get('label')
-                )]
-                with open(segments_path, 'w') as f:
-                    json.dump(segments_data, f, indent=2)
-                print(f"[Full Disclosure] Removed segment from {segments_path}")
-        except Exception as e:
-            print(f"[Full Disclosure] Error removing segment from JSON: {e}")
+
+        if segment.get('auto'):
+            # Auto-detected arrhythmia segment deletion
+            start_sec = float(segment.get('start_sec', 0.0))
+            end_sec = float(segment.get('end_sec', 0.0))
+            target_label = str(segment.get('label', '')).strip().lower()
+
+            targets = {
+                'ventricular fibrillation': 'Ventricular Fibrillation',
+                'vfib': 'Ventricular Fibrillation',
+                'supraventricular tachycardia (svt)': 'Supraventricular Tachycardia (SVT)',
+                'ventricular tachycardia': 'Ventricular Tachycardia',
+                'vtach': 'Ventricular Tachycardia',
+                'atrial fibrillation': 'Atrial Fibrillation',
+                'afib': 'Atrial Fibrillation',
+                'atrial flutter': 'Atrial Flutter',
+                'aflutter': 'Atrial Flutter',
+                'sinus bradycardia': 'Sinus Bradycardia',
+                'bradycardia': 'Sinus Bradycardia',
+                'sinus tachycardia': 'Sinus Tachycardia',
+                'tachycardia': 'Sinus Tachycardia',
+            }
+
+            def _matches_this_auto_segment(ev):
+                if 'manual' in str(ev.get('source', '')).lower():
+                    return False
+                ev_start = float(ev.get('timestamp', 0.0) or 0.0)
+                ev_end = float(ev.get('end_timestamp', ev.get('end_ts', ev_start)) or ev_start)
+                
+                # Check time bounds: event must fall within or overlap this segment's span
+                if ev_end < start_sec - 0.5 or ev_start > end_sec + 0.5:
+                    return False
+                
+                ev_label = str(ev.get('label', ev.get('type', ''))).strip().lower()
+                canonical = next((v for k, v in targets.items() if k in ev_label), None)
+                if canonical and canonical.lower() == target_label:
+                    return True
+                if target_label in ev_label or ev_label in target_label:
+                    return True
+                return False
+
+            old_events = list(getattr(self._engine, '_structured_events', []) or [])
+            self._engine._structured_events = [ev for ev in old_events if not _matches_this_auto_segment(ev)]
+            self._event_index_dirty = True
+            print(f"[Full Disclosure] Deleted auto segment '{segment.get('label')}' ({start_sec:.1f}s - {end_sec:.1f}s)")
+
+            # Persist deleted auto segment to disk so report generator omits it
+            try:
+                session_dir = os.path.dirname(self._engine.ecgh_path)
+                del_path = os.path.join(session_dir, 'deleted_auto_segments.json')
+                del_list = []
+                if os.path.exists(del_path):
+                    with open(del_path, 'r', encoding='utf-8') as f:
+                        del_list = json.load(f)
+                del_list.append({
+                    'start_sec': start_sec,
+                    'end_sec': end_sec,
+                    'label': segment.get('label', '')
+                })
+                with open(del_path, 'w', encoding='utf-8') as f:
+                    json.dump(del_list, f, indent=2)
+                print(f"[Full Disclosure] Saved deleted auto segment to {del_path}")
+            except Exception as e:
+                print(f"[Full Disclosure] Error saving deleted auto segment: {e}")
+        else:
+            # Manual segment deletion (100% unchanged)
+            if segment in self._segment_annotations:
+                self._segment_annotations.remove(segment)
+            
+            # Remove from JSON file as well
+            try:
+                session_dir = os.path.dirname(self._engine.ecgh_path)
+                segments_path = os.path.join(session_dir, 'manual_segments.json')
+                if os.path.exists(segments_path):
+                    with open(segments_path, 'r') as f:
+                        segments_data = json.load(f)
+                    # Remove the segment by matching start_sec, end_sec, and label
+                    segments_data = [s for s in segments_data if not (
+                        abs(s.get('start_sec', 0) - segment.get('start_sec', 0)) < 0.01 and
+                        abs(s.get('end_sec', 0) - segment.get('end_sec', 0)) < 0.01 and
+                        s.get('label') == segment.get('label')
+                    )]
+                    with open(segments_path, 'w') as f:
+                        json.dump(segments_data, f, indent=2)
+                    print(f"[Full Disclosure] Removed segment from {segments_path}")
+            except Exception as e:
+                print(f"[Full Disclosure] Error removing segment from JSON: {e}")
         
         # Clear and rebuild visible segment list in segment overlay
         if hasattr(self, '_segment_overlay'):
@@ -2224,8 +2376,12 @@ class HolterFullDisclosureDialog(QDialog):
                     )
             self._segment_overlay.update()
 
+        # Update canvases to refresh waveform tints and bottom-right arrhythmia label
+        if hasattr(self, '_current_start'):
+            self._update_canvases(self._current_start)
 
-    def _show_beat_context_menu(self, click_x: int, global_pos):
+
+    def _show_beat_context_menu(self, click_x: int, global_pos, clicked_segment=None):
         """Show right-click context menu for beat labeling with hierarchical dropdown menus."""
         from PyQt5.QtWidgets import QMenu, QAction
         
@@ -2346,6 +2502,11 @@ class HolterFullDisclosureDialog(QDialog):
         delete_action = QAction("Delete", self)
         delete_action.triggered.connect(lambda: self._delete_beat_at_position(click_x))
         menu.addAction(delete_action)
+
+        if clicked_segment is not None:
+            del_seg_action = QAction("Delete segment", self)
+            del_seg_action.triggered.connect(lambda: self._delete_segment(clicked_segment))
+            menu.addAction(del_seg_action)
         
         menu.addSeparator()
         
