@@ -3302,15 +3302,13 @@ class HolterFullDisclosureDialog(QDialog):
         targets = {
             'ventricular fibrillation': ('Ventricular Fibrillation', '#FF3333'),
             'vfib': ('Ventricular Fibrillation', '#FF3333'),
+            'supraventricular tachycardia (svt)': ('Supraventricular Tachycardia (SVT)', '#FFA500'),
             'ventricular tachycardia': ('Ventricular Tachycardia', '#E67E22'),
             'vtach': ('Ventricular Tachycardia', '#E67E22'),
             'atrial fibrillation': ('Atrial Fibrillation', '#B36BFF'),
             'afib': ('Atrial Fibrillation', '#B36BFF'),
             'atrial flutter': ('Atrial Flutter', '#FF69B4'),
             'aflutter': ('Atrial Flutter', '#FF69B4'),
-            # Before the bare 'tachycardia' fallback below, which would
-            # otherwise draw it as Sinus Tachycardia.
-            'supraventricular tachycardia (svt)': ('Supraventricular Tachycardia (SVT)', '#FFA500'),
             'sinus bradycardia': ('Sinus Bradycardia', '#00BFFF'),
             'bradycardia': ('Sinus Bradycardia', '#00BFFF'),
             'sinus tachycardia': ('Sinus Tachycardia', '#00FFFF'),
@@ -4633,6 +4631,15 @@ class HolterToolHandlers:
         # Handle different actions
         action = event_data.get('action', 'add_event')
         
+        if action == 'instant_print':
+            # TODO: Implement instant print
+            print("[Add Event] Instant print triggered")
+        elif action == 'export_pdf':
+            # TODO: Implement PDF export
+            print("[Add Event] PDF export triggered")
+        elif action == 'add_event':
+            # Just add to event list
+            print(f"[Add Event] Event added at timestamp {event_data['timestamp']}")
         if action == 'instant_print':
             # TODO: Implement instant print
             print("[Add Event] Instant print triggered")

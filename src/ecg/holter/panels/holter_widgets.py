@@ -1501,6 +1501,11 @@ class ECGStripCanvas(QWidget):
                     active_label = 'X'
                 elif 'ventricular fibrillation' in ev_lbl or 'vfib' in ev_lbl:
                     active_label = 'V'
+                elif 'supraventricular tachycardia (svt)' in ev_lbl:
+                    # Must be checked BEFORE 'ventricular tachycardia' because
+                    # 'supraventricular tachycardia' contains 'ventricular tachycardia'
+                    # as a substring, causing a false VT match.
+                    active_label = 'S'
                 elif 'ventricular tachycardia' in ev_lbl or 'vtach' in ev_lbl:
                     active_label = 'V'
                 elif 'atrial fibrillation' in ev_lbl or 'afib' in ev_lbl:
@@ -1510,8 +1515,6 @@ class ECGStripCanvas(QWidget):
                 elif 'sinus bradycardia' in ev_lbl:
                     active_label = 'S'
                 elif 'sinus tachycardia' in ev_lbl:
-                    active_label = 'S'
-                elif 'supraventricular tachycardia (svt)' in ev_lbl:
                     active_label = 'S'
                 elif 'bradycardia (non-sinus)' in ev_lbl:
                     active_label = 'S'

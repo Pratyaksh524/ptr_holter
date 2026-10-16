@@ -82,46 +82,49 @@ class HolterReplayEngine:
                             label_code = 'N'
                             color = '#00FF00'  # Default green for NSR
                             
-                            # Color mapping for arrhythmia types
-                            if 'ventricular fibrillation' in arr_label or 'vfib' in arr_label or 'vf' in arr_label:
+                            # ── Unified Auto-Segment Color System ──────────────
+                            # Colors must match holter_full_disclosure.py targets
+                            # dict exactly so all views stay in sync.
+                            # SVT must be checked BEFORE VT: 'supraventricular
+                            # tachycardia' contains 'ventricular tachycardia'
+                            # as a substring (false VT match otherwise).
+                            # ────────────────────────────────────────────────────
+                            if 'ventricular fibrillation' in arr_label or 'vfib' in arr_label:
                                 label_code = 'V'
                                 color = '#FF3333'  # Red
-                            elif 'ventricular tachycardia' in arr_label or 'vtach' in arr_label:
-                                label_code = 'V'
+                            elif 'supraventricular tachycardia' in arr_label or 'svt' in arr_label:
+                                label_code = 'S'  # Supraventricular
                                 color = '#FFA500'  # Orange
+                            elif 'ventricular tachycardia' in arr_label or 'vtach' in arr_label:
+                                label_code = 'V'  # Ventricular
+                                color = '#E67E22'  # Burnt Orange
                             elif 'atrial fibrillation' in arr_label or 'afib' in arr_label:
                                 label_code = 'AF'
-                                color = '#9932CC'  # Purple
+                                color = '#B36BFF'  # Purple
                             elif 'atrial flutter' in arr_label or 'aflutter' in arr_label:
                                 label_code = 'AF'
                                 color = '#FF69B4'  # Pink
+                            elif 'av block' in arr_label:
+                                label_code = 'P'
+                                color = '#FF00FF'  # Magenta
                             elif 'sinus bradycardia' in arr_label or 'bradycardia' in arr_label:
                                 label_code = 'S'
-                                color = '#0000FF'  # Blue
+                                color = '#00BFFF'  # Deep Sky Blue
                             elif 'sinus tachycardia' in arr_label or 'tachycardia' in arr_label:
                                 label_code = 'S'
-                                color = '#00BFFF'  # Deep Sky Blue
-                            elif '1st-degree av block' in arr_label:
-                                label_code = 'P'
-                                color = '#FFFF00'  # Yellow
-                            elif '2nd-degree av block' in arr_label:
-                                label_code = 'P'
-                                color = '#FFD700'  # Gold
-                            elif '3rd-degree av block' in arr_label:
-                                label_code = 'P'
-                                color = '#FF8C00'  # Dark Orange
-                            elif 'right bundle branch block' in arr_label:
-                                label_code = 'P'
-                                color = '#32CD32'  # Lime Green
-                            elif 'left bundle branch block' in arr_label:
-                                label_code = 'P'
-                                color = '#9370DB'  # Medium Purple
+                                color = '#00FFFF'  # Cyan
                             elif 'premature ventricular contraction' in arr_label or 'pvc' in arr_label:
                                 label_code = 'V'
-                                color = '#8B4513'  # Brown
+                                color = '#E67E22'  # Burnt Orange (ventricular)
                             elif 'premature atrial contraction' in arr_label or 'pac' in arr_label:
                                 label_code = 'S'
-                                color = '#00FFFF'  # Cyan
+                                color = '#FFA500'  # Orange (supraventricular)
+                            elif 'right bundle branch block' in arr_label or 'left bundle branch block' in arr_label:
+                                label_code = 'P'
+                                color = '#FF00FF'  # Magenta (conduction)
+                            elif 'bundle branch block' in arr_label:
+                                label_code = 'P'
+                                color = '#FF00FF'  # Magenta (conduction)
                             
                             # Calculate end timestamp (use chunk duration)
                             chunk_start = float(m.get('t', 0.0) or 0.0)
@@ -177,46 +180,49 @@ class HolterReplayEngine:
                     label_code = 'N'
                     color = '#00FF00'  # Default green for NSR
                     
-                    # Color mapping for arrhythmia types
-                    if 'ventricular fibrillation' in label_lower or 'vfib' in label_lower or 'vf' in label_lower:
+                    # ── Unified Auto-Segment Color System ──────────────
+                    # Colors must match holter_full_disclosure.py targets
+                    # dict exactly so all views stay in sync.
+                    # SVT must be checked BEFORE VT: 'supraventricular
+                    # tachycardia' contains 'ventricular tachycardia'
+                    # as a substring (false VT match otherwise).
+                    # ────────────────────────────────────────────────────
+                    if 'ventricular fibrillation' in label_lower or 'vfib' in label_lower:
                         label_code = 'V'
                         color = '#FF3333'  # Red
-                    elif 'ventricular tachycardia' in label_lower or 'vtach' in label_lower:
-                        label_code = 'V'
+                    elif 'supraventricular tachycardia' in label_lower or 'svt' in label_lower:
+                        label_code = 'S'  # Supraventricular
                         color = '#FFA500'  # Orange
+                    elif 'ventricular tachycardia' in label_lower or 'vtach' in label_lower:
+                        label_code = 'V'  # Ventricular
+                        color = '#E67E22'  # Burnt Orange
                     elif 'atrial fibrillation' in label_lower or 'afib' in label_lower:
                         label_code = 'AF'
-                        color = '#9932CC'  # Purple
+                        color = '#B36BFF'  # Purple
                     elif 'atrial flutter' in label_lower or 'aflutter' in label_lower:
                         label_code = 'AF'
                         color = '#FF69B4'  # Pink
+                    elif 'av block' in label_lower:
+                        label_code = 'P'
+                        color = '#FF00FF'  # Magenta
                     elif 'sinus bradycardia' in label_lower or 'bradycardia' in label_lower:
                         label_code = 'S'
-                        color = '#0000FF'  # Blue
+                        color = '#00BFFF'  # Deep Sky Blue
                     elif 'sinus tachycardia' in label_lower or 'tachycardia' in label_lower:
                         label_code = 'S'
-                        color = '#00BFFF'  # Deep Sky Blue
-                    elif '1st-degree av block' in label_lower:
-                        label_code = 'P'
-                        color = '#FFFF00'  # Yellow
-                    elif '2nd-degree av block' in label_lower:
-                        label_code = 'P'
-                        color = '#FFD700'  # Gold
-                    elif '3rd-degree av block' in label_lower:
-                        label_code = 'P'
-                        color = '#FF8C00'  # Dark Orange
-                    elif 'right bundle branch block' in label_lower:
-                        label_code = 'P'
-                        color = '#32CD32'  # Lime Green
-                    elif 'left bundle branch block' in label_lower:
-                        label_code = 'P'
-                        color = '#9370DB'  # Medium Purple
+                        color = '#00FFFF'  # Cyan
                     elif 'premature ventricular contraction' in label_lower or 'pvc' in label_lower:
                         label_code = 'V'
-                        color = '#8B4513'  # Brown
+                        color = '#E67E22'  # Burnt Orange (ventricular)
                     elif 'premature atrial contraction' in label_lower or 'pac' in label_lower:
                         label_code = 'S'
-                        color = '#00FFFF'  # Cyan
+                        color = '#FFA500'  # Orange (supraventricular)
+                    elif 'right bundle branch block' in label_lower or 'left bundle branch block' in label_lower:
+                        label_code = 'P'
+                        color = '#FF00FF'  # Magenta (conduction)
+                    elif 'bundle branch block' in label_lower:
+                        label_code = 'P'
+                        color = '#FF00FF'  # Magenta (conduction)
                     
                     # Check if item has end_timestamp, otherwise calculate from
                     # duration -- or, if neither is stored, cap the fallback
