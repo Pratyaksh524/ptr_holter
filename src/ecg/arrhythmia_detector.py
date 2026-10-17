@@ -338,6 +338,7 @@ def _detect_p_wave(
     baseline: float,
     fs: float,
     strict_selection: bool = False,
+    prev_rr_ms: Optional[float] = None,
 ) -> Dict[str, object]:
     result = {
         "p_present": False,
@@ -347,6 +348,20 @@ def _detect_p_wave(
         "p_duration_ms": None,
         "p_amplitude": 0.0,
     }
+    # At extreme tachycardia rates (HR >= 180 BPM / RR < 333.3 ms), physiological
+    # P-waves merge with preceding T-waves (P-on-T fusion) and cannot be
+    # independently resolved. Any wave in this pre-QRS zone is a T-wave or
+    # fused component, so P-wave presence and PR interval are suppressed.
+    if prev_rr_ms is not None and prev_rr_ms < 333.3:
+        return result
+
+    # When prev_rr_ms is not explicitly passed, check if a preceding QRS
+    # complex sits within 333.3 ms of r_idx (HR >= 180 BPM collision):
+    r_amp = abs(float(signal[r_idx]) - baseline)
+    collision_zone = signal[max(0, r_idx - _ms_to_samples(333.3, fs)): max(0, r_idx - _ms_to_samples(70, fs))]
+    if collision_zone.size and r_amp > 1e-4 and float(np.max(np.abs(collision_zone - baseline))) > 0.55 * r_amp:
+        return result
+
     p_start = max(0, r_idx - _ms_to_samples(400, fs))
     p_end = max(p_start + 1, r_idx - _ms_to_samples(50, fs))
     if p_end - p_start < 5:
@@ -501,6 +516,7 @@ def measure_beat(
     r_idx: int,
     fs: float = DEFAULT_FS,
     strict_pr: bool = False,
+    prev_rr_ms: Optional[float] = None,
 ) -> Optional[Dict[str, object]]:
     signal_arr = _safe_array(signal)
     if signal_arr.size == 0 or r_idx <= 0 or r_idx >= signal_arr.size:
@@ -538,7 +554,7 @@ def measure_beat(
         beat["noise_reasons"] = ["qrs_out_of_range"]
         return beat
 
-    beat.update(_detect_p_wave(signal_arr, int(r_idx), baseline, fs, strict_selection=strict_pr))
+    beat.update(_detect_p_wave(signal_arr, int(r_idx), baseline, fs, strict_selection=strict_pr, prev_rr_ms=prev_rr_ms))
     if beat["p_present"] and beat["p_onset"] is not None:
         p_onset = int(beat["p_onset"])
         p_peak = int(beat.get("p_peak") or p_onset)

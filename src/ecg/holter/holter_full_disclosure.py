@@ -2118,6 +2118,7 @@ class HolterFullDisclosureDialog(QDialog):
                 "Poly VTach (Unstable)",
                 "Asystole",
                 "Sinus Bradycardia",
+                "Sinus Tachycardia",
                 "2nd Deg AV Block T",
                 "3rd Deg AV Block",
                 "Rt Bundle Branch B",
@@ -2456,6 +2457,7 @@ class HolterFullDisclosureDialog(QDialog):
                 "Poly VTach (Unstable)",
                 "Asystole",
                 "Sinus Bradycardia",
+                "Sinus Tachycardia",
                 "2nd Deg AV Block T",
                 "3rd Deg AV Block",
                 "Rt Bundle Branch B",
@@ -3754,8 +3756,9 @@ class HolterFullDisclosureDialog(QDialog):
                         ventricular_tachycardia_active = True
 
             pr_values, qrs_values = [], []
-            for p in peaks:
-                beat = measure_beat(sig, int(p), fs, strict_pr=True)
+            for i, p in enumerate(peaks):
+                prev_rr_ms = (float(p) - float(peaks[i - 1])) * 1000.0 / fs if i > 0 else None
+                beat = measure_beat(sig, int(p), fs, strict_pr=True, prev_rr_ms=prev_rr_ms)
                 if not beat:
                     continue
 
@@ -3795,7 +3798,13 @@ class HolterFullDisclosureDialog(QDialog):
             # minimum 25 ms band. This affects only the visible readout; the
             # sinus-conduction gate used by auto classification remains
             # unchanged.
-            if ventricular_fibrillation_active or ventricular_tachycardia_active or atrial_arrhythmia_active:
+            effective_window_fast = False
+            if len(peaks) >= 2:
+                w_rr_ms = np.diff(np.asarray(peaks, dtype=float)) * 1000.0 / fs
+                if w_rr_ms.size and float(np.median(w_rr_ms)) < 333.3:
+                    effective_window_fast = True
+
+            if ventricular_fibrillation_active or ventricular_tachycardia_active or atrial_arrhythmia_active or effective_window_fast:
                 pr_txt = "--"
             elif len(pr_values) >= 2:
                 # ``pr_values`` is collected as a Python list. Convert it

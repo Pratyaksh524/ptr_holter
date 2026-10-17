@@ -447,9 +447,10 @@ def _detect_arrhythmias_uncached(
                 metric_cursor += 1
                 continue
             local_peak = int(round((peak_sec - metric_start) * fs))
+            prev_rr_ms = (all_r_peaks[metric_cursor] - all_r_peaks[metric_cursor - 1]) * 1000.0 if metric_cursor > 0 else None
             if 0 < local_peak < len(metric_signal):
                 rate_beat_metrics[metric_cursor] = measure_beat(
-                    metric_signal, local_peak, fs, strict_pr=True
+                    metric_signal, local_peak, fs, strict_pr=True, prev_rr_ms=prev_rr_ms
                 )
                 metric = rate_beat_metrics[metric_cursor]
                 if metric and metric.get('p_peak') is not None:
@@ -585,8 +586,21 @@ def _detect_arrhythmias_uncached(
         # a hard equality because physiological P amplitude can vary.
         p_amplitudes = np.asarray([float(b.get('p_amplitude') or 0.0) for b in valid])
         p_durations = np.asarray([float(b.get('p_duration_ms') or 0.0) for b in valid])
-        if max(np.count_nonzero(p_amplitudes >= 0.0), np.count_nonzero(p_amplitudes < 0.0)) < required:
-            return False
+        if len(p_amplitudes) <= 30:
+            if max(np.count_nonzero(p_amplitudes >= 0.0), np.count_nonzero(p_amplitudes < 0.0)) < required:
+                return False
+        else:
+            w = 15
+            p_pol_consistent_count = 0
+            for i in range(len(p_amplitudes)):
+                lo = max(0, i - w)
+                hi = min(len(p_amplitudes), i + w + 1)
+                win = p_amplitudes[lo:hi]
+                dom_pos = np.count_nonzero(win >= 0.0) >= np.count_nonzero(win < 0.0)
+                if (p_amplitudes[i] >= 0.0) == dom_pos:
+                    p_pol_consistent_count += 1
+            if p_pol_consistent_count < required:
+                return False
         if len(p_durations) <= 30:
             p_duration_median = float(np.median(p_durations))
             p_dur_consistent_count = int(np.count_nonzero(np.abs(p_durations - p_duration_median) <= 40.0))
@@ -680,7 +694,7 @@ def _detect_arrhythmias_uncached(
         tachy_start_idx = None
 
         for i, rr in enumerate(all_rr_ms):
-            is_fast = (rr <= 600.0) or (rr <= 630.0 and in_tachy and i + 1 < len(all_rr_ms) and all_rr_ms[i + 1] <= 600.0)
+            is_fast = (333.3 <= rr <= 600.5) or (rr <= 630.0 and in_tachy and i + 1 < len(all_rr_ms) and 333.3 <= all_rr_ms[i + 1] <= 600.5)
             if is_fast:
                 if not in_tachy:
                     in_tachy = True
@@ -1217,7 +1231,7 @@ def _detect_arrhythmias_uncached(
         if rr_mean <= 0:
             return False
         rate = 60000.0 / rr_mean
-        if not (100.0 <= rate <= 250.0):
+        if not (180.0 <= rate <= 300.0):
             return False
         if float(np.std(rr_ms)) / rr_mean > 0.08:
             return False
