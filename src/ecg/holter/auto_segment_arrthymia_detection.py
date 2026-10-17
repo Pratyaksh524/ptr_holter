@@ -1,4 +1,4 @@
-﻿"""
+"""
 ecg/holter/auto_segment_arrthymia_detection.py
 ================================================
 Auto-detected arrhythmia segment pipeline for the Holter Full Disclosure
@@ -526,13 +526,26 @@ def _detect_arrhythmias_uncached(
         # PR is a beat-to-beat conduction measurement. Reject only when a
         # majority of the candidate's beats disagree; an occasional missed
         # P boundary or noise bump must not erase a genuine long brady run.
+        # For short runs (<= 30 beats), use the candidate median; for long
+        # sustained episodes (> 30 beats), use a rolling local median (+-15 beats)
+        # so natural multi-minute autonomic PR drift does not erase true sinus rhythm.
         pr_valid = [b for b in valid if b.get('pr_ms') is not None]
         if len(pr_valid) < required:
             return False
         pr_values = np.asarray([float(b['pr_ms']) for b in pr_valid], dtype=float)
-        pr_median = float(np.median(pr_values))
-        pr_consistent = np.abs(pr_values - pr_median) <= 25.0
-        if int(np.count_nonzero(pr_consistent)) < required:
+        if len(pr_values) <= 30:
+            pr_median = float(np.median(pr_values))
+            pr_consistent_count = int(np.count_nonzero(np.abs(pr_values - pr_median) <= 25.0))
+        else:
+            w = 15
+            pr_consistent_count = 0
+            for i in range(len(pr_values)):
+                lo = max(0, i - w)
+                hi = min(len(pr_values), i + w + 1)
+                loc_med = float(np.median(pr_values[lo:hi]))
+                if abs(pr_values[i] - loc_med) <= 25.0:
+                    pr_consistent_count += 1
+        if pr_consistent_count < required:
             return False
 
         qrs_values = np.asarray([float(b['qrs_ms']) for b in valid], dtype=float)
@@ -574,8 +587,19 @@ def _detect_arrhythmias_uncached(
         p_durations = np.asarray([float(b.get('p_duration_ms') or 0.0) for b in valid])
         if max(np.count_nonzero(p_amplitudes >= 0.0), np.count_nonzero(p_amplitudes < 0.0)) < required:
             return False
-        p_duration_median = float(np.median(p_durations))
-        if int(np.count_nonzero(np.abs(p_durations - p_duration_median) <= 40.0)) < required:
+        if len(p_durations) <= 30:
+            p_duration_median = float(np.median(p_durations))
+            p_dur_consistent_count = int(np.count_nonzero(np.abs(p_durations - p_duration_median) <= 40.0))
+        else:
+            w = 15
+            p_dur_consistent_count = 0
+            for i in range(len(p_durations)):
+                lo = max(0, i - w)
+                hi = min(len(p_durations), i + w + 1)
+                loc_med = float(np.median(p_durations[lo:hi]))
+                if abs(p_durations[i] - loc_med) <= 40.0:
+                    p_dur_consistent_count += 1
+        if p_dur_consistent_count < required:
             return False
         return True
 
@@ -666,7 +690,7 @@ def _detect_arrhythmias_uncached(
                     tachy_end_idx = i
                     beat_count = tachy_end_idx - tachy_start_idx + 1
                     dur = all_r_peaks[tachy_end_idx] - all_r_peaks[tachy_start_idx]
-                    if beat_count >= 4 and dur >= 2.0 \
+                    if beat_count >= 3 and dur >= 1.0 \
                             and sinus_conduction_gate(tachy_start_idx, tachy_end_idx):
                         s_sec = all_r_peaks[tachy_start_idx]
                         e_sec = all_r_peaks[tachy_end_idx]
@@ -687,7 +711,7 @@ def _detect_arrhythmias_uncached(
             tachy_end_idx = len(all_rr_ms)
             beat_count = tachy_end_idx - tachy_start_idx + 1
             dur = all_r_peaks[tachy_end_idx] - all_r_peaks[tachy_start_idx]
-            if beat_count >= 4 and dur >= 2.0 \
+            if beat_count >= 3 and dur >= 1.0 \
                     and sinus_conduction_gate(tachy_start_idx, tachy_end_idx):
                 s_sec = all_r_peaks[tachy_start_idx]
                 e_sec = all_r_peaks[tachy_end_idx]
@@ -813,6 +837,13 @@ def _detect_arrhythmias_uncached(
     def _is_vfib_window(window_signal, r_peaks, fs):
         if len(r_peaks) < 2:
             return False
+        # VF is a chaotic, disorganized ventricular rhythm. A regular rhythm
+        # (such as regular VT or sinus tachycardia) cannot be VFib.
+        if len(r_peaks) >= 3:
+            rr_diffs = np.diff(np.asarray(r_peaks, dtype=float)) * 1000.0 / float(fs)
+            mean_rr = float(np.mean(rr_diffs))
+            if mean_rr > 0 and (float(np.std(rr_diffs)) / mean_rr) < 0.20:
+                return False
         beats = [b for b in (measure_beat(window_signal, int(p), fs) for p in r_peaks) if b is not None]
         if not beats:
             return False
@@ -901,16 +932,18 @@ def _detect_arrhythmias_uncached(
         if float(np.std(qrs_ms)) > 25.0:
             return False
 
+        # Incidental noise bumps or dissociated atrial activity are tolerated;
+        # only an organized P/PR majority with physiological AV conduction
+        # (PR >= 100 ms) means the rhythm is supraventricular, not VT.
+        # Wide VT recordings can make the generic P-finder report coincidental
+        # sub-100ms bumps before QRS which are not conducted sinus P waves.
         p_present = sum(
             1 for b in core_beats
             if b.get('p_present') and b.get('p_onset') is not None
             and b.get('q_onset') is not None and b['p_onset'] < b['q_onset']
+            and (b.get('pr_ms') is not None and b['pr_ms'] >= 100.0)
         )
-        valid_pr = sum(1 for b in core_beats if b.get('pr_ms') is not None)
-        # Incidental noise bumps or dissociated atrial activity are tolerated;
-        # only an organized P/PR majority means the rhythm is
-        # supraventricular, not VT.  Wide VT recordings can make the generic
-        # P-finder report a few coincidental bumps before QRS.
+        valid_pr = sum(1 for b in core_beats if b.get('pr_ms') is not None and b['pr_ms'] >= 100.0)
         return p_present <= 0.50 * len(core_beats) and valid_pr <= 0.50 * len(core_beats)
 
     def _ventricular_tachycardia_core_start(r_peaks, fs):

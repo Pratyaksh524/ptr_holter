@@ -259,7 +259,17 @@ def _qrs_bounds(signal: np.ndarray, r_idx: int, fs: float) -> Tuple[int, int, fl
     smooth_window = _ensure_odd(min(11, signal.size - (1 - signal.size % 2)))
     smoothed = savgol_filter(signal, smooth_window, 3, mode="interp") if signal.size >= smooth_window else signal
     slopes = np.gradient(smoothed)
-    baseline = _median_baseline(signal, r_idx - _ms_to_samples(400, fs), _ms_to_samples(100, fs))
+    # Pre-QRS local baseline: at high heart rates (e.g. tachycardia >100 BPM),
+    # r_idx - 400ms falls directly onto the preceding beat's R/T wave,
+    # causing baseline to be hundreds of counts too high and preventing
+    # q_onset/j_point detection. Use the local pre-QRS window instead,
+    # falling back to the 400ms window only if insufficient samples exist.
+    pre_qrs_start = max(0, r_idx - _ms_to_samples(160, fs))
+    pre_qrs_end = max(pre_qrs_start + 1, r_idx - _ms_to_samples(35, fs))
+    if pre_qrs_end - pre_qrs_start >= 5:
+        baseline = float(np.median(signal[pre_qrs_start:pre_qrs_end]))
+    else:
+        baseline = _median_baseline(signal, r_idx - _ms_to_samples(400, fs), _ms_to_samples(100, fs))
     local_slopes = np.abs(slopes[qrs_left:qrs_right + 1])
     slope_threshold = max(float(np.percentile(local_slopes, 35)) if local_slopes.size else 0.0, 1e-4)
     baseline_threshold = max(0.15 * max(float(np.ptp(signal[qrs_left:qrs_right + 1])), 0.05), 0.015)
@@ -343,7 +353,13 @@ def _detect_p_wave(
         return result
 
     window = signal[p_start:p_end]
-    prominence = max(0.04, 0.18 * max(float(np.ptp(window)), 0.05))
+    # FIX: Scale-adaptive prominence threshold.
+    # 0.04 was in mV; for ADC-count signals (Holter recorded data) the ptp
+    # of the P-wave search window is in hundreds of counts, so 18% of that
+    # is already large enough. The max(0.04, ...) floor only applies for
+    # signals already in mV scale. This one-liner handles both correctly.
+    window_ptp = float(np.ptp(window))
+    prominence = max(0.04, 0.12 * window_ptp) if window_ptp > 0.05 else 0.04
 
     if strict_selection:
         # For the on-screen PR measurement, search both polarities and choose
@@ -387,12 +403,20 @@ def _detect_p_wave(
     # detector-wide baseline path unchanged.
     p_baseline = float(np.median(window)) if strict_selection else baseline
     amplitude = float(signal[p_peak] - p_baseline)
-    # Threshold lowered from 0.08 → 0.04 mV: small but real P waves (common in
-    # standard single-lead recordings) were being rejected, causing NSR to be
-    # misclassified as "Rhythm Undetermined".
-    if abs(amplitude) < 0.04:
+
+    # FIX: Scale-adaptive amplitude threshold.
+    # The old threshold (0.04) was in mV — it blocked real P waves when the
+    # signal is in raw ADC counts (Holter recorded data), where a normal
+    # P wave can be 50-300 counts while R is 500-2000 counts.
+    # New: use 3% of R-peak amplitude as minimum (works in both mV and ADC).
+    r_amplitude = abs(float(signal[r_idx]) - p_baseline)
+    # Fallback: if r_amplitude is near-zero (e.g. at signal edge), use 0.04
+    if r_amplitude < 1e-6:
+        r_amplitude = 1.0
+    min_p_amp = max(0.04, 0.03 * r_amplitude)  # min 0.04 OR 3% of R
+    if abs(amplitude) < min_p_amp:
         return result
-    boundary_threshold = max(0.02, 0.2 * abs(amplitude))
+    boundary_threshold = max(0.02 * r_amplitude, 0.2 * abs(amplitude))
 
     p_onset = p_peak
     left_limit = max(p_start, p_peak - _ms_to_samples(120, fs))
@@ -515,15 +539,17 @@ def measure_beat(
         return beat
 
     beat.update(_detect_p_wave(signal_arr, int(r_idx), baseline, fs, strict_selection=strict_pr))
-    if (
-        beat["p_present"]
-        and beat["p_onset"] is not None
-        and (qrs_bounds_resolved or not strict_pr)
-        and int(beat.get("p_end") or 0) < int(q_onset)
-    ):
-        pr_ms = float((int(q_onset) - int(beat["p_onset"])) * 1000.0 / fs)
-        if 80.0 <= pr_ms <= 400.0:
-            beat["pr_ms"] = pr_ms
+    if beat["p_present"] and beat["p_onset"] is not None:
+        p_onset = int(beat["p_onset"])
+        p_peak = int(beat.get("p_peak") or p_onset)
+        # Clinical PR standard: P-onset to Q-onset.
+        # P-onset and P-peak must strictly precede Q-onset, and Q-onset <= R.
+        if p_onset < int(q_onset) and p_peak <= int(q_onset):
+            pr_ms = float((int(q_onset) - p_onset) * 1000.0 / fs)
+            if 60.0 <= pr_ms <= 400.0:
+                beat["pr_ms"] = pr_ms
+                if beat.get("p_end") is not None and int(beat["p_end"]) > int(q_onset):
+                    beat["p_end"] = int(q_onset)
 
     t_end, t_amp = _tangent_t_end(signal_arr, int(r_idx), baseline, fs)
     if t_end is not None:
@@ -907,7 +933,7 @@ def is_ventricular_fibrillation(signal: np.ndarray, r_peaks: List[int], fs: floa
         pass
 
     if score > 0.4:
-        print(f" ⚠️ VFib Evaluation -> Score: {score:.2f} | Flags: {debug_flags}")
+        print(f" [VFib] Evaluation -> Score: {score:.2f} | Flags: {debug_flags}")
 
     # If flutter spectral features are present, reduce amplitude CoV weight.
     # Only let this veto a BORDERLINE candidate: VF's own chaotic baseline can
@@ -934,14 +960,15 @@ def is_ventricular_fibrillation(signal: np.ndarray, r_peaks: List[int], fs: floa
     # short and chaotic, so short_rr_ratio is high and this gate does not apply.
     if len(valid_rr) > 3:
         median_rr_ms = float(np.median(valid_rr))
-        if median_rr_ms > 0:
-            implied_hr = 60000.0 / median_rr_ms
-            if short_rr_ratio <= 0.35 and 20.0 <= implied_hr <= 150.0:
+        p75_rr_ms = float(np.percentile(valid_rr, 75))
+        effective_rr_ms = max(median_rr_ms, p75_rr_ms)
+        if effective_rr_ms > 0:
+            implied_hr = 60000.0 / effective_rr_ms
+            if 20.0 <= implied_hr <= 150.0:
                 if score >= 0.60:
                     print(
                         f" VFib rejected: organised rhythm at {implied_hr:.0f} bpm "
-                        f"(median RR {median_rr_ms:.0f} ms, only "
-                        f"{short_rr_ratio*100:.0f}% of beats < 450 ms). "
+                        f"(effective RR {effective_rr_ms:.0f} ms). "
                         f"Noise score was {score:.2f}."
                     )
                 return False

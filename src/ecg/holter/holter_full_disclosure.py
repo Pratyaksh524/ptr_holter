@@ -3727,6 +3727,7 @@ class HolterFullDisclosureDialog(QDialog):
             # auto-segment detection and its thresholds are unchanged.
             atrial_arrhythmia_active = False
             ventricular_fibrillation_active = False
+            ventricular_tachycardia_active = False
             if getattr(self, '_auto_marking_visible', False):
                 # Persisted event stores can contain legacy/non-dict entries
                 # after reopening a recording. One malformed entry must not
@@ -3748,6 +3749,9 @@ class HolterFullDisclosureDialog(QDialog):
                     elif event_label in {'ventricular fibrillation', 'vfib'} \
                             or 'ventricular fibrillation' in event_label:
                         ventricular_fibrillation_active = True
+                    elif event_label in {'ventricular tachycardia', 'vtach'} \
+                            or 'ventricular tachycardia' in event_label:
+                        ventricular_tachycardia_active = True
 
             pr_values, qrs_values = [], []
             for p in peaks:
@@ -3778,6 +3782,7 @@ class HolterFullDisclosureDialog(QDialog):
                 # interval. Suppress it for the complete visible VFib
                 # window, just as the QRS readout above is suppressed.
                 if not atrial_arrhythmia_active and not ventricular_fibrillation_active \
+                        and not ventricular_tachycardia_active \
                         and beat.get('pr_ms') is not None:
                     pr_values.append(beat['pr_ms'])
 
@@ -3790,7 +3795,7 @@ class HolterFullDisclosureDialog(QDialog):
             # minimum 25 ms band. This affects only the visible readout; the
             # sinus-conduction gate used by auto classification remains
             # unchanged.
-            if ventricular_fibrillation_active:
+            if ventricular_fibrillation_active or ventricular_tachycardia_active or atrial_arrhythmia_active:
                 pr_txt = "--"
             elif len(pr_values) >= 2:
                 # ``pr_values`` is collected as a Python list. Convert it
