@@ -2322,9 +2322,6 @@ class HolterMainWindow(QDialog):
             QMessageBox.information(self, "Recording Complete",
                                     f"Comprehensive ECG Analysis recording saved to:\n{summary.get('session_dir', '')}")
             self.load_completed_session(summary.get('session_dir', ''), summary.get('patient_info', {}))
-            
-            # Auto-generate report when recording is stopped
-            self._generate_report()
 
     def _generate_report(self):
         from PyQt5.QtWidgets import QProgressDialog
