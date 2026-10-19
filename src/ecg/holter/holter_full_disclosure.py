@@ -233,9 +233,12 @@ class PageGridBackground(QWidget):
             pen_small = QPen(QColor("#F4A0AC"))
             pen_small.setWidth(1)
 
+            dpi_x = max(72.0, float(self.physicalDpiX() or self.logicalDpiX()))
+            dpi_y = max(72.0, float(self.physicalDpiY() or self.logicalDpiY()))
+            px_per_mm_x = dpi_x / 25.4
+            px_per_mm_y = dpi_y / 25.4
+
             # Level 3: Clearly visible large box boundary (200px)
-            pen_large = QPen(QColor("#F4A0AC"))
-            pen_large.setWidth(1)
 
             step_tiny  = 8    # 1mm → 8px  (tiny box)
             step_small = 40   # 5mm → 40px (5 tiny = 1 small)
@@ -243,28 +246,25 @@ class PageGridBackground(QWidget):
 
             # Draw Level 1: tiny grid lines (skip small and large boundaries)
             painter.setPen(pen_tiny)
-            for gx in range(0, w, step_tiny):
-                if gx % step_small != 0:
+            for mm in range(0, int(w / px_per_mm_x) + 1):
+                gx = round(mm * px_per_mm_x)
+                if mm % 5 != 0:
                     painter.drawLine(gx, 0, gx, h)
-            for gy in range(0, h, step_tiny):
-                if gy % step_small != 0:
+            for mm in range(0, int(h / px_per_mm_y) + 1):
+                gy = round(mm * px_per_mm_y)
+                if mm % 5 != 0:
                     painter.drawLine(0, gy, w, gy)
 
             # Draw Level 2: small box lines (skip large boundaries)
             painter.setPen(pen_small)
-            for gx in range(0, w, step_small):
-                if gx % step_large != 0:
-                    painter.drawLine(gx, 0, gx, h)
-            for gy in range(0, h, step_small):
-                if gy % step_large != 0:
-                    painter.drawLine(0, gy, w, gy)
+            for mm in range(0, int(w / px_per_mm_x) + 1, 5):
+                gx = round(mm * px_per_mm_x)
+                painter.drawLine(gx, 0, gx, h)
+            for mm in range(0, int(h / px_per_mm_y) + 1, 5):
+                gy = round(mm * px_per_mm_y)
+                painter.drawLine(0, gy, w, gy)
 
             # Draw Level 3: large block boundaries (always visible)
-            painter.setPen(pen_large)
-            for gx in range(0, w, step_large):
-                painter.drawLine(gx, 0, gx, h)
-            for gy in range(0, h, step_large):
-                painter.drawLine(0, gy, w, gy)
         else:
             # Default Dark Mode
             painter.fillRect(self.rect(), QColor(COL_BLACK))
@@ -1869,9 +1869,8 @@ class HolterFullDisclosureDialog(QDialog):
         self._gain, self._gain_label = next_step
         self.btn_gain.setText(f"Gain: {self._gain_label}")
         self._update_speed_gain_label()
-        # Row height is screen-driven (_sync_row_height_to_viewport), not
-        # gain-driven, so changing gain no longer resizes rows -- only the
-        # waveform amplitude inside the existing row changes.
+        # Gain changes only the waveform amplitude; keep the existing row
+        # layout unchanged.
         for c in self._canvases:
             c.set_gain(self._gain)
             c.update()  # Force repaint with new gain

@@ -50,6 +50,13 @@ from ..holter_helpers import (
     _style_active_btn, _style_btn, _table_style, _template_filter_key,
 )
 
+try:
+    # Shared morphology-preserving display filter.  The Gaussian low-pass in
+    # enhanced_filter.py has no overshoot/ringing around QRS edges.
+    from ...enhanced_filter import gaussian_lowpass
+except ImportError:
+    gaussian_lowpass = None
+
 
 # 6. HOLTER RR / HR TREND CANVAS
 class HolterRRTrendCanvas(QWidget):
@@ -936,21 +943,33 @@ class ECGStripCanvas(QWidget):
         else:
             raw_data = np.zeros(0)
 
-        # NOTE: fast_preview no longer skips the low-pass filter below - an
-        # earlier version did, to save time on in-between scrub frames, but
-        # that displayed the raw unfiltered signal (baseline wander + HF
-        # noise the filter normally removes) and made the trace look like
-        # pure noise while dragging. Filtering always runs; fast_preview now
-        # only skips the RR-interval recompute (self._rr_intervals), which
-        # isn't drawn as part of the trace itself.
+        # Filtering always runs for display.  Use the shared enhanced-filter
+        # Gaussian low-pass instead of a zero-phase Butterworth: the latter
+        # can ring around QRS edges and create a false J-point notch.  AC is
+        # intentionally off here; mains removal should only be enabled when
+        # the recording has confirmed mains interference.
         if len(raw_data) > 15:
             try:
-                if getattr(self, '_filter_ba', None) is None:
-                    from scipy.signal import butter
-                    self._filter_ba = butter(2, 25.0 / (self._fs / 2.0), btype='lowpass')
-                from scipy.signal import filtfilt
-                b, a = self._filter_ba
-                self._data = filtfilt(b, a, raw_data)
+                if gaussian_lowpass is not None:
+                    # Remove tiny isolated display spikes before the
+                    # morphology-safe Gaussian. This is display-only and
+                    # does not alter measurement or arrhythmia input.
+                    if raw_data.size >= 3:
+                        padded = np.pad(raw_data, (1, 1), mode="edge")
+                        display_data = np.median(
+                            np.stack((padded[:-2], padded[1:-1], padded[2:]), axis=0),
+                            axis=0,
+                        )
+                    else:
+                        display_data = raw_data
+                    # Keep a second Gaussian pass display-only. Cascading
+                    # Gaussian stages suppresses residual fine noise without
+                    # the overshoot/ringing that the old Butterworth path
+                    # produced around the QRS-to-ST transition.
+                    display_data = gaussian_lowpass(display_data, 35.0, self._fs)
+                    self._data = gaussian_lowpass(display_data, 35.0, self._fs)
+                else:
+                    self._data = raw_data
             except Exception:
                 self._data = raw_data
         else:
@@ -1431,10 +1450,12 @@ class ECGStripCanvas(QWidget):
                 # Level 2: Slightly more visible small box grid (40px)
                 pen_small = QPen(QColor("#F4A0AC"))
                 pen_small.setWidth(1)
+                dpi_x = max(72.0, float(self.physicalDpiX() or self.logicalDpiX()))
+                dpi_y = max(72.0, float(self.physicalDpiY() or self.logicalDpiY()))
+                px_per_mm_x = dpi_x / 25.4
+                px_per_mm_y = dpi_y / 25.4
 
                 # Level 3: Clearly visible large box boundary (200px)
-                pen_large = QPen(QColor("#F4A0AC"))
-                pen_large.setWidth(1)
 
                 step_tiny  = 8    # 1mm → 8px  (tiny box)
                 step_small = 40   # 5mm → 40px (5 tiny = 1 small)
@@ -1442,28 +1463,25 @@ class ECGStripCanvas(QWidget):
 
                 # Draw Level 1: tiny grid lines (skip small and large boundaries)
                 painter.setPen(pen_tiny)
-                for gx in range(0, w, step_tiny):
-                    if gx % step_small != 0:
+                for mm in range(0, int(w / px_per_mm_x) + 1):
+                    gx = round(mm * px_per_mm_x)
+                    if mm % 5 != 0:
                         painter.drawLine(gx, 0, gx, h)
-                for gy in range(0, h, step_tiny):
-                    if gy % step_small != 0:
+                for mm in range(0, int(h / px_per_mm_y) + 1):
+                    gy = round(mm * px_per_mm_y)
+                    if mm % 5 != 0:
                         painter.drawLine(0, gy, w, gy)
 
                 # Draw Level 2: small box lines (skip large boundaries)
                 painter.setPen(pen_small)
-                for gx in range(0, w, step_small):
-                    if gx % step_large != 0:
-                        painter.drawLine(gx, 0, gx, h)
-                for gy in range(0, h, step_small):
-                    if gy % step_large != 0:
-                        painter.drawLine(0, gy, w, gy)
+                for mm in range(0, int(w / px_per_mm_x) + 1, 5):
+                    gx = round(mm * px_per_mm_x)
+                    painter.drawLine(gx, 0, gx, h)
+                for mm in range(0, int(h / px_per_mm_y) + 1, 5):
+                    gy = round(mm * px_per_mm_y)
+                    painter.drawLine(0, gy, w, gy)
 
                 # Draw Level 3: large block boundaries (always visible)
-                painter.setPen(pen_large)
-                for gx in range(0, w, step_large):
-                    painter.drawLine(gx, 0, gx, h)
-                for gy in range(0, h, step_large):
-                    painter.drawLine(0, gy, w, gy)
             else:
                 painter.fillRect(self.rect(), QColor(COL_BLACK))
                 minor_pen = QPen(QColor(COL_GRID_MINOR))
