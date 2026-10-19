@@ -693,8 +693,13 @@ def _detect_arrhythmias_uncached(
         in_tachy = False
         tachy_start_idx = None
 
+        # Lower bound 340 ms, not 333.3: _detect_p_wave suppresses P whenever
+        # the previous QRS sits within 333.3 ms, and RR at ~180 bpm jitters
+        # around that edge. Those P-less beats sat inside the run and failed
+        # the 75% P gate for the whole run, dropping valid 100-175 bpm sinus
+        # tachycardia along with them.
         for i, rr in enumerate(all_rr_ms):
-            is_fast = (333.3 <= rr <= 600.5) or (rr <= 630.0 and in_tachy and i + 1 < len(all_rr_ms) and 333.3 <= all_rr_ms[i + 1] <= 600.5)
+            is_fast = (340.0 <= rr <= 600.5) or (rr <= 630.0 and in_tachy and i + 1 < len(all_rr_ms) and 340.0 <= all_rr_ms[i + 1] <= 600.5)
             if is_fast:
                 if not in_tachy:
                     in_tachy = True
@@ -1913,13 +1918,22 @@ def _detect_arrhythmias_uncached(
 
         # Beat-exact edges for Supraventricular Tachycardia (SVT). Its onset and end are
         # abrupt (textbook: "after three sinus beats, Supraventricular Tachycardia develops"),
-        # develops"), so the edge is simply where the RR enters / leaves the
-        # episode's own rate: the first beat that opens two consecutive RR
-        # intervals within +/-15% of the episode's median RR, and the last
-        # beat that closes two such intervals. Searched out to one window
-        # past each window-vote edge, since that edge sits on the 5 s grid.
+        # so the edge is simply where the RR enters / leaves the episode's
+        # rate: the first beat that opens two consecutive RR intervals within
+        # +/-15% of the median RR, and the last beat that closes two such
+        # intervals. Searched out to one window past each window-vote edge,
+        # since that edge sits on the 5 s grid.
+        # The median is taken from the beats next to each edge, not the whole
+        # episode: when the rate keeps climbing (200 -> 270 bpm), the episode
+        # median only reflects the fast end and its band rejected the slower
+        # opening SVT beats, pulling the start ~80 s inward. Each RR must also
+        # stay in SVT range (<= 340 ms, the Sinus Tachycardia run's lower
+        # bound), so a local band can't extend SVT over 170 bpm sinus beats.
+        _svt_max_rr = 0.340
+
         def _at_rr_in_band(a, b, median_rr):
-            return 0.85 * median_rr <= (b - a) <= 1.15 * median_rr
+            rr = b - a
+            return 0.85 * median_rr <= rr <= 1.15 * median_rr and rr <= _svt_max_rr
 
         for region in merged_morph:
             if region['label'] != 'Supraventricular Tachycardia (SVT)':
@@ -1928,18 +1942,21 @@ def _detect_arrhythmias_uncached(
                 inside = [p for p in _sorted_peaks if region['start_sec'] <= p <= region['end_sec']]
                 if len(inside) < 3:
                     continue
-                median_rr = float(np.median(np.diff(inside)))
+                head = [p for p in inside if p <= region['start_sec'] + window_size]
+                tail = [p for p in inside if p >= region['end_sec'] - window_size]
+                head_rr = float(np.median(np.diff(head if len(head) >= 3 else inside)))
+                tail_rr = float(np.median(np.diff(tail if len(tail) >= 3 else inside)))
                 near = [p for p in _sorted_peaks
                         if region['start_sec'] - window_size <= p <= region['end_sec'] + window_size]
                 new_start = new_end = None
                 for i in range(len(near) - 2):
-                    if _at_rr_in_band(near[i], near[i + 1], median_rr) and \
-                            _at_rr_in_band(near[i + 1], near[i + 2], median_rr):
+                    if _at_rr_in_band(near[i], near[i + 1], head_rr) and \
+                            _at_rr_in_band(near[i + 1], near[i + 2], head_rr):
                         new_start = near[i]
                         break
                 for i in range(len(near) - 1, 1, -1):
-                    if _at_rr_in_band(near[i - 1], near[i], median_rr) and \
-                            _at_rr_in_band(near[i - 2], near[i - 1], median_rr):
+                    if _at_rr_in_band(near[i - 1], near[i], tail_rr) and \
+                            _at_rr_in_band(near[i - 2], near[i - 1], tail_rr):
                         new_end = near[i]
                         break
                 if new_start is not None and new_end is not None and new_start < new_end - 0.5:

@@ -3869,12 +3869,19 @@ class HolterFullDisclosureDialog(QDialog):
             # displayed recording because of a stale dialog reader or a
             # refresh race.  The reader path below is only an initial-load
             # fallback, before the canvas has received its data.
+            #
+            # Measure from the canvas's pre-filter _raw_data, not its
+            # display-smoothed _data: the strip's double Gaussian pass
+            # (see ECGStripCanvas.set_data) shifts P-wave/QRS onsets enough
+            # to move this readout.
             lead_ii_canvas = next(
                 (c for c in getattr(self, '_canvases', [])
                  if getattr(c, 'lead_name', '') == 'II'),
                 None,
             )
-            canvas_data = getattr(lead_ii_canvas, '_data', None) if lead_ii_canvas is not None else None
+            canvas_data = getattr(lead_ii_canvas, '_raw_data', None) if lead_ii_canvas is not None else None
+            if canvas_data is None and lead_ii_canvas is not None:
+                canvas_data = getattr(lead_ii_canvas, '_data', None)
             canvas_start = getattr(lead_ii_canvas, '_start_sec', None) if lead_ii_canvas is not None else None
             canvas_fs = getattr(lead_ii_canvas, '_fs', None) if lead_ii_canvas is not None else None
 
@@ -3883,6 +3890,16 @@ class HolterFullDisclosureDialog(QDialog):
                 sig = np.asarray(canvas_data, dtype=float)
                 fs = float(canvas_fs)
                 source_start = float(canvas_start)
+                # PR/QRS logic was tuned on the strip's old Butterworth 25 Hz
+                # filtfilt output; reproduce that exact input here so the
+                # display-only Gaussian filter cannot change these values.
+                if getattr(lead_ii_canvas, '_raw_data', None) is not None:
+                    try:
+                        from scipy.signal import butter, filtfilt
+                        b, a = butter(2, 25.0 / (fs / 2.0), btype='lowpass')
+                        sig = filtfilt(b, a, sig)
+                    except Exception:
+                        pass
             else:
                 reader = getattr(getattr(self, '_engine', None), '_reader', None)
                 if reader is None:

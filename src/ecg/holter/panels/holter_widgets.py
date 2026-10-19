@@ -975,6 +975,11 @@ class ECGStripCanvas(QWidget):
         else:
             self._data = raw_data
 
+        # Kept alongside the filtered self._data so PR/QRS measurement code
+        # (e.g. holter_full_disclosure._update_pr_qrs_label) can read the
+        # pre-filter signal instead of the display-smoothed one.
+        self._raw_data = raw_data
+
         self._beat_annotations = beat_annotations or []
         self._structured_events = structured_events or []
         self._start_sec = start_sec
