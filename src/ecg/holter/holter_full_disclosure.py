@@ -2060,6 +2060,10 @@ class HolterFullDisclosureDialog(QDialog):
         if hasattr(self, '_grid_background') and self._grid_background is not None:
             self._grid_background.set_mode(mode)
 
+        for canvas in getattr(self, '_canvases', []):
+            if hasattr(canvas, 'set_display_theme_mode'):
+                canvas.set_display_theme_mode(mode)
+
         if hasattr(self, '_canvas_frame') and self._canvas_frame is not None:
             if mode == 'graph':
                 self._canvas_frame.setStyleSheet("background: #FFFFFF;")

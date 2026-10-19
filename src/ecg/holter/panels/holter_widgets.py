@@ -803,6 +803,9 @@ class ECGStripCanvas(QWidget):
         # so the grid reads as one continuous sheet instead of restarting
         # inside every lead's own small container.
         self._draw_background = draw_background
+        # Full Disclosure supplies the shared background, so draw_background
+        # alone cannot tell whether the current theme is dark or graph.
+        self._display_theme_mode = "dark"
         self._gain = 1.0
         self._speed = 25
         self._inverted = False
@@ -880,6 +883,11 @@ class ECGStripCanvas(QWidget):
 
     def set_gain(self, gain: float):
         self._gain = gain
+        self.update()
+
+    def set_display_theme_mode(self, mode: str):
+        """Set the parent Full Disclosure background theme for annotations."""
+        self._display_theme_mode = str(mode or "dark").lower()
         self.update()
 
     def set_paper_speed(self, speed: int):
@@ -2230,7 +2238,9 @@ class ECGStripCanvas(QWidget):
                     # Draw HR (derived from this specific R-R gap) just under
                     # the time-axis labels, and the R-R interval value itself
                     # just below that -- one HR number per interval, not a
-                    # single window-wide average. Both plain white; the HR
+                    # single window-wide average. They are black on the
+                    # light full-disc graph background and remain white on
+                    # the dark canvas; the HR
                     # text is centered directly over the RR text below it
                     # rather than sharing its left edge, since the two
                     # strings are rarely the same width (e.g. "81" over
@@ -2245,7 +2255,10 @@ class ECGStripCanvas(QWidget):
                     rr_x = mid_x - rr_w // 2
                     hr_x = mid_x - hr_w // 2
 
-                    painter.setPen(QPen(QColor("#FFFFFF")))
+                    # Full-disc graph mode uses the light ECG paper background;
+                    # keep the original white labels on the dark canvas.
+                    label_color = "#000000" if self._display_theme_mode == "graph" else "#FFFFFF"
+                    painter.setPen(QPen(QColor(label_color)))
                     painter.drawText(hr_x, 40, hr_text)
                     painter.drawText(rr_x, 54, interval_text)
                     
