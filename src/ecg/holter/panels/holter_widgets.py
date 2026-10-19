@@ -1189,16 +1189,11 @@ class ECGStripCanvas(QWidget):
             center = (mn + rng / 2.0)
             d = center - (d - center)
 
-        # Gain is a vertical display magnification, not permission for the
-        # trace to enter the neighbouring lead row. Keep the baseline fixed
-        # and proportionally fit unusually large amplified deflections into
-        # the existing canvas range, preserving their shape without clipping.
-        center = (mn + rng / 2.0)
-        max_deviation = float(np.max(np.abs(d - center))) if d.size else 0.0
-        allowed_deviation = (rng * 0.5) * 0.94
-        if max_deviation > allowed_deviation > 0.0:
-            d = center + (d - center) * (allowed_deviation / max_deviation)
-            
+        # Do not normalize the amplified signal to the current time window.
+        # That made the apparent gain change whenever horizontal scrolling
+        # brought a larger or smaller beat into view. Gain must remain fixed
+        # across all windows; any out-of-range samples are clipped at draw time.
+
         return d, mn, rng
 
     def _x_to_index(self, x: int, width: int, n: int) -> int:
