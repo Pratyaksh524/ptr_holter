@@ -839,9 +839,18 @@ class ECGStripCanvas(QWidget):
     def set_invert(self, inverted: bool):
         self._inverted = bool(inverted)
         self.update()
-        
-        # Drag selection: multiple selected beats
-        self._selected_beats = []  # List of timestamps for all selected beats
+
+    def set_theme_mode(self, mode: str):
+        """Set display theme mode: 'dark' (default) or 'graph' (medical ECG paper)."""
+        # TODO: Testing display mode toggle support
+        self._theme_mode = mode
+        if mode == 'graph':
+            self._color = "#000000"
+            self._pen_width = 1.8  # Thickened black trace for clear visibility on ECG paper
+        else:
+            self._color = COL_GREEN
+            self._pen_width = 0.7
+        self.update()
 
     def _find_magnifier_host(self):
         parent = self.parentWidget()
@@ -1405,17 +1414,65 @@ class ECGStripCanvas(QWidget):
         painter = QPainter(self)
         w, h = self.width(), self.height()
         if self._draw_background:
-            painter.fillRect(self.rect(), QColor(COL_BLACK))
-            minor_pen = QPen(QColor(COL_GRID_MINOR))
-            minor_pen.setWidth(1)
-            major_pen = QPen(QColor(COL_GRID_MAJOR))
-            major_pen.setWidth(1)
-            for gx in range(0, w, 20):
-                painter.setPen(major_pen if gx % 100 == 0 else minor_pen)
-                painter.drawLine(gx, 0, gx, h)
-            for gy in range(0, h, 20):
-                painter.setPen(major_pen if gy % 100 == 0 else minor_pen)
-                painter.drawLine(0, gy, w, gy)
+            if getattr(self, '_theme_mode', 'dark') == 'graph':
+                # Medical Standard ECG Graph Paper Mode — 3-level grid matching Image 1:
+                #   Level 1 (tiny)  : 8px  = 1mm  → very faint pink lines
+                #   Level 2 (small) : 40px = 5mm  → 5 tiny boxes per small box
+                #   Level 3 (large) : 200px= 25mm → 5 small boxes per large block
+                painter.fillRect(self.rect(), QColor("#FFE8EA"))
+
+                # Level 1: Faint pink tiny grid (8px)
+                pen_tiny = QPen(QColor("#FFCDD2"))
+                pen_tiny.setWidth(1)
+
+                # Level 2: Slightly more visible small box grid (40px)
+                pen_small = QPen(QColor("#F4A0AC"))
+                pen_small.setWidth(1)
+
+                # Level 3: Clearly visible large box boundary (200px)
+                pen_large = QPen(QColor("#F4A0AC"))
+                pen_large.setWidth(1)
+
+                step_tiny  = 8    # 1mm → 8px  (tiny box)
+                step_small = 40   # 5mm → 40px (5 tiny = 1 small)
+                step_large = 200  # 25mm→ 200px (5 small = 1 large)
+
+                # Draw Level 1: tiny grid lines (skip small and large boundaries)
+                painter.setPen(pen_tiny)
+                for gx in range(0, w, step_tiny):
+                    if gx % step_small != 0:
+                        painter.drawLine(gx, 0, gx, h)
+                for gy in range(0, h, step_tiny):
+                    if gy % step_small != 0:
+                        painter.drawLine(0, gy, w, gy)
+
+                # Draw Level 2: small box lines (skip large boundaries)
+                painter.setPen(pen_small)
+                for gx in range(0, w, step_small):
+                    if gx % step_large != 0:
+                        painter.drawLine(gx, 0, gx, h)
+                for gy in range(0, h, step_small):
+                    if gy % step_large != 0:
+                        painter.drawLine(0, gy, w, gy)
+
+                # Draw Level 3: large block boundaries (always visible)
+                painter.setPen(pen_large)
+                for gx in range(0, w, step_large):
+                    painter.drawLine(gx, 0, gx, h)
+                for gy in range(0, h, step_large):
+                    painter.drawLine(0, gy, w, gy)
+            else:
+                painter.fillRect(self.rect(), QColor(COL_BLACK))
+                minor_pen = QPen(QColor(COL_GRID_MINOR))
+                minor_pen.setWidth(1)
+                major_pen = QPen(QColor(COL_GRID_MAJOR))
+                major_pen.setWidth(1)
+                for gx in range(0, w, 20):
+                    painter.setPen(major_pen if gx % 100 == 0 else minor_pen)
+                    painter.drawLine(gx, 0, gx, h)
+                for gy in range(0, h, 20):
+                    painter.setPen(major_pen if gy % 100 == 0 else minor_pen)
+                    painter.drawLine(0, gy, w, gy)
 
         if self._data.size < 2:
             painter.end()
@@ -1686,8 +1743,11 @@ class ECGStripCanvas(QWidget):
 
         colored_intervals.sort(key=lambda x: x[0])
         
+        painter.setRenderHint(QPainter.Antialiasing, True)
         default_pen = QPen(QColor(self._color))
         default_pen.setWidthF(self._pen_width)
+        default_pen.setCapStyle(Qt.RoundCap)
+        default_pen.setJoinStyle(Qt.RoundJoin)
 
         n = len(d)
         # Vectorized coordinate computation (numpy) instead of a per-sample Python loop.
@@ -1713,7 +1773,7 @@ class ECGStripCanvas(QWidget):
         painter.drawPath(trace_path)
 
         # Overlay colored sub-segments (arrhythmia regions / annotated beats) on top
-        # of the base trace â€” only a handful of these exist per window, so drawing
+        # of the base trace — only a handful of these exist per window, so drawing
         # each as its own short path is cheap.
         for start_idx, end_idx, color in colored_intervals:
             start_idx = max(0, start_idx)
@@ -1721,7 +1781,9 @@ class ECGStripCanvas(QWidget):
             if end_idx <= start_idx:
                 continue
             seg_pen = QPen(QColor(color))
-            seg_pen.setWidthF(self._pen_width * 2.0)
+            seg_pen.setWidthF(max(2.0, self._pen_width * 1.3))
+            seg_pen.setCapStyle(Qt.RoundCap)
+            seg_pen.setJoinStyle(Qt.RoundJoin)
             painter.setPen(seg_pen)
             seg_path = QPainterPath()
             seg_path.moveTo(xs[start_idx], ys[start_idx])

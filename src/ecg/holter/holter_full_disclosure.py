@@ -207,21 +207,78 @@ class PageGridBackground(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        # TODO: Testing mode toggle: 'dark' (default) or 'graph' (medical ECG paper)
+        self._mode = 'dark'
+
+    def set_mode(self, mode: str):
+        self._mode = mode
+        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(COL_BLACK))
         w, h = self.width(), self.height()
-        minor_pen = QPen(QColor(COL_GRID_MINOR))
-        minor_pen.setWidth(1)
-        major_pen = QPen(QColor(COL_GRID_MAJOR))
-        major_pen.setWidth(1)
-        for gx in range(0, w, 20):
-            painter.setPen(major_pen if gx % 100 == 0 else minor_pen)
-            painter.drawLine(gx, 0, gx, h)
-        for gy in range(0, h, 20):
-            painter.setPen(major_pen if gy % 100 == 0 else minor_pen)
-            painter.drawLine(0, gy, w, gy)
+
+        if self._mode == 'graph':
+            # Medical Standard ECG Graph Paper Mode — 3-level grid matching Image 1:
+            #   Level 1 (tiny)  : 8px  = 1mm  → very faint pink lines
+            #   Level 2 (small) : 40px = 5mm  → 5 tiny boxes per small box
+            #   Level 3 (large) : 200px= 25mm → 5 small boxes per large block
+            painter.fillRect(self.rect(), QColor("#FFE8EA"))
+
+            # Level 1: Faint pink tiny grid (8px)
+            pen_tiny = QPen(QColor("#FFCDD2"))
+            pen_tiny.setWidth(1)
+
+            # Level 2: Slightly more visible small box grid (40px)
+            pen_small = QPen(QColor("#F4A0AC"))
+            pen_small.setWidth(1)
+
+            # Level 3: Clearly visible large box boundary (200px)
+            pen_large = QPen(QColor("#F4A0AC"))
+            pen_large.setWidth(1)
+
+            step_tiny  = 8    # 1mm → 8px  (tiny box)
+            step_small = 40   # 5mm → 40px (5 tiny = 1 small)
+            step_large = 200  # 25mm→ 200px (5 small = 1 large)
+
+            # Draw Level 1: tiny grid lines (skip small and large boundaries)
+            painter.setPen(pen_tiny)
+            for gx in range(0, w, step_tiny):
+                if gx % step_small != 0:
+                    painter.drawLine(gx, 0, gx, h)
+            for gy in range(0, h, step_tiny):
+                if gy % step_small != 0:
+                    painter.drawLine(0, gy, w, gy)
+
+            # Draw Level 2: small box lines (skip large boundaries)
+            painter.setPen(pen_small)
+            for gx in range(0, w, step_small):
+                if gx % step_large != 0:
+                    painter.drawLine(gx, 0, gx, h)
+            for gy in range(0, h, step_small):
+                if gy % step_large != 0:
+                    painter.drawLine(0, gy, w, gy)
+
+            # Draw Level 3: large block boundaries (always visible)
+            painter.setPen(pen_large)
+            for gx in range(0, w, step_large):
+                painter.drawLine(gx, 0, gx, h)
+            for gy in range(0, h, step_large):
+                painter.drawLine(0, gy, w, gy)
+        else:
+            # Default Dark Mode
+            painter.fillRect(self.rect(), QColor(COL_BLACK))
+            minor_pen = QPen(QColor(COL_GRID_MINOR))
+            minor_pen.setWidth(1)
+            major_pen = QPen(QColor(COL_GRID_MAJOR))
+            major_pen.setWidth(1)
+            for gx in range(0, w, 20):
+                painter.setPen(major_pen if gx % 100 == 0 else minor_pen)
+                painter.drawLine(gx, 0, gx, h)
+            for gy in range(0, h, 20):
+                painter.setPen(major_pen if gy % 100 == 0 else minor_pen)
+                painter.drawLine(0, gy, w, gy)
+
         painter.end()
 
 
@@ -486,6 +543,10 @@ class HolterFullDisclosureDialog(QDialog):
                 self._selection_mode = 'parallel_single'
         else:
             self._selection_mode = 'parallel_single'
+        
+        # TODO: Testing display mode toggle: 'dark' (default) or 'graph' (medical ECG paper)
+        self._display_theme_mode = 'dark'
+        self._lead_labels = []
         
         # Pending manual beats to restore after canvases are created
         self._pending_manual_beats = None
@@ -1168,6 +1229,7 @@ class HolterFullDisclosureDialog(QDialog):
                 f" padding-right: 4px;"
             )
             lbl.setFixedWidth(44)
+            self._lead_labels.append(lbl)
 
             canvas = ECGStripCanvas(row_parent, height=self._canvas_height, color=COL_GREEN, lead_name=lead, show_annotations=(lead == "I"), draw_background=False)
             canvas.set_paper_speed(25)
@@ -1396,6 +1458,38 @@ class HolterFullDisclosureDialog(QDialog):
             menu.exec_(QPoint(btn_pos.x(), btn_pos.y() - menu_h))
         self.btn_sel_mode.clicked.connect(_show_sel_mode_menu)
         bot_layout.addWidget(self.btn_sel_mode)
+
+        # --- Display mode dropdown (Dark Mode / Graph Mode) ---
+        # TODO: Testing display mode toggle button & dropdown (Dark Mode / Graph Mode)
+        self.btn_display_mode = QPushButton("▲ Dark Mode")
+        self.btn_display_mode.setStyleSheet(f"""
+            QPushButton {{
+                background: #0d1b2a; color: #a0c4e8;
+                border: 1px solid {COL_GREEN_DRK}; padding: 5px 14px;
+                font-size: 13px; font-weight: bold; border-radius: 4px;
+            }}
+            QPushButton:hover {{ background: #162a3a; color: {COL_GREEN}; }}
+        """)
+        def _show_display_mode_menu():
+            menu = QMenu(self)
+            menu.setStyleSheet(f"""
+                QMenu {{
+                    background-color: {COL_DARK}; color: #a0c4e8;
+                    border: 1px solid {COL_GREEN_DRK};
+                    font-size: 13px; font-weight: bold;
+                }}
+                QMenu::item:selected {{ background-color: {COL_GREEN_DRK}; color: {COL_GREEN}; }}
+                QMenu::item {{ padding: 6px 20px; }}
+            """)
+            act_dark = menu.addAction("✔ Dark Mode" if self._display_theme_mode == 'dark' else "  Dark Mode")
+            act_graph = menu.addAction("✔ Graph Mode" if self._display_theme_mode == 'graph' else "  Graph Mode")
+            act_dark.triggered.connect(lambda: self._switch_display_theme('dark'))
+            act_graph.triggered.connect(lambda: self._switch_display_theme('graph'))
+            btn_pos = self.btn_display_mode.mapToGlobal(QPoint(0, 0))
+            menu_h  = menu.sizeHint().height()
+            menu.exec_(QPoint(btn_pos.x(), btn_pos.y() - menu_h))
+        self.btn_display_mode.clicked.connect(_show_display_mode_menu)
+        bot_layout.addWidget(self.btn_display_mode)
 
         # Arrhythmia indicator left of Recording label
         self.lbl_arrhythmia = QLabel("")
@@ -1934,6 +2028,97 @@ class HolterFullDisclosureDialog(QDialog):
             if hasattr(self, '_segment_overlay'):
                 self._segment_overlay.show()
                 self._refresh_segment_overlay()
+
+    # ------------------------------------------------------------------
+    # Display theme mode switching (Testing mode: Dark Mode / Graph Mode)
+    # ------------------------------------------------------------------
+    def _switch_display_theme(self, mode: str):
+        """Switch between 'dark' (default) and 'graph' (medical ECG paper) display mode.
+        TODO: Testing display theme mode toggle."""
+        self._display_theme_mode = mode
+        if hasattr(self, 'btn_display_mode'):
+            self.btn_display_mode.setText("▲ Dark Mode" if mode == 'dark' else "▲ Graph Mode")
+            if mode == 'graph':
+                self.btn_display_mode.setStyleSheet("""
+                    QPushButton {
+                        background: #FFE4E6; color: #990000;
+                        border: 1px solid #E64A5E; padding: 5px 14px;
+                        font-size: 13px; font-weight: bold; border-radius: 4px;
+                    }
+                    QPushButton:hover { background: #FECDD3; color: #880000; }
+                """)
+            else:
+                self.btn_display_mode.setStyleSheet(f"""
+                    QPushButton {{
+                        background: #0d1b2a; color: #a0c4e8;
+                        border: 1px solid {COL_GREEN_DRK}; padding: 5px 14px;
+                        font-size: 13px; font-weight: bold; border-radius: 4px;
+                    }}
+                    QPushButton:hover {{ background: #162a3a; color: {COL_GREEN}; }}
+                """)
+
+        if hasattr(self, '_grid_background') and self._grid_background is not None:
+            self._grid_background.set_mode(mode)
+
+        if hasattr(self, '_canvas_frame') and self._canvas_frame is not None:
+            if mode == 'graph':
+                self._canvas_frame.setStyleSheet("background: #FFFFFF;")
+            else:
+                self._canvas_frame.setStyleSheet(f"background: {COL_BLACK};")
+
+        # Update lead labels styling
+        if hasattr(self, '_lead_labels'):
+            for lbl in self._lead_labels:
+                if mode == 'graph':
+                    lbl.setStyleSheet(
+                        "color: #990000; font-weight: bold; font-size: 14px;"
+                        " background: #FFFFFF; border-right: 1px solid #D32F2F;"
+                        " padding-right: 4px;"
+                    )
+                else:
+                    lbl.setStyleSheet(
+                        f"color: {COL_GREEN}; font-weight: bold; font-size: 14px;"
+                        f" background: #0a0f18; border-right: 1px solid {COL_GREEN_DRK};"
+                        f" padding-right: 4px;"
+                    )
+
+        # Update scrollbar style
+        if hasattr(self, '_leads_scroll') and self._leads_scroll is not None:
+            if mode == 'graph':
+                self._leads_scroll.setStyleSheet("""
+                    QScrollArea { background: transparent; border: none; }
+                    QScrollBar:vertical {
+                        background: #FFE4E6; width: 10px; border-radius: 4px; margin: 0;
+                    }
+                    QScrollBar::handle:vertical {
+                        background: #E64A5E; min-height: 24px; border-radius: 4px;
+                    }
+                    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+                """)
+            else:
+                self._leads_scroll.setStyleSheet(f"""
+                    QScrollArea {{ background: transparent; border: none; }}
+                    QScrollBar:vertical {{
+                        background: #0d1b2a; width: 10px; border-radius: 4px; margin: 0;
+                    }}
+                    QScrollBar::handle:vertical {{
+                        background: {COL_GREEN_DRK}; min-height: 24px; border-radius: 4px;
+                    }}
+                    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+                """)
+
+        # Update waveform strip canvases
+        if hasattr(self, '_canvases'):
+            for c in self._canvases:
+                if hasattr(c, 'set_theme_mode'):
+                    c.set_theme_mode(mode)
+                else:
+                    c.update()
+
+        if hasattr(self, '_vertical_line_overlay') and self._vertical_line_overlay is not None:
+            self._vertical_line_overlay.update()
+        if hasattr(self, '_segment_overlay') and self._segment_overlay is not None:
+            self._segment_overlay.update()
 
     # ------------------------------------------------------------------
     # Segment context menu + labeling
