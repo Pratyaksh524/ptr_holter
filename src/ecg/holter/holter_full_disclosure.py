@@ -335,12 +335,15 @@ class SegmentOverlay(QWidget):
         self._drag_end_x   = None
         self.update()
 
-    def add_segment(self, start_x, end_x, start_sec, end_sec, label, color, start_time_str='', end_time_str='', auto=False, true_mid_x=None):
+    def add_segment(self, start_x, end_x, start_sec, end_sec, label, color, start_time_str='', end_time_str='', auto=False, true_mid_x=None, layer=0):
+        # layer: text row for this segment's label/times. Rhythm segments use
+        # row 0; bundle branch blocks (drawn alongside a rhythm over the same
+        # time) use row 1 so the two sets of text never overlap.
         self._segments.append({
             'start_x': start_x, 'end_x': end_x,
             'start_sec': start_sec, 'end_sec': end_sec, 'auto': bool(auto),
             'label': label, 'color': color, 'start_time_str': start_time_str, 'end_time_str': end_time_str,
-            'true_mid_x': true_mid_x,
+            'true_mid_x': true_mid_x, 'layer': int(layer),
         })
         self.update()
 
@@ -373,12 +376,15 @@ class SegmentOverlay(QWidget):
         # collision guard below -- which only ever looks at the PREVIOUS
         # label's right edge -- actually means "the label immediately to
         # the left", however these segments were added.
-        last_label_right_edge = None
+        last_label_right_edges = {}  # per text row (segment 'layer')
         for seg in sorted(self._segments, key=lambda s: min(s['start_x'], s['end_x'])):
             sx = min(seg['start_x'], seg['end_x'])
             ex = max(seg['start_x'], seg['end_x'])
             if ex <= sx:
                 continue
+            layer = int(seg.get('layer', 0) or 0)
+            text_y = 20 + 14 * layer
+            last_label_right_edge = last_label_right_edges.get(layer)
             try:
                 c = QColor(seg['color'])
             except Exception:
@@ -463,27 +469,27 @@ class SegmentOverlay(QWidget):
 
             painter.setFont(lbl_font)
             painter.setPen(QPen(c, 1))
-            painter.drawText(start_text_x, 20, lbl)
+            painter.drawText(start_text_x, text_y, lbl)
 
             if time_str:
                 painter.setFont(t_font)
                 painter.setPen(QPen(QColor("#FFFFFF")))
-                painter.drawText(start_text_x + lbl_w + spacer_w, 20, time_str)
+                painter.drawText(start_text_x + lbl_w + spacer_w, text_y, time_str)
 
-            last_label_right_edge = start_text_x + total_w
+            last_label_right_edges[layer] = start_text_x + total_w
 
-            # Draw start time on left edge of segment (y = 20, in white)
+            # Draw start time on left edge of segment (y = text row, in white)
             if start_time_str:
                 painter.setFont(t_font)
                 painter.setPen(QPen(QColor("#FFFFFF")))
-                painter.drawText(sx + 4, 20, start_time_str)
+                painter.drawText(sx + 4, text_y, start_time_str)
 
-            # Draw end time on right edge of segment (y = 20, in white)
+            # Draw end time on right edge of segment (y = text row, in white)
             if end_time_str:
                 end_time_w = painter.fontMetrics().horizontalAdvance(end_time_str)
                 painter.setFont(t_font)
                 painter.setPen(QPen(QColor("#FFFFFF")))
-                painter.drawText(ex - end_time_w - 4, 20, end_time_str)
+                painter.drawText(ex - end_time_w - 4, text_y, end_time_str)
 
         painter.end()
 
@@ -3664,25 +3670,47 @@ class HolterFullDisclosureDialog(QDialog):
             'bradycardia': ('Sinus Bradycardia', '#00BFFF'),
             'sinus tachycardia': ('Sinus Tachycardia', '#00FFFF'),
             'tachycardia': ('Sinus Tachycardia', '#00FFFF'),
+            # AV conduction blocks (auto_segment_arrthymia_detection.py's
+            # _AV_COLORS). Exact full labels only, so a stored replay entry
+            # like a bare "AV Block" isn't drawn as one of these degrees.
+            'third-degree av block': ('Third-degree AV Block', '#C0FF00'),
+            'second-degree av block (mobitz ii)': ('Second-degree AV Block (Mobitz II)', '#FF00FF'),
+            'second-degree av block (mobitz i)': ('Second-degree AV Block (Mobitz I)', '#4169E1'),
+            'first-degree av block': ('First-degree AV Block', '#FFD700'),
+        }
+        # Bundle branch blocks (auto_segment_arrthymia_detection.py's
+        # _BUNDLE_BRANCH_BLOCK_COLORS) are a QRS-shape layer drawn alongside the rhythm, so
+        # they are merged in their own list: one sitting between two pieces
+        # of a rhythm must not stop those pieces merging as before.
+        # "incomplete ..." keys come first: "complete ..." is a substring.
+        bundle_branch_block_targets = {
+            'incomplete right bundle branch block': ('Incomplete Right Bundle Branch Block', '#9E9E9E'),
+            'incomplete left bundle branch block': ('Incomplete Left Bundle Branch Block', '#D2B48C'),
+            'complete right bundle branch block': ('Complete Right Bundle Branch Block', '#E0E0E0'),
+            'complete left bundle branch block': ('Complete Left Bundle Branch Block', '#8B4513'),
         }
         reader_start = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
         regions = []
+        bundle_branch_block_regions = []
         for ev in sorted(visible_events or [], key=lambda item: float(item.get('timestamp', 0.0) or 0.0)):
             label_raw = str(ev.get('label', ev.get('type', '')) or '')
             label_lower = label_raw.lower()
-            match = next((value for key, value in targets.items() if key in label_lower), None)
+            bundle_branch_block_match = next((value for key, value in bundle_branch_block_targets.items() if key in label_lower), None)
+            match = bundle_branch_block_match or next((value for key, value in targets.items() if key in label_lower), None)
             if match is None:
                 continue
             start_sec = float(ev.get('timestamp', 0.0) or 0.0)
             end_sec = float(ev.get('end_timestamp', ev.get('end_ts', start_sec)) or start_sec)
             if end_sec <= start_sec:
                 continue
-            if regions and regions[-1][2][0] == match[0] and start_sec <= regions[-1][1] + 0.5:
-                regions[-1] = (regions[-1][0], max(regions[-1][1], end_sec), match)
+            group = bundle_branch_block_regions if bundle_branch_block_match else regions
+            if group and group[-1][2][0] == match[0] and start_sec <= group[-1][1] + 0.5:
+                group[-1] = (group[-1][0], max(group[-1][1], end_sec), match)
             else:
-                regions.append((start_sec, end_sec, match))
+                group.append((start_sec, end_sec, match))
 
-        for start_sec, end_sec, match in regions:
+        bundle_branch_block_names = {value[0] for value in bundle_branch_block_targets.values()}
+        for start_sec, end_sec, match in regions + bundle_branch_block_regions:
             # Clip only for drawing; retain the true event times in the overlay metadata.
             draw_start = max(start_sec, ref._start_sec)
             draw_end = min(end_sec, ref_end)
@@ -3716,7 +3744,8 @@ class HolterFullDisclosureDialog(QDialog):
                 end_time = datetime.fromtimestamp(reader_start + end_sec).strftime('%H:%M:%S')
             self._segment_overlay.add_segment(
                 sx, ex, start_sec, end_sec, match[0], match[1],
-                start_time, end_time, auto=True, true_mid_x=true_mid_x
+                start_time, end_time, auto=True, true_mid_x=true_mid_x,
+                layer=1 if match[0] in bundle_branch_block_names else 0,
             )
 
     def _scroll_throttle_interval(self):
@@ -4105,6 +4134,10 @@ class HolterFullDisclosureDialog(QDialog):
                         'ventricular fibrillation', 'ventricular tachycardia',
                         'atrial fibrillation', 'atrial flutter',
                         'supraventricular tachycardia (svt)',
+                        'first-degree av block',
+                        'second-degree av block (mobitz i)',
+                        'second-degree av block (mobitz ii)',
+                        'third-degree av block',
                     }:
                         active_auto.append((event_start, event_end, label))
             if active_auto:
@@ -4190,6 +4223,28 @@ class HolterFullDisclosureDialog(QDialog):
                 arrhythmia_label = f"Arrhythmia: Normal Sinus Rhythm at {current_time}"
             else:
                 arrhythmia_label = "Arrhythmia: Normal Sinus Rhythm"
+
+        # A bundle branch block is a QRS-shape finding alongside the rhythm,
+        # so it is appended to the rhythm text above rather than replacing it.
+        try:
+            if self._auto_marking_visible and arrhythmia_label:
+                bundle_branch_block_labels = {
+                    'complete right bundle branch block', 'incomplete right bundle branch block',
+                    'complete left bundle branch block', 'incomplete left bundle branch block',
+                }
+                for event in getattr(self._engine, '_structured_events', []) or []:
+                    if not isinstance(event, dict) or 'manual' in str(event.get('source', '')).lower():
+                        continue
+                    label = str(event.get('label', event.get('type', '')) or '')
+                    if label.lower() not in bundle_branch_block_labels:
+                        continue
+                    ev_start = float(event.get('timestamp', 0.0) or 0.0)
+                    ev_end = float(event.get('end_timestamp', ev_start) or ev_start)
+                    if ev_start <= start_sec <= ev_end:
+                        arrhythmia_label = f"{arrhythmia_label} | {label}"
+                        break
+        except Exception as e:
+            print(f"[Full Disclosure] Error updating Bundle Branch Block label: {e}")
 
         # Auto-segment detection is still running in the background: don't
         # claim a rhythm (the fallbacks above would say Normal Sinus Rhythm).

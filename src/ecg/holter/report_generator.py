@@ -37,9 +37,9 @@ def _detector_owns_label(label: str) -> bool:
     which showed up here as episodes with no occurring time."""
     lower = str(label or '').lower()
     return lower in {
-        'ventricular fibrillation', 'atrial fibrillation', 'atrial flutter',
+        'ventricular fibrillation', 'ventricular tachycardia', 'atrial fibrillation', 'atrial flutter',
         'supraventricular tachycardia (svt)', 'sinus bradycardia', 'sinus tachycardia',
-    } or 'av block' in lower
+    } or 'av block' in lower or 'bundle branch block' in lower
 
 
 def _load_auto_segment_events(session_dir: str) -> List[Dict[str, object]]:
@@ -227,11 +227,38 @@ def _build_timeline_events(session_dir: str,
         s_t = float(seg.get('start_sec', 0.0) or 0.0)
         e_t = float(seg.get('end_sec', s_t) or s_t)
         active_segments_ranges.append((s_t, e_t))
+    manual_segment_ranges = list(active_segments_ranges)
 
     for seg in auto_segments:
         s_t = float(seg.get('start_sec', seg.get('timestamp', 0.0)) or 0.0)
         e_t = float(seg.get('end_sec', seg.get('end_timestamp', s_t)) or s_t)
         lbl = str(seg.get('label', 'Event'))
+
+        # A bundle branch block is a QRS-shape finding that runs alongside
+        # the rhythm (e.g. Sinus Bradycardia with Complete Right Bundle
+        # Branch Block), so it overlaps an auto rhythm segment by design.
+        # It is only held back by a manual segment, and is not added to
+        # active_segments_ranges, so the rhythm rows and the Normal Sinus
+        # Rhythm return markers below are exactly as without it.
+        if 'bundle branch block' in lbl.lower():
+            if any(ms < e_t and s_t < me for ms, me in manual_segment_ranges):
+                continue
+            timeline_events.append({
+                'timestamp': s_t,
+                'sort_ts': s_t,
+                'label': f"Auto segment marked ({lbl})",
+                'event_type': lbl,
+                'source': 'Auto'
+            })
+            if e_t > s_t + 0.1:
+                timeline_events.append({
+                    'timestamp': e_t,
+                    'sort_ts': e_t,
+                    'label': f"Auto segment marked end ({lbl})",
+                    'event_type': lbl,
+                    'source': 'Auto'
+                })
+            continue
 
         # Check if inside manual segment (or a previously-processed auto
         # segment -- this list accumulates both). A strict/open-interval
@@ -277,8 +304,13 @@ def _build_timeline_events(session_dir: str,
         # the report show a false final NSR row after VFib/VT.
         recording_end_sec = 0.0
         try:
+            # Chunk start time: metrics.jsonl rows store it as 't' (seconds
+            # from recording start); 'timestamp' is the older key. Reading
+            # only 'timestamp' gave 0 for every row, so the "recording end"
+            # came out as one chunk (5 s) and every Normal Sinus Rhythm
+            # return marker after a segment was skipped as "at the end".
             recording_end_sec = max(
-                float(metric.get('timestamp', 0.0) or 0.0)
+                float(metric.get('timestamp', metric.get('t', 0.0)) or 0.0)
                 + float(metric.get('duration_sec', metric.get('duration', 0.0)) or 0.0)
                 for metric in (metrics or [])
                 if isinstance(metric, dict)
@@ -419,7 +451,16 @@ def _build_timeline_events(session_dir: str,
             last_ev = deduped_timeline[-1]
             if last_ev.get('label') == ev.get('label') and abs(float(last_ev.get('timestamp', 0.0)) - float(ev.get('timestamp', 0.0))) < 0.2:
                 continue
-            if last_ev.get('label') == 'Normal Sinus Rhythm' and ev.get('label') == 'Normal Sinus Rhythm':
+            # Bundle branch block rows run alongside the rhythm rows, so they
+            # are looked past here: two Normal Sinus Rhythm rows still
+            # collapse into one exactly as they did without them.
+            last_rhythm_ev = next(
+                (e for e in reversed(deduped_timeline)
+                 if 'bundle branch block' not in str(e.get('event_type', '')).lower()),
+                None,
+            )
+            if last_rhythm_ev is not None and last_rhythm_ev.get('label') == 'Normal Sinus Rhythm' \
+                    and ev.get('label') == 'Normal Sinus Rhythm':
                 continue
         deduped_timeline.append(ev)
 
@@ -650,14 +691,15 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         _afib_burden_pct = (_afib_total_sec / _rec_dur_sec * 100.0) if _rec_dur_sec > 0 else 0.0
 
         # AV block episode counts, same auto-segment source as AFib/Flutter
-        # above. The detector only ever distinguishes Mobitz I for 2nd-
-        # degree block (see auto_segment_arrthymia_detection.py / the AV
-        # Block path falling through to analyze_ecg()) -- there is no
-        # Mobitz II detection anywhere in this app, so that row is always
-        # "-" rather than a fabricated count.
+        # above (auto_segment_arrthymia_detection.py labels 2nd-degree block
+        # as "... (Mobitz I)" or "... (Mobitz II)").
         _av_block_2_1_count = sum(
             1 for e in _auto_segment_events_all
-            if 'second' in str(e.get('label', '')).lower() and 'av block' in str(e.get('label', '')).lower()
+            if str(e.get('label', '')).lower() == 'second-degree av block (mobitz i)'
+        )
+        _av_block_2_2_count = sum(
+            1 for e in _auto_segment_events_all
+            if str(e.get('label', '')).lower() == 'second-degree av block (mobitz ii)'
         )
         _av_block_3_count = sum(
             1 for e in _auto_segment_events_all
@@ -774,7 +816,7 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         ])
         others_panel = _grid_panel("Others", [
             ("2nd deg. AV block type I", str(_av_block_2_1_count) if _auto_segment_events_all else "-"),
-            ("2nd deg. AV block type II", "-"),
+            ("2nd deg. AV block type II", str(_av_block_2_2_count) if _auto_segment_events_all else "-"),
             ("3rd deg. AV block", str(_av_block_3_count) if _auto_segment_events_all else "-"),
         ])
 
@@ -902,7 +944,18 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
             'sinus rhythm' in label_lower
             and 'normal sinus rhythm' not in label_lower
         )
-        if is_generic_sinus_rhythm or any(term in label_lower for term in excluded_summary_terms):
+        # AV blocks (First-degree, Mobitz I, Mobitz II, Third-degree) and
+        # Ventricular Tachycardia from the waveform auto-segment detector
+        # carry their own segment timing and are reported. The note on
+        # 'ventricular tachycardia' above predates the detector's own VT
+        # rule (_is_ventricular_tachycardia_window); the terms above still
+        # filter every other source (stored tally, manual) as before.
+        is_auto_reported = label in auto_segment_counts and (
+            'av block' in label_lower or label_lower == 'ventricular tachycardia'
+        )
+        if is_generic_sinus_rhythm or (
+            not is_auto_reported and any(term in label_lower for term in excluded_summary_terms)
+        ):
             continue
         filtered_arrhy_counts[label] = count
 
@@ -1830,9 +1883,13 @@ def _generate_text_report(session_dir, patient_info, summary, output_path) -> st
         'long qt', 'prolonged qt', 'wide qrs', 'premature ventricular contraction', 'pvc',
         'second-degree', 'second degree', 'third-degree', 'third degree',
     )
+    # Auto-segment AV blocks are reported, same as in the PDF summary.
     filtered_arrhy_counts = {
         k: v for k, v in combined_arrhy_counts.items()
-        if not any(term in k.lower() for term in excluded_summary_terms)
+        if (
+            (k in auto_segment_counts and 'av block' in k.lower())
+            or not any(term in k.lower() for term in excluded_summary_terms)
+        )
         and not ('sinus rhythm' in k.lower() and 'normal sinus rhythm' not in k.lower())
     }
 
