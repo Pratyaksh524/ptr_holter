@@ -335,8 +335,22 @@ def _build_timeline_events(session_dir: str,
             })
 
         # Add baseline return after segments if there's a gap before next segment
+        #
+        # After an AUTO segment the row is placed where Full Disclosure's
+        # rhythm label itself switches to Normal Sinus Rhythm: that label
+        # keeps showing the segment for as long as the visible frame's
+        # wall-clock second is the segment's own end second, so the first
+        # second it reads Normal Sinus Rhythm is the end second + 1 (end
+        # 12:27:24.2 -> NSR 12:27:25). Rows after a manual segment are left
+        # exactly as before.
+        _report_start_wall = _report_recording_start_time(session_dir)
         for ms, me in active_segments_ranges:
-            t_resume = me + 0.05
+            if (ms, me) in manual_segment_ranges:
+                t_resume = me + 0.05
+            elif _report_start_wall:
+                t_resume = float(np.floor(_report_start_wall + me)) + 1.0 - _report_start_wall
+            else:
+                t_resume = float(np.floor(me)) + 1.0
             if recording_end_sec > 0.0 and t_resume >= recording_end_sec - 0.05:
                 continue
             in_another = any(other_s <= t_resume <= other_e for other_s, other_e in active_segments_ranges if (other_s, other_e) != (ms, me))
