@@ -152,6 +152,89 @@ def generate_holter_report(session_dir: str,
                                       output_path.replace('.pdf', '.txt'))
 
 
+_NSR_CONFIRM_READERS: Dict[str, object] = {}
+
+
+def _first_confirmed_nsr_beat(session_dir: str, t_from: float, t_to: float):
+    """Report wrapper around first_confirmed_nsr_beat() for a session folder.
+    Returns False when the recording can't be read."""
+    try:
+        from .file_format import ECGHFileReader
+        reader = _NSR_CONFIRM_READERS.get(session_dir)
+        if reader is None:
+            path = os.path.join(session_dir, 'recording.ecgh')
+            if not os.path.exists(path):
+                return False
+            reader = ECGHFileReader(path)
+            _NSR_CONFIRM_READERS[session_dir] = reader
+    except Exception as e:
+        print(f"[HolterReport] NSR confirmation skipped: {e}")
+        return False
+    return first_confirmed_nsr_beat(reader, t_from, t_to)
+
+
+def first_confirmed_nsr_beat(reader, t_from: float, t_to: float):
+    """Time (s) of the first beat in [t_from, t_to) that opens a run of 3
+    consecutive confirmed normal sinus beats, or None if there is none.
+
+    Shared by the report's Event Timeline and Full Disclosure's rhythm
+    label. A beat is confirmed sinus when, measured on Lead II with the same
+    measure_beat(strict_pr=True) the auto-segment detector uses: a P wave
+    precedes it with PR 120-200 ms, its QRS is narrow (< 120 ms), and the RR
+    from the previous beat is 600-1000 ms (60-100 bpm; 10 ms of slack above
+    1000 so an exact 60 bpm rhythm measuring 1000-1002 ms doesn't flicker
+    between confirmed and not); the 3 beats' PRs agree within 50 ms. Returns False when the recording can't be read, so
+    the caller can keep its previous behaviour.
+    """
+    try:
+        from ecg.pan_tompkins import pan_tompkins
+        from ecg.arrhythmia_detector import measure_beat
+        names = list(getattr(reader, 'lead_names', []) or [])
+        if 'II' not in names:
+            return False
+        fs = float(getattr(reader, 'fs', 500) or 500)
+        total = float(getattr(reader, 'duration_sec', 0.0) or 0.0)
+        t_to = min(t_to, t_from + 120.0, total)
+        read_start = max(0.0, t_from - 1.5)
+        read_end = min(total, t_to + 1.0)
+        if read_end - read_start < 2.0:
+            return None
+        data = reader.read_range(read_start, read_end)
+        lead_ii = np.asarray(data[names.index('II')], dtype=float)
+        peaks = [int(p) for p in pan_tompkins(lead_ii, fs=fs)]
+        half = int(fs)
+        run = []  # (time, pr) of the current run of confirmed beats
+        for k in range(1, len(peaks)):
+            p = peaks[k]
+            t = read_start + p / fs
+            if t < t_from:
+                continue
+            if t >= t_to:
+                break
+            rr_ms = (p - peaks[k - 1]) * 1000.0 / fs
+            lo, hi = max(0, p - half), min(lead_ii.size, p + half)
+            beat = measure_beat(lead_ii[lo:hi], p - lo, fs, strict_pr=True, prev_rr_ms=rr_ms)
+            pr = beat.get('pr_ms') if beat else None
+            qrs = float(beat.get('qrs_ms') or 0.0) if beat else 0.0
+            confirmed = (
+                beat is not None and pr is not None and 120.0 <= float(pr) <= 200.0
+                and 0.0 < qrs < 120.0 and 600.0 <= rr_ms <= 1010.0
+            )
+            if not confirmed:
+                run = []
+                continue
+            run.append((t, float(pr)))
+            if len(run) >= 3:
+                prs = [v for _, v in run[-3:]]
+                if max(prs) - min(prs) <= 50.0:
+                    return run[-3][0]
+                run = run[-2:]
+        return None
+    except Exception as e:
+        print(f"[HolterReport] NSR confirmation skipped: {e}")
+        return False
+
+
 def _build_timeline_events(session_dir: str,
                            auto_segment_events=None,
                            metrics=None) -> List[Dict[str, object]]:
@@ -327,10 +410,30 @@ def _build_timeline_events(session_dir: str,
                 + [0.0]
             )
         starts_in_segment = any(ms <= 0.5 and me > 0.0 for ms, me in active_segments_ranges)
+
+        # Normal Sinus Rhythm rows are placed at the first CONFIRMED sinus
+        # beat (_first_confirmed_nsr_beat: P with PR 120-200 ms, QRS < 120
+        # ms, 60-100 bpm, 3 beats in a row) up to the next segment. With no
+        # such beat (or an unreadable recording) the row stays where it was
+        # before -- recording start, or the second after a segment ends --
+        # matching Full Disclosure's label, which falls back to Normal Sinus
+        # Rhythm whenever no segment is active.
+        def _next_segment_start(after):
+            starts = [ms for ms, me in active_segments_ranges if ms > after + 0.01]
+            starts += [bs for bs, be in bundle_branch_block_ranges if bs > after + 0.01]
+            if recording_end_sec > 0.0:
+                starts.append(recording_end_sec)
+            return min(starts) if starts else after + 120.0
+
+        start_row_sec = 0.0
+        if not starts_in_segment:
+            confirmed_start = _first_confirmed_nsr_beat(session_dir, 0.0, _next_segment_start(-1.0))
+            if confirmed_start not in (None, False):
+                start_row_sec = float(confirmed_start)
         if not starts_in_segment:
             timeline_events.append({
-                'timestamp': 0.0,
-                'sort_ts': 0.0,
+                'timestamp': start_row_sec,
+                'sort_ts': start_row_sec,
                 'label': 'Normal Sinus Rhythm',
                 'event_type': 'Normal Sinus Rhythm',
                 'source': 'Auto'
@@ -357,7 +460,8 @@ def _build_timeline_events(session_dir: str,
             if (ms, me) in manual_segment_ranges:
                 t_resume = me + 0.05
             else:
-                t_resume = _display_resume(me)
+                confirmed = _first_confirmed_nsr_beat(session_dir, me, _next_segment_start(me))
+                t_resume = _display_resume(me) if confirmed in (None, False) else float(confirmed)
             if recording_end_sec > 0.0 and t_resume >= recording_end_sec - 0.05:
                 continue
             in_another = any(other_s <= t_resume <= other_e for other_s, other_e in active_segments_ranges if (other_s, other_e) != (ms, me))
@@ -391,7 +495,8 @@ def _build_timeline_events(session_dir: str,
                 )
             ]
             for bs, be in bundle_branch_block_ranges:
-                t_resume = _display_resume(be)
+                confirmed = _first_confirmed_nsr_beat(session_dir, be, _next_segment_start(be))
+                t_resume = _display_resume(be) if confirmed in (None, False) else float(confirmed)
                 if recording_end_sec > 0.0 and t_resume >= recording_end_sec - 0.05:
                     continue
                 if any(other_s <= t_resume <= other_e for other_s, other_e in active_segments_ranges) \

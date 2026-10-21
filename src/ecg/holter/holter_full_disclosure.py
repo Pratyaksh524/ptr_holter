@@ -4262,7 +4262,13 @@ class HolterFullDisclosureDialog(QDialog):
         except Exception as e:
             print(f"[Full Disclosure] Error updating auto rhythm label: {e}")
         
-        if not arrhythmia_label and lead_i_canvas and hasattr(lead_i_canvas, '_beat_annotations'):
+        # Beat badges (Single PVC, PVC/PAC Couplet, Bigeminy..., VT Run, SVT
+        # Run, AFib, Paced) describe the raw beat stream, so they are only
+        # shown before "Auto Arrhythmia Detection" is clicked. Once auto
+        # marking is on, this label comes only from the auto-detected
+        # segments above (and the Normal Sinus Rhythm fallback below).
+        if not arrhythmia_label and not getattr(self, '_auto_marking_visible', False) \
+                and lead_i_canvas and hasattr(lead_i_canvas, '_beat_annotations'):
             # Get beats in current window
             window_beats = [b for b in lead_i_canvas._beat_annotations 
                            if start_sec <= b.get('timestamp', 0.0) <= end_sec]

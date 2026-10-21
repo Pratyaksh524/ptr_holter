@@ -2051,7 +2051,7 @@ def _detect_arrhythmias_uncached(
         # / R' that defines a bundle branch block -- measured on synthetic
         # beats: true ~150 ms Right Bundle Branch Block read 116 ms by measure_beat, 162 ms here;
         # normal beats on real recordings 84-86 ms here, 90-94 ms there.
-        widths, shapes_per_beat = [], []
+        widths, shapes_per_beat, shape_peaks = [], [], []
         quiet = max(1, int(0.016 * fs_))
         for r in core:
             lo, hi = max(0, r - half_sec), min(n, r + half_sec)
@@ -2137,9 +2137,10 @@ def _detect_arrhythmias_uncached(
             beat_right_bundle_branch_block = v1_right_bundle_branch_block and any(s for s, _ in lateral)
             beat_left_bundle_branch_block = v1_left_bundle_branch_block and all(r_ for _, r_ in lateral)
             shapes_per_beat.append((beat_right_bundle_branch_block, beat_left_bundle_branch_block))
+            shape_peaks.append(r)
         if len(widths) < required or len(shapes_per_beat) < required:
             return None
-        return float(np.median(widths)), shapes_per_beat
+        return float(np.median(widths)), shapes_per_beat, shape_peaks
 
     def _bundle_branch_block_majority(shapes_per_beat, side):
         need = int(np.ceil(0.75 * len(shapes_per_beat)))
@@ -2150,30 +2151,43 @@ def _detect_arrhythmias_uncached(
     # Complete Right Bundle Branch Block: QRS >= 120 ms; V1 rsR' / terminal R'; wide slurred S in
     # I or V6; >= 75% of beats show it.
     def _is_complete_right_bundle_branch_block_window(ctx):
-        width, shapes_per_beat = ctx
+        width, shapes_per_beat = ctx[0], ctx[1]
         return width >= 120.0 and _bundle_branch_block_majority(shapes_per_beat, 'R')
 
     # Incomplete Right Bundle Branch Block: same Right Bundle Branch Block shape, QRS 110-119 ms.
     def _is_incomplete_right_bundle_branch_block_window(ctx):
-        width, shapes_per_beat = ctx
+        width, shapes_per_beat = ctx[0], ctx[1]
         return 110.0 <= width < 120.0 and _bundle_branch_block_majority(shapes_per_beat, 'R')
 
     # Complete Left Bundle Branch Block: QRS >= 120 ms; V1 dominantly negative (QS/rS); broad
     # monophasic R in I and V6 with no septal q and no S; >= 75% of beats.
     def _is_complete_left_bundle_branch_block_window(ctx):
-        width, shapes_per_beat = ctx
+        width, shapes_per_beat = ctx[0], ctx[1]
         return width >= 120.0 and _bundle_branch_block_majority(shapes_per_beat, 'L')
 
     # Incomplete Left Bundle Branch Block: same Left Bundle Branch Block shape, QRS 110-119 ms.
     def _is_incomplete_left_bundle_branch_block_window(ctx):
-        width, shapes_per_beat = ctx
+        width, shapes_per_beat = ctx[0], ctx[1]
         return 110.0 <= width < 120.0 and _bundle_branch_block_majority(shapes_per_beat, 'L')
 
-    def _classify_bundle_branch_block_window(padded_array, core_r_peaks, best_signal, fs_):
-        """Return the Bundle Branch Block label for this window, or None."""
+    def _classify_bundle_branch_block_window(padded_array, core_r_peaks, best_signal, fs_, votes_out=None):
+        """Return (label, (first_beat, last_beat)) for this window, or None.
+
+        votes_out: if given, every beat this window judged is appended as
+        (r_peak_sample, right_pattern, left_pattern) -- also when the window
+        gets no label -- for the beat-level edge extension further below.
+
+        The span runs from the first to the last beat in the window whose own
+        shape is that block's pattern, not the whole window: a window passes
+        with >= 75% such beats, so its first or last beats can still be the
+        rhythm before or after it (seen: 2 narrow sinus beats at 10:20:32.69
+        and 10:20:34.69 opened a Right Bundle Branch Block segment whose
+        first wide beat was 10:20:35.21)."""
         ctx = _bundle_branch_block_window_beats(padded_array, core_r_peaks, best_signal, fs_)
         if ctx is None:
             return None
+        if votes_out is not None:
+            votes_out.extend((peak, r_, l_) for peak, (r_, l_) in zip(ctx[2], ctx[1]))
         for label, rule in (
             (_COMPLETE_LEFT_BUNDLE_BRANCH_BLOCK, _is_complete_left_bundle_branch_block_window),
             (_COMPLETE_RIGHT_BUNDLE_BRANCH_BLOCK, _is_complete_right_bundle_branch_block_window),
@@ -2181,7 +2195,14 @@ def _detect_arrhythmias_uncached(
             (_INCOMPLETE_RIGHT_BUNDLE_BRANCH_BLOCK, _is_incomplete_right_bundle_branch_block_window),
         ):
             if rule(ctx):
-                return label
+                right = 'Right' in label
+                matching = [
+                    peak for peak, (r_, l_) in zip(ctx[2], ctx[1])
+                    if ((r_ and not l_) if right else (l_ and not r_))
+                ]
+                if not matching:
+                    return None
+                return label, (min(matching), max(matching))
         return None
 
     # Tried shrinking this to 6s/3s to reduce detection latency; verified
@@ -2214,6 +2235,9 @@ def _detect_arrhythmias_uncached(
 
     morphological_candidates = []
     bundle_branch_block_candidates = []
+    # Every beat any window judged for a bundle branch block pattern:
+    # beat time (s, 2 decimals) -> [(right_pattern, left_pattern), ...].
+    bundle_branch_block_beat_votes = {}
 
     # How far past each window's own edges to read before detecting R-peaks
     # for it, purely so Pan-Tompkins has settling room and doesn't miss or
@@ -2289,6 +2313,20 @@ def _detect_arrhythmias_uncached(
                             p for p in all_peaks
                             if current_time <= pad_start + p / fs < window_end
                         ]
+                        # Bundle branch block: its own layer, judged on every
+                        # (non-noisy) window before the rhythm chain below. Its
+                        # only effect on that chain is the VFib veto there.
+                        try:
+                            window_votes = []
+                            bundle_branch_block_result = _classify_bundle_branch_block_window(
+                                padded_array, core_r_peaks, padded_signal, fs, votes_out=window_votes)
+                            for vote_peak, vote_right, vote_left in window_votes:
+                                bundle_branch_block_beat_votes.setdefault(
+                                    round(float(pad_start + vote_peak / fs), 2), []
+                                ).append((bool(vote_right), bool(vote_left)))
+                        except Exception as e:
+                            bundle_branch_block_result = None
+                            print(f"[Auto Arrhythmia Detect] Bundle Branch Block window error {current_time:.1f}s: {e}")
                         # Resolve the organized-wide-complex overlap first:
                         # the same unresolved QRS flag can otherwise make a
                         # regular monomorphic VT window look like VFib.
@@ -2296,7 +2334,18 @@ def _detect_arrhythmias_uncached(
                             # Burnt orange distinguishes organized VT from
                             # VFib red and Supraventricular Tachycardia orange.
                             target_morph = ('Ventricular Tachycardia', '#E67E22')
-                        elif _is_vfib_window(padded_signal, core_r_peaks, fs):
+                        # VFib is not called where this same window is a
+                        # proven conducted bundle branch block: P waves with
+                        # a consistent PR on >= 75% of beats, one QRS shape,
+                        # QRS >= 110 ms and >= 75% RBBB/LBBB morphology
+                        # (_classify_bundle_branch_block_window). VFib has no
+                        # AV conduction; seen: a 30 -> 80 bpm change into
+                        # RBBB read as VFib only because the window's RR
+                        # spread was large and the wide QRS never 'resolved'.
+                        # _is_vfib_window itself is unchanged; a vetoed
+                        # window goes on through the rest of the chain.
+                        elif (_is_vfib_window(padded_signal, core_r_peaks, fs)
+                              and bundle_branch_block_result is None):
                             target_morph = ('Ventricular Fibrillation', '#FF3333')
                         else:
                             # P waves are judged on Lead II (see the
@@ -2328,18 +2377,12 @@ def _detect_arrhythmias_uncached(
                                     target_morph = (av_label, _AV_COLORS[av_label])
                                     av_span_sec = (pad_start + av_s / fs, pad_start + av_e / fs)
 
-                        # Bundle branch block: its own layer, judged on every
-                        # (non-noisy) window regardless of target_morph above
-                        # and never feeding back into it.
-                        try:
-                            bundle_branch_block_label = _classify_bundle_branch_block_window(padded_array, core_r_peaks, padded_signal, fs)
-                        except Exception as e:
-                            bundle_branch_block_label = None
-                            print(f"[Auto Arrhythmia Detect] Bundle Branch Block window error {current_time:.1f}s: {e}")
-                        if bundle_branch_block_label is not None:
-                            bundle_branch_block_core = sorted(core_r_peaks)
-                            b_start = float(pad_start + bundle_branch_block_core[0] / fs)
-                            b_end = float(pad_start + bundle_branch_block_core[-1] / fs)
+                        if bundle_branch_block_result is not None:
+                            # Beat-exact: first to last beat showing the block's
+                            # own pattern (see _classify_bundle_branch_block_window).
+                            bundle_branch_block_label, (bbb_first, bbb_last) = bundle_branch_block_result
+                            b_start = float(pad_start + bbb_first / fs)
+                            b_end = float(pad_start + bbb_last / fs)
                             b_s_str, b_e_str = make_time_strs(b_start, b_end)
                             bundle_branch_block_candidates.append({
                                 'start_sec': b_start,
@@ -2990,8 +3033,111 @@ def _detect_arrhythmias_uncached(
                 continue
             merged_bundle_branch_block.append(dict(c))
 
+        # Beat-level edge extension. A window is labelled only when >= 75% of
+        # its beats show one pattern, so beats right at a change between two
+        # patterns can sit in no labelled window at all (seen: the 2 first
+        # Left Bundle Branch Block beats at 614.21/614.96 s -- the 610-620 s
+        # window that judged them Left had only 62% Left beats, and the
+        # 615-625 s window that was labelled started after them). Each
+        # region's edges move outward one beat at a time while the next beat
+        # was itself judged the same pattern (majority of its votes), with no
+        # missing beat in between (gap <= 1.5x the region's own RR), at most
+        # one window, never into another bundle branch block region.
+        vote_times = sorted(bundle_branch_block_beat_votes)
+
+        def _beat_side(t):
+            votes = bundle_branch_block_beat_votes.get(t, [])
+            right = sum(1 for r_, l_ in votes if r_ and not l_)
+            left = sum(1 for r_, l_ in votes if l_ and not r_)
+            if right > len(votes) / 2:
+                return 'R'
+            if left > len(votes) / 2:
+                return 'L'
+            return None
+
+        for region in merged_bundle_branch_block:
+            side = 'R' if 'Right' in region['label'] else 'L'
+            others = [(o['start_sec'], o['end_sec']) for o in merged_bundle_branch_block if o is not region]
+            inside = [t for t in vote_times if region['start_sec'] - 0.01 <= t <= region['end_sec'] + 0.01]
+            rr = float(np.median(np.diff(inside))) if len(inside) >= 2 else 1.0
+            max_gap = 1.5 * rr
+            new_start = region['start_sec']
+            for t in reversed([t for t in vote_times if region['start_sec'] - window_size <= t < region['start_sec'] - 0.01]):
+                if new_start - t > max_gap or _beat_side(t) != side \
+                        or any(o_s - 0.01 <= t <= o_e + 0.01 for o_s, o_e in others):
+                    break
+                new_start = t
+            new_end = region['end_sec']
+            for t in [t for t in vote_times if region['end_sec'] + 0.01 < t <= region['end_sec'] + window_size]:
+                if t - new_end > max_gap or _beat_side(t) != side \
+                        or any(o_s - 0.01 <= t <= o_e + 0.01 for o_s, o_e in others):
+                    break
+                new_end = t
+            region['start_sec'], region['end_sec'] = float(new_start), float(new_end)
+            region['start_time_str'], region['end_time_str'] = make_time_strs(region['start_sec'], region['end_sec'])
+
+        # Two bundle branch block regions that meet beat to beat (one ends on
+        # a beat, the next starts on the very next beat, e.g. Right -> Left)
+        # leave that one RR interval in neither region: seen as a 0.76 s gap
+        # (613.44 -> 614.20 s) where Full Disclosure's label fell back to
+        # "Normal Sinus Rhythm" for one second. Where the gap is no more than
+        # one beat (<= 1.5x the earlier region's own RR), the earlier region
+        # now ends where the next one starts.
+        merged_bundle_branch_block.sort(key=lambda x: x['start_sec'])
+        for cur, nxt in zip(merged_bundle_branch_block, merged_bundle_branch_block[1:]):
+            gap = nxt['start_sec'] - cur['end_sec']
+            if gap <= 0:
+                continue
+            inside = [t for t in vote_times if cur['start_sec'] - 0.01 <= t <= cur['end_sec'] + 0.01]
+            rr = float(np.median(np.diff(inside))) if len(inside) >= 2 else 1.0
+            if gap <= 1.5 * rr:
+                cur['end_sec'] = nxt['start_sec']
+                cur['start_time_str'], cur['end_time_str'] = make_time_strs(cur['start_sec'], cur['end_sec'])
+
         def _bundle_branch_block_rank(label):
             return _BUNDLE_BRANCH_BLOCK_LABELS.index(label) if label in _BUNDLE_BRANCH_BLOCK_LABELS else -1
+
+        # A Ventricular Fibrillation region is cut back off any stretch that
+        # a window proved to be a conducted bundle branch block (labelled
+        # window: P waves with a consistent PR, one QRS shape, wide QRS and
+        # RBBB/LBBB morphology on >= 75% of beats; span = its first to last
+        # such beat). VFib has no AV conduction. Its window vote and edge
+        # refinement can still run it over such beats where a window mixes
+        # the end of real VFib with the bundle branch block that follows --
+        # seen: real VFib ending ~38 s, first Right Bundle Branch Block beat
+        # 40.22 s, VFib drawn to 45.0 s, because the wide RBBB beats never
+        # count as "organized" for the VFib end search. Pieces under 1 s are
+        # dropped. Rule functions are unchanged; only VFib regions that
+        # overlap a proven bundle branch block move.
+        proven_bundle_branch_block = [(c['start_sec'], c['end_sec']) for c in bundle_branch_block_candidates]
+        cut_segments = []
+        for seg in detected_segments:
+            if seg['label'] != 'Ventricular Fibrillation':
+                cut_segments.append(seg)
+                continue
+            pieces = [(seg['start_sec'], seg['end_sec'])]
+            for b_start, b_end in proven_bundle_branch_block:
+                next_pieces = []
+                for p_start, p_end in pieces:
+                    if b_end <= p_start or b_start >= p_end:
+                        next_pieces.append((p_start, p_end))
+                        continue
+                    if b_start > p_start:
+                        next_pieces.append((p_start, b_start))
+                    if b_end < p_end:
+                        next_pieces.append((b_end, p_end))
+                pieces = next_pieces
+            if pieces == [(seg['start_sec'], seg['end_sec'])]:
+                cut_segments.append(seg)
+                continue
+            for p_start, p_end in pieces:
+                if p_end - p_start < 1.0:
+                    continue
+                piece = dict(seg)
+                piece['start_sec'], piece['end_sec'] = p_start, p_end
+                piece['start_time_str'], piece['end_time_str'] = make_time_strs(p_start, p_end)
+                cut_segments.append(piece)
+        detected_segments = cut_segments
 
         ventricular = [
             (s['start_sec'], s['end_sec']) for s in detected_segments
