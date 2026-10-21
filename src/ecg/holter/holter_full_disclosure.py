@@ -3879,6 +3879,54 @@ class HolterFullDisclosureDialog(QDialog):
         self.time_scrollbar.setValue(int(self._current_start * 100))
         self._update_canvases(self._current_start)
 
+    @staticmethod
+    def _bundle_branch_block_global_qrs_ms(leads_data, lead_names, r_idx, fs):
+        """Global (multi-lead) QRS duration of one beat, in ms, or None.
+
+        Same measurement auto_segment_arrthymia_detection.py's bundle branch
+        block rule uses: the combined slope of leads I, II, aVL, V1, V2, V5,
+        V6 (each scaled by its own QRS size); the QRS runs from where that
+        slope first rises above 10% of its peak to where it stays below 10%
+        for 16 ms (20% when a discordant ST-T keeps it above 10%). A single
+        lead under-reads a bundle branch block's QRS -- part of it is
+        isoelectric in that lead, and its slurred terminal S / R' is cut
+        off -- e.g. Lead II read 132-134 ms where the global QRS is ~154 ms.
+        """
+        from scipy.signal import savgol_filter
+        idx = [lead_names.index(n) for n in ('I', 'II', 'aVL', 'V1', 'V2', 'V5', 'V6') if n in lead_names]
+        if len(idx) < 3:
+            return None
+        w_lo, w_hi = int(r_idx) - int(0.15 * fs), int(r_idx) + int(0.20 * fs)
+        if w_lo < 0 or w_hi > leads_data.shape[1]:
+            return None
+        velocity = np.zeros(w_hi - w_lo)
+        p_lo, p_hi = int(0.07 * fs), int(0.27 * fs)
+        for i in idx:
+            x = np.asarray(leads_data[i][w_lo:w_hi], dtype=float)
+            if x.size >= 11:
+                x = savgol_filter(x, 11, 3)
+            size = float(np.ptp(x[p_lo:p_hi])) or 1.0
+            velocity += np.abs(np.gradient(x)) / size
+        peak = p_lo + int(np.argmax(velocity[p_lo:p_hi]))
+        quiet = max(1, int(0.016 * fs))
+
+        def edge(threshold, step):
+            run = 0
+            rng = range(peak, -1, -1) if step < 0 else range(peak, velocity.size)
+            for k in rng:
+                run = run + 1 if velocity[k] < threshold else 0
+                if run >= quiet:
+                    return k + quiet - 1 if step < 0 else k - quiet + 1
+            return None
+
+        onset = edge(0.10 * float(velocity[peak]), -1)
+        offset = edge(0.10 * float(velocity[peak]), +1)
+        if offset is None:
+            offset = edge(0.20 * float(velocity[peak]), +1)
+        if onset is None or offset is None or offset <= onset:
+            return None
+        return (offset - onset) * 1000.0 / fs
+
     def _update_pr_qrs_label(self, start_sec: float, end_sec: float):
         """TODO(testing-only): recompute PR interval / QRS duration from
         Lead II's own beats in the currently visible window, purely so a
@@ -3998,6 +4046,17 @@ class HolterFullDisclosureDialog(QDialog):
                         bundle_branch_block_active = True
 
             pr_values, qrs_values = [], []
+            # Bundle branch block: all leads over the same span as the Lead II
+            # signal above (same start, same sample count), for the global QRS.
+            bbb_leads_data, bbb_lead_names = None, []
+            if bundle_branch_block_active:
+                try:
+                    bbb_reader = getattr(getattr(self, '_engine', None), '_reader', None) or getattr(self, '_reader', None)
+                    if bbb_reader is not None:
+                        bbb_lead_names = list(getattr(bbb_reader, 'lead_names', []) or [])
+                        bbb_leads_data = bbb_reader.read_range(source_start, source_start + raw_sig.size / fs)
+                except Exception:
+                    bbb_leads_data = None
             for i, p in enumerate(peaks):
                 prev_rr_ms = (float(p) - float(peaks[i - 1])) * 1000.0 / fs if i > 0 else None
                 if bundle_branch_block_active:
@@ -4022,7 +4081,16 @@ class HolterFullDisclosureDialog(QDialog):
                     beat = measure_beat(raw_sig, anchor, fs, strict_pr=True, prev_rr_ms=prev_rr_ms)
                     if not beat:
                         continue
-                    if 40.0 <= float(beat.get('qrs_ms') or 0.0) <= 220.0:
+                    # QRS: the global multi-lead duration (see
+                    # _bundle_branch_block_global_qrs_ms); Lead II's own
+                    # width only if all leads couldn't be read.
+                    global_qrs = None
+                    if bbb_leads_data is not None:
+                        global_qrs = self._bundle_branch_block_global_qrs_ms(
+                            bbb_leads_data, bbb_lead_names, int(p), fs)
+                    if global_qrs is not None and 40.0 <= global_qrs <= 250.0:
+                        qrs_values.append(global_qrs)
+                    elif bbb_leads_data is None and 40.0 <= float(beat.get('qrs_ms') or 0.0) <= 220.0:
                         qrs_values.append(float(beat['qrs_ms']))
                     if beat.get('pr_ms') is not None:
                         pr_values.append(beat['pr_ms'])

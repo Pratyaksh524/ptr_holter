@@ -1425,8 +1425,26 @@ def _detect_arrhythmias_uncached(
         beats = {p: measure_beat(sig, p, fs) for p in peaks}
         if any(beats.get(p) is None for p in core):
             return None
-        if sum(1 for p in core if beats[p].get('qrs_bounds_resolved')) < 0.8 * len(core):
-            return None
+        # Organized ventricular activity: >= 80% of QRS boundaries resolved,
+        # OR one QRS shape beat to beat (median correlation to the window's
+        # own QRS template >= 0.9, the SVT rule's test). A wide, abnormally
+        # shaped QRS -- a ventricular escape rhythm in complete block, or a
+        # bundle branch block -- often never returns cleanly to baseline, so
+        # its boundary doesn't "resolve" even though every beat is the same
+        # organized complex; VFib's chaotic beats fail both tests.
+        qrs_resolved_majority = sum(1 for p in core if beats[p].get('qrs_bounds_resolved')) >= 0.8 * len(core)
+        if not qrs_resolved_majority:
+            half = ms(50)
+            shapes_q = [sig[p - half:p + half] for p in core if p - half >= 0 and p + half <= n]
+            if len(shapes_q) < 3:
+                return None
+            shapes_q = np.array([s - np.mean(s) for s in shapes_q])
+            template_q = np.median(shapes_q, axis=0)
+            if not np.any(template_q):
+                return None
+            corrs_q = [float(np.corrcoef(s, template_q)[0, 1]) for s in shapes_q if np.any(s)]
+            if not corrs_q or float(np.median(corrs_q)) < 0.9:
+                return None
 
         def q_onset_of(p):
             b = beats.get(p)
@@ -1461,10 +1479,17 @@ def _detect_arrhythmias_uncached(
         # their QRS, keeping only ones that share one shape (a T wave or a
         # noise bump picked up instead of a real P won't).
         h = ms(60)
+        # A "P" measure_beat() reports inside a QRS zone is the QRS's own
+        # upstroke, not a P wave: in complete block with a wide ventricular
+        # escape the real P often lies outside the 50-400 ms search window,
+        # which then falls back to the QRS edge -- seen: those false seeds,
+        # all one shape, outvoted the real P waves and built a QRS-onset
+        # template that rejected every real P.
         seeds = [
             b for b in beats.values()
             if b is not None and b.get('p_present') and b.get('p_peak') is not None
             and b.get('p_onset') is not None and h <= int(b['p_peak']) < n - h
+            and not in_zone(int(b['p_peak']), qrs_zones)
         ]
         if len(seeds) < 2:
             return None
@@ -1641,6 +1666,10 @@ def _detect_arrhythmias_uncached(
             'qrs_pr': qrs_pr,
             'pp_ms': pp * 1000.0 / fs,
             'atrial_regular': atrial_regular,
+            # True when the context came through the original resolved-QRS
+            # gate (not the QRS-shape one); the AFib/Flutter veto uses only
+            # those, exactly as before the shape gate was added.
+            'qrs_resolved_majority': qrs_resolved_majority,
             'nearest_p_to_qrs_ms': nearest_p_to_qrs,
         }
 
@@ -2285,7 +2314,8 @@ def _detect_arrhythmias_uncached(
                             # waves at <= 200/min is neither. Mobitz I's grouped
                             # beating plus its changing PR otherwise reads as
                             # "irregular RR, no consistent PR" = AFib.
-                            if atrial_label and av_ctx is not None and av_ctx['atrial_regular']:
+                            if atrial_label and av_ctx is not None and av_ctx['atrial_regular'] \
+                                    and av_ctx['qrs_resolved_majority']:
                                 atrial_label = None
                             if atrial_label:
                                 target_morph = (atrial_label, '#FF00FF')
