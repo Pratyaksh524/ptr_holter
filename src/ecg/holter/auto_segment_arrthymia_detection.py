@@ -2018,6 +2018,20 @@ def _detect_arrhythmias_uncached(
                 continue
             anchor = a_lo + int(np.argmax(np.abs(seg_ii[a_lo:a_hi] - np.median(seg_ii))))
             b = measure_beat(seg_ii, anchor, fs_, strict_pr=True, prev_rr_ms=prev_rr)
+            # Second try, only where the strict search found no PR: the strict
+            # search takes the candidate wave CLOSEST to the QRS and gives up
+            # if that one is too small, so a little PR-segment noise just
+            # before the QRS hides a clear P wave further back (seen: P ~170
+            # at R-130 ms, a -10..-20 noise dip at R-80 ms chosen instead, PR
+            # missing on 9 of 20 beats and every BBB window failing). The
+            # non-strict search takes the most PROMINENT wave instead -- the
+            # real P. Only at <= 120 bpm (RR >= 500 ms): faster, the previous
+            # beat's T wave sits close enough before the QRS to be taken for
+            # a P. The PR-consistency check below still has to pass.
+            if (b is None or b.get('pr_ms') is None) and prev_rr is not None and prev_rr >= 500.0:
+                b_relaxed = measure_beat(seg_ii, anchor, fs_, strict_pr=False, prev_rr_ms=prev_rr)
+                if b_relaxed is not None and b_relaxed.get('pr_ms') is not None:
+                    b = b_relaxed
             if b and b.get('p_present') and b.get('p_onset') is not None:
                 with_p += 1
                 if b.get('pr_ms') is not None:
@@ -3130,8 +3144,17 @@ def _detect_arrhythmias_uncached(
             if pieces == [(seg['start_sec'], seg['end_sec'])]:
                 cut_segments.append(seg)
                 continue
+            bbb_edges = [e for span in proven_bundle_branch_block for e in span]
             for p_start, p_end in pieces:
                 if p_end - p_start < 1.0:
+                    continue
+                # A piece left right against a proven bundle branch block
+                # and shorter than one window step is the transition out of
+                # (or into) that block -- the window that mixed its last wide
+                # beats with the next rhythm read as VFib -- not VFib itself
+                # (seen: 359.30-362.45 s, RBBB beats then 30 bpm narrow beats).
+                touches_bbb = any(abs(p_start - e) < 0.01 or abs(p_end - e) < 0.01 for e in bbb_edges)
+                if touches_bbb and p_end - p_start < step_size:
                     continue
                 piece = dict(seg)
                 piece['start_sec'], piece['end_sec'] = p_start, p_end
