@@ -1561,6 +1561,10 @@ def _detect_arrhythmias_uncached(
             chain = {anchor: False}  # sample -> hidden
             used = {anchor}
             mismatches = 0
+            # Mismatches right after a hidden P whose real P sits within two
+            # P-P tolerances (see hidden_drift_mismatches below). Counted
+            # only; the walk itself is unchanged.
+            hidden_drift = 0
             for direction in (1, -1):
                 t = anchor
                 while True:
@@ -1582,6 +1586,8 @@ def _detect_arrhythmias_uncached(
                     # Clean baseline exactly where a P wave was due, and none there.
                     if judge_lo <= e <= judge_hi:
                         mismatches += 1
+                        if chain.get(t) and any(abs(c[0] - exp) <= 2 * tol for c in clear):
+                            hidden_drift += 1
                     ahead = [c[0] for c in clear if (c[0] - exp) * direction > 0]
                     if not ahead:
                         break
@@ -1589,6 +1595,7 @@ def _detect_arrhythmias_uncached(
                     chain[t] = False
                     used.add(t)
             extras = [c for c in clear if c[0] not in used and judge_lo <= c[0] <= judge_hi]
+            walk_chain.hidden_drift = hidden_drift
             return chain, mismatches, extras
 
         # A T wave can match the P template too (both are smooth humps), and
@@ -1600,8 +1607,8 @@ def _detect_arrhythmias_uncached(
             chain, mismatches, extras = walk_chain(anchor)
             key = (sum(1 for c in clear if c[0] in chain), -mismatches, -sum(chain.values()))
             if best_chain is None or key > best_chain[0]:
-                best_chain = (key, chain, mismatches, extras)
-        _, chain, mismatches, extras = best_chain
+                best_chain = (key, chain, mismatches, extras, walk_chain.hidden_drift)
+        _, chain, mismatches, extras, hidden_drift_mismatches = best_chain
 
         chain_times = sorted(chain)
         judged = [t for t in chain_times if judge_lo <= t <= judge_hi]
@@ -1612,6 +1619,18 @@ def _detect_arrhythmias_uncached(
         hidden_count = sum(1 for t in judged if chain[t])
         atrial_regular = (
             mismatches == 0 and not extras and pp_cv <= 0.12
+            and hidden_count <= 0.5 * len(judged)
+        )
+        # Third-degree AV block only: a P wave that falls inside a QRS can't be
+        # seen, so the chain places it at its expected time -- a guess. The
+        # next P is then judged from that guess with one interval's tolerance,
+        # but the uncertainty spans two intervals; seen: P-P stretching ~120 ms
+        # around the QRS that hides a P (tolerance 90 ms) in complete block,
+        # one mismatch per window, and no window passed. Here such a mismatch
+        # is forgiven when the real P is within two tolerances. atrial_regular
+        # itself, and every rule that reads it, is unchanged.
+        atrial_regular_complete_block = atrial_regular or (
+            mismatches == hidden_drift_mismatches and not extras and pp_cv <= 0.12
             and hidden_count <= 0.5 * len(judged)
         )
 
@@ -1634,6 +1653,7 @@ def _detect_arrhythmias_uncached(
             next_p = chain_times[idx + 1] if idx + 1 < len(chain_times) else None
             onset = t - onset_offset
             following = [p for p in peaks if p - q_to_r > t]
+            long_pr_qrs, long_pr_ms = None, None
             if not following:
                 conducted, qrs, pr_ms = None, None, None  # can't tell yet
             else:
@@ -1643,9 +1663,17 @@ def _detect_arrhythmias_uncached(
                 conducted = bool(ok) and not in_zone(t, qrs_zones)
                 qrs = p_r if conducted else None
                 pr_ms = (q_on - onset) * 1000.0 / fs if conducted and not chain[t] else None
+                # Mobitz I only (see _is_mobitz_i_window): a visible P whose
+                # QRS follows 450-600 ms later, still before the next P wave.
+                # 'conducted' above is unchanged for every other rule.
+                if (not conducted and not chain[t] and not in_zone(t, qrs_zones)
+                        and ms(450) < q_on - onset <= ms(600)
+                        and (next_p is None or q_on < next_p - onset_offset)):
+                    long_pr_qrs, long_pr_ms = p_r, (q_on - onset) * 1000.0 / fs
             events.append({
                 't': t, 'hidden': chain[t], 'conducted': conducted,
                 'qrs': qrs, 'pr_ms': pr_ms,
+                'mobitz_i_long_pr_qrs': long_pr_qrs, 'mobitz_i_long_pr_ms': long_pr_ms,
             })
 
         qrs_pr = {e['qrs']: e['pr_ms'] for e in events if e['conducted'] and e['qrs'] is not None}
@@ -1666,6 +1694,7 @@ def _detect_arrhythmias_uncached(
             'qrs_pr': qrs_pr,
             'pp_ms': pp * 1000.0 / fs,
             'atrial_regular': atrial_regular,
+            'atrial_regular_complete_block': atrial_regular_complete_block,
             # True when the context came through the original resolved-QRS
             # gate (not the QRS-shape one); the AFib/Flutter veto uses only
             # those, exactly as before the shape gate was added.
@@ -1758,10 +1787,22 @@ def _detect_arrhythmias_uncached(
     # the window; a cycle cut off by the window edge is just not judged.
     # Returns (first R of the earliest cycle, first R after the last blocked
     # P), or None.
+    # In Wenckebach the PR is longest on the beat right before the dropped P,
+    # and can pass 450 ms there; seen: 5:4 cycles with PR 146 -> 206 -> 386
+    # -> 456 ms, then a blocked P. With the 450 ms conduction limit the
+    # 456 ms beat read as blocked, two "blocked" P waves in a row, and no
+    # window passed. This rule alone counts a P conducted at a 450-600 ms PR
+    # (QRS still before the next P wave); every other rule sees 'conducted'
+    # unchanged.
     def _is_mobitz_i_window(ctx):
         if not ctx['atrial_regular']:
             return None
-        cycles = _blocked_p_cycles(ctx)
+        events = [
+            dict(e, conducted=True, qrs=e['mobitz_i_long_pr_qrs'], pr_ms=e['mobitz_i_long_pr_ms'])
+            if e['conducted'] is False and e['mobitz_i_long_pr_ms'] is not None else e
+            for e in ctx['events']
+        ]
+        cycles = _blocked_p_cycles(dict(ctx, events=events))
         if not cycles:
             return None
         fs_ = ctx['fs']
@@ -1837,7 +1878,7 @@ def _detect_arrhythmias_uncached(
     # grouped/irregular, so gate 2 keeps it out.
     # Returns the (first, last) R-peak sample of the window's beats, or None.
     def _is_third_degree_av_block_window(ctx):
-        if not ctx['atrial_regular']:
+        if not ctx['atrial_regular_complete_block']:
             return None
         qrs = ctx['qrs']
         if len(qrs) < 3:
@@ -2909,6 +2950,18 @@ def _detect_arrhythmias_uncached(
             a, b = _pr_at.get(float(beat)), _pr_at.get(float(further_out))
             return a is not None and b is not None and abs(a - b) <= 20.0
 
+        # A beat inside a proven bundle branch block (P waves with a consistent
+        # PR, _classify_bundle_branch_block_window) is conducted, so it can't
+        # belong to a complete block either. The PR brake above can't see it
+        # there: the strict whole-recording P search often loses the P in front
+        # of a wide QRS (seen: the first RBBB beat after a 30 bpm escape rhythm
+        # came 2.27 s later, inside the RR band, with no PR, and the region
+        # ended on it -- both labels at once).
+        _third_degree_bbb_spans = [(c['start_sec'], c['end_sec']) for c in bundle_branch_block_candidates]
+
+        def _in_proven_bundle_branch_block(beat):
+            return any(s - 0.05 <= beat <= e + 0.05 for s, e in _third_degree_bbb_spans)
+
         for region in merged_morph:
             if region['label'] != _AV_THIRD:
                 continue
@@ -2927,6 +2980,8 @@ def _detect_arrhythmias_uncached(
                         break
                     if k > 0 and _sinus_conducted(p, before[k - 1]):
                         break
+                    if _in_proven_bundle_branch_block(p):
+                        break
                     new_start = p
                 after = [p for p in _sorted_peaks
                          if inside[-1] < p <= region['end_sec'] + window_size]
@@ -2934,6 +2989,8 @@ def _detect_arrhythmias_uncached(
                     if not (lo <= p - new_end <= hi):
                         break
                     if k + 1 < len(after) and _sinus_conducted(p, after[k + 1]):
+                        break
+                    if _in_proven_bundle_branch_block(p):
                         break
                     new_end = p
                 if new_start < new_end - 0.5:
