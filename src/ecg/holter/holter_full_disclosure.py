@@ -338,7 +338,7 @@ class SegmentOverlay(QWidget):
     def add_segment(self, start_x, end_x, start_sec, end_sec, label, color, start_time_str='', end_time_str='', auto=False, true_mid_x=None, layer=0):
         # layer: text row for this segment's label/times. Rhythm segments use
         # row 0; bundle branch blocks (drawn alongside a rhythm over the same
-        # time) use row 1 so the two sets of text never overlap.
+        # time) use row 1, above row 0, so the two sets of text never overlap.
         self._segments.append({
             'start_x': start_x, 'end_x': end_x,
             'start_sec': start_sec, 'end_sec': end_sec, 'auto': bool(auto),
@@ -383,7 +383,10 @@ class SegmentOverlay(QWidget):
             if ex <= sx:
                 continue
             layer = int(seg.get('layer', 0) or 0)
-            text_y = 20 + 14 * layer
+            # Row 0 (rhythm) at y=20 as always; row 1 (bundle branch block)
+            # sits ABOVE it, at the top edge, so it never runs into the
+            # HR/RR labels the strip draws just below row 0.
+            text_y = 20 if layer == 0 else 15
             last_label_right_edge = last_label_right_edges.get(layer)
             try:
                 c = QColor(seg['color'])
@@ -3685,9 +3688,9 @@ class HolterFullDisclosureDialog(QDialog):
         # "incomplete ..." keys come first: "complete ..." is a substring.
         bundle_branch_block_targets = {
             'incomplete right bundle branch block': ('Incomplete Right Bundle Branch Block', '#9E9E9E'),
-            'incomplete left bundle branch block': ('Incomplete Left Bundle Branch Block', '#D2B48C'),
+            'incomplete left bundle branch block': ('Incomplete Left Bundle Branch Block', '#76D7C4'),
             'complete right bundle branch block': ('Complete Right Bundle Branch Block', '#E0E0E0'),
-            'complete left bundle branch block': ('Complete Left Bundle Branch Block', '#8B4513'),
+            'complete left bundle branch block': ('Complete Left Bundle Branch Block', '#1ABC9C'),
         }
         reader_start = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
         regions = []
@@ -3917,6 +3920,7 @@ class HolterFullDisclosureDialog(QDialog):
             if canvas_data is not None and len(canvas_data) >= 50 \
                     and canvas_start is not None and canvas_fs:
                 sig = np.asarray(canvas_data, dtype=float)
+                raw_sig = sig  # before the 25 Hz filter below; see bundle branch block note
                 fs = float(canvas_fs)
                 source_start = float(canvas_start)
                 # PR/QRS logic was tuned on the strip's old Butterworth 25 Hz
@@ -3950,6 +3954,7 @@ class HolterFullDisclosureDialog(QDialog):
                     self.lbl_pr_qrs.setText("PR: -- ms   QRS: -- ms")
                     return
                 sig = np.asarray(chunk[lead_idx], dtype=float)
+                raw_sig = sig
                 source_start = pad_start
 
             peaks = [
@@ -3964,6 +3969,7 @@ class HolterFullDisclosureDialog(QDialog):
             atrial_arrhythmia_active = False
             ventricular_fibrillation_active = False
             ventricular_tachycardia_active = False
+            bundle_branch_block_active = False
             if getattr(self, '_auto_marking_visible', False):
                 # Persisted event stores can contain legacy/non-dict entries
                 # after reopening a recording. One malformed entry must not
@@ -3988,10 +3994,39 @@ class HolterFullDisclosureDialog(QDialog):
                     elif event_label in {'ventricular tachycardia', 'vtach'} \
                             or 'ventricular tachycardia' in event_label:
                         ventricular_tachycardia_active = True
+                    elif 'bundle branch block' in event_label:
+                        bundle_branch_block_active = True
 
             pr_values, qrs_values = [], []
             for i, p in enumerate(peaks):
                 prev_rr_ms = (float(p) - float(peaks[i - 1])) * 1000.0 / fs if i > 0 else None
+                if bundle_branch_block_active:
+                    # Right/Left bundle branch block (auto-marked here): the
+                    # same measurement the bundle branch block detector uses.
+                    # The beat is taken at Lead II's own dominant QRS
+                    # deflection (40 ms before to 100 ms after the detected
+                    # peak) on the unfiltered signal: at the detected peak --
+                    # a small r ahead of a deep S in RBBB, or the dip just
+                    # before the QRS in LBBB -- the P-wave search either
+                    # mistook the P for a too-close QRS or picked that dip
+                    # and found no P, so PR read "--" on every beat. The
+                    # wide BBB QRS often never returns cleanly to baseline,
+                    # so its width is shown whether or not that boundary
+                    # "resolved". Measured: RBBB PR 148-152 / QRS 132-134 ms,
+                    # LBBB PR 152-154 / QRS 130-132 ms.
+                    a_lo = max(0, int(p) - int(0.04 * fs))
+                    a_hi = min(raw_sig.size, int(p) + int(0.10 * fs))
+                    if a_hi <= a_lo:
+                        continue
+                    anchor = a_lo + int(np.argmax(np.abs(raw_sig[a_lo:a_hi] - np.median(raw_sig))))
+                    beat = measure_beat(raw_sig, anchor, fs, strict_pr=True, prev_rr_ms=prev_rr_ms)
+                    if not beat:
+                        continue
+                    if 40.0 <= float(beat.get('qrs_ms') or 0.0) <= 220.0:
+                        qrs_values.append(float(beat['qrs_ms']))
+                    if beat.get('pr_ms') is not None:
+                        pr_values.append(beat['pr_ms'])
+                    continue
                 beat = measure_beat(sig, int(p), fs, strict_pr=True, prev_rr_ms=prev_rr_ms)
                 if not beat:
                     continue
@@ -4224,14 +4259,21 @@ class HolterFullDisclosureDialog(QDialog):
             else:
                 arrhythmia_label = "Arrhythmia: Normal Sinus Rhythm"
 
-        # A bundle branch block is a QRS-shape finding alongside the rhythm,
-        # so it is appended to the rhythm text above rather than replacing it.
+        # A bundle branch block is a QRS-shape finding alongside the rhythm.
+        # Where the rhythm text above is only the Normal Sinus Rhythm
+        # fallback, the label shows the bundle branch block alone, with its
+        # own time ("Complete Right Bundle Branch Block at 15:10:49"); where
+        # an auto rhythm segment is active (e.g. Sinus Bradycardia) it is
+        # appended to that rhythm's text. It is active by the same rules as
+        # the rhythm segments above: from its own start, through the
+        # wall-clock second it ends in.
         try:
             if self._auto_marking_visible and arrhythmia_label:
                 bundle_branch_block_labels = {
                     'complete right bundle branch block', 'incomplete right bundle branch block',
                     'complete left bundle branch block', 'incomplete left bundle branch block',
                 }
+                reader_start_bbb = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
                 for event in getattr(self._engine, '_structured_events', []) or []:
                     if not isinstance(event, dict) or 'manual' in str(event.get('source', '')).lower():
                         continue
@@ -4240,9 +4282,22 @@ class HolterFullDisclosureDialog(QDialog):
                         continue
                     ev_start = float(event.get('timestamp', 0.0) or 0.0)
                     ev_end = float(event.get('end_timestamp', ev_start) or ev_start)
-                    if ev_start <= start_sec <= ev_end:
+                    if reader_start_bbb:
+                        still_on = math.floor(reader_start_bbb + ev_end) >= math.floor(reader_start_bbb + start_sec)
+                    else:
+                        still_on = ev_end >= start_sec
+                    if not (ev_start <= start_sec and still_on):
+                        continue
+                    if arrhythmia_label.startswith("Arrhythmia: Normal Sinus Rhythm"):
+                        if reader_start_bbb:
+                            shown_sec = min(max(start_sec, ev_start), ev_end)
+                            bbb_time = datetime.fromtimestamp(reader_start_bbb + shown_sec).strftime('%H:%M:%S')
+                            arrhythmia_label = f"Arrhythmia: {label} at {bbb_time}"
+                        else:
+                            arrhythmia_label = f"Arrhythmia: {label}"
+                    else:
                         arrhythmia_label = f"{arrhythmia_label} | {label}"
-                        break
+                    break
         except Exception as e:
             print(f"[Full Disclosure] Error updating Bundle Branch Block label: {e}")
 

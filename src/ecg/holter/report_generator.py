@@ -228,6 +228,7 @@ def _build_timeline_events(session_dir: str,
         e_t = float(seg.get('end_sec', s_t) or s_t)
         active_segments_ranges.append((s_t, e_t))
     manual_segment_ranges = list(active_segments_ranges)
+    bundle_branch_block_ranges = []
 
     for seg in auto_segments:
         s_t = float(seg.get('start_sec', seg.get('timestamp', 0.0)) or 0.0)
@@ -243,6 +244,7 @@ def _build_timeline_events(session_dir: str,
         if 'bundle branch block' in lbl.lower():
             if any(ms < e_t and s_t < me for ms, me in manual_segment_ranges):
                 continue
+            bundle_branch_block_ranges.append((s_t, e_t))
             timeline_events.append({
                 'timestamp': s_t,
                 'sort_ts': s_t,
@@ -344,17 +346,57 @@ def _build_timeline_events(session_dir: str,
         # 12:27:24.2 -> NSR 12:27:25). Rows after a manual segment are left
         # exactly as before.
         _report_start_wall = _report_recording_start_time(session_dir)
+
+        def _display_resume(seg_end):
+            if _report_start_wall:
+                return float(np.floor(_report_start_wall + seg_end)) + 1.0 - _report_start_wall
+            return float(np.floor(seg_end)) + 1.0
+
+        manual_resume_times = set()
         for ms, me in active_segments_ranges:
             if (ms, me) in manual_segment_ranges:
                 t_resume = me + 0.05
-            elif _report_start_wall:
-                t_resume = float(np.floor(_report_start_wall + me)) + 1.0 - _report_start_wall
             else:
-                t_resume = float(np.floor(me)) + 1.0
+                t_resume = _display_resume(me)
             if recording_end_sec > 0.0 and t_resume >= recording_end_sec - 0.05:
                 continue
             in_another = any(other_s <= t_resume <= other_e for other_s, other_e in active_segments_ranges if (other_s, other_e) != (ms, me))
             if not in_another:
+                if (ms, me) in manual_segment_ranges:
+                    manual_resume_times.add(t_resume)
+                timeline_events.append({
+                    'timestamp': t_resume,
+                    'sort_ts': t_resume,
+                    'label': 'Normal Sinus Rhythm',
+                    'event_type': 'Normal Sinus Rhythm',
+                    'source': 'Auto'
+                })
+
+        # Bundle branch block: while one is marked, Full Disclosure's label
+        # reads the bundle branch block, not Normal Sinus Rhythm, so no
+        # Normal Sinus Rhythm row falls inside one (rows after a manual
+        # segment are left as they are). Where it ends with no rhythm
+        # segment there, Normal Sinus Rhythm resumes by the same end-second
+        # + 1 rule as after any other auto segment.
+        if bundle_branch_block_ranges:
+            def _in_bundle_branch_block(t):
+                return any(bs <= t <= be for bs, be in bundle_branch_block_ranges)
+
+            timeline_events[:] = [
+                ev for ev in timeline_events
+                if not (
+                    ev.get('label') == 'Normal Sinus Rhythm'
+                    and float(ev.get('timestamp', 0.0) or 0.0) not in manual_resume_times
+                    and _in_bundle_branch_block(float(ev.get('timestamp', 0.0) or 0.0))
+                )
+            ]
+            for bs, be in bundle_branch_block_ranges:
+                t_resume = _display_resume(be)
+                if recording_end_sec > 0.0 and t_resume >= recording_end_sec - 0.05:
+                    continue
+                if any(other_s <= t_resume <= other_e for other_s, other_e in active_segments_ranges) \
+                        or _in_bundle_branch_block(t_resume):
+                    continue
                 timeline_events.append({
                     'timestamp': t_resume,
                     'sort_ts': t_resume,
@@ -465,16 +507,7 @@ def _build_timeline_events(session_dir: str,
             last_ev = deduped_timeline[-1]
             if last_ev.get('label') == ev.get('label') and abs(float(last_ev.get('timestamp', 0.0)) - float(ev.get('timestamp', 0.0))) < 0.2:
                 continue
-            # Bundle branch block rows run alongside the rhythm rows, so they
-            # are looked past here: two Normal Sinus Rhythm rows still
-            # collapse into one exactly as they did without them.
-            last_rhythm_ev = next(
-                (e for e in reversed(deduped_timeline)
-                 if 'bundle branch block' not in str(e.get('event_type', '')).lower()),
-                None,
-            )
-            if last_rhythm_ev is not None and last_rhythm_ev.get('label') == 'Normal Sinus Rhythm' \
-                    and ev.get('label') == 'Normal Sinus Rhythm':
+            if last_ev.get('label') == 'Normal Sinus Rhythm' and ev.get('label') == 'Normal Sinus Rhythm':
                 continue
         deduped_timeline.append(ev)
 

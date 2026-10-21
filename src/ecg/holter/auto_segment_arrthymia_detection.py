@@ -1875,8 +1875,8 @@ def _detect_arrhythmias_uncached(
     _BUNDLE_BRANCH_BLOCK_COLORS = {
         _COMPLETE_RIGHT_BUNDLE_BRANCH_BLOCK: '#E0E0E0',   # light gray
         _INCOMPLETE_RIGHT_BUNDLE_BRANCH_BLOCK: '#9E9E9E',   # mid gray
-        _COMPLETE_LEFT_BUNDLE_BRANCH_BLOCK: '#8B4513',   # saddle brown
-        _INCOMPLETE_LEFT_BUNDLE_BRANCH_BLOCK: '#D2B48C',   # tan
+        _COMPLETE_LEFT_BUNDLE_BRANCH_BLOCK: '#1ABC9C',   # strong teal
+        _INCOMPLETE_LEFT_BUNDLE_BRANCH_BLOCK: '#76D7C4',   # light teal
     }
     # Complete outranks incomplete where two Bundle Branch Block regions overlap.
     _BUNDLE_BRANCH_BLOCK_LABELS = (_COMPLETE_LEFT_BUNDLE_BRANCH_BLOCK, _COMPLETE_RIGHT_BUNDLE_BRANCH_BLOCK, _INCOMPLETE_LEFT_BUNDLE_BRANCH_BLOCK, _INCOMPLETE_RIGHT_BUNDLE_BRANCH_BLOCK)
@@ -2073,6 +2073,22 @@ def _detect_arrhythmias_uncached(
                 if run >= quiet:
                     offset = k - quiet + 1
                     break
+            # Left bundle branch block: a large discordant ST-T starts right
+            # where the QRS ends, so the combined slope never settles under
+            # 10% of its peak (measured: it dips to 11-15% between QRS and T
+            # and rises again) and no QRS end was found -- every beat was
+            # skipped. Only then, the QRS end is the first point the slope
+            # stays under 20% of its peak for the same 16 ms: the dip
+            # between QRS and T. Beats whose end was found above are
+            # unaffected.
+            if offset is None:
+                fallback_threshold = 0.20 * float(velocity[peak])
+                run = 0
+                for k in range(peak, velocity.size):
+                    run = run + 1 if velocity[k] < fallback_threshold else 0
+                    if run >= quiet:
+                        offset = k - quiet + 1
+                        break
             if onset is None or offset is None or offset <= onset:
                 continue
             widths.append((offset - onset) * 1000.0 / fs_)
