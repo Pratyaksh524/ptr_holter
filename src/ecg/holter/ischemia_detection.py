@@ -34,13 +34,17 @@ Method, rhythm by rhythm, chunk by chunk:
      point sits 10-20 ms before the end of the QRS in V1-V3 (+0.09..+0.17 mV
      at J, ~0 at J+20), and by J+60..J+80 the T wave has started
      (+0.24 mV at J+80 at 105 bpm). J+20..J+40 was flat at ~0 on every lead.
-  5. Criteria (>= 2 contiguous leads of one territory: inferior II/III/aVF,
-     lateral I/aVL/V5/V6, anterior V1-V4):
-       ST Elevation : >= 0.1 mV (V2, V3: >= 0.2 mV).
-       ST Depression: <= -0.1 mV, horizontal or downsloping (not more than
-                      0.05 mV above the J+20 level).
-     A chunk with both is labeled ST Elevation (the depression is
-     reciprocal).
+  5. Criteria, limb leads and chest leads judged separately (never mixed):
+       limb group  (I, II, III, aVL, aVF)  : any 2 leads
+       chest group (V1-V6)                 : any 2 leads
+       ST Elevation : limb leads >= 1 mm (0.1 mV), chest leads >= 2 mm
+                      (0.2 mV).
+       ST Depression: limb and chest leads <= -1 mm (-0.1 mV), horizontal or
+                      downsloping (not more than 0.05 mV above the J+20
+                      level).
+     aVR is not judged. A chunk with both is labeled ST Elevation (the
+     depression is reciprocal). Values are reported per lead, in mm
+     (10 mm = 1 mV, the standard 10 mm/mV).
   6. Episodes: consecutive positive chunks of one label, joined across gaps
      up to _MERGE_GAP_SEC, kept when they last >= _MIN_EPISODE_SEC (the
      Holter "1 mm x 1 min" convention).
@@ -72,16 +76,16 @@ _MIN_BEATS = 4
 _MIN_EPISODE_SEC = 60.0
 _MERGE_GAP_SEC = 60.0
 
-_ELEVATION_MV = 0.10
-_ELEVATION_V2_V3_MV = 0.20
-_DEPRESSION_MV = -0.10
+_MM_PER_MV = 10.0
+_ELEVATION_MV = {'limb': 0.10, 'chest': 0.20}     # 1 mm limb leads, 2 mm chest leads
+_DEPRESSION_MV = -0.10                            # 1 mm, limb and chest leads
 _UPSLOPE_LIMIT_MV = 0.05
+_MIN_LEADS_IN_GROUP = 2
 
-_TERRITORIES = {
-    'inferior': ('II', 'III', 'aVF'),
-    'lateral': ('I', 'aVL', 'V5', 'V6'),
-    'anterior': ('V1', 'V2', 'V3', 'V4'),
-}
+# Limb and chest leads are measured and judged as two separate arrays
+# (limb leads: frontal plane; chest leads: horizontal plane).
+LIMB_LEADS = ('I', 'II', 'III', 'aVR', 'aVL', 'aVF')
+CHEST_LEADS = ('V1', 'V2', 'V3', 'V4', 'V5', 'V6')
 
 _SKIP_RHYTHMS = (
     'ventricular fibrillation',
@@ -180,10 +184,25 @@ def _median_beats(data: np.ndarray, peaks: List[int], ref_idx: int, fs: float):
     return np.median(beats, axis=0), pre, corr
 
 
+def _lead_order(name: str) -> int:
+    order = LIMB_LEADS + CHEST_LEADS
+    return order.index(name) if name in order else len(order)
+
+
+def _lead_group(names: List[str], st_early: List[float], st_level: List[float]) -> Dict[str, Any]:
+    """One lead group as arrays: lead names, ST at J+20 ms and ST at the ST
+    point, in mV, index-aligned."""
+    return {'names': list(names),
+            'st_early': np.asarray(st_early, dtype=float),
+            'st_level': np.asarray(st_level, dtype=float)}
+
+
 def _chunk_st(data: np.ndarray, lead_names: List[str], fs: float, pan_tompkins,
               ref_idx: int, skip_leads: set):
-    """ST deviation (mV) at J+20 ms and at the ST point (J+40, J+30 ms above
-    120 bpm) for every lead of one chunk, or None when it can't be measured."""
+    """ST deviation (mV) of one chunk, limb leads and chest leads in separate
+    arrays: ({'limb': group, 'chest': group}, heart rate), or None when the
+    chunk can't be measured. group = see _lead_group (ST at J+20 ms and at
+    the ST point J+40 ms, J+30 ms above 120 bpm)."""
     peaks = [int(p) for p in pan_tompkins(np.asarray(data[ref_idx], dtype=float), fs=fs)]
     if len(peaks) < _MIN_BEATS:
         return None
@@ -209,48 +228,61 @@ def _chunk_st(data: np.ndarray, lead_names: List[str], fs: float, pan_tompkins,
     half = max(1, int(0.005 * fs))
     if base_lo < 0 or st_point + half >= med.shape[1]:
         return None
-    out = {}
+    limb = ([], [], [])
+    chest = ([], [], [])
     for li, name in enumerate(lead_names):
         if name in skip_leads or li >= med.shape[0]:
+            continue
+        group = limb if name in LIMB_LEADS else chest if name in CHEST_LEADS else None
+        if group is None:
             continue
         x = med[li]
         baseline = float(np.mean(x[base_lo:base_hi]))
         st_early = float(np.mean(x[early - half:early + half])) - baseline
         st_level = float(np.mean(x[st_point - half:st_point + half])) - baseline
-        out[name] = (st_early * _ADC_TO_MV, st_level * _ADC_TO_MV)
-    return out, hr
+        group[0].append(name)
+        group[1].append(st_early * _ADC_TO_MV)
+        group[2].append(st_level * _ADC_TO_MV)
+    return {'limb': _lead_group(*limb), 'chest': _lead_group(*chest)}, hr
 
 
-def _chunk_label(st: Dict[str, tuple]):
-    """('ST Elevation' | 'ST Depression' | None, leads, worst mV)."""
-    elevated, depressed = [], []
-    for name, (st_early, st_level) in st.items():
-        if name == 'aVR':
-            continue
-        limit = _ELEVATION_V2_V3_MV if name in ('V2', 'V3') else _ELEVATION_MV
-        if st_level >= limit:
-            elevated.append((name, st_level))
-        if st_level <= _DEPRESSION_MV and (st_level - st_early) <= _UPSLOPE_LIMIT_MV:
-            depressed.append((name, st_level))
+def _chunk_label(st: Dict[str, Dict[str, Any]]):
+    """('ST Elevation' | 'ST Depression' | None, {lead: ST mV}) for one chunk.
 
-    def territory_hit(hits):
-        names = {n for n, _ in hits}
-        leads = []
-        for group in _TERRITORIES.values():
-            in_group = [n for n in group if n in names]
-            if len(in_group) >= 2:
-                leads.extend(in_group)
-        return leads
+    The limb-lead array and the chest-lead array are judged separately; a
+    label needs at least _MIN_LEADS_IN_GROUP leads of ONE group past its
+    threshold. The returned dict holds the leads of the groups that
+    qualified.
+    """
+    elevated, depressed = {}, {}
+    for key in ('limb', 'chest'):
+        group = st[key]
+        elev, dep = {}, {}
+        for name, st_early, st_level in zip(group['names'], group['st_early'], group['st_level']):
+            if name == 'aVR':
+                continue
+            if st_level >= _ELEVATION_MV[key]:
+                elev[name] = float(st_level)
+            if st_level <= _DEPRESSION_MV and (st_level - st_early) <= _UPSLOPE_LIMIT_MV:
+                dep[name] = float(st_level)
+        if len(elev) >= _MIN_LEADS_IN_GROUP:
+            elevated.update(elev)
+        if len(dep) >= _MIN_LEADS_IN_GROUP:
+            depressed.update(dep)
+    if elevated:
+        return ST_ELEVATION, elevated
+    if depressed:
+        return ST_DEPRESSION, depressed
+    return None, {}
 
-    elev_leads = territory_hit(elevated)
-    if elev_leads:
-        worst = max(v for n, v in elevated if n in elev_leads)
-        return ST_ELEVATION, elev_leads, worst
-    dep_leads = territory_hit(depressed)
-    if dep_leads:
-        worst = min(v for n, v in depressed if n in dep_leads)
-        return ST_DEPRESSION, dep_leads, worst
-    return None, [], 0.0
+
+def _chunk_all_leads_mv(st: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+    """ST level (mV) of every lead of one chunk, for the 6 + 6 lead display."""
+    out = {}
+    for key in ('limb', 'chest'):
+        for name, level in zip(st[key]['names'], st[key]['st_level']):
+            out[name] = float(level)
+    return out
 
 
 def detect_st_episodes(
@@ -288,7 +320,7 @@ def detect_st_episodes(
                 return f"{int(t // 3600):02d}:{int((t % 3600) // 60):02d}:{int(t % 60):02d}"
             return fmt(s_sec), fmt(e_sec)
 
-    # Positive chunks: (start, end, label, leads, worst mV)
+    # Positive chunks: (start, end, label, {lead: ST mV})
     positives = []
     for c_start, c_end, labels in _rhythm_chunks(total, rhythm_segments):
         low = [l.lower() for l in labels]
@@ -313,30 +345,39 @@ def detect_st_episodes(
                 result = _chunk_st(data, lead_names[:data.shape[0]], fs, pan_tompkins, ref_idx, skip_leads)
                 if result is not None:
                     st, _hr = result
-                    label, leads, worst = _chunk_label(st)
+                    label, lead_mv = _chunk_label(st)
                     if label is not None:
-                        positives.append((t, t_end, label, leads, worst))
+                        positives.append((t, t_end, label, lead_mv, _chunk_all_leads_mv(st)))
             except Exception as e:
                 print(f"[Ischemia Detect] Chunk error {t:.1f}s: {e}")
             t = t_end
 
-    # Episodes: same label, gaps up to _MERGE_GAP_SEC joined.
+    # Episodes: same label, gaps up to _MERGE_GAP_SEC joined. Per lead the
+    # worst value over the episode is kept.
+    def worse(label, a, b):
+        return max(a, b) if label == ST_ELEVATION else min(a, b)
+
     episodes = []
-    for s, e, label, leads, worst in positives:
-        if episodes and episodes[-1]['label'] == label and s - episodes[-1]['end_sec'] <= _MERGE_GAP_SEC:
+    for s_sec, e_sec, label, lead_mv, all_mv in positives:
+        if episodes and episodes[-1]['label'] == label and s_sec - episodes[-1]['end_sec'] <= _MERGE_GAP_SEC:
             ep = episodes[-1]
-            ep['end_sec'] = e
-            ep['st_leads'] = sorted(set(ep['st_leads']) | set(leads))
-            ep['st_mv'] = max(ep['st_mv'], worst) if label == ST_ELEVATION else min(ep['st_mv'], worst)
+            ep['end_sec'] = e_sec
+            for lead, v in lead_mv.items():
+                ep['lead_mv'][lead] = worse(label, ep['lead_mv'][lead], v) if lead in ep['lead_mv'] else v
+            for lead, v in all_mv.items():
+                ep['all_mv'][lead] = worse(label, ep['all_mv'][lead], v) if lead in ep['all_mv'] else v
             continue
-        episodes.append({'start_sec': s, 'end_sec': e, 'label': label,
-                         'st_leads': sorted(set(leads)), 'st_mv': worst})
+        episodes.append({'start_sec': s_sec, 'end_sec': e_sec, 'label': label,
+                         'lead_mv': dict(lead_mv), 'all_mv': dict(all_mv)})
 
     out = []
     for ep in episodes:
         if ep['end_sec'] - ep['start_sec'] < _MIN_EPISODE_SEC:
             continue
         s_str, e_str = make_time_strs(ep['start_sec'], ep['end_sec'])
+        leads = sorted(ep['lead_mv'], key=_lead_order)
+        values = list(ep['lead_mv'].values())
+        worst = max(values) if ep['label'] == ST_ELEVATION else min(values)
         out.append({
             'start_sec': float(ep['start_sec']),
             'end_sec': float(ep['end_sec']),
@@ -345,17 +386,25 @@ def detect_st_episodes(
             'start_time_str': s_str,
             'end_time_str': e_str,
             'detected_rhythm': ep['label'],
-            'st_leads': ep['st_leads'],
-            'st_mv': round(float(ep['st_mv']), 3),
+            'st_leads': leads,
+            'st_mv': round(float(worst), 3),
+            'st_lead_mm': {lead: round(ep['lead_mv'][lead] * _MM_PER_MV, 1) for lead in leads},
+            # every lead (worst value over the episode), qualifying or not
+            'st_all_mm': {lead: round(v * _MM_PER_MV, 1) for lead, v in
+                          sorted(ep['all_mv'].items(), key=lambda kv: _lead_order(kv[0]))},
         })
     return out
 
 
-def format_st_summary(episodes: Optional[List[Dict[str, Any]]], label: str) -> str:
-    """One-line text for the Overview / Replay "ST Elevation" / "ST Depression"
-    rows. episodes: every detected segment (any label) or None when detection
-    hasn't run -- then "-". No episode of this label: "None". Otherwise
-    "<count> ep, <total duration>, <worst mV> (<leads>)"."""
+def format_st_summary(episodes: Optional[List[Dict[str, Any]]], label: str, multiline: bool = False) -> str:
+    """Text for the Overview / Replay "ST Elevation" / "ST Depression" rows.
+    episodes: every detected segment (any label) or None when detection
+    hasn't run -- then "-". No episode of this label: "None". Otherwise the
+    episode count and total duration, then the six limb leads and below them
+    the six chest leads, each as "<lead>: <worst value in mm>" separated by
+    commas (the worst qualifying value of each lead over all episodes of this
+    label; a lead that did not meet the criteria shows "-"). multiline=True puts the three parts on
+    three lines (for the tables), otherwise they are joined with " | "."""
     if episodes is None:
         return "-"
     eps = [e for e in episodes if e.get('label') == label]
@@ -363,8 +412,20 @@ def format_st_summary(episodes: Optional[List[Dict[str, Any]]], label: str) -> s
         return "None"
     total = sum(max(0.0, float(e['end_sec']) - float(e['start_sec'])) for e in eps)
     m, s = int(total // 60), int(total % 60)
-    values = [float(e.get('st_mv', 0.0) or 0.0) for e in eps]
-    worst = max(values) if label == ST_ELEVATION else min(values)
-    leads = sorted({lead for e in eps for lead in (e.get('st_leads') or [])})
-    lead_str = f" ({','.join(leads)})" if leads else ""
-    return f"{len(eps)} ep, {m}m{s:02d}s, {worst:+.2f} mV{lead_str}"
+    per_lead: Dict[str, float] = {}
+    for e in eps:
+        # Only the leads that met the criteria, with their qualifying value --
+        # the same values the report's ST Event list shows.
+        for lead, mm in (e.get('st_lead_mm') or {}).items():
+            mm = float(mm)
+            if lead not in per_lead:
+                per_lead[lead] = mm
+            else:
+                per_lead[lead] = max(per_lead[lead], mm) if label == ST_ELEVATION else min(per_lead[lead], mm)
+
+    def line(leads):
+        return ", ".join(f"{lead}: {per_lead[lead]:+.1f}" if lead in per_lead else f"{lead}: -" for lead in leads)
+
+    head = f"{len(eps)} ep, {m}m{s:02d}s (mm)"
+    parts = [head, line(LIMB_LEADS), line(CHEST_LEADS)]
+    return ("\n" if multiline else " | ").join(parts)

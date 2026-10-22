@@ -272,8 +272,14 @@ class HolterReplayPanel(QWidget):
 
         self._overview_table = QTableWidget(0, 2)
         self._overview_table.setHorizontalHeaderLabels(["Name", "Value"])
-        self._overview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self._overview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        # No horizontal scrolling: the Name column takes what it needs, Value
+        # takes the rest and its text (ST episodes) goes down, line by line.
+        self._overview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self._overview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._overview_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._overview_table.setWordWrap(True)
+        # refit one event later: the new column width is only in place after the resize is done
+        self._overview_table.horizontalHeader().sectionResized.connect(lambda *_: QTimer.singleShot(0, self._fit_st_rows))
         self._overview_table.verticalHeader().setVisible(False)
         self._overview_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._overview_table.setSelectionMode(QAbstractItemView.NoSelection)
@@ -1209,9 +1215,10 @@ class HolterReplayPanel(QWidget):
         summary_rows = self._compute_replay_overview(metrics_list, rr_n)
         self._overview_table.setRowCount(len(summary_rows))
         for r, (name, value) in enumerate(summary_rows):
-            self._overview_table.setRowHeight(r, 24)
+            self._overview_table.setRowHeight(r, max(24, 18 * (str(value).count("\n") + 1) + 8))
             n_item = QTableWidgetItem(name)
             v_item = QTableWidgetItem(value)
+            v_item.setToolTip(value)
             bg_col = QColor("#121822") if r % 2 == 0 else QColor("#0A0D13")
             n_item.setBackground(bg_col)
             v_item.setBackground(bg_col)
@@ -1219,6 +1226,23 @@ class HolterReplayPanel(QWidget):
             v_item.setForeground(QColor("#FFFFFF"))
             self._overview_table.setItem(r, 0, n_item)
             self._overview_table.setItem(r, 1, v_item)
+            if name in ('ST Elevation', 'ST Depression') and "\n" in str(value):
+                # limb leads on one line, chest leads below; wrapped to the column
+                self._overview_table.resizeRowToContents(r)
+                self._overview_table.setRowHeight(r, max(self._overview_table.rowHeight(r), 24))
+
+    def _fit_st_rows(self, *_args):
+        """Size the ST Elevation / ST Depression rows to their wrapped text.
+        Called after the rows are filled and whenever a column is resized
+        (the Value column's width is only final once the table is laid out)."""
+        table = self._overview_table
+        for r in range(table.rowCount()):
+            name_item, value_item = table.item(r, 0), table.item(r, 1)
+            if name_item is None or value_item is None:
+                continue
+            if name_item.text() in ('ST Elevation', 'ST Depression') and "\n" in value_item.text():
+                table.resizeRowToContents(r)
+                table.setRowHeight(r, max(table.rowHeight(r), 24))
 
     def _compute_replay_overview(self, metrics_list: list, rr_n: list) -> list:
         total_beats = len(rr_n)
@@ -1242,24 +1266,15 @@ class HolterReplayPanel(QWidget):
         brady_pct = (brady_chunks / total_chunks) * 100.0
         af_dur_str = f"{(af_chunks * chunk_dur) / 60.0:.1f} m"
 
-        # ST Elevation/Depression: the single real per-chunk ST measurement
-        # ('st_mv', Lead II -- same field report_generator.py averages into
-        # 'avg_st_mv') has no per-channel breakdown stored anywhere in
-        # metrics.jsonl, so this reports the worst real value seen, not a
-        # fabricated multi-channel reading. "-" when no chunk ever went
-        # elevated/depressed, same as every other unmeasured row in this app.
-        st_vals = [float(m.get('st_mv', 0.0) or 0.0) for m in metrics_list]
-        st_elev_vals = [v for v in st_vals if v > 0]
-        st_dep_vals = [v for v in st_vals if v < 0]
-        st_elevation_str = f"{max(st_elev_vals):.2f} mV" if st_elev_vals else "-"
-        st_depression_str = f"{min(st_dep_vals):.2f} mV" if st_dep_vals else "-"
-        # Once auto detection has run, the ST episodes it found
-        # (ischemia_detection: 12 leads, contiguous-lead criteria, >= 1 min)
-        # replace that single worst Lead II value.
+        # ST Elevation/Depression: the episodes ischemia_detection found on
+        # the recording's own 12 leads (limb leads >= 1 mm, chest leads
+        # >= 2 mm, any 2 leads of one group, >= 1 min). The old per-chunk
+        # 'st_mv' stored in metrics.jsonl (one Lead II reading taken while
+        # recording, never recomputed, seen reading up to 9 mV) is no longer
+        # shown. "-" until the episodes have been calculated.
         st_episodes = (getattr(self, '_summary', None) or {}).get('st_episodes')
-        if st_episodes is not None:
-            st_elevation_str = format_st_summary(st_episodes, ST_ELEVATION)
-            st_depression_str = format_st_summary(st_episodes, ST_DEPRESSION)
+        st_elevation_str = format_st_summary(st_episodes, ST_ELEVATION, multiline=True)
+        st_depression_str = format_st_summary(st_episodes, ST_DEPRESSION, multiline=True)
 
         return [
             ("Total NNs", str(total_beats)),

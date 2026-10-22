@@ -88,10 +88,15 @@ def _load_auto_segment_events(session_dir: str) -> List[Dict[str, object]]:
                         return True
             return False
 
+        from .ischemia_detection import ST_LABELS
         for segment in detect_arrhythmias(reader):
             start_sec = float(segment.get('start_sec', 0.0) or 0.0)
             end_sec = float(segment.get('end_sec', 0.0) or 0.0)
             rhythm_lbl = str(segment.get('detected_rhythm', segment.get('label', 'Event')))
+            # ST Elevation / Depression episodes have their own ST ANALYSIS
+            # page (_load_st_episodes); they are not arrhythmia rows.
+            if rhythm_lbl in ST_LABELS:
+                continue
             if _is_deleted(start_sec, end_sec, rhythm_lbl):
                 continue
             events.append({
@@ -110,6 +115,33 @@ def _load_auto_segment_events(session_dir: str) -> List[Dict[str, object]]:
         return events
     except Exception as exc:
         print(f"[HolterReport] Could not load auto segments: {exc}")
+        return []
+
+
+def _load_st_episodes(session_dir: str) -> List[Dict[str, object]]:
+    """ST Elevation / ST Depression episodes of this recording
+    (ischemia_detection, run inside detect_arrhythmias()), for the ST
+    ANALYSIS page. Calculated from the recording's 12 leads whether or not
+    "Auto Arrhythmia Detection" was clicked -- that button only gates the
+    rhythm marks. Uses the cached detection result when there is one."""
+    ecgh_path = os.path.join(session_dir, 'recording.ecgh')
+    if not os.path.exists(ecgh_path):
+        return []
+    try:
+        from .auto_segment_arrthymia_detection import detect_arrhythmias, get_cached_detection
+        from .ischemia_detection import ST_LABELS
+        segments = get_cached_detection(ecgh_path)
+        if segments is None:
+            from .file_format import ECGHFileReader
+            reader = ECGHFileReader(ecgh_path)
+            try:
+                segments = detect_arrhythmias(reader)
+            finally:
+                reader.close()
+        episodes = [s for s in segments if s.get('label') in ST_LABELS]
+        return sorted(episodes, key=lambda s: float(s.get('start_sec', 0.0) or 0.0))
+    except Exception as exc:
+        print(f"[HolterReport] Could not load ST episodes: {exc}")
         return []
 
 
@@ -1102,8 +1134,12 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         # 'ventricular tachycardia' above predates the detector's own VT
         # rule (_is_ventricular_tachycardia_window); the terms above still
         # filter every other source (stored tally, manual) as before.
+        # 'Supraventricular Tachycardia (SVT)' contains the text "ventricular
+        # tachycardia", so the substring filter above removed it from the
+        # summary even though the detector reported it with its own timing.
         is_auto_reported = label in auto_segment_counts and (
-            'av block' in label_lower or label_lower == 'ventricular tachycardia'
+            'av block' in label_lower
+            or label_lower in ('ventricular tachycardia', 'supraventricular tachycardia (svt)')
         )
         if is_generic_sinus_rhythm or (
             not is_auto_reported and any(term in label_lower for term in excluded_summary_terms)
@@ -1287,20 +1323,39 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     story.append(Paragraph("ST ANALYSIS", title_style))
     story.append(HRFlowable(width="100%", thickness=2, color=ORANGE, spaceAfter=4*mm))
 
-    # ST detection/calculation is intentionally not connected yet. Keep this
-    # page as a presentation template until the ST clinical logic is finalized.
-    _st_episodes = []
-    _st_dep = []
-    _st_elev = []
-    _st_channel = '--'
+    # ST episodes from ischemia_detection (12 leads; limb leads >= 1 mm, chest
+    # leads >= 2 mm elevation, >= 1 mm depression, any 2 leads of one group,
+    # >= 1 min). Per episode 'st_lead_mm' holds the leads that met the
+    # criteria and their worst value in mm (10 mm = 1 mV).
+    _st_episodes = _load_st_episodes(session_dir)
+    _st_dep = [e for e in _st_episodes if e.get('label') == 'ST Depression']
+    _st_elev = [e for e in _st_episodes if e.get('label') == 'ST Elevation']
+    _st_channel = '12'
+
+    def _st_group_summary(eps, elevation):
+        """[episodes, total duration, max (mV), start time of the episode
+        holding that max] for one ST type."""
+        if not eps:
+            return ['0', '-', '-', '-']
+        total = sum(max(0.0, float(e['end_sec']) - float(e['start_sec'])) for e in eps)
+        best_val, best_ep = None, None
+        for e in eps:
+            for mm in (e.get('st_lead_mm') or {}).values():
+                mv = float(mm) / 10.0
+                if best_val is None or (mv > best_val if elevation else mv < best_val):
+                    best_val, best_ep = mv, e
+        return [
+            str(len(eps)),
+            _sec_to_hms(total),
+            f"{best_val:+.2f}" if best_val is not None else '-',
+            _format_system_time(session_dir, float(best_ep['start_sec'])) if best_ep is not None else '-',
+        ]
+
     _st_summary_data = [
         ['Channel', 'ST Depression', '', '', '', 'ST Elevation', '', '', ''],
         ['', 'Episodes', 'Duration', 'Max (mV)', 'Start Time',
          'Episodes', 'Duration', 'Max (mV)', 'Start Time'],
-        [_st_channel, str(len(_st_dep)),
-         '-', '-', '-',
-         str(len(_st_elev)),
-         '-', '-', '-'],
+        [_st_channel] + _st_group_summary(_st_dep, False) + _st_group_summary(_st_elev, True),
     ]
     _st_summary_table = Table(_st_summary_data,
                               colWidths=[15*mm, 15*mm, 20*mm, 17*mm, 23*mm,
@@ -1321,19 +1376,28 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     story.append(Spacer(1, 8*mm))
     story.append(Paragraph("ST Event list", h2_style))
 
-    _st_event_rows = [['Index', 'Channel', 'Type', 'Max (mV)', 'At', 'Duration', 'ST slope']]
-    for _idx, _event in enumerate(_st_episodes, 1):
-        _st_event_rows.append([
-            str(_idx), _st_channel, _event['type'], f"{_event['max_mv']:.2f}",
-            _format_system_time(session_dir, _event['start']),
-            _grid_hms(_event['end'] - _event['start']),
-            'Up' if _event['type'] == 'ST Elevation' else 'Down',
-        ])
-    for _ in range(max(0, 28 - len(_st_episodes))):
+    # One row per lead of each episode that met the criteria: its value in
+    # mV, the lead name (At), the episode's start - end system time, and
+    # whether it is an elevation or a depression.
+    _st_lead_order = ('I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6')
+    _st_event_rows = [['Index', 'Channel', 'Type', 'mV', 'At', 'Duration', 'ST slope']]
+    _st_idx = 0
+    for _event in _st_episodes:
+        _span = (f"{_format_system_time(session_dir, float(_event['start_sec']))} - "
+                 f"{_format_system_time(session_dir, float(_event['end_sec']))}")
+        _slope = 'Elevation' if _event.get('label') == 'ST Elevation' else 'Depression'
+        _lead_mm = _event.get('st_lead_mm') or {}
+        for _lead in sorted(_lead_mm, key=lambda n: _st_lead_order.index(n) if n in _st_lead_order else 99):
+            _st_idx += 1
+            _st_event_rows.append([
+                str(_st_idx), _st_channel, '12 lead', f"{float(_lead_mm[_lead]) / 10.0:+.2f}",
+                _lead, _span, _slope,
+            ])
+    for _ in range(max(0, 28 - _st_idx)):
         _st_event_rows.append([''] * 7)
     _st_event_table = Table(_st_event_rows,
-                            colWidths=[12*mm, 16*mm, 29*mm, 22*mm,
-                                       29*mm, 25*mm, 27*mm],
+                            colWidths=[12*mm, 16*mm, 22*mm, 20*mm,
+                                       18*mm, 46*mm, 26*mm],
                             repeatRows=1)
     _st_event_table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), GRAY),

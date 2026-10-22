@@ -252,8 +252,14 @@ class HolterExpertReviewPanel(QWidget):
         # Overview Table matching reference workstation layout
         self._overview = QTableWidget(0, 2)
         self._overview.setHorizontalHeaderLabels(["Name", "Value"])
-        self._overview.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self._overview.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        # No horizontal scrolling: the Name column takes what it needs, Value
+        # takes the rest and its text (ST episodes) goes down, line by line.
+        self._overview.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self._overview.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._overview.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._overview.setWordWrap(True)
+        # refit one event later: the new column width is only in place after the resize is done
+        self._overview.horizontalHeader().sectionResized.connect(lambda *_: QTimer.singleShot(0, self._fit_st_rows))
         self._overview.verticalHeader().setVisible(False)
         self._overview.setEditTriggers(QTableWidget.NoEditTriggers)
         self._overview.setSelectionMode(QAbstractItemView.NoSelection)
@@ -394,14 +400,15 @@ class HolterExpertReviewPanel(QWidget):
             ("Pacing Min HR", "-"),
             ("Longest RR", f"{summary.get('longest_rr_ms', 0)/1000:.2f}s"),
             ("RRI (\u22652.0s)", f"{summary.get('pauses', 0)}"),
-            ("ST Elevation", format_st_summary(summary.get('st_episodes'), ST_ELEVATION)),
-            ("ST Depression", format_st_summary(summary.get('st_episodes'), ST_DEPRESSION)),
+            ("ST Elevation", format_st_summary(summary.get('st_episodes'), ST_ELEVATION, multiline=True)),
+            ("ST Depression", format_st_summary(summary.get('st_episodes'), ST_DEPRESSION, multiline=True)),
         ]
         self._overview.setRowCount(len(rows))
         for i, (k, v) in enumerate(rows):
-            self._overview.setRowHeight(i, 24)
+            self._overview.setRowHeight(i, max(24, 18 * (str(v).count("\n") + 1) + 8))
             ki = QTableWidgetItem(k)
             vi = QTableWidgetItem(v)
+            vi.setToolTip(v)
             bg_col = QColor("#121822") if i % 2 == 0 else QColor("#0A0D13")
             ki.setBackground(bg_col)
             vi.setBackground(bg_col)
@@ -409,6 +416,23 @@ class HolterExpertReviewPanel(QWidget):
             vi.setForeground(QColor("#FFFFFF"))
             self._overview.setItem(i, 0, ki)
             self._overview.setItem(i, 1, vi)
+            if k in ('ST Elevation', 'ST Depression') and "\n" in str(v):
+                # limb leads on one line, chest leads below; wrapped to the column
+                self._overview.resizeRowToContents(i)
+                self._overview.setRowHeight(i, max(self._overview.rowHeight(i), 24))
+
+    def _fit_st_rows(self, *_args):
+        """Size the ST Elevation / ST Depression rows to their wrapped text.
+        Called after the rows are filled and whenever a column is resized
+        (the Value column's width is only final once the table is laid out)."""
+        table = self._overview
+        for r in range(table.rowCount()):
+            name_item, value_item = table.item(r, 0), table.item(r, 1)
+            if name_item is None or value_item is None:
+                continue
+            if name_item.text() in ('ST Elevation', 'ST Depression') and "\n" in value_item.text():
+                table.resizeRowToContents(r)
+                table.setRowHeight(r, max(table.rowHeight(r), 24))
 
     def set_replay_frame(self, data, beat_annotations=None, start_sec=0.0):
         if data is None or not isinstance(data, np.ndarray) or data.ndim != 2 or data.shape[1] == 0:

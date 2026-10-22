@@ -2175,21 +2175,22 @@ class HolterMainWindow(QDialog):
             self._refresh_ui()
 
     def _refresh_st_episodes(self):
-        """Put the ST Elevation / ST Depression episodes found by auto
-        detection (ischemia_detection, run inside detect_arrhythmias()) into
-        the summary as 'st_episodes' and redraw the OVERVIEW and REPLAY
-        tables. Same gate as the report: only once "Auto Arrhythmia
-        Detection" has been clicked for this recording; before that the rows
-        stay "-". Uses the cached detection result; if there is none yet,
-        detection runs in the background and the rows fill in when done."""
+        """Put the ST Elevation / ST Depression episodes of this recording
+        (ischemia_detection, run inside detect_arrhythmias()) into the summary
+        as 'st_episodes' and redraw the OVERVIEW and REPLAY tables. ST is
+        calculated from the recording's own data for any recording; it does
+        not depend on the "Auto Arrhythmia Detection" button, which only
+        controls whether rhythm marks are drawn. Uses the cached result; if
+        there is none yet, the calculation runs in the background and the
+        rows ("-" meanwhile) fill in when it is done."""
         session_dir = getattr(self, 'session_dir', '') or ''
         ecgh_path = os.path.join(session_dir, 'recording.ecgh') if session_dir else ''
         episodes = None
         try:
             from .auto_segment_arrthymia_detection import (
-                detect_arrhythmias_async, get_cached_detection, is_auto_marking_enabled)
+                detect_arrhythmias_async, get_cached_detection)
             from .ischemia_detection import ST_LABELS
-            if ecgh_path and os.path.exists(ecgh_path) and is_auto_marking_enabled(session_dir):
+            if ecgh_path and os.path.exists(ecgh_path):
                 segments = get_cached_detection(ecgh_path)
                 if segments is not None:
                     episodes = [seg for seg in segments if seg.get('label') in ST_LABELS]
