@@ -57,11 +57,14 @@ from scipy.signal import savgol_filter
 
 ST_ELEVATION = 'ST Elevation'
 ST_DEPRESSION = 'ST Depression'
+T_INVERSION = 'T Inversion'
 ST_COLORS = {
     ST_ELEVATION: '#00E5A0',   # mint green
     ST_DEPRESSION: '#00BFFF',  # deep sky blue
+    T_INVERSION: '#FFB020',    # amber
 }
-ST_LABELS = (ST_ELEVATION, ST_DEPRESSION)
+# every label this module produces (they are ischemia findings, not rhythms)
+ST_LABELS = (ST_ELEVATION, ST_DEPRESSION, T_INVERSION)
 
 # Same ADC scale the Full Disclosure measuring ruler uses (theme.ADC_TO_MV).
 try:
@@ -93,6 +96,16 @@ _SKIP_RHYTHMS = (
     'bundle branch block',
 )
 _MAX_QRS_MS = 120.0
+
+# T inversion (detect_t_inversion_episodes)
+_T_INVERSION_MV = -0.10          # T wave 1 mm (0.1 mV) or more below the PR baseline
+_T_MAX_HR = 120.0                # above this the T wave runs into the next P wave
+_T_START_AFTER_J_SEC = 0.06      # T search window starts here after the J point
+_T_MIN_PROMINENCE_MV = 0.02      # a real T wave is a turning point, not a slope
+_T_NOT_JUDGED = {'limb': ('aVR',), 'chest': ('V1',)}   # inverted T is normal there
+# AFib / Flutter: the f-waves / flutter waves (seen up to -2 mV deflections in
+# the T window) are not T waves and would read as T inversion.
+_T_SKIP_RHYTHMS = _SKIP_RHYTHMS + ('atrial fibrillation', 'atrial flutter')
 
 
 def _rhythm_chunks(total_duration: float, rhythm_segments: List[Dict[str, Any]]):
@@ -394,6 +407,312 @@ def detect_st_episodes(
                           sorted(ep['all_mv'].items(), key=lambda kv: _lead_order(kv[0]))},
         })
     return out
+
+
+def _chunk_t_wave(data: np.ndarray, lead_names: List[str], fs: float, pan_tompkins, ref_idx: int):
+    """T wave amplitude (mV, signed, relative to the PR-segment baseline) of
+    every lead of one chunk: ({'limb': {lead: mV}, 'chest': {lead: mV}}, heart
+    rate), or None when the chunk can't be measured (too few beats, beats of
+    different shapes, wide QRS, heart rate above _T_MAX_HR).
+
+    Measured on the median beat (same beats / QRS bounds / baseline as the ST
+    measurement). Search window: from J + 60 ms to 0.55 x RR after the R peak
+    (at most 0.50 s), so it never reaches the next P wave. The T wave is the
+    largest turning point (local peak or trough) of the smoothed beat inside
+    that window; a slope that only runs into the window edge (a downsloping ST
+    segment, the next P wave) is not a T wave and counts as 0."""
+    from scipy.signal import find_peaks
+
+    peaks = [int(p) for p in pan_tompkins(np.asarray(data[ref_idx], dtype=float), fs=fs)]
+    if len(peaks) < _MIN_BEATS:
+        return None
+    rr = np.diff(peaks) / float(fs)
+    if not rr.size:
+        return None
+    rr_med = float(np.median(rr))
+    hr = 60.0 / rr_med
+    if hr > _T_MAX_HR:
+        return None
+    built = _median_beats(data, peaks, ref_idx, fs)
+    if built is None:
+        return None
+    med, r_idx, corr = built
+    if corr < 0.9:
+        return None
+    bounds = _qrs_bounds(med, r_idx, fs)
+    if bounds is None:
+        return None
+    onset, j_point = bounds
+    if (j_point - onset) * 1000.0 / fs >= _MAX_QRS_MS:
+        return None
+    base_lo, base_hi = onset - int(0.04 * fs), onset - int(0.01 * fs)
+    t_lo = j_point + int(_T_START_AFTER_J_SEC * fs)
+    t_hi = min(r_idx + int(min(0.50, 0.55 * rr_med) * fs), med.shape[1] - 1)
+    if base_lo < 0 or t_hi - t_lo < int(0.08 * fs):
+        return None
+    win = int(0.04 * fs) | 1                      # ~40 ms smoothing, odd
+    min_prom = _T_MIN_PROMINENCE_MV / _ADC_TO_MV
+    out = {'limb': {}, 'chest': {}}
+    for li, name in enumerate(lead_names):
+        group = 'limb' if name in LIMB_LEADS else 'chest' if name in CHEST_LEADS else None
+        if group is None or li >= med.shape[0]:
+            continue
+        x = np.asarray(med[li], dtype=float)
+        x = savgol_filter(x, win, 3) if x.size > win else x
+        seg = x[t_lo:t_hi + 1] - float(np.mean(x[base_lo:base_hi]))
+        cand = []
+        for sign in (1.0, -1.0):
+            idx, _ = find_peaks(sign * seg, prominence=min_prom)
+            cand.extend(float(seg[i]) for i in idx)
+        amp = max(cand, key=abs) if cand else 0.0
+        out[group][name] = amp * _ADC_TO_MV
+    return out, hr
+
+
+def _t_chunk_label(t_mv: Dict[str, Dict[str, float]]):
+    """(T_INVERSION | None, {lead: T mV}) for one chunk. Limb leads and chest
+    leads are judged separately, never mixed: a group qualifies when at least
+    _MIN_LEADS_IN_GROUP of its leads have a T wave at or below
+    _T_INVERSION_MV. aVR and V1 are not judged (an inverted T is normal
+    there). The returned dict holds the leads of the groups that qualified."""
+    inverted = {}
+    for key in ('limb', 'chest'):
+        inv = {name: float(mv) for name, mv in t_mv[key].items()
+               if name not in _T_NOT_JUDGED[key] and mv <= _T_INVERSION_MV}
+        if len(inv) >= _MIN_LEADS_IN_GROUP:
+            inverted.update(inv)
+    return (T_INVERSION, inverted) if inverted else (None, {})
+
+
+def detect_t_inversion_episodes(
+    reader,
+    rhythm_segments: Optional[List[Dict[str, Any]]] = None,
+    make_time_strs: Optional[Callable[[float, float], tuple]] = None,
+) -> List[Dict[str, Any]]:
+    """Return T Inversion episodes as segment dicts, same format as
+    detect_st_episodes() ('st_leads', 'st_mv', 'st_lead_mm' = qualifying
+    leads, 'st_all_mm' = T amplitude of all 12 leads, all in mm / worst = most
+    negative).
+
+    Runs on the same Full Disclosure recording data (all 12 leads, same
+    SignalPreprocessor filter), rhythm by rhythm in 10 s chunks, exactly like
+    the ST detection: VT / VFib / bundle branch block stretches and wide-QRS
+    chunks are skipped; episodes need >= _MIN_EPISODE_SEC and gaps up to
+    _MERGE_GAP_SEC are joined. It never changes any other segment.
+
+    Pass the RHYTHM segments only (without ST / T episodes)."""
+    try:
+        from ecg.pan_tompkins import pan_tompkins
+    except ImportError:  # pragma: no cover
+        from ..pan_tompkins import pan_tompkins
+    try:
+        from .analysis_pipeline import SignalPreprocessor, HolterConfig
+        fs0 = getattr(reader, 'fs', 500) or 500
+        preproc = SignalPreprocessor(fs=fs0, config=HolterConfig.from_clinical_config())
+    except Exception:
+        preproc = None
+
+    fs = float(getattr(reader, 'fs', 500) or 500)
+    total = float(getattr(reader, 'duration_sec', 0.0) or 0.0)
+    lead_names = list(getattr(reader, 'lead_names', []) or [])
+    if total <= 0 or not lead_names:
+        return []
+    ref_name = next((n for n in ('II', 'V5', 'I', 'V6') if n in lead_names), lead_names[0])
+    ref_idx = lead_names.index(ref_name)
+    rhythm_segments = [s for s in (rhythm_segments or []) if s.get('label') not in ST_LABELS]
+
+    if make_time_strs is None:
+        def make_time_strs(s_sec, e_sec):
+            def fmt(t):
+                return f"{int(t // 3600):02d}:{int((t % 3600) // 60):02d}:{int(t % 60):02d}"
+            return fmt(s_sec), fmt(e_sec)
+
+    positives = []     # (start, end, {lead: mV qualifying}, {lead: mV all})
+    for c_start, c_end, labels in _rhythm_chunks(total, rhythm_segments):
+        low = [l.lower() for l in labels]
+        if any(skip in l for l in low for skip in _T_SKIP_RHYTHMS):
+            continue
+        t = c_start
+        while t < c_end:
+            t_end = min(t + _CHUNK_SEC, c_end)
+            if t_end - t < _MIN_CHUNK_SEC:
+                break
+            try:
+                p0 = max(0.0, t - _CHUNK_PAD_SEC)
+                p1 = min(total, t_end + _CHUNK_PAD_SEC)
+                raw = reader.read_range(p0, p1)
+                if raw is None or raw.shape[1] < int(fs * _MIN_CHUNK_SEC):
+                    t = t_end
+                    continue
+                data = np.asarray(raw, dtype=float)
+                if preproc is not None:
+                    data = np.vstack([np.asarray(preproc.process(x), dtype=float) for x in data])
+                result = _chunk_t_wave(data, lead_names[:data.shape[0]], fs, pan_tompkins, ref_idx)
+                if result is not None:
+                    t_mv, _hr = result
+                    label, lead_mv = _t_chunk_label(t_mv)
+                    if label is not None:
+                        all_mv = {**t_mv['limb'], **t_mv['chest']}
+                        positives.append((t, t_end, lead_mv, all_mv))
+            except Exception as e:
+                print(f"[T Inversion Detect] Chunk error {t:.1f}s: {e}")
+            t = t_end
+
+    # Episodes: gaps up to _MERGE_GAP_SEC joined; per lead the most negative T
+    # of the episode is kept.
+    episodes = []
+    for s_sec, e_sec, lead_mv, all_mv in positives:
+        if episodes and s_sec - episodes[-1]['end_sec'] <= _MERGE_GAP_SEC:
+            ep = episodes[-1]
+            ep['end_sec'] = e_sec
+            for lead, v in lead_mv.items():
+                ep['lead_mv'][lead] = min(ep['lead_mv'][lead], v) if lead in ep['lead_mv'] else v
+            for lead, v in all_mv.items():
+                ep['all_mv'][lead] = min(ep['all_mv'][lead], v) if lead in ep['all_mv'] else v
+            continue
+        episodes.append({'start_sec': s_sec, 'end_sec': e_sec,
+                         'lead_mv': dict(lead_mv), 'all_mv': dict(all_mv)})
+
+    out = []
+    for ep in episodes:
+        if ep['end_sec'] - ep['start_sec'] < _MIN_EPISODE_SEC:
+            continue
+        s_str, e_str = make_time_strs(ep['start_sec'], ep['end_sec'])
+        leads = sorted(ep['lead_mv'], key=_lead_order)
+        out.append({
+            'start_sec': float(ep['start_sec']),
+            'end_sec': float(ep['end_sec']),
+            'label': T_INVERSION,
+            'color': ST_COLORS[T_INVERSION],
+            'start_time_str': s_str,
+            'end_time_str': e_str,
+            'detected_rhythm': T_INVERSION,
+            'st_leads': leads,
+            'st_mv': round(float(min(ep['lead_mv'].values())), 3),
+            'st_lead_mm': {lead: round(ep['lead_mv'][lead] * _MM_PER_MV, 1) for lead in leads},
+            'st_all_mm': {lead: round(v * _MM_PER_MV, 1) for lead, v in
+                          sorted(ep['all_mv'].items(), key=lambda kv: _lead_order(kv[0]))},
+        })
+    return out
+
+
+_T_CACHE_FILENAME = 't_inversion_cache.json'
+_t_memory_cache: Dict[str, List[Dict[str, Any]]] = {}
+_t_jobs: Dict[str, Any] = {}
+
+
+def _t_cache_key(path: str) -> Optional[str]:
+    """Same key as the arrhythmia detection cache (file size / mtime / code
+    fingerprint), so the result is recomputed when the recording or any code
+    changes."""
+    try:
+        from .auto_segment_arrthymia_detection import _cache_key
+        return _cache_key(path)
+    except Exception:
+        return None
+
+
+def get_cached_t_inversion(path: str) -> Optional[List[Dict[str, Any]]]:
+    """Cached detect_t_inversion_episodes() result for this recording, or
+    None. Cheap."""
+    import copy
+    import json
+    import os
+    key = _t_cache_key(path)
+    if key is None:
+        return None
+    if key in _t_memory_cache:
+        return copy.deepcopy(_t_memory_cache[key])
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(path)), _T_CACHE_FILENAME), 'r', encoding='utf-8') as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if saved.get('key') != key:
+        return None
+    _t_memory_cache[key] = saved.get('episodes', [])
+    return copy.deepcopy(_t_memory_cache[key])
+
+
+def compute_t_inversion(path: str, rhythm_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """detect_t_inversion_episodes() on the recording at `path` (opens and
+    closes the reader), cached in memory and next to the recording. Blocking;
+    t_inversion_async() runs it on a worker thread."""
+    import json
+    import os
+    from .file_format import ECGHFileReader
+    reader = ECGHFileReader(path)
+    try:
+        episodes = detect_t_inversion_episodes(reader, rhythm_segments=list(rhythm_segments or []))
+    finally:
+        reader.close()
+    ck = _t_cache_key(path)
+    if ck is not None:
+        _t_memory_cache[ck] = episodes
+        try:
+            cache_path = os.path.join(os.path.dirname(os.path.abspath(path)), _T_CACHE_FILENAME)
+            with open(cache_path + '.tmp', 'w', encoding='utf-8') as f:
+                json.dump({'key': ck, 'episodes': episodes}, f, default=float)
+            os.replace(cache_path + '.tmp', cache_path)
+        except OSError:
+            pass
+    return episodes
+
+
+def t_inversion_async(path: str, rhythm_segments: List[Dict[str, Any]],
+                      on_done: Callable[[List[Dict[str, Any]]], None]) -> None:
+    """Run detect_t_inversion_episodes() on the recording at `path` on a
+    worker thread and call on_done(episodes) on the Qt main thread (the
+    result is cached in memory and next to the recording). Must be called
+    from the Qt main thread."""
+    import copy
+    import json
+    import os
+    import threading
+    from PyQt5.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
+
+    cached = get_cached_t_inversion(path)
+    if cached is not None:
+        QTimer.singleShot(0, lambda: on_done(cached))
+        return
+    key = _t_cache_key(path) or os.path.abspath(path)
+    job = _t_jobs.get(key)
+    if job is not None:
+        job.callbacks.append(on_done)
+        return
+
+    class _Job(QObject):
+        done = pyqtSignal(object)
+
+        def __init__(self):
+            super().__init__()
+            self.callbacks = [on_done]
+            self.done.connect(self._deliver)
+
+        @pyqtSlot(object)
+        def _deliver(self, episodes):
+            _t_jobs.pop(key, None)
+            for cb in self.callbacks:
+                try:
+                    cb(copy.deepcopy(episodes))
+                except RuntimeError:
+                    pass  # the receiving widget was closed meanwhile
+                except Exception as e:
+                    print(f"[T Inversion Detect] Callback error: {e}")
+
+    job = _Job()
+    _t_jobs[key] = job
+    segments = copy.deepcopy(list(rhythm_segments or []))
+
+    def _run():
+        episodes = []
+        try:
+            episodes = compute_t_inversion(path, segments)
+        except Exception as e:
+            print(f"[T Inversion Detect] Failed: {e}")
+        job.done.emit(episodes)
+
+    threading.Thread(target=_run, daemon=True, name='t-inversion-detect').start()
 
 
 def format_st_summary(episodes: Optional[List[Dict[str, Any]]], label: str, multiline: bool = False) -> str:

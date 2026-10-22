@@ -1271,11 +1271,13 @@ class HolterFullDisclosureDialog(QDialog):
         self._leads_scroll.setStyleSheet(f"""
             QScrollArea {{ background: transparent; border: none; }}
             QScrollBar:vertical {{
-                background: #0d1b2a; width: 10px; border-radius: 4px; margin: 0;
+                background: #16233A; width: 16px; border: 1px solid #2A4268; border-radius: 8px; margin: 0;
             }}
             QScrollBar::handle:vertical {{
-                background: {COL_GREEN_DRK}; min-height: 24px; border-radius: 4px;
+                background: #3B8EF0; min-height: 40px; border-radius: 6px; margin: 2px;
             }}
+            QScrollBar::handle:vertical:hover {{ background: #6AAEFF; }}
+            QScrollBar::handle:vertical:pressed {{ background: #9CC7FF; }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
         """)
         self._leads_scroll.viewport().setStyleSheet("background: transparent;")
@@ -1326,7 +1328,7 @@ class HolterFullDisclosureDialog(QDialog):
 
 
         self.time_scrollbar = QScrollBar(Qt.Horizontal)
-        self.time_scrollbar.setFixedHeight(12)
+        self.time_scrollbar.setFixedHeight(18)
         # QScrollBar::left-arrow/right-arrow don't honor the usual CSS
         # border-triangle trick (confirmed: it renders as a plain filled
         # square, not a triangle, unlike QComboBox::down-arrow elsewhere in
@@ -1337,27 +1339,29 @@ class HolterFullDisclosureDialog(QDialog):
         _arrow_right = os.path.join(_assets_dir, 'scrollbar_arrow_right.png').replace('\\', '/')
         self.time_scrollbar.setStyleSheet(f"""
             QScrollBar:horizontal {{
-                background: #0d1b2a; height: 12px; border-radius: 5px; margin: 0 16px;
+                background: #16233A; height: 18px; border: 1px solid #2A4268; border-radius: 9px; margin: 0 20px;
             }}
             QScrollBar::handle:horizontal {{
-                background: {COL_GREEN_DRK}; min-width: 24px; border-radius: 5px;
+                background: #3B8EF0; min-width: 40px; border-radius: 6px; margin: 2px;
             }}
+            QScrollBar::handle:horizontal:hover {{ background: #6AAEFF; }}
+            QScrollBar::handle:horizontal:pressed {{ background: #9CC7FF; }}
             QScrollBar::add-line:horizontal {{
-                background: #E8EEF4; width: 16px; border-radius: 3px;
+                background: #E8EEF4; width: 20px; border-radius: 3px;
                 subcontrol-position: right; subcontrol-origin: margin;
             }}
             QScrollBar::sub-line:horizontal {{
-                background: #E8EEF4; width: 16px; border-radius: 3px;
+                background: #E8EEF4; width: 20px; border-radius: 3px;
                 subcontrol-position: left; subcontrol-origin: margin;
             }}
             QScrollBar::add-line:horizontal:hover, QScrollBar::sub-line:horizontal:hover {{
                 background: #FFFFFF;
             }}
             QScrollBar::left-arrow:horizontal {{
-                image: url({_arrow_left}); width: 8px; height: 8px;
+                image: url({_arrow_left}); width: 10px; height: 10px;
             }}
             QScrollBar::right-arrow:horizontal {{
-                image: url({_arrow_right}); width: 8px; height: 8px;
+                image: url({_arrow_right}); width: 10px; height: 10px;
             }}
         """)
         self._update_scrollbar_range()
@@ -2100,22 +2104,25 @@ class HolterFullDisclosureDialog(QDialog):
                 self._leads_scroll.setStyleSheet("""
                     QScrollArea { background: transparent; border: none; }
                     QScrollBar:vertical {
-                        background: #FFE4E6; width: 10px; border-radius: 4px; margin: 0;
+                        background: #FFE4E6; width: 16px; border: 1px solid #F3A5AF; border-radius: 8px; margin: 0;
                     }
                     QScrollBar::handle:vertical {
-                        background: #E64A5E; min-height: 24px; border-radius: 4px;
+                        background: #E64A5E; min-height: 40px; border-radius: 6px; margin: 2px;
                     }
+                    QScrollBar::handle:vertical:hover { background: #C8344A; }
                     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
                 """)
             else:
                 self._leads_scroll.setStyleSheet(f"""
                     QScrollArea {{ background: transparent; border: none; }}
                     QScrollBar:vertical {{
-                        background: #0d1b2a; width: 10px; border-radius: 4px; margin: 0;
+                        background: #16233A; width: 16px; border: 1px solid #2A4268; border-radius: 8px; margin: 0;
                     }}
                     QScrollBar::handle:vertical {{
-                        background: {COL_GREEN_DRK}; min-height: 24px; border-radius: 4px;
+                        background: #3B8EF0; min-height: 40px; border-radius: 6px; margin: 2px;
                     }}
+                    QScrollBar::handle:vertical:hover {{ background: #6AAEFF; }}
+                    QScrollBar::handle:vertical:pressed {{ background: #9CC7FF; }}
                     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
                 """)
 

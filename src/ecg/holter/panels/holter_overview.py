@@ -47,7 +47,7 @@ from ..holter_helpers import (
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas, HolterRRTrendCanvas, HRTrendCanvas
 
 # 4. HOLTER OVERVIEW PANEL
-from ..ischemia_detection import ST_DEPRESSION, ST_ELEVATION, format_st_summary
+from ..ischemia_detection import ST_DEPRESSION, ST_ELEVATION, T_INVERSION, format_st_summary
 
 class HolterOverviewPanel(QWidget):
     def __init__(self, parent=None):
@@ -392,6 +392,7 @@ class HolterExpertReviewPanel(QWidget):
             ("Pacing Min HR", "-"),
             ("Longest RR", f"{summary.get('longest_rr_ms', 0)/1000:.2f}s"),
             ("RRI (\u22652.0s)", f"{summary.get('pauses', 0)}"),
+            ("T Inversion", format_st_summary(summary.get('t_episodes'), T_INVERSION, multiline=True)),
             ("ST Elevation", format_st_summary(summary.get('st_episodes'), ST_ELEVATION, multiline=True)),
             ("ST Depression", format_st_summary(summary.get('st_episodes'), ST_DEPRESSION, multiline=True)),
         ]
@@ -408,7 +409,7 @@ class HolterExpertReviewPanel(QWidget):
             vi.setForeground(QColor(UI_TEXT))
             self._overview.setItem(i, 0, ki)
             self._overview.setItem(i, 1, vi)
-            if k in ('ST Elevation', 'ST Depression') and "\n" in str(v):
+            if k in ('T Inversion', 'ST Elevation', 'ST Depression') and "\n" in str(v):
                 # limb leads on one line, chest leads below; wrapped to the column
                 self._overview.resizeRowToContents(i)
                 self._overview.setRowHeight(i, max(self._overview.rowHeight(i), 24))
@@ -422,7 +423,7 @@ class HolterExpertReviewPanel(QWidget):
             name_item, value_item = table.item(r, 0), table.item(r, 1)
             if name_item is None or value_item is None:
                 continue
-            if name_item.text() in ('ST Elevation', 'ST Depression') and "\n" in value_item.text():
+            if name_item.text() in ('T Inversion', 'ST Elevation', 'ST Depression') and "\n" in value_item.text():
                 table.resizeRowToContents(r)
                 table.setRowHeight(r, max(table.rowHeight(r), 24))
 

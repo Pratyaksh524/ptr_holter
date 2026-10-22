@@ -129,7 +129,9 @@ def _load_st_episodes(session_dir: str) -> List[Dict[str, object]]:
         return []
     try:
         from .auto_segment_arrthymia_detection import detect_arrhythmias, get_cached_detection
-        from .ischemia_detection import ST_LABELS
+        # T Inversion episodes are not on the ST ANALYSIS page (yet)
+        from .ischemia_detection import ST_DEPRESSION, ST_ELEVATION
+        ST_LABELS = (ST_ELEVATION, ST_DEPRESSION)
         segments = get_cached_detection(ecgh_path)
         if segments is None:
             from .file_format import ECGHFileReader
@@ -142,6 +144,35 @@ def _load_st_episodes(session_dir: str) -> List[Dict[str, object]]:
         return sorted(episodes, key=lambda s: float(s.get('start_sec', 0.0) or 0.0))
     except Exception as exc:
         print(f"[HolterReport] Could not load ST episodes: {exc}")
+        return []
+
+
+def _load_t_episodes(session_dir: str) -> List[Dict[str, object]]:
+    """T Inversion episodes of this recording (ischemia_detection.
+    detect_t_inversion_episodes), for the T wave section of the ST ANALYSIS
+    page. Uses the cached result when there is one; otherwise calculates it
+    from the recording's 12 leads (the rhythm segments only split it rhythm
+    by rhythm)."""
+    ecgh_path = os.path.join(session_dir, 'recording.ecgh')
+    if not os.path.exists(ecgh_path):
+        return []
+    try:
+        from .auto_segment_arrthymia_detection import detect_arrhythmias, get_cached_detection
+        from .ischemia_detection import compute_t_inversion, get_cached_t_inversion
+        episodes = get_cached_t_inversion(ecgh_path)
+        if episodes is None:
+            segments = get_cached_detection(ecgh_path)
+            if segments is None:
+                from .file_format import ECGHFileReader
+                reader = ECGHFileReader(ecgh_path)
+                try:
+                    segments = detect_arrhythmias(reader)
+                finally:
+                    reader.close()
+            episodes = compute_t_inversion(ecgh_path, segments)
+        return sorted(episodes, key=lambda s: float(s.get('start_sec', 0.0) or 0.0))
+    except Exception as exc:
+        print(f"[HolterReport] Could not load T inversion episodes: {exc}")
         return []
 
 
@@ -1393,7 +1424,8 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
                 str(_st_idx), _st_channel, '12 lead', f"{float(_lead_mm[_lead]) / 10.0:+.2f}",
                 _lead, _span, _slope,
             ])
-    for _ in range(max(0, 28 - _st_idx)):
+    # 20 rows (was 28) so the T wave section below fits on this page
+    for _ in range(max(0, 20 - _st_idx)):
         _st_event_rows.append([''] * 7)
     _st_event_table = Table(_st_event_rows,
                             colWidths=[12*mm, 16*mm, 22*mm, 20*mm,
@@ -1410,6 +1442,46 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         ('PADDING', (0, 0), (-1, -1), 4),
     ]))
     story.append(_st_event_table)
+
+    # T wave section (T Inversion, ischemia_detection): one row per episode,
+    # small, under the ST Event list on the same page. mV = the most negative
+    # T wave of the episode, At = the leads that met the criteria, Duration =
+    # the episode's start - end system time.
+    _t_episodes = _load_t_episodes(session_dir)
+    story.append(Spacer(1, 5*mm))
+    story.append(Paragraph("T wave", h2_style))
+    _t_cell_style = ParagraphStyle('TWaveCell', parent=styles['Normal'], fontSize=7, leading=8.5,
+                                   alignment=TA_CENTER)
+    _t_rows = [['Index', 'Channel', 'Type', 'Max (mV)', 'At', 'Duration', 'T wave']]
+    _T_MAX_ROWS = 4
+    for _i, _ep in enumerate(_t_episodes[:_T_MAX_ROWS], start=1):
+        _t_leads = sorted(_ep.get('st_lead_mm') or {},
+                          key=lambda n: _st_lead_order.index(n) if n in _st_lead_order else 99)
+        _t_rows.append([
+            str(_i), _st_channel, '12 lead', f"{float(_ep.get('st_mv', 0.0)):+.2f}",
+            Paragraph(', '.join(_t_leads), _t_cell_style),
+            f"{_format_system_time(session_dir, float(_ep['start_sec']))} - "
+            f"{_format_system_time(session_dir, float(_ep['end_sec']))}",
+            'Inversion',
+        ])
+    if len(_t_episodes) > _T_MAX_ROWS:
+        _t_rows.append(['', '', '', '', f"+{len(_t_episodes) - _T_MAX_ROWS} more episodes", '', ''])
+    for _ in range(max(0, 3 - (len(_t_rows) - 1))):
+        _t_rows.append([''] * 7)
+    _t_table = Table(_t_rows,
+                     colWidths=[11*mm, 15*mm, 20*mm, 18*mm, 40*mm, 36*mm, 20*mm],
+                     repeatRows=1)
+    _t_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), GRAY),
+        ('GRID', (0, 0), (-1, -1), 0.45, DARK),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 7.5),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, GRAY]),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('PADDING', (0, 0), (-1, -1), 3),
+    ]))
+    story.append(_t_table)
 
     # -------------------------------------------------------------------------
     # PAGE 4: HRV TIME DOMAIN REPORT

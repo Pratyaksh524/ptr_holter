@@ -49,7 +49,7 @@ from ..tool_engine import ECGToolEngine
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas, HolterRRTrendCanvas, HRTrendCanvas
 
 # 6. HOLTER REPLAY PANEL
-from ..ischemia_detection import ST_DEPRESSION, ST_ELEVATION, format_st_summary
+from ..ischemia_detection import ST_DEPRESSION, ST_ELEVATION, T_INVERSION, format_st_summary
 
 class HolterReplayPanel(QWidget):
     playback_state_changed = pyqtSignal(bool)
@@ -1198,7 +1198,7 @@ class HolterReplayPanel(QWidget):
             v_item.setForeground(QColor(UI_TEXT))
             self._overview_table.setItem(r, 0, n_item)
             self._overview_table.setItem(r, 1, v_item)
-            if name in ('ST Elevation', 'ST Depression') and "\n" in str(value):
+            if name in ('T Inversion', 'ST Elevation', 'ST Depression') and "\n" in str(value):
                 # limb leads on one line, chest leads below; wrapped to the column
                 self._overview_table.resizeRowToContents(r)
                 self._overview_table.setRowHeight(r, max(self._overview_table.rowHeight(r), 24))
@@ -1212,7 +1212,7 @@ class HolterReplayPanel(QWidget):
             name_item, value_item = table.item(r, 0), table.item(r, 1)
             if name_item is None or value_item is None:
                 continue
-            if name_item.text() in ('ST Elevation', 'ST Depression') and "\n" in value_item.text():
+            if name_item.text() in ('T Inversion', 'ST Elevation', 'ST Depression') and "\n" in value_item.text():
                 table.resizeRowToContents(r)
                 table.setRowHeight(r, max(table.rowHeight(r), 24))
 
@@ -1245,6 +1245,7 @@ class HolterReplayPanel(QWidget):
         # recording, never recomputed, seen reading up to 9 mV) is no longer
         # shown. "-" until the episodes have been calculated.
         st_episodes = (getattr(self, '_summary', None) or {}).get('st_episodes')
+        t_inversion_str = format_st_summary((getattr(self, '_summary', None) or {}).get('t_episodes'), T_INVERSION, multiline=True)
         st_elevation_str = format_st_summary(st_episodes, ST_ELEVATION, multiline=True)
         st_depression_str = format_st_summary(st_episodes, ST_DEPRESSION, multiline=True)
 
@@ -1260,6 +1261,7 @@ class HolterReplayPanel(QWidget):
             ("AF Duration", af_dur_str),
             ("V Total", str(ve)),
             ("S Total", str(sve)),
+            ("T Inversion", t_inversion_str),
             ("ST Elevation", st_elevation_str),
             ("ST Depression", st_depression_str),
         ]

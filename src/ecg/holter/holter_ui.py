@@ -2228,6 +2228,7 @@ class HolterMainWindow(QDialog):
         session_dir = getattr(self, 'session_dir', '') or ''
         ecgh_path = os.path.join(session_dir, 'recording.ecgh') if session_dir else ''
         episodes = None
+        segments = None
         try:
             from .auto_segment_arrthymia_detection import (
                 detect_arrhythmias_async, get_cached_detection)
@@ -2244,11 +2245,33 @@ class HolterMainWindow(QDialog):
                         if getattr(self, 'session_dir', '') and                                 os.path.join(self.session_dir, 'recording.ecgh') == path:
                             self._refresh_st_episodes()
                     detect_arrhythmias_async(ecgh_path, _done)
+            # T Inversion: its own calculation (not an arrhythmia mark). It
+            # uses the rhythm segments only to go rhythm by rhythm.
+            if segments is not None:
+                from .ischemia_detection import get_cached_t_inversion, t_inversion_async
+                t_cached = get_cached_t_inversion(ecgh_path)
+                if t_cached is not None:
+                    self._t_episodes = t_cached
+                elif not getattr(self, '_t_detection_pending', False):
+                    self._t_detection_pending = True
+
+                    def _t_done(t_eps, path=ecgh_path):
+                        self._t_detection_pending = False
+                        if getattr(self, 'session_dir', '') and os.path.join(self.session_dir, 'recording.ecgh') == path:
+                            self._t_episodes = t_eps
+                            self._push_ischemia_to_panels()
+                    t_inversion_async(ecgh_path, segments, _t_done)
         except Exception as e:
             print(f"[Holter UI] ST episodes unavailable: {e}")
         self._st_episodes = episodes
+        self._push_ischemia_to_panels()
+
+    def _push_ischemia_to_panels(self):
+        """Put the ST and T Inversion episodes into the summary and redraw the
+        OVERVIEW and REPLAY tables."""
         if isinstance(getattr(self, '_summary', None), dict):
-            self._summary['st_episodes'] = episodes
+            self._summary['st_episodes'] = getattr(self, '_st_episodes', None)
+            self._summary['t_episodes'] = getattr(self, '_t_episodes', None)
             if hasattr(self, '_expert_panel'):
                 self._expert_panel.update_from_metrics(self._metrics_list, self._summary)
             if hasattr(self, '_replay_panel'):
@@ -2257,6 +2280,7 @@ class HolterMainWindow(QDialog):
     def _refresh_ui(self):
         if isinstance(getattr(self, '_summary', None), dict) and hasattr(self, '_st_episodes'):
             self._summary['st_episodes'] = self._st_episodes
+            self._summary['t_episodes'] = getattr(self, '_t_episodes', None)
         if hasattr(self, '_summary_cards'):
             self._summary_cards.update_summary(self._summary)
         if hasattr(self, '_insight_panel'):
