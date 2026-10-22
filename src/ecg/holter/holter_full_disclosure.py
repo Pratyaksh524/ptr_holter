@@ -4055,6 +4055,20 @@ class HolterFullDisclosureDialog(QDialog):
                     if bbb_reader is not None:
                         bbb_lead_names = list(getattr(bbb_reader, 'lead_names', []) or [])
                         bbb_leads_data = bbb_reader.read_range(source_start, source_start + raw_sig.size / fs)
+                        # Same filter the auto-segment bundle branch block
+                        # gate applies before this exact global-QRS
+                        # measurement (0.5-40 Hz bandpass + 50 Hz notch):
+                        # mains hum on the chest leads otherwise pushes the
+                        # onset/offset search past the real QRS edges (seen:
+                        # 226 ms shown here for a beat the filtered detector
+                        # measured at 158-174 ms, same recording).
+                        if bbb_leads_data is not None:
+                            from .analysis_pipeline import SignalPreprocessor, HolterConfig
+                            _bbb_preproc = SignalPreprocessor(fs=fs, config=HolterConfig.from_clinical_config())
+                            bbb_leads_data = np.vstack([
+                                np.asarray(_bbb_preproc.process(np.asarray(lead, dtype=float)), dtype=float)
+                                for lead in bbb_leads_data
+                            ])
                 except Exception:
                     bbb_leads_data = None
             for i, p in enumerate(peaks):

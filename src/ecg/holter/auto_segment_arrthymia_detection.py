@@ -950,10 +950,9 @@ def _detect_arrhythmias_uncached(
         """Detect an organized fast wide-complex ventricular run."""
         if len(r_peaks) < 4:
             return False
-        beats = [
-            b for b in (measure_beat(window_signal, int(p), fs) for p in r_peaks)
-            if b is not None
-        ]
+        measured = [(int(p), measure_beat(window_signal, int(p), fs)) for p in r_peaks]
+        beat_peaks = [p for p, b in measured if b is not None]
+        beats = [b for _, b in measured if b is not None]
         if len(beats) < 4:
             return False
 
@@ -977,6 +976,28 @@ def _detect_arrhythmias_uncached(
                 if best_start is None or (run_end - run_start) > (best_end - best_start):
                     best_start, best_end = run_start, run_end
                 run_start = None
+        # A window split about evenly between two rhythms (seen: 8 sinus RRs
+        # at 750 ms, then 8 VT RRs at 375 ms) has its median RR in between
+        # (526 ms), so no run sits within 15% of it. Only then, the longest
+        # run of consecutive RRs within 15% of that run's own median is
+        # taken instead -- and only if it is at least 6 RRs long: inside
+        # VFib, 3-4 RRs can match by chance (seen: 318/352/310/304 ms amid
+        # RR 228-3060 ms) and must not read as VT. A window whose core was
+        # found above is unaffected.
+        if best_start is None or (best_end - best_start + 1) < 3:
+            best_start = best_end = None
+            for s in range(len(rr_ms)):
+                e = s
+                while e + 1 < len(rr_ms):
+                    run_median = float(np.median(rr_ms[s:e + 2]))
+                    if np.all(np.abs(rr_ms[s:e + 2] - run_median) <= 0.15 * run_median):
+                        e += 1
+                    else:
+                        break
+                if best_start is None or (e - s) > (best_end - best_start):
+                    best_start, best_end = s, e
+            if best_start is not None and (best_end - best_start + 1) < 6:
+                best_start = best_end = None
         if best_start is None or (best_end - best_start + 1) < 3:
             return False
         core_beats = beats[best_start:best_end + 2]
@@ -1011,13 +1032,31 @@ def _detect_arrhythmias_uncached(
         # (PR >= 100 ms) means the rhythm is supraventricular, not VT.
         # Wide VT recordings can make the generic P-finder report coincidental
         # sub-100ms bumps before QRS which are not conducted sinus P waves.
+        # A P wave can't sit inside the previous beat's QRS: a "P" less than
+        # 120 ms after the previous beat is that beat itself. At 160 bpm the
+        # P search, run from a QRS onset placed late, reached back 370 ms
+        # onto the previous VT complex (PR "310 ms" on 22 of 22 beats) and
+        # called the run supraventricular. Sinus P waves (~150 ms before
+        # their QRS, hundreds of ms after the previous beat) are unaffected.
+        min_after_prev = int(round(0.12 * fs))
+
+        def real_p(i, b):
+            if b.get('p_peak') is None:
+                return True
+            prev = beat_peaks[best_start + i - 1] if best_start + i - 1 >= 0 else None
+            return prev is None or int(b['p_peak']) - prev >= min_after_prev
+
         p_present = sum(
-            1 for b in core_beats
+            1 for i, b in enumerate(core_beats)
             if b.get('p_present') and b.get('p_onset') is not None
             and b.get('q_onset') is not None and b['p_onset'] < b['q_onset']
             and (b.get('pr_ms') is not None and b['pr_ms'] >= 100.0)
+            and real_p(i, b)
         )
-        valid_pr = sum(1 for b in core_beats if b.get('pr_ms') is not None and b['pr_ms'] >= 100.0)
+        valid_pr = sum(
+            1 for i, b in enumerate(core_beats)
+            if b.get('pr_ms') is not None and b['pr_ms'] >= 100.0 and real_p(i, b)
+        )
         return p_present <= 0.50 * len(core_beats) and valid_pr <= 0.50 * len(core_beats)
 
     def _ventricular_tachycardia_core_start(r_peaks, fs):
@@ -1045,6 +1084,23 @@ def _detect_arrhythmias_uncached(
                 if best_start is None or (run_end - run_start) > (best_end - best_start):
                     best_start, best_end = run_start, run_end
                 run_start = None
+        # Same fallback as _is_ventricular_tachycardia_window (>= 6 RRs): a
+        # window split about evenly between sinus and VT has its median RR in
+        # between.
+        if best_start is None or (best_end - best_start + 1) < 3:
+            best_start = best_end = None
+            for s in range(len(rr_ms)):
+                e = s
+                while e + 1 < len(rr_ms):
+                    run_median = float(np.median(rr_ms[s:e + 2]))
+                    if np.all(np.abs(rr_ms[s:e + 2] - run_median) <= 0.15 * run_median):
+                        e += 1
+                    else:
+                        break
+                if best_start is None or (e - s) > (best_end - best_start):
+                    best_start, best_end = s, e
+            if best_start is not None and (best_end - best_start + 1) < 6:
+                best_start = best_end = None
         if best_start is None or (best_end - best_start + 1) < 3:
             return None
         return float(peaks[best_start]) / float(fs)
@@ -1633,6 +1689,25 @@ def _detect_arrhythmias_uncached(
             mismatches == hidden_drift_mismatches and not extras and pp_cv <= 0.12
             and hidden_count <= 0.5 * len(judged)
         )
+        # AFib/Flutter veto only (see the call site): the clearly visible P
+        # waves, in time order, form ONE steady P-P train with at most one
+        # phase reset. Gaps of 2-3 P-P intervals (a P hidden in a QRS) are
+        # part of the train. Seen: at a Mobitz I -> First-degree change the
+        # P timing reset once (gap 1.23 s in a 750 ms train), the chain walk
+        # left the P waves before the reset as "extras", atrial_regular went
+        # false and the window read as Atrial Fibrillation although every P
+        # sat exactly 750 ms from the last. Fibrillatory waves don't form
+        # such a train. atrial_regular itself, and every rule reading it, is
+        # unchanged.
+        clear_times = sorted(c[0] for c in clear)
+        phase_resets = sum(
+            1 for d in np.diff(clear_times)
+            if not any(abs(d - m * pp) <= tol for m in (1, 2, 3))
+        )
+        atrial_regular_for_afib_veto = atrial_regular or (
+            len(clear_times) >= 6 and phase_resets <= 1
+            and hidden_count <= 0.5 * len(judged)
+        )
 
         # PR is measured between the two sharpest landmarks, P peak and R
         # peak, then shifted by this window's typical P-onset-to-P-peak and
@@ -1695,6 +1770,7 @@ def _detect_arrhythmias_uncached(
             'pp_ms': pp * 1000.0 / fs,
             'atrial_regular': atrial_regular,
             'atrial_regular_complete_block': atrial_regular_complete_block,
+            'atrial_regular_for_afib_veto': atrial_regular_for_afib_veto,
             # True when the context came through the original resolved-QRS
             # gate (not the QRS-shape one); the AFib/Flutter veto uses only
             # those, exactly as before the shape gate was added.
@@ -2034,6 +2110,23 @@ def _detect_arrhythmias_uncached(
         if len(core) < 5 or _bundle_branch_block_v1_idx is None or not _bundle_branch_block_lateral_idx \
                 or conduction_lead_idx >= padded_array.shape[0]:
             return None
+        # Same filter the AFib/Flutter/AV-block P-wave rules already use on
+        # this exact signal (0.5-40 Hz bandpass + 50 Hz notch) -- this gate
+        # alone still read raw samples. Mains hum on the chest leads (seen:
+        # V1/V5/V6 2-4x noisier on one recording than another with the same
+        # LBBB) sits inside the 10% slope threshold the QRS onset/offset
+        # search uses, so on a noisy recording the onset was never found on
+        # 50-90% of beats and the window failed outright; on a quieter one
+        # the same LBBB passed. Filtered, QRS onset/offset were found on
+        # every beat on both, width consistent within a few ms either way.
+        if _atrial_preproc is not None:
+            try:
+                padded_array = np.vstack([
+                    np.asarray(_atrial_preproc.process(np.asarray(lead, dtype=float)), dtype=float)
+                    for lead in padded_array
+                ])
+            except Exception:
+                pass
         n = padded_array.shape[1]
         half_sec = int(fs_)
         required = max(3, int(np.ceil(0.75 * len(core))))
@@ -2289,6 +2382,10 @@ def _detect_arrhythmias_uncached(
     window_count = 0
 
     morphological_candidates = []
+    # Ventricular rate (bpm) of each Supraventricular Tachycardia (SVT)
+    # window, keyed by id() of its candidate dict -- for the drop rule after
+    # the loop only; never part of the output segments.
+    _svt_window_rate = {}
     bundle_branch_block_candidates = []
     # Every beat any window judged for a bundle branch block pattern:
     # beat time (s, 2 decimals) -> [(right_pattern, left_pattern), ...].
@@ -2418,7 +2515,7 @@ def _detect_arrhythmias_uncached(
                             # waves at <= 200/min is neither. Mobitz I's grouped
                             # beating plus its changing PR otherwise reads as
                             # "irregular RR, no consistent PR" = AFib.
-                            if atrial_label and av_ctx is not None and av_ctx['atrial_regular'] \
+                            if atrial_label and av_ctx is not None and av_ctx['atrial_regular_for_afib_veto'] \
                                     and av_ctx['qrs_resolved_majority']:
                                 atrial_label = None
                             if atrial_label:
@@ -2479,6 +2576,10 @@ def _detect_arrhythmias_uncached(
                         'end_time_str': e_str,
                         'detected_rhythm': target_morph[0]
                     })
+                    if target_morph[0] == 'Supraventricular Tachycardia (SVT)' and len(core_r_peaks) >= 2:
+                        _svt_rr = float(np.median(np.diff(np.asarray(core_r_peaks, dtype=float)))) / float(fs)
+                        if _svt_rr > 0:
+                            _svt_window_rate[id(morphological_candidates[-1])] = 60.0 / _svt_rr
         except Exception as e:
             print(f"[Auto Arrhythmia Detect] Window error {current_time:.1f}s: {e}")
 
@@ -2512,9 +2613,20 @@ def _detect_arrhythmias_uncached(
     # way: 2:1 Atrial Flutter at 150/min is regular with one F wave visible
     # between beats, which reads exactly like P-on-T (seen: one such window
     # inside a Flutter episode).
+    # Only SVT windows at a 2:1-Flutter ventricular rate (atrial 250-350/min
+    # halved: ~125-175 bpm) are dropped. A faster one can't be 2:1 Flutter
+    # (seen: real SVT at 200 bpm, RR 300 ms, starting right after a 5:1
+    # Flutter -- every SVT window within 20 s was dropped and Flutter was
+    # stretched 14 s over it). A window whose rate is unknown is dropped as
+    # before.
+    def _svt_could_be_2to1_flutter(m):
+        rate = _svt_window_rate.get(id(m))
+        return rate is None or 125.0 <= rate <= 175.0
+
     morphological_candidates = [
         m for m in morphological_candidates
-        if not (('av block' in m['label'].lower() or m['label'] == 'Supraventricular Tachycardia (SVT)')
+        if not (('av block' in m['label'].lower()
+                 or (m['label'] == 'Supraventricular Tachycardia (SVT)' and _svt_could_be_2to1_flutter(m)))
                 and any(abs(m['start_sec'] - s) <= window_size * 2 for s in _atrial_starts))
     ]
 
