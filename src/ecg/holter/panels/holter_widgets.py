@@ -57,6 +57,12 @@ try:
 except ImportError:
     gaussian_lowpass = None
 
+try:
+    # Baseline-drift (DFT) filter shared with the 12-lead dashboard.
+    from ...ecg_filters import apply_dft_filter
+except ImportError:
+    apply_dft_filter = None
+
 
 # 6. HOLTER RR / HR TREND CANVAS
 class HolterRRTrendCanvas(QWidget):
@@ -950,18 +956,37 @@ class ECGStripCanvas(QWidget):
         # the recording has confirmed mains interference.
         if len(raw_data) > 15:
             try:
+                # Baseline drift (breathing, movement) removed for display with
+                # the same DFT filter the 12-lead dashboard uses: 0.5 Hz
+                # zero-phase Butterworth high-pass (apply_dft_filter). Zero
+                # phase, so the ST segment is not shifted. The strip is padded
+                # by mirroring up to 2 s on each side first: a 0.5 Hz high-pass
+                # run on a short page bends its first and last second.
+                # Display-only: _raw_data below stays unfiltered for PR/QRS
+                # measurement, and detection reads the recording itself.
+                display_input = raw_data
+                if apply_dft_filter is not None and raw_data.size > 30:
+                    pad = int(min(raw_data.size - 1, 2.0 * float(self._fs or 500)))
+                    mirrored = np.pad(raw_data, (pad, pad), mode="reflect")
+                    display_input = np.asarray(
+                        apply_dft_filter(mirrored, float(self._fs or 500), "0.5"), dtype=float
+                    )[pad:pad + raw_data.size]
+                    # Keep the strip's own level: the high-pass removes the
+                    # DC offset too, and the vertical placement below works
+                    # from the signal's median.
+                    display_input = display_input + float(np.median(raw_data))
                 if gaussian_lowpass is not None:
                     # Remove tiny isolated display spikes before the
                     # morphology-safe Gaussian. This is display-only and
                     # does not alter measurement or arrhythmia input.
-                    if raw_data.size >= 3:
-                        padded = np.pad(raw_data, (1, 1), mode="edge")
+                    if display_input.size >= 3:
+                        padded = np.pad(display_input, (1, 1), mode="edge")
                         display_data = np.median(
                             np.stack((padded[:-2], padded[1:-1], padded[2:]), axis=0),
                             axis=0,
                         )
                     else:
-                        display_data = raw_data
+                        display_data = display_input
                     # Keep a second Gaussian pass display-only. Cascading
                     # Gaussian stages suppresses residual fine noise without
                     # the overshoot/ringing that the old Butterworth path
@@ -969,7 +994,7 @@ class ECGStripCanvas(QWidget):
                     display_data = gaussian_lowpass(display_data, 35.0, self._fs)
                     self._data = gaussian_lowpass(display_data, 35.0, self._fs)
                 else:
-                    self._data = raw_data
+                    self._data = display_input
             except Exception:
                 self._data = raw_data
         else:

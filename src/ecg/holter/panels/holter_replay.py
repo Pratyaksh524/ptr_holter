@@ -48,6 +48,8 @@ from ..tool_engine import ECGToolEngine
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas, HolterRRTrendCanvas, HRTrendCanvas
 
 # 6. HOLTER REPLAY PANEL
+from ..ischemia_detection import ST_DEPRESSION, ST_ELEVATION, format_st_summary
+
 class HolterReplayPanel(QWidget):
     playback_state_changed = pyqtSignal(bool)
     seek_requested = pyqtSignal(float)
@@ -884,6 +886,10 @@ class HolterReplayPanel(QWidget):
             set_lbl("sve", summary.get('sve_beats', 0))
             set_lbl("sdnn", f"{summary.get('sdnn', 0)} ms")
             set_lbl("rmssd", f"{summary.get('rmssd', 0)} ms")
+        # ST episodes arrive through the summary; redraw the overview table
+        # with the metrics it was last drawn from.
+        if getattr(self, '_overview_args', None) is not None:
+            self._update_overview_table(*self._overview_args)
 
     def _slider_sec_to_value(self, seconds: float) -> int:
         units = max(1, int(getattr(self, "_slider_units_per_sec", 100)))
@@ -1199,6 +1205,7 @@ class HolterReplayPanel(QWidget):
     def _update_overview_table(self, metrics_list: list, rr_n: list):
         if not hasattr(self, "_overview_table"):
             return
+        self._overview_args = (metrics_list, rr_n)
         summary_rows = self._compute_replay_overview(metrics_list, rr_n)
         self._overview_table.setRowCount(len(summary_rows))
         for r, (name, value) in enumerate(summary_rows):
@@ -1246,6 +1253,13 @@ class HolterReplayPanel(QWidget):
         st_dep_vals = [v for v in st_vals if v < 0]
         st_elevation_str = f"{max(st_elev_vals):.2f} mV" if st_elev_vals else "-"
         st_depression_str = f"{min(st_dep_vals):.2f} mV" if st_dep_vals else "-"
+        # Once auto detection has run, the ST episodes it found
+        # (ischemia_detection: 12 leads, contiguous-lead criteria, >= 1 min)
+        # replace that single worst Lead II value.
+        st_episodes = (getattr(self, '_summary', None) or {}).get('st_episodes')
+        if st_episodes is not None:
+            st_elevation_str = format_st_summary(st_episodes, ST_ELEVATION)
+            st_depression_str = format_st_summary(st_episodes, ST_DEPRESSION)
 
         return [
             ("Total NNs", str(total_beats)),

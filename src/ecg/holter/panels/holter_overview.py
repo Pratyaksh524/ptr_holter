@@ -46,6 +46,8 @@ from ..holter_helpers import (
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas, HolterRRTrendCanvas, HRTrendCanvas
 
 # 4. HOLTER OVERVIEW PANEL
+from ..ischemia_detection import ST_DEPRESSION, ST_ELEVATION, format_st_summary
+
 class HolterOverviewPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -392,8 +394,8 @@ class HolterExpertReviewPanel(QWidget):
             ("Pacing Min HR", "-"),
             ("Longest RR", f"{summary.get('longest_rr_ms', 0)/1000:.2f}s"),
             ("RRI (\u22652.0s)", f"{summary.get('pauses', 0)}"),
-            ("ST Elevation", "-"),
-            ("ST Depression", "-"),
+            ("ST Elevation", format_st_summary(summary.get('st_episodes'), ST_ELEVATION)),
+            ("ST Depression", format_st_summary(summary.get('st_episodes'), ST_DEPRESSION)),
         ]
         self._overview.setRowCount(len(rows))
         for i, (k, v) in enumerate(rows):

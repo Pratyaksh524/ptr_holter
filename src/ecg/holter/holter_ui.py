@@ -1966,6 +1966,8 @@ class HolterMainWindow(QDialog):
                     QTimer.singleShot(0, self.close)
             else:
                 self._last_active_tab_name = tab_name
+                if tab_name in ("OVERVIEW", "REPLAY"):
+                    QTimer.singleShot(0, self._refresh_st_episodes)
                 is_recordings = (tab_name == "RECORDINGS")
                 self._tabs.tabBar().setVisible(not is_recordings)
                 # The record browser (reached via "View Previous Recording",
@@ -2172,7 +2174,46 @@ class HolterMainWindow(QDialog):
             self._load_session()
             self._refresh_ui()
 
+    def _refresh_st_episodes(self):
+        """Put the ST Elevation / ST Depression episodes found by auto
+        detection (ischemia_detection, run inside detect_arrhythmias()) into
+        the summary as 'st_episodes' and redraw the OVERVIEW and REPLAY
+        tables. Same gate as the report: only once "Auto Arrhythmia
+        Detection" has been clicked for this recording; before that the rows
+        stay "-". Uses the cached detection result; if there is none yet,
+        detection runs in the background and the rows fill in when done."""
+        session_dir = getattr(self, 'session_dir', '') or ''
+        ecgh_path = os.path.join(session_dir, 'recording.ecgh') if session_dir else ''
+        episodes = None
+        try:
+            from .auto_segment_arrthymia_detection import (
+                detect_arrhythmias_async, get_cached_detection, is_auto_marking_enabled)
+            from .ischemia_detection import ST_LABELS
+            if ecgh_path and os.path.exists(ecgh_path) and is_auto_marking_enabled(session_dir):
+                segments = get_cached_detection(ecgh_path)
+                if segments is not None:
+                    episodes = [seg for seg in segments if seg.get('label') in ST_LABELS]
+                elif not getattr(self, '_st_detection_pending', False):
+                    self._st_detection_pending = True
+
+                    def _done(_segments, path=ecgh_path):
+                        self._st_detection_pending = False
+                        if getattr(self, 'session_dir', '') and                                 os.path.join(self.session_dir, 'recording.ecgh') == path:
+                            self._refresh_st_episodes()
+                    detect_arrhythmias_async(ecgh_path, _done)
+        except Exception as e:
+            print(f"[Holter UI] ST episodes unavailable: {e}")
+        self._st_episodes = episodes
+        if isinstance(getattr(self, '_summary', None), dict):
+            self._summary['st_episodes'] = episodes
+            if hasattr(self, '_expert_panel'):
+                self._expert_panel.update_from_metrics(self._metrics_list, self._summary)
+            if hasattr(self, '_replay_panel'):
+                self._replay_panel.update_summary(self._summary)
+
     def _refresh_ui(self):
+        if isinstance(getattr(self, '_summary', None), dict) and hasattr(self, '_st_episodes'):
+            self._summary['st_episodes'] = self._st_episodes
         if hasattr(self, '_summary_cards'):
             self._summary_cards.update_summary(self._summary)
         if hasattr(self, '_insight_panel'):

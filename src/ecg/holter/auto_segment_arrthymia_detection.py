@@ -401,6 +401,25 @@ def _detect_arrhythmias_uncached(
     # amount of padding keeps P/QRS searches away from each read chunk's
     # artificial edges.
     rate_beat_metrics = [None] * len(all_r_peaks)
+    # The Sinus Bradycardia / Tachycardia gate measures P/PR/QRS on this
+    # parallel list instead: the same beats measured on the signal after a
+    # 25 Hz zero-phase low-pass, which is the signal the top-bar PR/QRS and
+    # measure_beat's PR logic were tuned on. On the raw samples a small bump
+    # (60-70 counts) ~55 ms before the QRS is closer than the real P wave, so
+    # the strict P search takes it, its PR (10-20 ms) fails the 60-400 ms
+    # range, and a clean 45 bpm run had PR on 0 of 12 beats and no Bradycardia
+    # label (the top bar showed PR 152 ms for the same beats, as it reads the
+    # filtered strip). rate_beat_metrics itself stays raw: the Third-degree
+    # AV Block edge refinement reads it and is unchanged.
+    rate_gate_metrics = [None] * len(all_r_peaks)
+    from scipy.signal import butter as _butter, filtfilt as _filtfilt
+    _gate_ba = _butter(2, 25.0 / (float(fs) / 2.0), btype='lowpass')
+
+    def _gate_filter(x):
+        try:
+            return _filtfilt(_gate_ba[0], _gate_ba[1], x)
+        except Exception:
+            return x
     # Lead II is the preferred conduction lead: it is the most reliable lead
     # for visible P waves and PR intervals in these recordings. R-peaks still
     # come from the strongest detection lead, but P/PR/QRS gating must not be
@@ -421,6 +440,7 @@ def _detect_arrhythmias_uncached(
             metric_cursor += 1
             continue
         metric_signal = np.asarray(metric_data[conduction_lead_idx], dtype=float)
+        gate_signal = _gate_filter(metric_signal)
         while metric_cursor < len(all_r_peaks):
             peak_sec = all_r_peaks[metric_cursor]
             if peak_sec >= metric_end - metric_pad_sec and metric_end < total_duration:
@@ -439,6 +459,14 @@ def _detect_arrhythmias_uncached(
                     metric['_p_time_sec'] = metric_start + float(metric['p_peak']) / float(fs)
                 if metric:
                     metric['_r_time_sec'] = peak_sec
+                gate_metric = measure_beat(
+                    gate_signal, local_peak, fs, strict_pr=True, prev_rr_ms=prev_rr_ms
+                )
+                rate_gate_metrics[metric_cursor] = gate_metric
+                if gate_metric and gate_metric.get('p_peak') is not None:
+                    gate_metric['_p_time_sec'] = metric_start + float(gate_metric['p_peak']) / float(fs)
+                if gate_metric:
+                    gate_metric['_r_time_sec'] = peak_sec
             metric_cursor += 1
 
     # Calculate beat-to-beat RR intervals
@@ -486,7 +514,7 @@ def _detect_arrhythmias_uncached(
         its own list, see brady_r_peaks below.
         """
         if metrics is None:
-            metrics = rate_beat_metrics
+            metrics = rate_gate_metrics
         if start_idx is None or end_idx is None:
             return False
         left = max(0, int(start_idx))
@@ -797,7 +825,7 @@ def _detect_arrhythmias_uncached(
 
         if _recovered_beats:
             brady_r_peaks = sorted(set(all_r_peaks) | set(_recovered_beats))
-            _metric_at = dict(zip(all_r_peaks, rate_beat_metrics))
+            _metric_at = dict(zip(all_r_peaks, rate_gate_metrics))
             brady_beat_metrics = []
             for k, peak_sec in enumerate(brady_r_peaks):
                 if peak_sec in _metric_at:
@@ -810,7 +838,7 @@ def _detect_arrhythmias_uncached(
                 m_end = min(total_duration, peak_sec + 1.0)
                 m_data = reader.read_range(m_start, m_end)
                 if m_data is not None and conduction_lead_idx < m_data.shape[0]:
-                    m_sig = np.asarray(m_data[conduction_lead_idx], dtype=float)
+                    m_sig = _gate_filter(np.asarray(m_data[conduction_lead_idx], dtype=float))
                     local_peak = int(round((peak_sec - m_start) * fs))
                     prev_rr_ms = (peak_sec - brady_r_peaks[k - 1]) * 1000.0 if k > 0 else None
                     if 0 < local_peak < len(m_sig):
@@ -825,7 +853,7 @@ def _detect_arrhythmias_uncached(
                 for k in range(len(brady_r_peaks) - 1)
             ]
         else:
-            brady_r_peaks, brady_beat_metrics, brady_rr_ms = all_r_peaks, rate_beat_metrics, all_rr_ms
+            brady_r_peaks, brady_beat_metrics, brady_rr_ms = all_r_peaks, rate_gate_metrics, all_rr_ms
 
         in_brady = False
         brady_start_idx = None
@@ -3376,6 +3404,17 @@ def _detect_arrhythmias_uncached(
 
     final_segments.extend(bundle_branch_block_segments)
     final_segments.sort(key=lambda x: x['start_sec'])
+
+    # Ischemia (ST Elevation / ST Depression): its own layer, after every
+    # rhythm segment is final. It reads the rhythm segments only to go
+    # rhythm by rhythm and to skip VT/VFib/LBBB; it never changes them.
+    try:
+        from .ischemia_detection import detect_st_episodes
+        final_segments.extend(detect_st_episodes(
+            reader, rhythm_segments=list(final_segments), make_time_strs=make_time_strs))
+        final_segments.sort(key=lambda x: x['start_sec'])
+    except Exception as e:
+        print(f"[Auto Arrhythmia Detect] Ischemia detection error: {e}")
 
     print(f"[Auto Arrhythmia Detect] Found {len(final_segments)} exact rhythm segments:")
     for s in final_segments:
