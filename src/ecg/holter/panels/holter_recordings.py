@@ -74,55 +74,121 @@ class HolterRecordManagementPanel(QWidget):
         return None
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
 
-        actions = QHBoxLayout()
-        actions.setSpacing(6)
+        # Toolbar card: title + count, search, date filter, actions.
+        toolbar = QFrame()
+        toolbar.setObjectName("recToolbar")
+        toolbar.setStyleSheet(
+            f"#recToolbar {{ background:{UI_PANEL}; border:1px solid {UI_BORDER}; border-radius:10px; }}"
+        )
+        actions = QHBoxLayout(toolbar)
+        actions.setContentsMargins(14, 10, 14, 10)
+        actions.setSpacing(8)
+
+        title_box = QVBoxLayout()
+        title_box.setSpacing(0)
+        title = QLabel("Recordings")
+        title.setStyleSheet(f"color:{UI_TEXT}; font-size:15px; font-weight:bold; background:transparent;")
+        self._count_label = QLabel("")
+        self._count_label.setStyleSheet(f"color:{UI_MUTED}; font-size:11px; background:transparent;")
+        title_box.addWidget(title)
+        title_box.addWidget(self._count_label)
+        actions.addLayout(title_box)
+        actions.addSpacing(18)
+
+        field_style = f"""
+            background:{UI_BG}; color:{UI_TEXT}; border:1px solid {UI_BORDER};
+            border-radius:8px; padding:7px 10px; font-size:12px;
+        """
         self._search = QLineEdit()
-        self._search.setPlaceholderText("Search patient / reporter / status")
-        self._search.setStyleSheet(f"QLineEdit{{background:{COL_DARK};color:{COL_GREEN};border:1px solid {COL_GREEN_DRK};"
-                                   f"border-radius:4px;padding:6px;font-size:12px;}}")
+        self._search.setPlaceholderText("Search patient, date, duration or status")
+        self._search.setClearButtonEnabled(True)
+        self._search.setStyleSheet(
+            f"QLineEdit {{ {field_style} }} QLineEdit:focus {{ border:1px solid {UI_ACCENT}; }}"
+        )
         self._search.textChanged.connect(self.refresh_records)
         self._filter = QComboBox()
         self._filter.addItems(["All", "Today", "Yesterday", "This Week", "This Month", "This Year"])
+        self._filter.setMinimumWidth(130)
         self._filter.setStyleSheet(f"""
-            QComboBox {{
-                background:{COL_DARK}; color:{COL_GREEN}; border:1px solid {COL_GREEN_DRK};
-                border-radius:4px; padding:6px; font-size:12px;
-            }}
+            QComboBox {{ {field_style} }}
+            QComboBox:focus {{ border:1px solid {UI_ACCENT}; }}
+            QComboBox::drop-down {{ border:none; width:22px; }}
             QComboBox QAbstractItemView {{
-                background:{COL_DARK}; color:white; selection-background-color:{COL_GREEN_DRK};
+                background:{UI_PANEL}; color:{UI_TEXT}; border:1px solid {UI_BORDER};
+                selection-background-color:#1E3A5F; outline:0;
             }}
         """)
         self._filter.currentTextChanged.connect(self.refresh_records)
-        actions.addWidget(QLabel("Search:", styleSheet=f"color:{COL_GREEN};font-size:12px;"))
-        actions.addWidget(self._search, 2)
-        actions.addWidget(QLabel("Filter:", styleSheet=f"color:{COL_GREEN};font-size:12px;"))
+        label_style = f"color:{UI_MUTED}; font-size:12px; font-weight:bold; background:transparent;"
+        actions.addWidget(QLabel("Search", styleSheet=label_style))
+        actions.addWidget(self._search, 3)
+        actions.addSpacing(6)
+        actions.addWidget(QLabel("Date", styleSheet=label_style))
         actions.addWidget(self._filter)
+        actions.addSpacing(10)
         self._action_buttons = {}
         for txt in ["Browse", "Import", "Export", "Backup", "Delete"]:
             btn = QPushButton(txt)
-            btn.setStyleSheet(_style_btn())
+            btn.setCursor(Qt.PointingHandCursor)
+            if txt == "Delete":
+                # Destructive action: same button, red text so it stands apart.
+                btn.setStyleSheet(_style_btn(fg="#FF6B6B", hover="#3A1D24"))
+            else:
+                btn.setStyleSheet(_style_btn())
             self._action_buttons[txt] = btn
             actions.addWidget(btn)
-        layout.addLayout(actions)
+        layout.addWidget(toolbar)
 
         cols = ["Name","Age","Gender","Record Time","Duration","Channel","Import Time","Status","Reporter","Conclusion"]
         self._table = QTableWidget(0, len(cols))
         self._table.setHorizontalHeaderLabels(cols)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        header = self._table.horizontalHeader()
+        header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header.setHighlightSections(False)
+        header.setFixedHeight(36)
+        # Name and Conclusion take the free width; the short columns stay compact.
+        _fixed_widths = {1: 60, 2: 80, 3: 160, 4: 100, 5: 72, 6: 160, 7: 120, 8: 96}
+        for col in range(len(cols)):
+            if col in _fixed_widths:
+                header.setSectionResizeMode(col, QHeaderView.Fixed)
+                self._table.setColumnWidth(col, _fixed_widths[col])
+            else:
+                header.setSectionResizeMode(col, QHeaderView.Stretch)
+        for col in (1, 2, 4, 5, 7):
+            self._table.horizontalHeaderItem(col).setTextAlignment(Qt.AlignCenter)
+        self._table.verticalHeader().setDefaultSectionSize(34)
+        self._table.verticalHeader().setFixedWidth(40)
+        self._table.verticalHeader().setDefaultAlignment(Qt.AlignCenter)
+        self._table.setAlternatingRowColors(True)
+        self._table.setShowGrid(False)
+        self._table.setWordWrap(False)
         self._table.setStyleSheet(
             _table_style() +
-            """
-            QTableWidget::item:selected {
+            f"""
+            QTableWidget {{ border-radius:10px; }}
+            QHeaderView::section {{
+                background:{UI_PANEL_ALT}; color:{UI_MUTED};
+                font-size:11px; font-weight:bold; padding:6px 10px;
+                border:none; border-bottom:1px solid {UI_BORDER};
+            }}
+            QHeaderView::section:vertical {{
+                color:#5F708A; font-weight:normal; padding:0px;
+                border:none; border-right:1px solid {UI_BORDER};
+            }}
+            QTableCornerButton::section {{ background:{UI_PANEL_ALT}; border:none; }}
+            QTableWidget::item {{ padding:4px 10px; border-bottom:1px solid #18263F; }}
+            QTableWidget::item:selected {{
                 background-color: rgba(66, 153, 225, 70);
                 color: #F3F7FB;
-                border: 1px solid rgba(255, 255, 255, 90);
-            }
-            QTableWidget::item:selected:active {
+                border-top: 1px solid rgba(255, 255, 255, 60);
+                border-bottom: 1px solid rgba(255, 255, 255, 60);
+            }}
+            QTableWidget::item:selected:active {{
                 background-color: rgba(66, 153, 225, 110);
-            }
+            }}
             """
         )
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -136,6 +202,11 @@ class HolterRecordManagementPanel(QWidget):
         self._table.itemSelectionChanged.connect(self._sync_selected_session)
         self._table.doubleClicked.connect(self._on_double_click)
         layout.addWidget(self._table, 1)
+        self._empty_label = QLabel("No recordings match this search / date filter.")
+        self._empty_label.setAlignment(Qt.AlignCenter)
+        self._empty_label.setStyleSheet(f"color:{UI_MUTED}; font-size:13px; padding:24px; background:transparent;")
+        self._empty_label.hide()
+        layout.addWidget(self._empty_label)
         self._action_buttons["Browse"].clicked.connect(self._browse_root)
         self._action_buttons["Import"].clicked.connect(self._import_session)
         self._action_buttons["Export"].clicked.connect(self._export_session)
@@ -145,7 +216,10 @@ class HolterRecordManagementPanel(QWidget):
     def refresh_records(self):
         self._table.setRowCount(0)
         self._selected_session = ""
-        if not os.path.isdir(self.output_dir): return
+        if not os.path.isdir(self.output_dir):
+            self._count_label.setText("0 recordings")
+            self._empty_label.setVisible(True)
+            return
         query = self._search.text().strip().lower()
         filter_label = self._filter.currentText()
         now = datetime.now()
@@ -240,12 +314,27 @@ class HolterRecordManagementPanel(QWidget):
             if is_active:
                 active_row = r
             for c, v in enumerate(row_values):
-                item = QTableWidgetItem(str(v))
-                item.setForeground(QColor(COL_GREEN if c == 0 else COL_WHITE))
+                text, colour, bold, italic = self._display_cell(c, str(v))
+                item = QTableWidgetItem(text)
+                item.setForeground(QColor(colour))
+                if bold or italic:
+                    font = item.font()
+                    font.setBold(bold)
+                    font.setItalic(italic)
+                    item.setFont(font)
+                if c in (1, 2, 4, 5, 7):
+                    item.setTextAlignment(Qt.AlignCenter)
+                else:
+                    item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                if c == 0:
+                    item.setToolTip(session_dir)
                 item.setData(Qt.UserRole, session_dir)
                 if is_active:
                     item.setBackground(QColor(46, 84, 137, 150))  # Semi-transparent blue highlight
                 self._table.setItem(r, c, item)
+        count = self._table.rowCount()
+        self._count_label.setText(f"{count} recording{'s' if count != 1 else ''}")
+        self._empty_label.setVisible(count == 0)
         if self._table.rowCount() > 0:
             # Select the recording that is currently open, not just the
             # newest one, so Browse shows the user where they are.
@@ -253,6 +342,26 @@ class HolterRecordManagementPanel(QWidget):
             self._table.selectRow(row)
             self._table.scrollToItem(self._table.item(row, 0))
             self._sync_selected_session()
+
+    @staticmethod
+    def _display_cell(col: int, value: str):
+        """(text, colour, bold, italic) of one table cell. Display only: the
+        row values used for searching are not changed."""
+        empty = value.strip() in ("", "-", "Select", "None")
+        if col == 0:  # Name
+            if value.strip().lower() in ("", "unknown"):
+                return "Unknown patient", UI_MUTED, False, False
+            return value, COL_GREEN, True, False
+        if col in (1, 2, 9) and empty:  # Age, Gender, Conclusion not filled in
+            return "—", "#5F708A", False, False
+        if col == 4 and empty:  # Duration unknown
+            return "—", "#5F708A", False, False
+        if col == 7:  # Status
+            ok = value.strip().lower() == "completed"
+            return f"●  {value}", UI_SUCCESS if ok else UI_WARNING, True, False
+        if col == 8:  # Reporter
+            return value, UI_MUTED, False, False
+        return value, UI_TEXT, False, False
 
     def _open_row(self, row, _column=0):
         item = self._table.item(row, 0)

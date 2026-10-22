@@ -314,6 +314,32 @@ def _style_btn(bg=UI_PANEL_ALT, fg=UI_TEXT, hover="#1A2C49"):
     """
 
 
+def _chip_html(caption: str, value, value_color: str = UI_TEXT) -> str:
+    """Header chip text: small muted caption, then the value in bold."""
+    from html import escape
+    return (f"<span style='color:{UI_MUTED};font-size:9px;font-weight:700;letter-spacing:1px;'>{escape(caption.upper())}</span>"
+            f"&nbsp;&nbsp;<span style='color:{value_color};font-size:11px;font-weight:700;'>{escape(str(value))}</span>")
+
+
+def _chip_style(accent: str = UI_BORDER) -> str:
+    return (f"QLabel{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-left:3px solid {accent};"
+            f"border-radius:6px;padding:5px 12px;}}")
+
+
+def _style_bar_btn() -> str:
+    return f"""
+        QPushButton {{
+            background: {UI_PANEL_ALT}; color: {UI_TEXT};
+            border: 1px solid {UI_BORDER}; border-radius: 6px;
+            padding: 4px 14px; font-size: 11px; font-weight: 700;
+        }}
+        QPushButton:hover {{ background: #1A2C49; border-color: {UI_ACCENT}; }}
+        QPushButton:pressed {{ background: {UI_PANEL}; border-color: {UI_ACCENT_HOVER}; }}
+        QPushButton:checked {{ background: {UI_ACCENT}; border-color: #5EA4FF; color: {UI_TEXT}; }}
+        QPushButton:disabled {{ background: #1A2233; color: #5F708A; border-color: #2A3953; }}
+    """
+
+
 def _style_active_btn():
     return f"""
         QPushButton {{
@@ -1099,6 +1125,15 @@ class HolterMainWindow(QDialog):
     def _recordings_panel(self):
         return getattr(self, '_record_mgmt_panel', None)
 
+    def _sync_filter_buttons(self, label=None):
+        """Highlight the top-bar date filter that the record browser is using."""
+        panel = self._recordings_panel()
+        combo = getattr(panel, '_filter', None) if panel is not None else None
+        if combo is not None:
+            label = combo.currentText()
+        for name, btn in getattr(self, '_filter_buttons', {}).items():
+            btn.setChecked(name == (label or "All"))
+
     def _open_recordings_folder(self):
         if self._is_replay_active():
             return
@@ -1421,25 +1456,27 @@ class HolterMainWindow(QDialog):
         tb_layout = QHBoxLayout(title_bar)
         tb_layout.setContentsMargins(16, 0, 16, 0)
         tb_layout.setSpacing(14)
-        self._mode_badge = QLabel("LIVE" if self._writer else "REVIEW")
+        self._mode_badge = QLabel("●  LIVE" if self._writer else "●  REVIEW")
         self._mode_badge.setStyleSheet(
-            f"background:{'#7A2633' if self._writer else '#124936'};color:{UI_TEXT};"
-            f"border:1px solid {UI_BORDER};border-radius:12px;padding:5px 12px;font-size:11px;font-weight:700;"
+            f"background:{'#3A1520' if self._writer else '#0E3326'};"
+            f"color:{'#FF6B6B' if self._writer else UI_SUCCESS};"
+            f"border:1px solid {'#7A2633' if self._writer else '#206B51'};border-radius:12px;"
+            f"padding:0px 12px;font-size:11px;font-weight:700;letter-spacing:1px;"
         )
-        tb_layout.addWidget(self._mode_badge)
+        self._mode_badge.setFixedHeight(26)
+        tb_layout.addWidget(self._mode_badge, 0, Qt.AlignVCenter)
         app_title = QLabel("Comprehensive ECG Analysis")
-        app_title.setStyleSheet(f"color:{UI_TEXT};font-size:18px;font-weight:700;border:none;")
+        app_title.setStyleSheet(f"color:{UI_TEXT};font-size:18px;font-weight:700;border:none;background:transparent;")
         tb_layout.addWidget(app_title)
         dur_text = self._summary.get('duration_sec', 0)
         dur_h = int(dur_text // 3600)
         dur_m = int((dur_text % 3600) // 60)
         dur_s = int(dur_text % 60)
-        self._dur_label = QLabel(f"{dur_h:02d}h {dur_m:02d}m {dur_s:02d}s")
-        self._dur_label.setStyleSheet(
-            f"color:{UI_TEXT};font-size:13px;font-weight:700;background:{UI_PANEL_ALT};"
-            f"padding:7px 12px;border-radius:8px;border:1px solid {UI_BORDER};"
-        )
-        tb_layout.addWidget(self._dur_label)
+        self._dur_label = QLabel(_chip_html("Duration", f"{dur_h:02d}h {dur_m:02d}m {dur_s:02d}s"))
+        self._dur_label.setTextFormat(Qt.RichText)
+        self._dur_label.setStyleSheet(_chip_style(UI_ACCENT))
+        self._dur_label.setFixedHeight(30)
+        tb_layout.addWidget(self._dur_label, 0, Qt.AlignVCenter)
         tb_layout.addStretch()
         self.gen_report_btn = QPushButton("Generate Report")
         self.gen_report_btn.setStyleSheet(
@@ -1473,65 +1510,59 @@ class HolterMainWindow(QDialog):
         patient_name = self.patient_info.get("patient_name") or self.patient_info.get("name") or "Unknown Patient"
         doctor_name = self.patient_info.get("doctor") or "No referring doctor"
         session_name = os.path.basename(self.session_dir) if self.session_dir else "Active Session"
-        self._patient_chip = QLabel(f"Patient: {patient_name}")
-        self._patient_chip.setStyleSheet(f"background:#123B2D;color:{UI_TEXT};border:1px solid #206B51;border-radius:14px;padding:6px 12px;font-size:11px;font-weight:700;")
+        self._patient_chip = QLabel(_chip_html("Patient", patient_name, UI_SUCCESS))
+        self._patient_chip.setStyleSheet(_chip_style(UI_SUCCESS))
         sb_layout.addWidget(self._patient_chip)
-        self._doctor_chip = QLabel(f"Doctor: {doctor_name}")
-        self._doctor_chip.setStyleSheet(f"background:{UI_PANEL};color:{UI_MUTED};border:1px solid {UI_BORDER};border-radius:14px;padding:6px 12px;font-size:11px;font-weight:600;")
+        self._doctor_chip = QLabel(_chip_html("Doctor", doctor_name))
+        self._doctor_chip.setStyleSheet(_chip_style())
         sb_layout.addWidget(self._doctor_chip)
-        self._session_chip = QLabel(f"Session: {session_name}")
-        self._session_chip.setStyleSheet(f"background:{UI_PANEL};color:{UI_MUTED};border:1px solid {UI_BORDER};border-radius:14px;padding:6px 12px;font-size:11px;font-weight:600;")
+        self._session_chip = QLabel(_chip_html("Session", session_name))
+        self._session_chip.setStyleSheet(_chip_style())
         sb_layout.addWidget(self._session_chip)
-        self._rec_time_chip = QLabel("Recording: --")
-        self._rec_time_chip.setStyleSheet(f"background:{UI_PANEL};color:{UI_MUTED};border:1px solid {UI_BORDER};border-radius:14px;padding:6px 12px;font-size:11px;font-weight:600;")
+        self._rec_time_chip = QLabel(_chip_html("Recording", "--"))
+        self._rec_time_chip.setStyleSheet(_chip_style())
         sb_layout.addWidget(self._rec_time_chip)
+        for chip in (self._patient_chip, self._doctor_chip, self._session_chip, self._rec_time_chip):
+            chip.setTextFormat(Qt.RichText)
+            chip.setFixedHeight(30)
         sb_layout.addStretch()
         self._analysis_state = QLabel("Clinical review mode")
-        self._analysis_state.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:600;border:none;")
+        self._analysis_state.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:600;border:none;background:transparent;")
         sb_layout.addWidget(self._analysis_state)
         main_layout.addWidget(session_bar)
 
         action_bar = QFrame()
-        action_bar.setStyleSheet("""
-            QFrame {
+        action_bar.setObjectName("holterActionBar")
+        action_bar.setStyleSheet(f"""
+            QFrame#holterActionBar {{
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #3D444B, stop:0.5 #20252A, stop:1 #0B0D0F);
-                border-bottom: 1px solid #56616B;
-            }
+                    stop:0 {UI_PANEL}, stop:1 {UI_BG});
+                border-bottom: 1px solid {UI_BORDER};
+            }}
         """)
         ab_layout = QHBoxLayout(action_bar)
-        ab_layout.setContentsMargins(8, 6, 8, 6)
+        ab_layout.setContentsMargins(12, 6, 12, 6)
         ab_layout.setSpacing(6)
         self._action_buttons = {}
         for label in ["Browse", "Search", "Analyse", "View", "Import", "Backup"]:
             btn = QPushButton(label)
-            btn.setFixedHeight(30)
-            btn.setStyleSheet("""
-                QPushButton {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 #59636D, stop:0.5 #30363C, stop:1 #171A1D);
-                    color: #FFFFFF; border: 1px solid #78838D;
-                    border-radius: 5px; padding: 5px 13px; font-weight: 700;
-                }
-                QPushButton:hover { background: #657481; border-color: #AEB8C0; }
-                QPushButton:pressed { background: #171B1F; }
-            """)
+            btn.setFixedHeight(28)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(_style_bar_btn())
             self._action_buttons[label] = btn
             ab_layout.addWidget(btn)
         ab_layout.addStretch()
+        show_lbl = QLabel("SHOW")
+        show_lbl.setStyleSheet(f"color:{UI_MUTED};font-size:9px;font-weight:700;letter-spacing:1px;border:none;background:transparent;padding-right:4px;")
+        ab_layout.addWidget(show_lbl)
         self._filter_buttons = {}
         for label in ["All", "Today", "Yesterday", "This Week", "This Month", "This Year"]:
             btn = QPushButton(label)
-            btn.setFixedHeight(30)
-            btn.setStyleSheet("""
-                QPushButton {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 #4B545D, stop:1 #20252A);
-                    color: #FFFFFF; border: 1px solid #68747E;
-                    border-radius: 5px; padding: 5px 11px; font-weight: 600;
-                }
-                QPushButton:hover { background: #5E6A75; color: #FFFFFF; }
-            """)
+            btn.setFixedHeight(28)
+            btn.setCheckable(True)
+            btn.setChecked(label == "All")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(_style_bar_btn())
             self._filter_buttons[label] = btn
             ab_layout.addWidget(btn)
         main_layout.addWidget(action_bar)
@@ -2007,6 +2038,10 @@ class HolterMainWindow(QDialog):
                 btn.clicked.connect(handler)
         for label, btn in self._filter_buttons.items():
             btn.clicked.connect(lambda _, t=label: self._apply_recordings_filter(t))
+            btn.clicked.connect(lambda _: self._sync_filter_buttons())
+        _rec_panel = self._recordings_panel()
+        if _rec_panel is not None and hasattr(_rec_panel, '_filter'):
+            _rec_panel._filter.currentTextChanged.connect(self._sync_filter_buttons)
 
         main_layout.addWidget(right_frame, 1)
         if hasattr(self, '_analysis_state'):
@@ -2303,20 +2338,20 @@ class HolterMainWindow(QDialog):
         dur_m = int((dur % 3600) // 60)
         dur_s = int(dur % 60)
         if hasattr(self, '_dur_label'):
-            self._dur_label.setText(f"{dur_h:02d}h {dur_m:02d}m {dur_s:02d}s")
+            self._dur_label.setText(_chip_html("Duration", f"{dur_h:02d}h {dur_m:02d}m {dur_s:02d}s"))
         if hasattr(self, '_patient_chip'):
             patient_name = self.patient_info.get("patient_name") or self.patient_info.get("name") or "Unknown Patient"
-            self._patient_chip.setText(f"Patient: {patient_name}")
+            self._patient_chip.setText(_chip_html("Patient", patient_name, UI_SUCCESS))
         if hasattr(self, '_doctor_chip'):
             doctor_name = self.patient_info.get("doctor") or "No referring doctor"
-            self._doctor_chip.setText(f"Doctor: {doctor_name}")
+            self._doctor_chip.setText(_chip_html("Doctor", doctor_name))
         if hasattr(self, '_session_chip'):
             session_name = os.path.basename(self.session_dir) if self.session_dir else "Active Session"
-            self._session_chip.setText(f"Session: {session_name}")
+            self._session_chip.setText(_chip_html("Session", session_name))
         if hasattr(self, '_rec_time_chip'):
             st_str, end_str = _get_recording_start_end_times(self.session_dir, dur)
             if st_str != "Unknown":
-                self._rec_time_chip.setText(f"Recording: {st_str} to {end_str}")
+                self._rec_time_chip.setText(_chip_html("Recording", f"{st_str}  →  {end_str}"))
                 self._rec_time_chip.show()
             else:
                 self._rec_time_chip.hide()
