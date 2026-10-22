@@ -41,6 +41,7 @@ from ..holter_helpers import (
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
     _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _card_style, _card_title_style,
 )
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas
@@ -50,7 +51,7 @@ class HolterAFPanel(QWidget):
     def __init__(self, parent=None, session_dir: str = ""):
         super().__init__(parent)
         self.session_dir = session_dir
-        self.setStyleSheet(f"background:{COL_BG};")
+        self.setStyleSheet(f"background:{UI_BG};")
         self._replay_engine = None
         self._duration_sec = 0.0
         self._af_rows = []
@@ -75,30 +76,39 @@ class HolterAFPanel(QWidget):
 
         # Left: AF event list
         left = QWidget()
+        left.setObjectName("afLeftCard")
+        left.setAttribute(Qt.WA_StyledBackground, True)
+        left.setStyleSheet(_card_style("QWidget#afLeftCard"))
         left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(6)
+        left_layout.setContentsMargins(10, 10, 10, 10)
+        left_layout.setSpacing(8)
 
         title = QLabel("AF Analysis")
-        title.setStyleSheet(f"color:#07111F;font-size:13px;font-weight:bold;background:qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #28E37B, stop:1 #89F7C5);padding:6px 10px;border-radius:6px;")
+        title.setStyleSheet(_card_title_style())
         left_layout.addWidget(title)
 
         cols = ["Start time", "Duration", "Type"]
         self._af_table = QTableWidget(0, len(cols))
         self._af_table.setHorizontalHeaderLabels(cols)
         self._af_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._af_table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._af_table.setAlternatingRowColors(True)
+        self._af_table.setShowGrid(False)
         self._af_table.setStyleSheet(_table_style())
         self._af_table.verticalHeader().setVisible(False)
         self._af_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._af_table.setCursor(Qt.PointingHandCursor)
         self._af_table.cellClicked.connect(self._on_af_row_clicked)
         left_layout.addWidget(self._af_table, 1)
 
         no_items = QLabel("There are no items to show.")
-        no_items.setStyleSheet(f"color:{COL_GREEN_DRK};font-style:italic;padding:8px;border:none;")
+        no_items.setAlignment(Qt.AlignCenter)
+        no_items.setStyleSheet(f"color:{UI_MUTED};font-style:italic;padding:8px;border:none;background:transparent;")
         self._no_items_lbl = no_items
         left_layout.addWidget(no_items)
 
         nav_row = QHBoxLayout()
+        nav_row.setSpacing(6)
         for lbl in ["AF Analysis", "Parameters", "Prev Event", "Next Event", "Remove All", "Remove"]:
 
             btn = QPushButton(lbl)
@@ -109,13 +119,20 @@ class HolterAFPanel(QWidget):
 
         # Right: ECG strip + Lorenz
         right = QWidget()
+        right.setObjectName("afRightCard")
+        right.setAttribute(Qt.WA_StyledBackground, True)
+        right.setStyleSheet(_card_style("QWidget#afRightCard"))
         right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setContentsMargins(10, 10, 10, 10)
         right_layout.setSpacing(6)
+
+        ecg_ttl = QLabel("12-Lead ECG")
+        ecg_ttl.setStyleSheet(_card_title_style())
+        right_layout.addWidget(ecg_ttl)
 
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setStyleSheet(f"QScrollArea{{background:{COL_BLACK};border:1px solid {COL_GREEN_DRK};border-radius:6px;}}")
+        scroll_area.setStyleSheet(f"QScrollArea{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:6px;}}")
         
         scroll_content = QWidget()
         scroll_content.setStyleSheet("background:transparent;")
@@ -127,7 +144,7 @@ class HolterAFPanel(QWidget):
         lead_names = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
         for i in range(12):
             lbl = QLabel(f"Lead {lead_names[i]}")
-            lbl.setStyleSheet(f"color:{COL_GREEN};font-size:11px;font-weight:bold;border:none;")
+            lbl.setStyleSheet(f"color:{COL_GREEN};font-size:11px;font-weight:bold;border:none;background:transparent;")
             scroll_layout.addWidget(lbl)
             
             # Disable vertical lines and labels for AF Analysis panel

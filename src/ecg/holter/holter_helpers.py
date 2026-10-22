@@ -38,6 +38,7 @@ UI_ACCENT = "#2F80ED"
 UI_ACCENT_HOVER = "#4B96FA"
 UI_SUCCESS = "#16C172"
 UI_WARNING = "#F59E0B"
+UI_GRID = "#1A2A44"   # faint table grid lines
 
 
 def _resolve_recordings_dir(session_dir: str = "") -> str:
@@ -184,6 +185,7 @@ def _style_filter_btn(active: bool = False, bg: str = UI_PANEL_ALT, fg: str = UI
         QPushButton:hover {{
             background: {hover};
             color: #FFFFFF;
+            border: 1px solid {UI_ACCENT};
         }}
         QPushButton:pressed {{ background: {bg}; border: 1px solid {UI_ACCENT_HOVER}; }}
         QPushButton:disabled {{ background: #1A2233; color: #5F708A; border: 1px solid #2A3953; }}
@@ -204,9 +206,74 @@ def _style_btn(bg=UI_PANEL_ALT, fg=UI_TEXT, hover="#1A2C49"):
         QPushButton:hover {{
             background: {hover};
             color: {UI_TEXT};
+            border: 1px solid {UI_ACCENT};
         }}
         QPushButton:pressed {{ background: {bg}; border: 1px solid {UI_ACCENT_HOVER}; }}
         QPushButton:disabled {{ background: #1A2233; color: #5F708A; border: 1px solid #2A3953; }}
+    """
+
+
+def _card_style(selector: str = "QFrame") -> str:
+    """Rounded panel card used to group a section of a screen."""
+    return f"{selector}{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-radius:8px;}}"
+
+
+def _card_title_style() -> str:
+    """Section heading inside a card: bold text with an accent bar on the left."""
+    return (f"QLabel{{color:{UI_TEXT};font-size:12px;font-weight:700;background:transparent;"
+            f"border:none;border-left:3px solid {UI_ACCENT};padding:2px 8px;}}")
+
+
+def _overview_table_style() -> str:
+    """Name / Value summary tables (Overview and Replay side panels)."""
+    return f"""
+        QTableWidget {{
+            background-color: {UI_PANEL};
+            color: {UI_TEXT};
+            border: 1px solid {UI_BORDER};
+            border-radius: 6px;
+            gridline-color: {UI_GRID};
+            font-size: 11px;
+            outline: none;
+        }}
+        QHeaderView {{ background: {UI_PANEL_ALT}; border: none; }}
+        QHeaderView::section {{
+            background: {UI_PANEL_ALT};
+            color: {UI_MUTED};
+            font-weight: bold;
+            font-size: 11px;
+            padding-left: 8px;
+            border: none;
+            border-bottom: 1px solid {UI_BORDER};
+            height: 26px;
+        }}
+        QTableWidget::item {{
+            padding-left: 8px;
+            padding-right: 8px;
+            border-bottom: 1px solid {UI_GRID};
+        }}
+    """
+
+
+def _global_style() -> str:
+    """Window-wide defaults for widgets that don't carry their own style:
+    scrollbars, splitter handles, tooltips and context menus."""
+    return f"""
+        QScrollBar:vertical {{ background: {UI_PANEL}; width: 10px; margin: 0; border: none; }}
+        QScrollBar::handle:vertical {{ background: {UI_BORDER}; min-height: 24px; border-radius: 5px; margin: 2px; }}
+        QScrollBar::handle:vertical:hover {{ background: #3A5378; }}
+        QScrollBar:horizontal {{ background: {UI_PANEL}; height: 10px; margin: 0; border: none; }}
+        QScrollBar::handle:horizontal {{ background: {UI_BORDER}; min-width: 24px; border-radius: 5px; margin: 2px; }}
+        QScrollBar::handle:horizontal:hover {{ background: #3A5378; }}
+        QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
+        QScrollBar::add-page, QScrollBar::sub-page {{ background: none; }}
+        QSplitter::handle {{ background: {UI_BORDER}; }}
+        QSplitter::handle:hover {{ background: {UI_ACCENT}; }}
+        QToolTip {{ background: {UI_PANEL_ALT}; color: {UI_TEXT}; border: 1px solid {UI_BORDER}; padding: 5px 8px; border-radius: 4px; }}
+        QMenu {{ background: {UI_PANEL}; color: {UI_TEXT}; border: 1px solid {UI_BORDER}; padding: 4px; }}
+        QMenu::item {{ padding: 6px 22px 6px 14px; border-radius: 4px; }}
+        QMenu::item:selected {{ background: #1E3A5F; }}
+        QMenu::separator {{ height: 1px; background: {UI_BORDER}; margin: 4px 6px; }}
     """
 
 
@@ -231,21 +298,29 @@ def _table_style():
             background: {UI_PANEL};
             alternate-background-color: {UI_PANEL_ALT};
             color: {UI_TEXT};
-            gridline-color: {UI_BORDER};
+            gridline-color: {UI_GRID};
             font-size: 12px;
             border: 1px solid {UI_BORDER};
+            border-radius: 6px;
             selection-background-color: #1E3A5F;
             selection-color: {UI_TEXT};
+            outline: none;
         }}
+        QHeaderView {{ background: {UI_PANEL_ALT}; border: none; }}
         QHeaderView::section {{
             background: {UI_PANEL_ALT};
             color: {UI_MUTED};
             font-size: 11px;
             font-weight: bold;
             padding: 6px;
-            border: 1px solid {UI_BORDER};
+            border: none;
+            border-right: 1px solid {UI_GRID};
+            border-bottom: 1px solid {UI_BORDER};
         }}
+        QHeaderView::section:last {{ border-right: none; }}
+        QTableCornerButton::section {{ background: {UI_PANEL_ALT}; border: none; border-bottom: 1px solid {UI_BORDER}; }}
         QTableWidget::item {{ padding: 5px; border: none; }}
+        QTableWidget::item:selected {{ background: #1E3A5F; color: {UI_TEXT}; }}
         QScrollBar:vertical {{
             border: none;
             background: {UI_PANEL_ALT};

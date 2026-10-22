@@ -41,6 +41,7 @@ from ..holter_helpers import (
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
     _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _card_style, _card_title_style,
 )
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas
@@ -49,7 +50,7 @@ from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, Magni
 class HolterHRVPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(f"background:{COL_BG};")
+        self.setStyleSheet(f"background:{UI_BG};")
         self._build_ui()
 
     def _find_template_host(self):
@@ -74,24 +75,41 @@ class HolterHRVPanel(QWidget):
         self._hrv_trend_btn.setStyleSheet(_style_btn())
         tab_row.addWidget(self._hrv_event_btn)
         tab_row.addWidget(self._hrv_trend_btn)
+        tab_row.setSpacing(6)
         tab_row.addStretch()
         layout.addLayout(tab_row)
+
+        table_card = QFrame()
+        table_card.setObjectName("hrvTableCard")
+        table_card.setStyleSheet(_card_style("QFrame#hrvTableCard"))
+        table_card_l = QVBoxLayout(table_card)
+        table_card_l.setContentsMargins(10, 10, 10, 10)
+        table_card_l.setSpacing(8)
+        table_ttl = QLabel("HRV Analysis")
+        table_ttl.setStyleSheet(_card_title_style())
+        table_card_l.addWidget(table_ttl)
 
         cols = ["Type", "Start at", "Duration", "Mean NN", "SDNN", "SDANN", "TRIIDX", "pNN50", "LF", "HF", "LF/HF", "Status"]
         self._table = QTableWidget(0, len(cols))
         self._table.setHorizontalHeaderLabels(cols)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._table.setAlternatingRowColors(True)
+        self._table.setShowGrid(False)
         self._table.setStyleSheet(_table_style())
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
-        layout.addWidget(self._table, 1)
+        table_card_l.addWidget(self._table, 1)
+        layout.addWidget(table_card, 1)
 
         # Bottom stats strip
         stats_frame = QFrame()
-        stats_frame.setStyleSheet(f"QFrame{{background:{COL_BLACK};border:1px solid {COL_GREEN_DRK};border-radius:4px;}}")
+        stats_frame.setObjectName("hrvStatsCard")
+        stats_frame.setStyleSheet(_card_style("QFrame#hrvStatsCard"))
         stats_layout = QGridLayout(stats_frame)
-        stats_layout.setSpacing(8)
-        stats_layout.setContentsMargins(12, 8, 12, 8)
+        stats_layout.setHorizontalSpacing(12)
+        stats_layout.setVerticalSpacing(4)
+        stats_layout.setContentsMargins(12, 10, 12, 10)
         self._summary_labels = {}
         stat_defs = [("NNs", "nns"), ("Mean NN", "mean_nn"), ("SDNN", "sdnn"), ("SDANN", "sdann"),
                      ("rMSSD", "rmssd"), ("pNN50", "pnn50"), ("TRIIDX", "triidx"), ("SDNNIDX", "sdnnidx"),
@@ -99,11 +117,11 @@ class HolterHRVPanel(QWidget):
         for i, (label, key) in enumerate(stat_defs):
             row, col = divmod(i, 4)
             lbl = QLabel(f"{label}:")
-            lbl.setStyleSheet(f"color:{COL_GREEN};font-size:11px;font-weight:bold;border:none;")
+            lbl.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:bold;border:none;background:transparent;")
             val = QLabel("-")
-            val.setStyleSheet(f"color:{COL_GREEN};font-size:14px;font-weight:bold;"
-                              f"background:{COL_DARK};border:1px solid {COL_GREEN_DRK};"
-                              f"border-radius:10px;padding:4px 10px;min-width:70px;")
+            val.setStyleSheet(f"color:{UI_TEXT};font-size:14px;font-weight:bold;"
+                              f"background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};"
+                              f"border-radius:6px;padding:4px 10px;min-width:70px;")
             val.setAlignment(Qt.AlignCenter)
             stats_layout.addWidget(lbl, row * 2, col)
             stats_layout.addWidget(val, row * 2 + 1, col)
@@ -111,6 +129,7 @@ class HolterHRVPanel(QWidget):
         layout.addWidget(stats_frame)
 
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
         for lbl in ["Insert", "Reset", "Remove"]:
             btn = QPushButton(lbl)
             btn.setStyleSheet(_style_btn())

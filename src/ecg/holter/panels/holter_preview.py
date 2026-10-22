@@ -41,6 +41,7 @@ from ..holter_helpers import (
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
     _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _card_style, _card_title_style,
 )
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas
@@ -49,19 +50,21 @@ from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, Magni
 class HolterInsightPanel(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(f"QFrame{{background:{COL_BLACK};border:1px solid {COL_GREEN_DRK};border-radius:10px;}}")
+        self.setObjectName("pvCard")
+        self.setStyleSheet(_card_style("QFrame#pvCard"))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
         title = QLabel("Comprehensive Report Preview")
-        title.setStyleSheet(f"color:{COL_GREEN};font-size:14px;font-weight:bold;background:{COL_DARK};"
-                            f"padding:7px;border-radius:4px;border:none;")
+        title.setStyleSheet(f"color:{UI_TEXT};font-size:14px;font-weight:bold;background:transparent;"
+                            f"padding:4px 8px;border:none;border-left:3px solid {UI_ACCENT};")
         layout.addWidget(title)
         self._report = QTextEdit()
         self._report.setReadOnly(True)
         self._report.setStyleSheet(f"""
-            QTextEdit{{background:{COL_BLACK};color:{COL_GREEN};
-              border:1px solid {COL_GREEN_DRK};border-radius:8px;padding:10px;font-size:13px;}}
+            QTextEdit{{background:{UI_BG};color:{UI_TEXT};
+              border:1px solid {UI_BORDER};border-radius:8px;padding:10px;font-size:13px;
+              selection-background-color:#1E3A5F;selection-color:{UI_TEXT};}}
         """)
         layout.addWidget(self._report)
 

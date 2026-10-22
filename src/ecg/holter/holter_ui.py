@@ -948,7 +948,8 @@ class HolterMainWindow(QDialog):
             self.resize(1400, 900)
 
         self.setWindowFlags(Qt.Window | Qt.CustomizeWindowHint | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
-        self.setStyleSheet(f"QDialog{{background:{UI_BG};}}")
+        from .holter_helpers import _global_style
+        self.setStyleSheet(f"QDialog{{background:{UI_BG};}}" + _global_style())
         self.showMaximized()
 
         self.session_dir = session_dir
@@ -1624,11 +1625,13 @@ class HolterMainWindow(QDialog):
                 border:1px solid {UI_BORDER};
                 border-top:none;
             }}
+            QTabBar {{
+                background:{UI_PANEL};
+            }}
             QTabBar::tab {{
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #4B545D, stop:0.5 #282E34, stop:1 #111417);
-                color:#FFFFFF;
-                border:1px solid #68747E;
+                background:{UI_PANEL_ALT};
+                color:#C9D6EA;
+                border:1px solid {UI_BORDER};
                 border-radius:8px;
                 padding:8px 10px;
                 font-size:11px;
@@ -1643,8 +1646,14 @@ class HolterMainWindow(QDialog):
                 border-color:#6EB4FF;
             }}
             QTabBar::tab:hover:!selected {{
-                background:#566572;
+                background:#1A2C49;
+                border-color:{UI_ACCENT};
                 color:#FFFFFF;
+            }}
+            QTabBar QToolButton {{
+                background:{UI_PANEL_ALT};
+                border:1px solid {UI_BORDER};
+                border-radius:6px;
             }}
             QGroupBox {{
                 border: none;

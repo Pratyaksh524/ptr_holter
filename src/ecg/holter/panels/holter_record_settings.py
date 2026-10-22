@@ -14,12 +14,113 @@ from PyQt5.QtWidgets import (
 
 from ..holter_helpers import (
     UI_ACCENT, UI_ACCENT_HOVER, UI_BG, UI_BORDER, UI_CARD, UI_MUTED,
-    UI_PANEL, UI_PANEL_ALT, UI_SUCCESS, UI_TEXT, UI_WARNING, _style_btn, _style_active_btn
+    UI_PANEL, UI_PANEL_ALT, UI_SUCCESS, UI_TEXT, UI_WARNING, _style_btn, _style_active_btn,
+    _card_style,
 )
 
 LEADS = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
 ALL_ROWS = LEADS + ["All"]
 GAIN_VALUES = ["5", "10", "20"]
+
+# ---------------------------------------------------------------------------
+# Local style helpers (purely cosmetic; shared by every page of this panel)
+# ---------------------------------------------------------------------------
+_RS_INPUT_BG = "#0B1322"
+_RS_INPUT_HOVER_BORDER = "#34507A"
+
+
+def _rs_input_style() -> str:
+    """Spin boxes / combo boxes: dark navy field, rounded, accent border on focus.
+    Paddings match the previous inline styles so control heights are unchanged."""
+    return f"""
+        QSpinBox, QDoubleSpinBox {{
+            background: {_RS_INPUT_BG};
+            color: {UI_TEXT};
+            border: 1px solid {UI_BORDER};
+            border-radius: 6px;
+            padding: 2px 6px;
+            font-size: 12px;
+            selection-background-color: {UI_ACCENT};
+            selection-color: #FFFFFF;
+        }}
+        QComboBox {{
+            background: {_RS_INPUT_BG};
+            color: {UI_TEXT};
+            border: 1px solid {UI_BORDER};
+            border-radius: 6px;
+            padding: 3px 8px;
+        }}
+        QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {{
+            border: 1px solid {_RS_INPUT_HOVER_BORDER};
+        }}
+        QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus, QComboBox:on {{
+            border: 1px solid {UI_ACCENT};
+        }}
+        QComboBox QAbstractItemView {{
+            background: {UI_PANEL};
+            color: {UI_TEXT};
+            border: 1px solid {UI_BORDER};
+            selection-background-color: {UI_ACCENT};
+            selection-color: #FFFFFF;
+            outline: none;
+        }}
+    """
+
+
+def _rs_choice_style() -> str:
+    """Radio buttons / check boxes: navy indicator, accent fill when checked."""
+    return f"""
+        QRadioButton, QCheckBox {{
+            color: {UI_TEXT};
+            font-size: 12px;
+            background: transparent;
+            spacing: 6px;
+        }}
+        QRadioButton::indicator, QCheckBox::indicator {{
+            width: 14px;
+            height: 14px;
+            background: {_RS_INPUT_BG};
+            border: 1px solid {_RS_INPUT_HOVER_BORDER};
+        }}
+        QRadioButton::indicator {{ border-radius: 8px; }}
+        QCheckBox::indicator {{ border-radius: 4px; }}
+        QRadioButton::indicator:hover, QCheckBox::indicator:hover {{
+            border: 1px solid {UI_ACCENT_HOVER};
+        }}
+        QRadioButton::indicator:checked {{
+            border: 1px solid {UI_ACCENT};
+            background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
+                                        stop:0 {UI_ACCENT_HOVER}, stop:0.45 {UI_ACCENT},
+                                        stop:0.55 {_RS_INPUT_BG}, stop:1 {_RS_INPUT_BG});
+        }}
+        QCheckBox::indicator:checked {{
+            border: 1px solid {UI_ACCENT_HOVER};
+            background: {UI_ACCENT};
+        }}
+    """
+
+
+def _rs_section_card(object_name: str):
+    """Rounded navy card (scoped by objectName) used to group a settings section."""
+    card = QFrame()
+    card.setObjectName(object_name)
+    card.setStyleSheet(_card_style(f"QFrame#{object_name}"))
+    card_lay = QVBoxLayout(card)
+    card_lay.setContentsMargins(14, 12, 14, 14)
+    card_lay.setSpacing(12)
+    return card, card_lay
+
+
+def _rs_section_title_style() -> str:
+    """Section heading inside a card: bold text with an accent bar on the left."""
+    return (f"QLabel{{color:{UI_TEXT};font-size:13px;font-weight:700;background:transparent;"
+            f"border:none;border-left:3px solid {UI_ACCENT};padding:2px 8px;}}")
+
+
+def _rs_col_header_style() -> str:
+    """Column headers of the small settings tables (muted, underlined)."""
+    return (f"QLabel{{color:{UI_MUTED};font-size:12px;font-weight:700;background:transparent;"
+            f"border:none;border-bottom:1px solid {UI_BORDER};padding-bottom:4px;}}")
 
 
 class ClickableRadioButton(QRadioButton):
@@ -60,20 +161,24 @@ class HolterRecordSettingsPanel(QWidget):
 
         # Header Info Banner
         header_card = QFrame()
+        header_card.setObjectName("rsHeaderCard")
         header_card.setStyleSheet(
-            f"QFrame {{ background: {UI_CARD}; border: 1px solid {UI_BORDER}; border-radius: 8px; padding: 10px; }}"
+            f"QFrame#rsHeaderCard {{ background: {UI_CARD}; border: 1px solid {UI_BORDER}; border-radius: 8px; }}"
         )
         header_layout = QHBoxLayout(header_card)
-        header_layout.setContentsMargins(12, 8, 12, 8)
+        header_layout.setContentsMargins(16, 12, 16, 12)
 
         title_lbl = QLabel("Record Settings")
-        title_lbl.setStyleSheet(f"font-size: 16px; font-weight: 700; color: {UI_TEXT}; border: none;")
+        title_lbl.setStyleSheet(
+            f"font-size: 16px; font-weight: 700; color: {UI_TEXT}; background: transparent; "
+            f"border: none; border-left: 3px solid {UI_ACCENT}; padding: 2px 10px;"
+        )
         header_layout.addWidget(title_lbl)
 
         header_layout.addStretch(1)
 
         info_lbl = QLabel(f"Recording duration: {self._duration_hours:g} hours | Session: {self._session_name}")
-        info_lbl.setStyleSheet(f"font-size: 12px; color: {UI_MUTED}; border: none;")
+        info_lbl.setStyleSheet(f"font-size: 12px; color: {UI_MUTED}; background: transparent; border: none;")
         header_layout.addWidget(info_lbl)
 
         main_layout.addWidget(header_card)
@@ -107,12 +212,13 @@ class HolterRecordSettingsPanel(QWidget):
                 background: {UI_PANEL_ALT};
                 color: {UI_TEXT};
             }}
-            QListWidget::item:selected {{
+            QListWidget::item:selected, QListWidget::item:selected:!active {{
                 background: {UI_ACCENT};
                 color: #FFFFFF;
                 font-weight: 700;
             }}
         """)
+        self._sidebar_list.setCursor(Qt.PointingHandCursor)
 
         item_display = QListWidgetItem("Display setting")
         item_clinical = QListWidgetItem("Clinical setting")
@@ -126,8 +232,9 @@ class HolterRecordSettingsPanel(QWidget):
 
         # Right Stacked Widget
         self._stacked_widget = QStackedWidget()
+        self._stacked_widget.setObjectName("rsStack")
         self._stacked_widget.setStyleSheet(f"""
-            QStackedWidget {{
+            QStackedWidget#rsStack {{
                 background: {UI_CARD};
                 border: 1px solid {UI_BORDER};
                 border-radius: 8px;
@@ -152,11 +259,13 @@ class HolterRecordSettingsPanel(QWidget):
 
         self._btn_wave_grid = QPushButton("Wave/Grid setting")
         self._btn_wave_grid.setStyleSheet(_style_btn())
+        self._btn_wave_grid.setCursor(Qt.PointingHandCursor)
         self._btn_wave_grid.setFixedHeight(34)
         bottom_bar.addWidget(self._btn_wave_grid)
 
         self._btn_reset = QPushButton("Reset")
         self._btn_reset.setStyleSheet(_style_btn())
+        self._btn_reset.setCursor(Qt.PointingHandCursor)
         self._btn_reset.setFixedHeight(34)
         self._btn_reset.clicked.connect(self._on_reset_clicked)
         bottom_bar.addWidget(self._btn_reset)
@@ -165,6 +274,7 @@ class HolterRecordSettingsPanel(QWidget):
 
         self._btn_ok = QPushButton("OK")
         self._btn_ok.setStyleSheet(_style_active_btn())
+        self._btn_ok.setCursor(Qt.PointingHandCursor)
         self._btn_ok.setFixedWidth(90)
         self._btn_ok.setFixedHeight(34)
         self._btn_ok.clicked.connect(self._on_ok_clicked)
@@ -172,13 +282,15 @@ class HolterRecordSettingsPanel(QWidget):
 
         self._btn_cancel = QPushButton("Cancel")
         self._btn_cancel.setStyleSheet(_style_btn())
+        self._btn_cancel.setCursor(Qt.PointingHandCursor)
         self._btn_cancel.setFixedWidth(90)
         self._btn_cancel.setFixedHeight(34)
         self._btn_cancel.clicked.connect(self._on_cancel_clicked)
         bottom_bar.addWidget(self._btn_cancel)
 
         self._btn_apply = QPushButton("Apply")
-        self._btn_apply.setStyleSheet(_style_btn())
+        self._btn_apply.setStyleSheet(_style_active_btn())
+        self._btn_apply.setCursor(Qt.PointingHandCursor)
         self._btn_apply.setFixedWidth(90)
         self._btn_apply.setFixedHeight(34)
         self._btn_apply.clicked.connect(self._on_apply_clicked)
@@ -197,7 +309,7 @@ class HolterRecordSettingsPanel(QWidget):
                 font-size: 13px;
                 color: {UI_TEXT};
                 border: 1px solid {UI_BORDER};
-                border-radius: 6px;
+                border-radius: 8px;
                 margin-top: 12px;
                 padding-top: 14px;
                 background: {UI_PANEL};
@@ -205,8 +317,11 @@ class HolterRecordSettingsPanel(QWidget):
             QGroupBox::title {{
                 subcontrol-origin: margin;
                 subcontrol-position: top left;
+                left: 12px;
                 padding: 0 8px;
-                color: {UI_ACCENT_HOVER};
+                color: {UI_TEXT};
+                background: {UI_PANEL};
+                border-left: 3px solid {UI_ACCENT};
             }}
         """
 
@@ -235,16 +350,16 @@ class HolterRecordSettingsPanel(QWidget):
 
         # Column headers
         lbl_lead_hdr = QLabel("Lead")
-        lbl_lead_hdr.setStyleSheet(f"font-weight: 700; color: {UI_MUTED}; font-size: 12px;")
+        lbl_lead_hdr.setStyleSheet(_rs_col_header_style())
         grid_gain.addWidget(lbl_lead_hdr, 0, 0)
 
         for col, val in enumerate(GAIN_VALUES):
             lbl_val_hdr = QLabel(f"{val} mm/mV")
-            lbl_val_hdr.setStyleSheet(f"font-weight: 700; color: {UI_MUTED}; font-size: 12px;")
+            lbl_val_hdr.setStyleSheet(_rs_col_header_style())
             grid_gain.addWidget(lbl_val_hdr, 0, col + 1)
 
         lbl_inv_hdr = QLabel("Invert")
-        lbl_inv_hdr.setStyleSheet(f"font-weight: 700; color: {UI_MUTED}; font-size: 12px;")
+        lbl_inv_hdr.setStyleSheet(_rs_col_header_style())
         grid_gain.addWidget(lbl_inv_hdr, 0, len(GAIN_VALUES) + 1)
 
         # Rows for I, II, III, aVR, aVL, aVF, V1, V2, V3, V4, V5, V6, All
@@ -262,7 +377,8 @@ class HolterRecordSettingsPanel(QWidget):
             for col_idx, val in enumerate(GAIN_VALUES):
                 r = ClickableRadioButton(val)
                 r.setAutoExclusive(False)   # managed by QButtonGroup instead
-                r.setStyleSheet(f"color: {UI_TEXT}; font-size: 12px;")
+                r.setStyleSheet(_rs_choice_style())
+                r.setCursor(Qt.PointingHandCursor)
                 # Default: 10 mm/mV (index 1) for all 12 leads; nothing for All
                 if lead != "All" and val == "10":
                     r.setChecked(True)
@@ -271,7 +387,8 @@ class HolterRecordSettingsPanel(QWidget):
                 self._gain_radios[lead].append(r)
 
             chk_invert = QCheckBox("")
-            chk_invert.setStyleSheet(f"color: {UI_TEXT}; font-size: 12px;")
+            chk_invert.setStyleSheet(_rs_choice_style())
+            chk_invert.setCursor(Qt.PointingHandCursor)
             grid_gain.addWidget(chk_invert, row_idx, len(GAIN_VALUES) + 1)
             self._invert_checks[lead] = chk_invert
 
@@ -310,15 +427,7 @@ class HolterRecordSettingsPanel(QWidget):
         self._combo_width.addItems(["10", "14", "20", "30"])
         self._combo_width.setCurrentText("14")
         self._combo_width.setFixedWidth(80)
-        self._combo_width.setStyleSheet(f"""
-            QComboBox {{
-                background: {UI_PANEL_ALT};
-                color: {UI_TEXT};
-                border: 1px solid {UI_BORDER};
-                border-radius: 4px;
-                padding: 3px 8px;
-            }}
-        """)
+        self._combo_width.setStyleSheet(_rs_input_style())
         grid_fd.addWidget(self._combo_width, 0, 1)
 
         lbl_sec = QLabel("s")
@@ -384,12 +493,9 @@ class HolterRecordSettingsPanel(QWidget):
 
         # Section title
         section_title = QLabel("Parameters for arrhythmia analysis")
-        section_title.setStyleSheet(
-            f"font-size:13px; font-weight:700; color:{UI_ACCENT_HOVER}; "
-            f"background:{UI_PANEL_ALT}; border:1px solid {UI_BORDER}; "
-            f"border-radius:4px; padding:6px 10px;"
-        )
-        layout.addWidget(section_title)
+        section_title.setStyleSheet(_rs_section_title_style())
+        clin_card, clin_card_lay = _rs_section_card("rsClinicalCard")
+        clin_card_lay.addWidget(section_title)
 
         # ---- Left column: basic params + right columns: age-based HR table ----
         body_row = QHBoxLayout()
@@ -403,10 +509,7 @@ class HolterRecordSettingsPanel(QWidget):
         left_grid.setHorizontalSpacing(10)
         left_grid.setVerticalSpacing(10)
 
-        spin_style = (
-            f"background:{UI_PANEL_ALT}; color:{UI_TEXT}; "
-            f"border:1px solid {UI_BORDER}; border-radius:4px; padding:2px 6px; font-size:12px;"
-        )
+        spin_style = _rs_input_style()
         lbl_style = f"color:{UI_TEXT}; font-size:12px;"
         hint_style = f"color:{UI_MUTED}; font-size:11px;"
 
@@ -503,6 +606,7 @@ class HolterRecordSettingsPanel(QWidget):
         for btn_lbl in ("Reanalysis", "Advanced", "Default"):
             btn = QPushButton(btn_lbl)
             btn.setStyleSheet(_style_btn())
+            btn.setCursor(Qt.PointingHandCursor)
             btn.setFixedHeight(30)
             btn_row.addWidget(btn)
         btn_row.addStretch(1)
@@ -520,7 +624,7 @@ class HolterRecordSettingsPanel(QWidget):
         right_grid.setVerticalSpacing(10)
 
         # Column headers
-        hdr_style = f"color:{UI_MUTED}; font-size:12px; font-weight:700;"
+        hdr_style = _rs_col_header_style()
         h_age = QLabel("Age Group")
         h_age.setStyleSheet(hdr_style)
         h_tachy = QLabel("Tachycardia HR (bpm)")
@@ -589,7 +693,8 @@ class HolterRecordSettingsPanel(QWidget):
         right_grid.setRowStretch(len(age_rows) + 1, 1)
         body_row.addWidget(right_widget)
 
-        layout.addLayout(body_row)
+        clin_card_lay.addLayout(body_row)
+        layout.addWidget(clin_card)
         layout.addStretch(1)
 
         scroll.setWidget(container)
@@ -607,10 +712,7 @@ class HolterRecordSettingsPanel(QWidget):
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(16)
 
-        spin_style = (
-            f"background:{UI_PANEL_ALT}; color:{UI_TEXT}; "
-            f"border:1px solid {UI_BORDER}; border-radius:4px; padding:2px 6px; font-size:12px;"
-        )
+        spin_style = _rs_input_style()
         lbl_style  = f"color:{UI_TEXT}; font-size:12px;"
         hint_style = f"color:{UI_MUTED}; font-size:11px;"
         unit_style = f"color:{UI_MUTED}; font-size:12px;"
@@ -619,12 +721,9 @@ class HolterRecordSettingsPanel(QWidget):
         # 1. HRV frequency domain analysis
         # ──────────────────────────────────────────────
         title_fd = QLabel("HRV frequency domain analysis")
-        title_fd.setStyleSheet(
-            f"font-size:13px; font-weight:700; color:{UI_ACCENT_HOVER}; "
-            f"background:{UI_PANEL_ALT}; border:1px solid {UI_BORDER}; "
-            f"border-radius:4px; padding:6px 10px;"
-        )
-        layout.addWidget(title_fd)
+        title_fd.setStyleSheet(_rs_section_title_style())
+        fd_card, fd_card_lay = _rs_section_card("rsHrvFdCard")
+        fd_card_lay.addWidget(title_fd)
 
         fd_body = QHBoxLayout()
         fd_body.setSpacing(24)
@@ -645,15 +744,7 @@ class HolterRecordSettingsPanel(QWidget):
         self._combo_hrv_mode.addItems(["AR", "FFT"])
         self._combo_hrv_mode.setCurrentText("AR")
         self._combo_hrv_mode.setFixedWidth(90)
-        self._combo_hrv_mode.setStyleSheet(f"""
-            QComboBox {{
-                background:{UI_PANEL_ALT}; color:{UI_TEXT};
-                border:1px solid {UI_BORDER}; border-radius:4px; padding:3px 8px;
-            }}
-            QComboBox QAbstractItemView {{
-                background:{UI_PANEL}; color:{UI_TEXT}; border:1px solid {UI_BORDER};
-            }}
-        """)
+        self._combo_hrv_mode.setStyleSheet(_rs_input_style())
         fd_left_grid.addWidget(self._combo_hrv_mode, 0, 1)
 
         # Min RRI
@@ -689,8 +780,9 @@ class HolterRecordSettingsPanel(QWidget):
 
         # Right: Power bands table (VLF / LF / HF)
         pb_frame = QFrame()
+        pb_frame.setObjectName("rsPowerBands")
         pb_frame.setStyleSheet(
-            f"QFrame {{ background:{UI_PANEL}; border:1px solid {UI_BORDER}; border-radius:6px; }}"
+            f"QFrame#rsPowerBands {{ background:{UI_PANEL_ALT}; border:1px solid {UI_BORDER}; border-radius:8px; }}"
         )
         pb_grid = QGridLayout(pb_frame)
         pb_grid.setContentsMargins(14, 10, 14, 10)
@@ -761,18 +853,16 @@ class HolterRecordSettingsPanel(QWidget):
 
         fd_body.addWidget(pb_frame)
         fd_body.addStretch(1)
-        layout.addLayout(fd_body)
+        fd_card_lay.addLayout(fd_body)
+        layout.addWidget(fd_card)
 
         # ──────────────────────────────────────────────
         # 2. HRV time domain analysis
         # ──────────────────────────────────────────────
         title_td = QLabel("HRV time domain analysis")
-        title_td.setStyleSheet(
-            f"font-size:13px; font-weight:700; color:{UI_ACCENT_HOVER}; "
-            f"background:{UI_PANEL_ALT}; border:1px solid {UI_BORDER}; "
-            f"border-radius:4px; padding:6px 10px;"
-        )
-        layout.addWidget(title_td)
+        title_td.setStyleSheet(_rs_section_title_style())
+        td_card, td_card_lay = _rs_section_card("rsHrvTdCard")
+        td_card_lay.addWidget(title_td)
 
         td_body = QHBoxLayout()
         td_body.setSpacing(32)
@@ -879,13 +969,15 @@ class HolterRecordSettingsPanel(QWidget):
         dn_grid.setRowStretch(2, 1)
         td_body.addWidget(dn_widget)
         td_body.addStretch(1)
-        layout.addLayout(td_body)
+        td_card_lay.addLayout(td_body)
+        layout.addWidget(td_card)
 
         # Default button (bottom right, matching reference)
         btn_default_row = QHBoxLayout()
         btn_default_row.addStretch(1)
         btn_hrv_default = QPushButton("Default")
         btn_hrv_default.setStyleSheet(_style_btn())
+        btn_hrv_default.setCursor(Qt.PointingHandCursor)
         btn_hrv_default.setFixedWidth(100)
         btn_hrv_default.setFixedHeight(30)
         btn_hrv_default.clicked.connect(self._on_hrv_default_clicked)

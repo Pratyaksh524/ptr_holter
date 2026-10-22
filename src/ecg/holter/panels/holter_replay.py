@@ -42,6 +42,7 @@ from ..holter_helpers import (
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
     _style_active_btn, _style_btn, _style_filter_btn, _table_style, _template_filter_key,
+    _card_style, _card_title_style, _overview_table_style,
 )
 
 from ..tool_engine import ECGToolEngine
@@ -61,7 +62,9 @@ class HolterReplayPanel(QWidget):
         super().__init__(parent)
         self.duration_sec = max(1, duration_sec)
         self._strip_length_sec = 10.0
-        self.setStyleSheet(f"background:{COL_DARK};")
+        self.setObjectName("replayPanel")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(f"QWidget#replayPanel{{background:{UI_BG};}}")
         self._replay_engine = None
         self._tool_engine = ECGToolEngine()
         self._current_replay_frame = None
@@ -98,14 +101,8 @@ class HolterReplayPanel(QWidget):
 
         #  "  "  48-hour session summary bar (replaces the two RR trend canvases)  "  " 
         summary_frame = QFrame()
-        summary_frame.setStyleSheet("""
-            QFrame {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #172D4D, stop:0.48 #10213A, stop:1 #080D16);
-                border: 1px solid #315783;
-                border-radius: 8px;
-            }
-        """)
+        summary_frame.setObjectName("rpSummaryCard")
+        summary_frame.setStyleSheet(_card_style("QFrame#rpSummaryCard"))
         summary_frame.setMinimumHeight(76)
         summary_layout = QHBoxLayout(summary_frame)
         summary_layout.setContentsMargins(12, 6, 12, 6)
@@ -116,9 +113,9 @@ class HolterReplayPanel(QWidget):
             col.setContentsMargins(12, 0, 12, 0)
             col.setSpacing(2)
             t = QLabel(title)
-            t.setStyleSheet("color:#D5E5F7;font-size:9px;font-weight:700;border:none;")
+            t.setStyleSheet(f"color:{UI_MUTED};font-size:9px;font-weight:700;border:none;background:transparent;")
             v = QLabel("-")
-            v.setStyleSheet("color:#FFFFFF;font-size:13px;font-weight:700;border:none;")
+            v.setStyleSheet(f"color:{UI_TEXT};font-size:13px;font-weight:700;border:none;background:transparent;")
             col.addWidget(t)
             col.addWidget(v)
             self._summary_labels[key] = v
@@ -166,10 +163,14 @@ class HolterReplayPanel(QWidget):
         top_splitter.setStyleSheet(f"QSplitter{{background:{UI_BG};}} QSplitter::handle{{background:{UI_BORDER};}}")
 
         left_wrap = QFrame()
-        left_wrap.setStyleSheet(f"QFrame{{background:#292D32;border:1px solid {UI_BORDER};border-radius:8px;}}")
+        left_wrap.setObjectName("rpLeftCard")
+        left_wrap.setStyleSheet(_card_style("QFrame#rpLeftCard"))
         lw_l = QVBoxLayout(left_wrap)
-        lw_l.setContentsMargins(4, 4, 4, 4)
+        lw_l.setContentsMargins(8, 8, 8, 8)
         lw_l.setSpacing(6)
+        lorenz_ttl = QLabel("RR Scatter (Lorenz)")
+        lorenz_ttl.setStyleSheet(_card_title_style())
+        lw_l.addWidget(lorenz_ttl)
         self._lorenz_canvas = LorenzCanvas(parent=left_wrap)
         lw_l.addWidget(self._lorenz_canvas, 3)
         lorenz_filter_row = QHBoxLayout()
@@ -193,10 +194,14 @@ class HolterReplayPanel(QWidget):
         top_splitter.addWidget(left_wrap)
 
         ecg_right = QFrame()
-        ecg_right.setStyleSheet(f"QFrame{{background:#292D32;border:1px solid {UI_BORDER};border-radius:8px;}}")
+        ecg_right.setObjectName("rpEcgCard")
+        ecg_right.setStyleSheet(_card_style("QFrame#rpEcgCard"))
         ecg_right_layout = QVBoxLayout(ecg_right)
-        ecg_right_layout.setContentsMargins(4, 4, 4, 4)
-        ecg_right_layout.setSpacing(2)
+        ecg_right_layout.setContentsMargins(8, 8, 8, 8)
+        ecg_right_layout.setSpacing(4)
+        ecg_ttl = QLabel("12-Lead ECG")
+        ecg_ttl.setStyleSheet(_card_title_style())
+        ecg_right_layout.addWidget(ecg_ttl)
 
         #  "  "  12-lead scrollable grid (1 column, 12 rows)  "  " 
         leads_scroll = QScrollArea()
@@ -204,9 +209,9 @@ class HolterReplayPanel(QWidget):
         leads_scroll.setFrameShape(QFrame.NoFrame)
         leads_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         leads_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        leads_scroll.setStyleSheet("QScrollArea{background:#25292E;border:none;}")
+        leads_scroll.setStyleSheet(f"QScrollArea{{background:{UI_PANEL};border:none;}}")
         leads_container = QWidget()
-        leads_container.setStyleSheet("background:#25292E;")
+        leads_container.setStyleSheet(f"background:{UI_PANEL};")
         leads_vbox = QVBoxLayout(leads_container)
         leads_vbox.setContentsMargins(2, 2, 2, 2)
         leads_vbox.setSpacing(2)
@@ -245,7 +250,7 @@ class HolterReplayPanel(QWidget):
         self._mini_lead_lbl = rhythm_lbl
         rhythm_lbl.setFixedWidth(34)
         rhythm_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        rhythm_lbl.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;")
+        rhythm_lbl.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;background:transparent;")
         # Replay mode: disable ALL coloring
         self._mini_strip = ECGStripCanvas(height=60, color="#00AA00", pen_width=0.9, show_annotations=False, disable_all_coloring=True)
         rhythm_row.addWidget(rhythm_lbl)
@@ -256,18 +261,13 @@ class HolterReplayPanel(QWidget):
 
 
         ov_frame = QFrame()
-        ov_frame.setStyleSheet("""
-            QFrame {
-                background: #0A0D10;
-                border: 1px solid #1E2832;
-                border-radius: 4px;
-            }
-        """)
+        ov_frame.setObjectName("rpOverviewCard")
+        ov_frame.setStyleSheet(_card_style("QFrame#rpOverviewCard"))
         ov_layout = QVBoxLayout(ov_frame)
-        ov_layout.setContentsMargins(4, 4, 4, 4)
-        ov_layout.setSpacing(0)
+        ov_layout.setContentsMargins(8, 8, 8, 8)
+        ov_layout.setSpacing(8)
         ov_title = QLabel("Overview")
-        ov_title.setStyleSheet("color: #FFFFFF; font-weight: bold; font-size: 13px; padding: 5px 8px; background: #131A22; border: 1px solid #232D38; border-bottom: none; border-top-left-radius: 3px; border-top-right-radius: 3px;")
+        ov_title.setStyleSheet(_card_title_style())
         ov_layout.addWidget(ov_title)
 
         self._overview_table = QTableWidget(0, 2)
@@ -284,35 +284,11 @@ class HolterReplayPanel(QWidget):
         self._overview_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._overview_table.setSelectionMode(QAbstractItemView.NoSelection)
         self._overview_table.setFocusPolicy(Qt.NoFocus)
-        self._overview_table.setShowGrid(True)
+        self._overview_table.setShowGrid(False)
         self._overview_table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._overview_table.horizontalHeader().setFixedHeight(28)
 
-        self._overview_table.setStyleSheet("""
-            QTableWidget {
-                background-color: #0A0E13;
-                color: #FFFFFF;
-                border: 1px solid #232D38;
-                gridline-color: #1A222C;
-                font-size: 11px;
-                font-family: 'Segoe UI', Arial, sans-serif;
-                outline: none;
-            }
-            QHeaderView::section {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1F2833, stop:1 #131A22);
-                color: #FFFFFF;
-                font-weight: bold;
-                font-size: 11px;
-                padding-left: 8px;
-                border: 1px solid #2A3644;
-                height: 26px;
-            }
-            QTableWidget::item {
-                padding-left: 8px;
-                padding-right: 8px;
-                border-bottom: 1px solid #141C24;
-            }
-        """)
+        self._overview_table.setStyleSheet(_overview_table_style())
         ov_layout.addWidget(self._overview_table, 1)
         top_splitter.addWidget(ov_frame)
         top_splitter.setSizes([430, 980, 280])
@@ -323,15 +299,17 @@ class HolterReplayPanel(QWidget):
         slider_row.setContentsMargins(2, 0, 2, 0)
         slider_row.setSpacing(8)
         self._time_start_label = QLabel("00:00:00")
-        self._time_start_label.setStyleSheet(f"color:{COL_TIMESTAMP};font-family:monospace;font-size:12px;border:none;")
+        self._time_start_label.setStyleSheet(f"color:{COL_TIMESTAMP};font-family:monospace;font-size:12px;border:none;background:transparent;")
         slider_row.addWidget(self._time_start_label)
         self._slider = QSlider(Qt.Horizontal)
         self._slider.setRange(0, self._slider_sec_to_value(self.duration_sec))
         self._slider.setStyleSheet(f"""
-            QSlider::groove:horizontal{{height:8px;background:{COL_DARK};border:1px solid {COL_GREEN_DRK};border-radius:4px;}}
-            QSlider::handle:horizontal{{background:{COL_GREEN};border:1px solid {COL_WHITE};border-radius:9px;
-                width:18px;height:18px;margin:-6px 0;}}
-            QSlider::sub-page:horizontal{{background:{COL_GREEN_DRK};border-radius:4px;}}
+            QSlider{{background:transparent;}}
+            QSlider::groove:horizontal{{height:8px;background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};border-radius:4px;}}
+            QSlider::handle:horizontal{{background:{UI_ACCENT};border:2px solid {UI_TEXT};border-radius:9px;
+                width:14px;height:14px;margin:-6px 0;}}
+            QSlider::handle:horizontal:hover{{background:{UI_ACCENT_HOVER};}}
+            QSlider::sub-page:horizontal{{background:{UI_ACCENT};border:1px solid {UI_ACCENT};border-radius:4px;}}
         """)
         self._slider.setTracking(True)
         self._slider.valueChanged.connect(self._on_slider)
@@ -339,7 +317,7 @@ class HolterReplayPanel(QWidget):
         slider_row.addWidget(self._slider, 1)
         self._pos_label = QLabel("00:00:00")
         self._pos_label.setStyleSheet(f"color:{COL_TIMESTAMP};font-family:monospace;font-size:14px;font-weight:bold;"
-                                      f"background:{COL_BLACK};padding:4px;border:1px solid {COL_GREEN_DRK};border-radius:4px;border:none;")
+                                      f"background:{UI_PANEL};padding:4px 8px;border:1px solid {UI_BORDER};border-radius:6px;")
         slider_row.addWidget(self._pos_label)
         layout.addLayout(slider_row)
 
@@ -356,24 +334,29 @@ class HolterReplayPanel(QWidget):
 
         for speed_lbl in ["0.5x", "1x", "2x", "4x"]:
             btn = QPushButton(speed_lbl)
-            btn.setStyleSheet(_style_btn(COL_DARK, COL_GREEN, COL_GREEN_DRK))
+            btn.setStyleSheet(_style_btn())
             btn.setFixedHeight(30)
             btn.setMinimumWidth(56)
             btn.clicked.connect(lambda _, s=speed_lbl: self._set_speed(s))
             ctrl_row.addWidget(btn)
         sep = QLabel("|")
-        sep.setStyleSheet(f"color:{COL_GREEN_DRK};")
+        sep.setStyleSheet(f"color:{UI_BORDER};background:transparent;border:none;")
         ctrl_row.addWidget(sep)
 
         lbl_lead = QLabel("Lead:")
-        lbl_lead.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;border:none;font-size:13px;")
+        lbl_lead.setStyleSheet(f"color:{UI_MUTED};font-weight:bold;border:none;font-size:13px;background:transparent;")
         ctrl_row.addWidget(lbl_lead)
         self._lead_combo = QComboBox()
         self._lead_combo.addItems(["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"])
         self._lead_combo.setCurrentIndex(1)
         self._lead_combo.setFixedWidth(70)
-        self._lead_combo.setStyleSheet(f"background:{COL_DARK};color:{COL_GREEN};border:1px solid {COL_GREEN_DRK};"
-                                       f"padding:4px;border-radius:4px;font-weight:bold;")
+        self._lead_combo.setStyleSheet(f"""
+            QComboBox {{ background:{UI_PANEL_ALT}; color:{UI_TEXT}; border:1px solid {UI_BORDER};
+                padding:4px 6px; border-radius:6px; font-weight:bold; }}
+            QComboBox:hover {{ border:1px solid {UI_ACCENT}; }}
+            QComboBox QAbstractItemView {{ background:{UI_PANEL}; color:{UI_TEXT}; border:1px solid {UI_BORDER};
+                selection-background-color:{UI_ACCENT}; selection-color:#FFFFFF; outline:none; }}
+        """)
         self._lead_combo.currentIndexChanged.connect(self._on_lead_changed)
         ctrl_row.addWidget(self._lead_combo)
 
@@ -384,13 +367,8 @@ class HolterReplayPanel(QWidget):
 
         # Bottom toolbar (like reference image)
         toolbar = QFrame()
-        toolbar.setStyleSheet(f"""
-            QFrame {{
-                background: #090B0D;
-                border: 1px solid #3A4148;
-                border-radius: 8px;
-            }}
-        """)
+        toolbar.setObjectName("rpToolbar")
+        toolbar.setStyleSheet(_card_style("QFrame#rpToolbar"))
         toolbar_layout = QHBoxLayout(toolbar)
         toolbar_layout.setContentsMargins(5, 4, 5, 4)
         toolbar_layout.setSpacing(5)
@@ -408,32 +386,26 @@ class HolterReplayPanel(QWidget):
             "Adjust strip position": 146,
             "Strip Length:10s": 120,
         }
-        tool_button_style = """
-            QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #4A5158, stop:0.5 #292E33, stop:1 #15181B);
-                color: #FFFFFF;
-                border: 1px solid #68727C;
-                border-bottom: 2px solid #101214;
-                border-radius: 5px;
+        tool_button_style = f"""
+            QPushButton {{
+                background: {UI_PANEL_ALT};
+                color: {UI_TEXT};
+                border: 1px solid {UI_BORDER};
+                border-radius: 6px;
                 padding: 5px 10px;
                 font-size: 10px;
                 font-weight: 600;
-            }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #69747E, stop:1 #353C43);
+            }}
+            QPushButton:hover {{
+                background: #1A2C49;
+                color: {UI_TEXT};
+                border: 1px solid {UI_ACCENT};
+            }}
+            QPushButton:pressed, QPushButton:checked {{
+                background: {UI_ACCENT};
                 color: #FFFFFF;
-                border: 1px solid #AAB4BD;
-            }
-            QPushButton:pressed, QPushButton:checked {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #171A1D, stop:1 #59636C);
-                color: #FFFFFF;
-                border: 1px solid #D0D7DD;
-                padding-top: 6px;
-                padding-bottom: 4px;
-            }
+                border: 1px solid #5EA4FF;
+            }}
         """
         for tool in ["Patient information", "Full Disc.", "Goto Template"]:
             tbtn = QPushButton(tool)
@@ -633,9 +605,9 @@ class HolterReplayPanel(QWidget):
         table.setAlternatingRowColors(True)
         for row, (label, value) in enumerate(rows):
             label_item = QTableWidgetItem(str(label))
-            label_item.setForeground(QColor(UI_TEXT))
+            label_item.setForeground(QColor(UI_MUTED))
             value_item = QTableWidgetItem(str(value))
-            value_item.setForeground(QColor(COL_WHITE))
+            value_item.setForeground(QColor(UI_TEXT))
             table.setItem(row, 0, label_item)
             table.setItem(row, 1, value_item)
         table.resizeRowsToContents()
@@ -722,7 +694,7 @@ class HolterReplayPanel(QWidget):
                 border-radius: 8px;
                 margin-top: 12px;
                 padding-top: 16px;
-                background: {COL_BLACK};
+                background: {UI_PANEL};
             }}
             QHeaderView::section {{
                 background: {UI_PANEL_ALT};
@@ -1219,11 +1191,11 @@ class HolterReplayPanel(QWidget):
             n_item = QTableWidgetItem(name)
             v_item = QTableWidgetItem(value)
             v_item.setToolTip(value)
-            bg_col = QColor("#121822") if r % 2 == 0 else QColor("#0A0D13")
+            bg_col = QColor(UI_PANEL) if r % 2 == 0 else QColor(UI_PANEL_ALT)
             n_item.setBackground(bg_col)
             v_item.setBackground(bg_col)
-            n_item.setForeground(QColor("#FFFFFF"))
-            v_item.setForeground(QColor("#FFFFFF"))
+            n_item.setForeground(QColor(UI_MUTED))
+            v_item.setForeground(QColor(UI_TEXT))
             self._overview_table.setItem(r, 0, n_item)
             self._overview_table.setItem(r, 1, v_item)
             if name in ('ST Elevation', 'ST Depression') and "\n" in str(value):

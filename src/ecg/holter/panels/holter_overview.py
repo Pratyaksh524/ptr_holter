@@ -41,6 +41,7 @@ from ..holter_helpers import (
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
     _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _card_style, _card_title_style, _overview_table_style,
 )
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas, HolterRRTrendCanvas, HRTrendCanvas
@@ -151,42 +152,61 @@ class HolterExpertReviewPanel(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
 
+        trend_card = QFrame()
+        trend_card.setObjectName("ovTrendCard")
+        trend_card.setStyleSheet(_card_style("QFrame#ovTrendCard"))
+        trend_l = QVBoxLayout(trend_card)
+        trend_l.setContentsMargins(6, 6, 6, 6)
         self._rr_trend_full = HolterRRTrendCanvas(title="RR Interval Trend (Full Recording)")
-        layout.addWidget(self._rr_trend_full)
+        trend_l.addWidget(self._rr_trend_full)
+        layout.addWidget(trend_card)
 
         body = QSplitter(Qt.Horizontal)
         body.setChildrenCollapsible(False)
-        body.setHandleWidth(1)
-        body.setStyleSheet(f"QSplitter{{background:{UI_BG};}} QSplitter::handle{{background:{UI_BORDER};}}")
+        body.setHandleWidth(6)
+        body.setStyleSheet(f"QSplitter{{background:{UI_BG};}} QSplitter::handle{{background:{UI_BG};}}")
 
         left = QFrame()
-        left.setStyleSheet(f"QFrame{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-radius:8px;}}")
+        left.setObjectName("ovLeftCard")
+        left.setStyleSheet(_card_style("QFrame#ovLeftCard"))
         left_l = QVBoxLayout(left)
         left_l.setContentsMargins(8, 8, 8, 8)
         left_l.setSpacing(8)
+        lorenz_ttl = QLabel("RR Scatter (Lorenz)")
+        lorenz_ttl.setStyleSheet(_card_title_style())
+        left_l.addWidget(lorenz_ttl)
         self._lorenz = LorenzCanvas()
         self._lorenz.setMinimumHeight(280)
         left_l.addWidget(self._lorenz, 2)
+        tmpl_ttl = QLabel("Templates")
+        tmpl_ttl.setStyleSheet(_card_title_style())
+        left_l.addWidget(tmpl_ttl)
         self._template_table = QTableWidget(0, 3)
         self._template_table.setHorizontalHeaderLabels(["Template", "Class", "Beats"])
         self._template_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._template_table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._template_table.verticalHeader().setVisible(False)
+        self._template_table.verticalHeader().setDefaultSectionSize(28)
         self._template_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._template_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._template_table.setAlternatingRowColors(True)
+        self._template_table.setShowGrid(False)
         self._template_table.setStyleSheet(_table_style())
         self._template_table.cellClicked.connect(self._on_template_clicked)
         left_l.addWidget(self._template_table, 1)
         body.addWidget(left)
 
-        #  "  "  Center: scrollable 12-lead ECG grid  "  " 
+        #  "  "  Center: scrollable 12-lead ECG grid  "  "
         center = QFrame()
-        center.setStyleSheet(f"QFrame{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:8px;}}")
+        center.setObjectName("ovCenterCard")
+        center.setStyleSheet(f"QFrame#ovCenterCard{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:8px;}}")
         center_l = QVBoxLayout(center)
-        center_l.setContentsMargins(4, 4, 4, 4)
-        center_l.setSpacing(0)
+        center_l.setContentsMargins(4, 6, 4, 4)
+        center_l.setSpacing(4)
 
         # 12-lead header
         hdr = QLabel("12-Lead ECG Overview")
-        hdr.setStyleSheet(f"color:{UI_TEXT};font-size:11px;font-weight:700;padding:4px 6px;border:none;")
+        hdr.setStyleSheet(_card_title_style())
         center_l.addWidget(hdr)
 
         leads_scroll = QScrollArea()
@@ -210,7 +230,7 @@ class HolterExpertReviewPanel(QWidget):
             lbl = QLabel(lead)
             lbl.setFixedWidth(34)
             lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            lbl.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;")
+            lbl.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;background:transparent;")
             # Expert/Overview mode: disable ALL coloring (disable_all_coloring=True) - no arrhythmia colors, just green
             strip = ECGStripCanvas(height=60, color="#00FF00", pen_width=0.9, lead_name=lead, show_vertical_lines=False, show_annotations=False, disable_all_coloring=True)
             strip.set_gain(1.0)
@@ -228,7 +248,7 @@ class HolterExpertReviewPanel(QWidget):
         rlbl = QLabel("II")
         rlbl.setFixedWidth(34)
         rlbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        rlbl.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;")
+        rlbl.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;background:transparent;")
         self._mini = ECGStripCanvas(height=40, color="#00AA00", pen_width=0.9, show_vertical_lines=False, show_annotations=False, disable_all_coloring=True)
         rhythm_row.addWidget(rlbl)
         rhythm_row.addWidget(self._mini, 1)
@@ -237,16 +257,13 @@ class HolterExpertReviewPanel(QWidget):
         body.addWidget(center)
 
         right = QFrame()
-        right.setStyleSheet(f"""
-            QFrame {{
-                background: #0A0D10;
-                border: 1px solid #1E2832;
-                border-radius: 4px;
-            }}
-        """)
+        right.setObjectName("ovRightCard")
+        right.setStyleSheet(_card_style("QFrame#ovRightCard"))
         right_l = QVBoxLayout(right)
+        right_l.setContentsMargins(8, 8, 8, 8)
+        right_l.setSpacing(8)
         ttl = QLabel("Overview")
-        ttl.setStyleSheet("color: #FFFFFF; font-weight: bold; font-size: 13px; padding: 5px 8px; background: #131A22; border: 1px solid #232D38; border-bottom: none; border-top-left-radius: 3px; border-top-right-radius: 3px;")
+        ttl.setStyleSheet(_card_title_style())
         right_l.addWidget(ttl)
 
         # Overview Table matching reference workstation layout
@@ -264,35 +281,10 @@ class HolterExpertReviewPanel(QWidget):
         self._overview.setEditTriggers(QTableWidget.NoEditTriggers)
         self._overview.setSelectionMode(QAbstractItemView.NoSelection)
         self._overview.setFocusPolicy(Qt.NoFocus)
-        self._overview.setShowGrid(True)
+        self._overview.setShowGrid(False)
         self._overview.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._overview.horizontalHeader().setFixedHeight(28)
-
-        self._overview.setStyleSheet("""
-            QTableWidget {
-                background-color: #0A0E13;
-                color: #DCE3EA;
-                border: 1px solid #232D38;
-                gridline-color: #1A222C;
-                font-size: 11px;
-                font-family: 'Segoe UI', Arial, sans-serif;
-                outline: none;
-            }
-            QHeaderView::section {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1F2833, stop:1 #131A22);
-                color: #FFFFFF;
-                font-weight: bold;
-                font-size: 11px;
-                padding-left: 8px;
-                border: 1px solid #2A3644;
-                height: 26px;
-            }
-            QTableWidget::item {
-                padding-left: 8px;
-                padding-right: 8px;
-                border-bottom: 1px solid #141C24;
-            }
-        """)
+        self._overview.setStyleSheet(_overview_table_style())
 
         right_l.addWidget(self._overview, 1)
         body.addWidget(right)
@@ -409,11 +401,11 @@ class HolterExpertReviewPanel(QWidget):
             ki = QTableWidgetItem(k)
             vi = QTableWidgetItem(v)
             vi.setToolTip(v)
-            bg_col = QColor("#121822") if i % 2 == 0 else QColor("#0A0D13")
+            bg_col = QColor(UI_PANEL) if i % 2 == 0 else QColor(UI_PANEL_ALT)
             ki.setBackground(bg_col)
             vi.setBackground(bg_col)
-            ki.setForeground(QColor("#FFFFFF"))
-            vi.setForeground(QColor("#FFFFFF"))
+            ki.setForeground(QColor(UI_MUTED))
+            vi.setForeground(QColor(UI_TEXT))
             self._overview.setItem(i, 0, ki)
             self._overview.setItem(i, 1, vi)
             if k in ('ST Elevation', 'ST Depression') and "\n" in str(v):

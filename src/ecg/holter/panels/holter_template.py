@@ -49,14 +49,15 @@ from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, Magni
 class _TemplateMetricCard(QFrame):
     def __init__(self, title: str, value: str = "", accent: str = COL_GREEN, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(f"QFrame{{background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #1B2433, stop:1 #111827);border:1px solid {UI_BORDER};border-radius:10px;}}")
+        self.setObjectName("tpMetricCard")
+        self.setStyleSheet(f"QFrame#tpMetricCard{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-left:3px solid {UI_ACCENT};border-radius:8px;}}")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(2)
         lbl = QLabel(title)
-        lbl.setStyleSheet(f"color:{UI_MUTED};font-size:10px;font-weight:700;border:none;")
+        lbl.setStyleSheet(f"color:{UI_MUTED};font-size:10px;font-weight:700;border:none;background:transparent;")
         self.value = QLabel(value)
-        self.value.setStyleSheet(f"color:{UI_TEXT};font-size:16px;font-weight:800;border:none;")
+        self.value.setStyleSheet(f"color:{UI_TEXT};font-size:16px;font-weight:800;border:none;background:transparent;")
         layout.addWidget(lbl)
         layout.addWidget(self.value)
 
@@ -102,7 +103,7 @@ class TemplateCardWidget(QFrame):
                 border-radius: 14px;
             }}
             QLineEdit, QComboBox {{
-                background: #0C1320;
+                background: {ui_bg};
                 color: {ui_text};
                 border: 1px solid {border};
                 border-radius: 7px;
@@ -110,10 +111,10 @@ class TemplateCardWidget(QFrame):
                 font-size: 11px;
             }}
             QComboBox QAbstractItemView {{
-                background: #0B1220;
+                background: {ui_panel};
                 color: {ui_text};
-                selection-background-color: {ui_accent};
-                selection-color: #07111F;
+                selection-background-color: #1E3A5F;
+                selection-color: {ui_text};
                 border: 1px solid {border};
                 outline: 0;
             }}
@@ -123,6 +124,7 @@ class TemplateCardWidget(QFrame):
             }}
             QComboBox::drop-down {{ border: none; width: 16px; }}
             QLineEdit:focus, QComboBox:focus {{ border-color: {ui_accent}; }}
+            QLabel {{ background: transparent; }}
         """
 
         layout = QVBoxLayout(self)
@@ -140,7 +142,7 @@ class TemplateCardWidget(QFrame):
         self.class_combo.setFixedWidth(95)  # Increased width for "Unconfirmed"
         self.count_pill = QLabel("0 beats")
         self.count_pill.setAlignment(Qt.AlignCenter)
-        self.count_pill.setStyleSheet(f"color:{UI_TEXT};font-size:11px;font-weight:800;background:#152235;border:1px solid {self._accent};border-radius:10px;padding:4px 8px;")
+        self.count_pill.setStyleSheet(f"color:{UI_TEXT};font-size:11px;font-weight:800;background:{UI_PANEL_ALT};border:1px solid {self._accent};border-radius:10px;padding:4px 8px;")
         header.addWidget(self.id_edit)
         header.addWidget(self.class_combo)
         header.addStretch()
@@ -164,7 +166,7 @@ class TemplateCardWidget(QFrame):
             badge.setToolTip(tooltip)
             badge.setAlignment(Qt.AlignCenter)
             badge.setVisible(False)
-            badge.setStyleSheet(f"color:{UI_TEXT};font-size:10px;font-weight:800;background:#17243A;border:1px solid {UI_BORDER};border-radius:8px;padding:2px 6px;")
+            badge.setStyleSheet(f"color:{UI_TEXT};font-size:10px;font-weight:800;background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};border-radius:8px;padding:2px 6px;")
             self.badge_labels[key] = badge
             badge_row.addWidget(badge)
         self.setToolTip("It means that all the beat forms under the template are similar in the template")
@@ -178,7 +180,7 @@ class TemplateCardWidget(QFrame):
         bottom = QHBoxLayout()
         bottom.setSpacing(6)
         self.template_no = QLabel("#T1")
-        self.template_no.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:700;border:none;")
+        self.template_no.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:700;border:none;background:transparent;")
         self.view_toggle = QToolButton()
         self.view_toggle.setCheckable(True)
         self.view_toggle.setChecked(True)
@@ -190,12 +192,12 @@ class TemplateCardWidget(QFrame):
                 border: 1px solid {UI_BORDER};
                 border-radius: 13px;
                 color: {UI_TEXT};
-                background: #0C1320;
+                background: {UI_BG};
                 font-weight: 900;
             }}
             QToolButton:hover {{
                 border-color: {UI_ACCENT_HOVER};
-                background: #11203A;
+                background: {UI_PANEL_ALT};
             }}
             QToolButton:checked {{
                 background: {UI_SUCCESS};
@@ -278,14 +280,14 @@ class TemplateCardWidget(QFrame):
     def _apply_styles(self):
         if self._selected:
             border = UI_ACCENT_HOVER
-            bg_top = "#18263C"
-            bg_bottom = "#101B2B"
+            bg_top = "#1A2C49"
+            bg_bottom = UI_PANEL_ALT
         else:
-            border = "#6EB4FF" if self._hovered else self._accent
-            bg_top = "#141F31" if self._hovered else "#121C2D"
-            bg_bottom = "#101827" if self._hovered else "#0D1521"
-        self.setStyleSheet(self._card_style.format(border=border, bg_top=bg_top, bg_bottom=bg_bottom, ui_text=UI_TEXT, ui_accent=UI_ACCENT))
-        self.count_pill.setStyleSheet(f"color:{UI_TEXT};font-size:11px;font-weight:800;background:#152235;border:1px solid {border};border-radius:10px;padding:4px 8px;")
+            border = UI_ACCENT_HOVER if self._hovered else self._accent
+            bg_top = UI_PANEL_ALT if self._hovered else UI_PANEL
+            bg_bottom = UI_PANEL if self._hovered else UI_CARD
+        self.setStyleSheet(self._card_style.format(border=border, bg_top=bg_top, bg_bottom=bg_bottom, ui_text=UI_TEXT, ui_accent=UI_ACCENT, ui_bg=UI_BG, ui_panel=UI_PANEL))
+        self.count_pill.setStyleSheet(f"color:{UI_TEXT};font-size:11px;font-weight:800;background:{UI_PANEL_ALT};border:1px solid {border};border-radius:10px;padding:4px 8px;")
         self.thumb.setStyleSheet(f"background:{COL_BLACK};border:1px solid {border};border-radius:10px;")
 
     def set_accent(self, accent: str):
@@ -340,7 +342,7 @@ class TemplateCardWidget(QFrame):
             elif key == "demix":
                 badge.setStyleSheet(f"color:{UI_TEXT};font-size:10px;font-weight:900;background:#122C46;border:1px solid #2D9CDB;border-radius:8px;padding:2px 6px;")
             elif key == "auto_update":
-                badge.setStyleSheet(f"color:{UI_TEXT};font-size:10px;font-weight:900;background:#1F2030;border:1px solid {UI_MUTED};border-radius:8px;padding:2px 6px;")
+                badge.setStyleSheet(f"color:{UI_TEXT};font-size:10px;font-weight:900;background:{UI_PANEL_ALT};border:1px solid {UI_MUTED};border-radius:8px;padding:2px 6px;")
         self.badge_container.setVisible(any_badge)
 
         self.view_toggle.blockSignals(True)
@@ -362,7 +364,7 @@ class HolterBeatTemplatePanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(f"background:{COL_BG};")
+        self.setStyleSheet(f"background:{UI_BG};")
         self._template_rows = []
         self._current_filter = "all"
         self._selected_template_key = ""
@@ -388,7 +390,7 @@ class HolterBeatTemplatePanel(QWidget):
         layout.setSpacing(8)
 
         title = QLabel("Template System")
-        title.setStyleSheet(f"color:#07111F;font-size:13px;font-weight:bold;background:qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #28E37B, stop:1 #89F7C5);padding:7px 12px;border-radius:8px;")
+        title.setStyleSheet(f"QLabel{{color:{UI_TEXT};font-size:13px;font-weight:bold;background:transparent;border:none;border-left:3px solid {UI_ACCENT};padding:4px 10px;}}")
         layout.addWidget(title)
 
         stats = QGridLayout()
@@ -409,7 +411,7 @@ class HolterBeatTemplatePanel(QWidget):
         filter_row = QHBoxLayout()
         filter_row.setSpacing(8)
         filter_lbl = QLabel("Filter")
-        filter_lbl.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:700;border:none;")
+        filter_lbl.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:700;border:none;background:transparent;")
         filter_row.addWidget(filter_lbl)
         self._filter_buttons = {}
         for key, text in [
@@ -450,9 +452,9 @@ class HolterBeatTemplatePanel(QWidget):
         self._scroll.setFrameShape(QFrame.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._scroll.setStyleSheet(f"QScrollArea{{background:{COL_BG};border:none;}}")
+        self._scroll.setStyleSheet(f"QScrollArea{{background:{UI_BG};border:none;}}")
         self._cards_host = QWidget()
-        self._cards_host.setStyleSheet(f"background:{COL_BG};")
+        self._cards_host.setStyleSheet(f"background:{UI_BG};")
         self._cards_layout = QGridLayout(self._cards_host)
         self._cards_layout.setContentsMargins(0, 0, 0, 0)
         self._cards_layout.setSpacing(7)
@@ -463,7 +465,7 @@ class HolterBeatTemplatePanel(QWidget):
         self._splitter.addWidget(self._scroll)
 
         self._detail_grid_host = QWidget()
-        self._detail_grid_host.setStyleSheet(f"background:{COL_BLACK};border-left:1px solid {COL_GREEN_DRK};")
+        self._detail_grid_host.setStyleSheet(f"background:{COL_BLACK};border-left:1px solid {UI_BORDER};")
         self._detail_layout = QGridLayout(self._detail_grid_host)
         self._detail_layout.setContentsMargins(4, 4, 4, 4)
         self._detail_layout.setSpacing(4)
@@ -472,7 +474,8 @@ class HolterBeatTemplatePanel(QWidget):
         for i in range(12):
             lead_name = lead_names_12[i]
             frame = QFrame()
-            frame.setStyleSheet(f"QFrame{{background:{COL_BLACK};border:1px solid {COL_GREEN_DRK};}}")
+            frame.setObjectName("tpLeadFrame")
+            frame.setStyleSheet(f"QFrame#tpLeadFrame{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:6px;}}")
             flayout = QVBoxLayout(frame)
             flayout.setContentsMargins(2, 2, 2, 2)
             flayout.setSpacing(0)
@@ -771,22 +774,22 @@ class HolterBeatTemplatePanel(QWidget):
         box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
         box.setDefaultButton(QMessageBox.No)
         box.setStyleSheet(f"""
-            QMessageBox {{ background: {COL_BLACK}; }}
-            QMessageBox QLabel {{ color: {COL_WHITE}; font-size: 12px; }}
+            QMessageBox {{ background: {UI_PANEL}; }}
+            QMessageBox QLabel {{ color: {UI_TEXT}; font-size: 12px; background: transparent; }}
             QMessageBox QPushButton {{
-                background: #1B2740;
-                color: {COL_WHITE};
+                background: {UI_PANEL_ALT};
+                color: {UI_TEXT};
                 border: 1px solid {UI_BORDER};
                 border-radius: 6px;
                 padding: 6px 14px;
                 min-width: 64px;
             }}
             QMessageBox QPushButton:hover {{
-                background: #243552;
+                background: #1A2C49;
                 border-color: {UI_ACCENT};
             }}
             QMessageBox QPushButton:pressed {{
-                background: #132033;
+                background: {UI_PANEL_ALT};
             }}
         """)
         return box.exec_() == QMessageBox.Yes
@@ -939,7 +942,7 @@ class HolterBeatTemplatePanel(QWidget):
             self._set_selected_keys([card_key])
         target_keys = list(self._selected_template_keys) or [card_key]
         menu = QMenu(self)
-        menu.setStyleSheet(f"QMenu {{ background: #0B1220; color: {UI_TEXT}; border: 1px solid {UI_BORDER}; padding: 6px; }} QMenu::item {{ padding: 6px 20px 6px 18px; border-radius: 4px; }} QMenu::item:selected {{ background: {UI_ACCENT}; color: #07111F; }} QMenu::separator {{ height: 1px; background: {UI_BORDER}; margin: 6px 4px; }}")
+        menu.setStyleSheet(f"QMenu {{ background: {UI_PANEL}; color: {UI_TEXT}; border: 1px solid {UI_BORDER}; padding: 6px; }} QMenu::item {{ padding: 6px 20px 6px 18px; border-radius: 4px; }} QMenu::item:selected {{ background: #1E3A5F; color: {UI_TEXT}; }} QMenu::separator {{ height: 1px; background: {UI_BORDER}; margin: 6px 4px; }}")
         prop_menu = menu.addMenu("Template properties")
         # Updated options: N, S, V, P, AF, X, Other, Unconfirmed
         for title, code in [
