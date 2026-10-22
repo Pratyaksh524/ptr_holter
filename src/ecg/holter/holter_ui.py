@@ -1888,8 +1888,6 @@ class HolterMainWindow(QDialog):
         self._lorenz_tab_panel = HolterLorenzPanel(replay_engine=self._replay_engine)
         self._lorenz_tab_panel.update_from_metrics(self._metrics_list)
         self._lorenz_tab_panel.seek_requested.connect(self._on_seek_requested)
-        if self._replay_engine:
-            self._lorenz_tab_panel.set_replay_engine(self._replay_engine)
         self._tabs.addTab(self._lorenz_tab_panel, _make_icon("LORENZ"), "LORENZ")
 
 
