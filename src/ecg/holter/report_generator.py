@@ -1331,10 +1331,11 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     story.append(Paragraph("ST ANALYSIS", title_style))
     story.append(HRFlowable(width="100%", thickness=2, color=ORANGE, spaceAfter=4*mm))
 
-    # ST episodes from ischemia_detection (12 leads; limb leads >= 1 mm, chest
-    # leads >= 2 mm elevation, >= 1 mm depression, any 2 leads of one group,
-    # >= 1 min). Per episode 'st_lead_mm' holds the leads that met the
-    # criteria and their worst value in mm (10 mm = 1 mV).
+    # ST events from ischemia_detection (12 leads, Full Disclosure screen mm;
+    # per 10 s frame limb leads >= 1 mm, chest leads >= 2 mm elevation,
+    # >= 1 mm depression, any 2 leads of one group; >= 30 s). Per event
+    # 'st_lead_mm' holds the leads that met the criteria with their average,
+    # 'st_lead_max_mm' their largest value (10 mm = 1 mV).
     _st_episodes = _load_st_episodes(session_dir)
     _st_dep = [e for e in _st_episodes if e.get('label') == 'ST Depression']
     _st_elev = [e for e in _st_episodes if e.get('label') == 'ST Elevation']
@@ -1348,7 +1349,7 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         total = sum(max(0.0, float(e['end_sec']) - float(e['start_sec'])) for e in eps)
         best_val, best_ep = None, None
         for e in eps:
-            for mm in (e.get('st_lead_mm') or {}).values():
+            for mm in (e.get('st_lead_max_mm') or e.get('st_lead_mm') or {}).values():
                 mv = float(mm) / 10.0
                 if best_val is None or (mv > best_val if elevation else mv < best_val):
                     best_val, best_ep = mv, e

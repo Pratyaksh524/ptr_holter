@@ -393,8 +393,11 @@ class HolterExpertReviewPanel(QWidget):
             ("Longest RR", f"{summary.get('longest_rr_ms', 0)/1000:.2f}s"),
             ("RRI (\u22652.0s)", f"{summary.get('pauses', 0)}"),
             ("T Inversion", format_st_summary(summary.get('t_episodes'), T_INVERSION, multiline=True)),
-            ("ST Elevation", format_st_summary(summary.get('st_episodes'), ST_ELEVATION, multiline=True)),
-            ("ST Depression", format_st_summary(summary.get('st_episodes'), ST_DEPRESSION, multiline=True)),
+            # ST: event list, Full Disclosure screen mm (average/max per lead)
+            ("ST Elevation", format_st_summary(summary.get('st_episodes'), ST_ELEVATION, multiline=True,
+                                               info=summary.get('st_info'))),
+            ("ST Depression", format_st_summary(summary.get('st_episodes'), ST_DEPRESSION, multiline=True,
+                                                info=summary.get('st_info'))),
         ]
         self._overview.setRowCount(len(rows))
         for i, (k, v) in enumerate(rows):

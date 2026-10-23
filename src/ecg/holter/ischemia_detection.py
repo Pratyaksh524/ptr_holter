@@ -10,44 +10,45 @@ and filters every lead exactly as the Full Disclosure strip does
 (_fd_filter): 0.5 Hz DFT high-pass (zero-phase, 2 s mirror padding), 3-point
 median, Gaussian low-pass 35 Hz twice (zero-phase).
 
-Method, chunk by chunk:
-  1. The recording is read in 10 s chunks (1.5 s padding each side).
-  2. Skipped chunks -- where the ST segment / T wave can't be read -- decided
-     from the chunk's own beats, not from any rhythm label:
+ST Elevation / ST Depression (detect_st_episodes), frame by frame:
+  1. The recording is read in 10 s frames (1.5 s padding each side).
+  2. Skipped frames -- where the ST segment can't be read -- decided from the
+     frame's own beats, not from any rhythm label:
        - beats that don't share one shape (median correlation < 0.9 with the
-         chunk's template): ectopics, noise, Ventricular Fibrillation;
+         frame's template): ectopics, noise, Ventricular Fibrillation;
        - median beat with QRS >= 120 ms: bundle branch block, ventricular
-         rhythm, paced beats. A wide QRS has secondary ST-T changes, and its
-         J point sits in the slurred end of the QRS (seen: RBBB/LBBB reading
-         +1.3..+3.1 mV "ST elevation").
-  3. Per chunk: R-peaks found on the reference lead; beats aligned to each
-     other. The median beat of each lead is used only to locate the QRS.
-  4. QRS onset and J point (QRS end) from the median beats and the combined
-     slope of all leads -- the same global multi-lead method the bundle
-     branch block width uses. Baseline = PR segment (40-10 ms before QRS
-     onset). ST level measured at J+40 ms (J+30 ms above 120 bpm), slope
-     from J+20 ms to that point, in mV relative to the baseline. Measured on
-     every beat of the 10 s window; the value of a lead is the one that
-     occurs most often among those beats (0.5 mm bins, mean of the fullest
-     bin), not the value of an averaged beat.
-     Why not at J or J+80: measured on normal sinus beats, the global J
-     point sits 10-20 ms before the end of the QRS in V1-V3 (+0.09..+0.17 mV
-     at J, ~0 at J+20), and by J+60..J+80 the T wave has started
-     (+0.24 mV at J+80 at 105 bpm). J+20..J+40 was flat at ~0 on every lead.
-  5. Criteria, limb leads and chest leads judged separately (never mixed):
-       limb group  (I, II, III, aVL, aVF)  : any 2 leads
-       chest group (V1-V6)                 : any 2 leads
-       ST Elevation : limb leads >= 1 mm (0.1 mV), chest leads >= 2 mm
-                      (0.2 mV).
-       ST Depression: limb and chest leads <= -1 mm (-0.1 mV), horizontal or
-                      downsloping (not more than 0.05 mV above the J+20
-                      level).
-     aVR is not judged. A chunk with both is labeled ST Elevation (the
-     depression is reciprocal). Values are reported per lead, in mm
-     (10 mm = 1 mV, the standard 10 mm/mV).
-  6. Episodes: consecutive positive chunks of one label, joined across gaps
-     up to _MERGE_GAP_SEC, kept when they last >= _MIN_EPISODE_SEC (the
-     Holter "1 mm x 1 min" convention).
+         rhythm, paced beats (secondary ST-T changes; the J point sits in
+         the slurred end of the QRS);
+       - irregular RR (median beat-to-beat RR change > 12 % of the RR):
+         Atrial Fibrillation, frequent ectopics. In Atrial Fibrillation the
+         PR segment holds f waves, so it is not a baseline.
+  3. R-peaks found on the reference lead; beats aligned to each other. The
+     median beat is used only to locate the QRS onset and J point (combined
+     slope of all leads, as the bundle branch block width).
+  4. Per beat and per lead: baseline = PR segment (40-10 ms before QRS
+     onset); ST at J+40 ms (J+30 ms above 120 bpm) and at J+20 ms (slope).
+     The value of a lead in the frame is the one that occurs most often
+     among its beats (0.1 mm bins, mean of the fullest bin). A lead whose
+     beats spread more than 1 mm (interquartile range) is noisy in that
+     frame and is not judged there.
+     All in the millimetres of the Full Disclosure screen (10 mm/mV,
+     _SCREEN_ADC_PER_MV).
+  5. Criteria per frame, limb leads and chest leads judged separately:
+       limb group  (I, II, III, aVL, aVF), any 2 leads
+       chest group (V1-V6), any 2 leads
+       ST Elevation : limb >= 1 mm, chest >= 2 mm.
+       ST Depression: limb and chest <= -1 mm, horizontal or downsloping
+                      (not rising more than 0.5 mm from J+20 to the ST
+                      point).
+     aVR is not judged. A frame with both is ST Elevation (the depression
+     is reciprocal).
+  6. Events: consecutive frames of one label, a gap of up to one frame
+     (10 s) joined, kept when the qualifying frames add up to >= 30 s.
+     Per event and per lead that qualified: the average over the frames in
+     which it qualified, and the largest value (max elevation / deepest
+     depression).
+  7. A recording shorter than 30 s can't hold an event; the Overview says
+     so instead of "None".
 """
 
 from typing import Any, Callable, Dict, List, Optional
@@ -76,15 +77,29 @@ _CHUNK_SEC = 10.0
 _CHUNK_PAD_SEC = 1.5
 _MIN_CHUNK_SEC = 5.0
 _MIN_BEATS = 4
-_MIN_EPISODE_SEC = 60.0
-_MERGE_GAP_SEC = 60.0
+_MIN_EPISODE_SEC = 60.0          # T Inversion episodes
+_MERGE_GAP_SEC = 60.0            # T Inversion episodes
+_MODE_BIN_MV = 0.05              # T Inversion
 
-_MODE_BIN_MV = 0.05              # beats within 0.5 mm of each other count as the same value
 _MM_PER_MV = 10.0
-_ELEVATION_MV = {'limb': 0.10, 'chest': 0.20}     # 1 mm limb leads, 2 mm chest leads
-_DEPRESSION_MV = -0.10                            # 1 mm, limb and chest leads
-_UPSLOPE_LIMIT_MV = 0.05
+
+# ST is measured in the millimetres of the Full Disclosure strip: it draws
+# 4096 ADC over its row height (8 rows fill the screen), which at 10 mm/mV
+# comes to ~933 ADC per mV on a 2560x1440 screen at 100 % scale (row 166 px =
+# 43.9 mm -> 93.3 ADC per mm). A fixed number, so the values don't change
+# with the window size.
+_SCREEN_ADC_PER_MV = 933.0
+_ADC_TO_MM = _MM_PER_MV / _SCREEN_ADC_PER_MV
+
+_ST_MODE_BIN_MM = 0.1            # beats within 0.1 mm of each other count as the same value
+_ELEVATION_MM = {'limb': 1.0, 'chest': 2.0}
+_DEPRESSION_MM = -1.0            # limb and chest leads
+_UPSLOPE_LIMIT_MM = 0.5          # depression rising more than this J+20 -> ST point is upsloping
+_LEAD_SPREAD_MM = 1.0            # beats of one lead spread wider than this: lead is noisy
+_IRREGULAR_RR = 0.12             # median |RR change| / median RR above this: irregular rhythm
 _MIN_LEADS_IN_GROUP = 2
+_ST_EVENT_GAP_SEC = 10.0         # one frame
+_ST_MIN_EVENT_SEC = 30.0
 
 # Limb and chest leads are measured and judged as two separate arrays
 # (limb leads: frontal plane; chest leads: horizontal plane).
@@ -225,40 +240,57 @@ def _lead_order(name: str) -> int:
     return order.index(name) if name in order else len(order)
 
 
-def _modal_st(st_level: np.ndarray, st_early: np.ndarray):
+def _modal_st(st_level: np.ndarray, st_early: np.ndarray, bin_size: float = _MODE_BIN_MV):
     """The ST value that occurs most often among the beats of one window (one
-    lead): the beats' ST levels are put in _MODE_BIN_MV wide bins, the fullest
+    lead): the beats' ST levels are put in bin_size wide bins, the fullest
     bin wins (a tie goes to the bin nearest the median), and the value is the
     mean of the beats in that bin -- ST level and ST at J+20 ms of the same
     beats. Returns (st_level, st_early) in the units given."""
-    bins = np.floor(st_level / _MODE_BIN_MV).astype(int)
+    bins = np.floor(st_level / bin_size).astype(int)
     keys, counts = np.unique(bins, return_counts=True)
     top = keys[counts == counts.max()]
     if top.size > 1:
         mid = float(np.median(st_level))
-        top = top[[int(np.argmin(np.abs((top + 0.5) * _MODE_BIN_MV - mid)))]]
+        top = top[[int(np.argmin(np.abs((top + 0.5) * bin_size - mid)))]]
     pick = bins == top[0]
     return float(np.mean(st_level[pick])), float(np.mean(st_early[pick]))
 
 
-def _lead_group(names: List[str], st_early: List[float], st_level: List[float]) -> Dict[str, Any]:
+def _lead_group(names: List[str], st_early: List[float], st_level: List[float],
+                noisy: List[bool]) -> Dict[str, Any]:
     """One lead group as arrays: lead names, ST at J+20 ms and ST at the ST
-    point, in mV, index-aligned."""
+    point (screen mm), and whether the lead was too noisy to judge,
+    index-aligned."""
     return {'names': list(names),
             'st_early': np.asarray(st_early, dtype=float),
-            'st_level': np.asarray(st_level, dtype=float)}
+            'st_level': np.asarray(st_level, dtype=float),
+            'noisy': list(noisy)}
+
+
+def _rr_irregular(peaks: List[int]) -> bool:
+    """True when the RR intervals jump from beat to beat (Atrial
+    Fibrillation, frequent ectopics): median |RR change| > _IRREGULAR_RR of
+    the median RR. Sinus rhythm changes gradually, a few % per beat."""
+    rr = np.diff(np.asarray(peaks, dtype=float))
+    if rr.size < 3:
+        return False
+    return float(np.median(np.abs(np.diff(rr)))) > _IRREGULAR_RR * float(np.median(rr))
 
 
 def _chunk_st(data: np.ndarray, lead_names: List[str], fs: float, pan_tompkins,
               ref_idx: int, skip_leads: set):
-    """ST deviation (mV) of one 10 s chunk, limb leads and chest leads in
-    separate arrays: ({'limb': group, 'chest': group}, heart rate), or None
-    when the chunk can't be measured. group = see _lead_group (ST at J+20 ms
-    and at the ST point J+40 ms, J+30 ms above 120 bpm). The ST value of a
-    lead is the value that occurs most often among the beats of the chunk
-    (_modal_st), not the value of an averaged beat."""
+    """ST deviation of one 10 s frame in screen mm, limb leads and chest
+    leads in separate arrays: ({'limb': group, 'chest': group}, heart rate),
+    or None when the frame can't be measured (see the module docstring).
+    group = see _lead_group (ST at J+20 ms and at the ST point J+40 ms, J+30
+    ms above 120 bpm). The ST value of a lead is the value that occurs most
+    often among the beats of the frame (_modal_st), not the value of an
+    averaged beat."""
     peaks = [int(p) for p in pan_tompkins(np.asarray(data[ref_idx], dtype=float), fs=fs)]
     if len(peaks) < _MIN_BEATS:
+        return None
+    # Irregular rhythm: no flat PR segment to measure from (f waves).
+    if _rr_irregular(peaks):
         return None
     rr = np.diff(peaks) / float(fs)
     hr = 60.0 / float(np.median(rr)) if rr.size else 0.0
@@ -285,8 +317,8 @@ def _chunk_st(data: np.ndarray, lead_names: List[str], fs: float, pan_tompkins,
     half = max(1, int(0.005 * fs))
     if base_lo < 0 or st_point + half >= med.shape[1]:
         return None
-    limb = ([], [], [])
-    chest = ([], [], [])
+    limb = ([], [], [], [])
+    chest = ([], [], [], [])
     for li, name in enumerate(lead_names):
         if name in skip_leads or li >= med.shape[0]:
             continue
@@ -295,33 +327,36 @@ def _chunk_st(data: np.ndarray, lead_names: List[str], fs: float, pan_tompkins,
             continue
         x = beats[:, li, :]                                   # [beat, sample]
         baseline = x[:, base_lo:base_hi].mean(axis=1)
-        beat_early = (x[:, early - half:early + half].mean(axis=1) - baseline) * _ADC_TO_MV
-        beat_level = (x[:, st_point - half:st_point + half].mean(axis=1) - baseline) * _ADC_TO_MV
-        st_level, st_early = _modal_st(beat_level, beat_early)
+        beat_early = (x[:, early - half:early + half].mean(axis=1) - baseline) * _ADC_TO_MM
+        beat_level = (x[:, st_point - half:st_point + half].mean(axis=1) - baseline) * _ADC_TO_MM
+        st_level, st_early = _modal_st(beat_level, beat_early, _ST_MODE_BIN_MM)
+        q1, q3 = np.percentile(beat_level, [25, 75])
         group[0].append(name)
         group[1].append(st_early)
         group[2].append(st_level)
+        group[3].append(bool(q3 - q1 > _LEAD_SPREAD_MM))
     return {'limb': _lead_group(*limb), 'chest': _lead_group(*chest)}, hr
 
 
 def _chunk_label(st: Dict[str, Dict[str, Any]]):
-    """('ST Elevation' | 'ST Depression' | None, {lead: ST mV}) for one chunk.
+    """('ST Elevation' | 'ST Depression' | None, {lead: ST mm}) for one frame.
 
     The limb-lead array and the chest-lead array are judged separately; a
     label needs at least _MIN_LEADS_IN_GROUP leads of ONE group past its
-    threshold. The returned dict holds the leads of the groups that
-    qualified.
+    threshold. Noisy leads and aVR are not judged. The returned dict holds
+    the leads of the groups that qualified.
     """
     elevated, depressed = {}, {}
     for key in ('limb', 'chest'):
         group = st[key]
         elev, dep = {}, {}
-        for name, st_early, st_level in zip(group['names'], group['st_early'], group['st_level']):
-            if name == 'aVR':
+        for name, st_early, st_level, noisy in zip(group['names'], group['st_early'],
+                                                   group['st_level'], group['noisy']):
+            if name == 'aVR' or noisy:
                 continue
-            if st_level >= _ELEVATION_MV[key]:
+            if st_level >= _ELEVATION_MM[key]:
                 elev[name] = float(st_level)
-            if st_level <= _DEPRESSION_MV and (st_level - st_early) <= _UPSLOPE_LIMIT_MV:
+            if st_level <= _DEPRESSION_MM and (st_level - st_early) <= _UPSLOPE_LIMIT_MM:
                 dep[name] = float(st_level)
         if len(elev) >= _MIN_LEADS_IN_GROUP:
             elevated.update(elev)
@@ -334,8 +369,8 @@ def _chunk_label(st: Dict[str, Dict[str, Any]]):
     return None, {}
 
 
-def _chunk_all_leads_mv(st: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
-    """ST level (mV) of every lead of one chunk, for the 6 + 6 lead display."""
+def _chunk_all_leads_mm(st: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+    """ST level (screen mm) of every lead of one frame."""
     out = {}
     for key in ('limb', 'chest'):
         for name, level in zip(st[key]['names'], st[key]['st_level']):
@@ -346,11 +381,16 @@ def _chunk_all_leads_mv(st: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
 def detect_st_episodes(
     reader,
     make_time_strs: Optional[Callable[[float, float], tuple]] = None,
+    info: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """Return ST Elevation / ST Depression episodes (start_sec, end_sec,
-    label, color, start_time_str, end_time_str, plus 'st_leads', 'st_mv' =
-    worst deviation in mV, 'st_lead_mm' = qualifying leads, 'st_all_mm' = all
-    leads). Reads the recording itself; see the module docstring."""
+    """Return ST Elevation / ST Depression events (start_sec, end_sec, label,
+    color, start_time_str, end_time_str, plus 'st_leads', 'st_lead_mm' =
+    qualifying leads, average over the frames they qualified in,
+    'st_lead_max_mm' = their largest value, 'st_mv' = the largest value in
+    mV, 'st_all_mm' = every lead, average over the event's frames). Screen
+    mm. When `info` is given it is filled with 'duration_sec', 'start_time',
+    'frames' and 'measured' (frames that could be read). See the module
+    docstring."""
     try:
         from ecg.pan_tompkins import pan_tompkins
     except ImportError:  # pragma: no cover
@@ -359,6 +399,9 @@ def detect_st_episodes(
     fs = float(getattr(reader, 'fs', 500) or 500)
     total = float(getattr(reader, 'duration_sec', 0.0) or 0.0)
     lead_names = list(getattr(reader, 'lead_names', []) or [])
+    if info is not None:
+        info.update({'duration_sec': total, 'frames': 0, 'measured': 0,
+                     'start_time': float(getattr(reader, 'start_time', 0.0) or 0.0)})
     if total <= 0 or not lead_names:
         return []
     ref_name = next((n for n in ('II', 'V5', 'I', 'V6') if n in lead_names), lead_names[0])
@@ -370,62 +413,66 @@ def detect_st_episodes(
                 return f"{int(t // 3600):02d}:{int((t % 3600) // 60):02d}:{int(t % 60):02d}"
             return fmt(s_sec), fmt(e_sec)
 
-    # Positive chunks: (start, end, label, {lead: ST mV})
+    # Positive frames: (start, end, label, {lead: mm}, {every lead: mm})
     positives = []
+    n_frames = n_measured = 0
     for t, t_end in _chunks(total):
+        n_frames += 1
         try:
             data = _read_chunk(reader, t, t_end, total, fs)
             if data is None:
                 continue
             result = _chunk_st(data, lead_names[:data.shape[0]], fs, pan_tompkins, ref_idx, set())
-            if result is not None:
-                st, _hr = result
-                label, lead_mv = _chunk_label(st)
-                if label is not None:
-                    positives.append((t, t_end, label, lead_mv, _chunk_all_leads_mv(st)))
+            if result is None:
+                continue
+            n_measured += 1
+            st, _hr = result
+            label, lead_mm = _chunk_label(st)
+            if label is not None:
+                positives.append((t, t_end, label, lead_mm, _chunk_all_leads_mm(st)))
         except Exception as e:
             print(f"[Ischemia Detect] Chunk error {t:.1f}s: {e}")
+    if info is not None:
+        info.update({'frames': n_frames, 'measured': n_measured})
 
-    # Episodes: same label, gaps up to _MERGE_GAP_SEC joined. Per lead the
-    # worst value over the episode is kept.
-    def worse(label, a, b):
-        return max(a, b) if label == ST_ELEVATION else min(a, b)
-
-    episodes = []
-    for s_sec, e_sec, label, lead_mv, all_mv in positives:
-        if episodes and episodes[-1]['label'] == label and s_sec - episodes[-1]['end_sec'] <= _MERGE_GAP_SEC:
-            ep = episodes[-1]
-            ep['end_sec'] = e_sec
-            for lead, v in lead_mv.items():
-                ep['lead_mv'][lead] = worse(label, ep['lead_mv'][lead], v) if lead in ep['lead_mv'] else v
-            for lead, v in all_mv.items():
-                ep['all_mv'][lead] = worse(label, ep['all_mv'][lead], v) if lead in ep['all_mv'] else v
-            continue
-        episodes.append({'start_sec': s_sec, 'end_sec': e_sec, 'label': label,
-                         'lead_mv': dict(lead_mv), 'all_mv': dict(all_mv)})
+    # Events: same label, a gap of up to one frame joined.
+    events = []
+    for s_sec, e_sec, label, lead_mm, all_mm in positives:
+        ev = events[-1] if events else None
+        if ev is None or ev['label'] != label or s_sec - ev['end_sec'] > _ST_EVENT_GAP_SEC + 1e-6:
+            ev = {'start_sec': s_sec, 'end_sec': e_sec, 'label': label,
+                  'qual_sec': 0.0, 'lead': {}, 'all': {}}
+            events.append(ev)
+        ev['end_sec'] = e_sec
+        ev['qual_sec'] += e_sec - s_sec
+        for lead, v in lead_mm.items():
+            ev['lead'].setdefault(lead, []).append(v)
+        for lead, v in all_mm.items():
+            ev['all'].setdefault(lead, []).append(v)
 
     out = []
-    for ep in episodes:
-        if ep['end_sec'] - ep['start_sec'] < _MIN_EPISODE_SEC:
+    for ev in events:
+        if ev['qual_sec'] < _ST_MIN_EVENT_SEC - 1e-6:
             continue
-        s_str, e_str = make_time_strs(ep['start_sec'], ep['end_sec'])
-        leads = sorted(ep['lead_mv'], key=_lead_order)
-        values = list(ep['lead_mv'].values())
-        worst = max(values) if ep['label'] == ST_ELEVATION else min(values)
+        elevation = ev['label'] == ST_ELEVATION
+        s_str, e_str = make_time_strs(ev['start_sec'], ev['end_sec'])
+        leads = sorted(ev['lead'], key=_lead_order)
+        peak = {lead: (max(v) if elevation else min(v)) for lead, v in ev['lead'].items()}
+        worst = max(peak.values()) if elevation else min(peak.values())
         out.append({
-            'start_sec': float(ep['start_sec']),
-            'end_sec': float(ep['end_sec']),
-            'label': ep['label'],
-            'color': ST_COLORS[ep['label']],
+            'start_sec': float(ev['start_sec']),
+            'end_sec': float(ev['end_sec']),
+            'label': ev['label'],
+            'color': ST_COLORS[ev['label']],
             'start_time_str': s_str,
             'end_time_str': e_str,
-            'detected_rhythm': ep['label'],
+            'detected_rhythm': ev['label'],
             'st_leads': leads,
-            'st_mv': round(float(worst), 3),
-            'st_lead_mm': {lead: round(ep['lead_mv'][lead] * _MM_PER_MV, 1) for lead in leads},
-            # every lead (worst value over the episode), qualifying or not
-            'st_all_mm': {lead: round(v * _MM_PER_MV, 1) for lead, v in
-                          sorted(ep['all_mv'].items(), key=lambda kv: _lead_order(kv[0]))},
+            'st_mv': round(float(worst) / _MM_PER_MV, 3),
+            'st_lead_mm': {lead: round(float(np.mean(ev['lead'][lead])), 1) for lead in leads},
+            'st_lead_max_mm': {lead: round(float(peak[lead]), 1) for lead in leads},
+            'st_all_mm': {lead: round(float(np.mean(v)), 1) for lead, v in
+                          sorted(ev['all'].items(), key=lambda kv: _lead_order(kv[0]))},
         })
     return out
 
@@ -648,7 +695,7 @@ def get_cached_ischemia(path: str) -> Optional[Dict[str, List[Dict[str, Any]]]]:
 
 def compute_ischemia(path: str) -> Dict[str, List[Dict[str, Any]]]:
     """ST and T Inversion episodes of the recording at `path`:
-    {'st': [...], 't': [...]} (opens and closes the reader), cached in memory
+    {'st': [...], 't': [...], 'st_info': {...}} (opens and closes the reader), cached in memory
     and next to the recording. Blocking; ischemia_async() runs it on a worker
     thread."""
     import json
@@ -656,7 +703,9 @@ def compute_ischemia(path: str) -> Dict[str, List[Dict[str, Any]]]:
     from .file_format import ECGHFileReader
     reader = ECGHFileReader(path)
     try:
-        result = {'st': detect_st_episodes(reader), 't': detect_t_inversion_episodes(reader)}
+        st_info: Dict[str, Any] = {}
+        result = {'st': detect_st_episodes(reader, info=st_info),
+                  't': detect_t_inversion_episodes(reader), 'st_info': st_info}
     finally:
         reader.close()
     key = _cache_key(path)
@@ -714,7 +763,7 @@ def ischemia_async(path: str, on_done: Callable[[Dict[str, List[Dict[str, Any]]]
     _jobs[key] = job
 
     def _run():
-        result = {'st': [], 't': []}
+        result = {'st': [], 't': [], 'st_info': None}
         try:
             result = compute_ischemia(path)
         except Exception as e:
@@ -724,36 +773,78 @@ def ischemia_async(path: str, on_done: Callable[[Dict[str, List[Dict[str, Any]]]
     threading.Thread(target=_run, daemon=True, name='ischemia-detect').start()
 
 
-def format_st_summary(episodes: Optional[List[Dict[str, Any]]], label: str, multiline: bool = False) -> str:
-    """Text for the Overview / Replay "ST Elevation" / "ST Depression" rows.
-    episodes: every detected segment (any label) or None when detection
-    hasn't run -- then "-". No episode of this label: "None". Otherwise the
-    episode count and total duration, then the six limb leads and below them
-    the six chest leads, each as "<lead>: <worst value in mm>" separated by
-    commas (the worst qualifying value of each lead over all episodes of this
-    label; a lead that did not meet the criteria shows "-"). multiline=True puts the three parts on
-    three lines (for the tables), otherwise they are joined with " | "."""
+_ST_OVERVIEW_EVENTS = 5
+
+
+def format_st_summary(episodes: Optional[List[Dict[str, Any]]], label: str, multiline: bool = False,
+                      info: Optional[Dict[str, Any]] = None) -> str:
+    """Text for the Overview / Replay "ST Elevation" / "ST Depression" /
+    "T Inversion" rows. episodes: every detected event (any label) or None
+    when detection hasn't run -- then "-".
+
+    ST: the event list -- per event its system start - end time, duration
+    and the qualifying leads as "<lead> <average>/<max>" in screen mm; the
+    longest _ST_OVERVIEW_EVENTS events, in time order, then "+N more". `info`
+    (detect_st_episodes) turns "None" into "Recording too short" / "Not
+    measurable" where that is why.
+
+    T Inversion: episode count and total duration, then the six limb leads
+    and the six chest leads with their worst value in mm.
+
+    multiline=True puts the parts on separate lines (for the tables),
+    otherwise they are joined with " | "."""
     if episodes is None:
         return "-"
+    sep = "\n" if multiline else " | "
     eps = [e for e in episodes if e.get('label') == label]
+
+    def dur(sec):
+        return f"{int(sec // 60)}m{int(sec % 60):02d}s"
+
+    if label != T_INVERSION:
+        if not eps:
+            if info and float(info.get('duration_sec', 0.0) or 0.0) < _ST_MIN_EVENT_SEC:
+                return f"Recording too short (< {int(_ST_MIN_EVENT_SEC)} s)"
+            if info and int(info.get('frames', 0) or 0) > 0 and int(info.get('measured', 0) or 0) == 0:
+                return "Not measurable (wide QRS / irregular / noise)"
+            return "None"
+        start = float((info or {}).get('start_time', 0.0) or 0.0)
+
+        def clock(sec):
+            if start > 0:
+                from datetime import datetime
+                return datetime.fromtimestamp(start + sec).strftime('%H:%M:%S')
+            return f"{int(sec // 3600):02d}:{int((sec % 3600) // 60):02d}:{int(sec % 60):02d}"
+
+        total = sum(max(0.0, float(e['end_sec']) - float(e['start_sec'])) for e in eps)
+        longest = sorted(eps, key=lambda e: float(e['start_sec']) - float(e['end_sec']))[:_ST_OVERVIEW_EVENTS]
+        shown = sorted(longest, key=lambda e: float(e['start_sec']))
+        lines = [f"{len(eps)} event{'s' if len(eps) != 1 else ''}, {dur(total)} (mm avg/max)"]
+        for i, e in enumerate(shown, 1):
+            avg = e.get('st_lead_mm') or {}
+            mx = e.get('st_lead_max_mm') or avg
+            s, en = float(e['start_sec']), float(e['end_sec'])
+            lines.append(f"{i}) {clock(s)} - {clock(en)} ({dur(en - s)})")
+            for group, names in (('Limb', LIMB_LEADS), ('Chest', CHEST_LEADS)):
+                leads = ", ".join(f"{lead} {float(avg[lead]):+.1f}/{float(mx.get(lead, avg[lead])):+.1f}"
+                                  for lead in names if lead in avg)
+                if leads:
+                    lines.append(f"    {group}: {leads}")
+        if len(eps) > len(shown):
+            lines.append(f"+{len(eps) - len(shown)} more (report)")
+        return sep.join(lines)
+
     if not eps:
         return "None"
     total = sum(max(0.0, float(e['end_sec']) - float(e['start_sec'])) for e in eps)
-    m, s = int(total // 60), int(total % 60)
     per_lead: Dict[str, float] = {}
     for e in eps:
-        # Only the leads that met the criteria, with their qualifying value --
-        # the same values the report's ST Event list shows.
         for lead, mm in (e.get('st_lead_mm') or {}).items():
             mm = float(mm)
-            if lead not in per_lead:
-                per_lead[lead] = mm
-            else:
-                per_lead[lead] = max(per_lead[lead], mm) if label == ST_ELEVATION else min(per_lead[lead], mm)
+            per_lead[lead] = min(per_lead[lead], mm) if lead in per_lead else mm
 
     def line(leads):
         return ", ".join(f"{lead}: {per_lead[lead]:+.1f}" if lead in per_lead else f"{lead}: -" for lead in leads)
 
-    head = f"{len(eps)} ep, {m}m{s:02d}s (mm)"
-    parts = [head, line(LIMB_LEADS), line(CHEST_LEADS)]
-    return ("\n" if multiline else " | ").join(parts)
+    head = f"{len(eps)} ep, {dur(total)} (mm)"
+    return sep.join([head, line(LIMB_LEADS), line(CHEST_LEADS)])

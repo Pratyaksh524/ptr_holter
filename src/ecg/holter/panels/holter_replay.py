@@ -1244,10 +1244,12 @@ class HolterReplayPanel(QWidget):
         # 'st_mv' stored in metrics.jsonl (one Lead II reading taken while
         # recording, never recomputed, seen reading up to 9 mV) is no longer
         # shown. "-" until the episodes have been calculated.
-        st_episodes = (getattr(self, '_summary', None) or {}).get('st_episodes')
         t_inversion_str = format_st_summary((getattr(self, '_summary', None) or {}).get('t_episodes'), T_INVERSION, multiline=True)
-        st_elevation_str = format_st_summary(st_episodes, ST_ELEVATION, multiline=True)
-        st_depression_str = format_st_summary(st_episodes, ST_DEPRESSION, multiline=True)
+        # ST: event list, Full Disclosure screen mm (average/max per lead)
+        st_episodes = (getattr(self, '_summary', None) or {}).get('st_episodes')
+        st_info = (getattr(self, '_summary', None) or {}).get('st_info')
+        st_elevation_str = format_st_summary(st_episodes, ST_ELEVATION, multiline=True, info=st_info)
+        st_depression_str = format_st_summary(st_episodes, ST_DEPRESSION, multiline=True, info=st_info)
 
         return [
             ("Total NNs", str(total_beats)),

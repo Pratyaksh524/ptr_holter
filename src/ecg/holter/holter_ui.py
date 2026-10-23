@@ -2233,6 +2233,7 @@ class HolterMainWindow(QDialog):
                 cached = get_cached_ischemia(ecgh_path)
                 if cached is not None:
                     st_eps, t_eps = cached.get('st', []), cached.get('t', [])
+                    self._st_info = cached.get('st_info')
                 elif not getattr(self, '_ischemia_pending', False):
                     self._ischemia_pending = True
 
@@ -2241,12 +2242,15 @@ class HolterMainWindow(QDialog):
                         if getattr(self, 'session_dir', '') and                                 os.path.join(self.session_dir, 'recording.ecgh') == path:
                             self._st_episodes = result.get('st', [])
                             self._t_episodes = result.get('t', [])
+                            self._st_info = result.get('st_info')
                             self._push_ischemia_to_panels()
                     ischemia_async(ecgh_path, _done)
         except Exception as e:
             print(f"[Holter UI] ST / T Inversion unavailable: {e}")
         self._st_episodes = st_eps
         self._t_episodes = t_eps
+        if st_eps is None:
+            self._st_info = None
         self._push_ischemia_to_panels()
 
     def _push_ischemia_to_panels(self):
@@ -2255,6 +2259,7 @@ class HolterMainWindow(QDialog):
         if isinstance(getattr(self, '_summary', None), dict):
             self._summary['st_episodes'] = getattr(self, '_st_episodes', None)
             self._summary['t_episodes'] = getattr(self, '_t_episodes', None)
+            self._summary['st_info'] = getattr(self, '_st_info', None)
             if hasattr(self, '_expert_panel'):
                 self._expert_panel.update_from_metrics(self._metrics_list, self._summary)
             if hasattr(self, '_replay_panel'):
@@ -2264,6 +2269,7 @@ class HolterMainWindow(QDialog):
         if isinstance(getattr(self, '_summary', None), dict) and hasattr(self, '_st_episodes'):
             self._summary['st_episodes'] = self._st_episodes
             self._summary['t_episodes'] = getattr(self, '_t_episodes', None)
+            self._summary['st_info'] = getattr(self, '_st_info', None)
         if hasattr(self, '_summary_cards'):
             self._summary_cards.update_summary(self._summary)
         if hasattr(self, '_insight_panel'):
