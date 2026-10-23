@@ -1294,9 +1294,12 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     # grid reads clearly instead of looking cramped.
     _detail_table = Table(
         _detail_rows,
-        colWidths=[20.2*mm, 10.7*mm, 8.5*mm, 8.5*mm, 8.5*mm,
-                   8.5*mm, 9.6*mm, 9.6*mm, 8.5*mm, 9.6*mm, 8.5*mm,
-                   8.5*mm, 9.6*mm, 9.6*mm, 8.5*mm, 9.6*mm, 8.5*mm, 14.9*mm],
+        # Fits the 180 mm frame; each column at least as wide as its header
+        # in 7.5 pt bold plus the 3 pt side padding ("Couplets" 11.3 mm,
+        # "Triplets" 9.6 mm, "Single" 7.9 mm were cut off at 8.5-9.6 mm).
+        colWidths=[14.5*mm, 9.5*mm, 7.5*mm, 7.5*mm, 7.5*mm,
+                   10.2*mm, 13.6*mm, 11.8*mm, 8.8*mm, 8.5*mm, 8.4*mm,
+                   10.2*mm, 13.6*mm, 11.8*mm, 8.8*mm, 8.5*mm, 8.4*mm, 10.8*mm],
         repeatRows=2,
     )
     _detail_table.setStyle(TableStyle([
@@ -1315,6 +1318,8 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ('ROWBACKGROUNDS', (0, 2), (-1, -1), [colors.white, GRAY]),
         ('PADDING', (0, 0), (-1, -1), 4.5),
+        ('LEFTPADDING', (0, 0), (-1, -1), 3),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 3),
     ]))
     story.append(Spacer(1, 4*mm))
     story.append(_detail_table)

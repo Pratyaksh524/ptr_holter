@@ -4102,6 +4102,22 @@ class HolterFullDisclosureDialog(QDialog):
                     beat = measure_beat(raw_sig, anchor, fs, strict_pr=True, prev_rr_ms=prev_rr_ms)
                     if not beat:
                         continue
+                    # The strict P search takes the wave CLOSEST to the QRS;
+                    # a wide bundle branch block QRS starts with a slurred
+                    # notch 50-80 ms before the dominant deflection, which it
+                    # takes for the P -- that "P" sits after the QRS onset, so
+                    # no PR came out and the header read "PR: --" on every
+                    # beat (seen: LBBB, 0 of 14 beats strict, 144-152 ms on all
+                    # 14 with the search below). Only where the strict search
+                    # found no PR, the non-strict search -- the most PROMINENT
+                    # wave, the real P -- is used, as the bundle branch block
+                    # detector does; only at RR >= 500 ms, as there: faster,
+                    # the previous T wave can be taken for a P.
+                    if beat.get('pr_ms') is None and prev_rr_ms is not None and prev_rr_ms >= 500.0:
+                        relaxed = measure_beat(raw_sig, anchor, fs, strict_pr=False, prev_rr_ms=prev_rr_ms)
+                        if relaxed and relaxed.get('pr_ms') is not None:
+                            beat = dict(beat)
+                            beat['pr_ms'] = relaxed['pr_ms']
                     # QRS: the global multi-lead duration (see
                     # _bundle_branch_block_global_qrs_ms); Lead II's own
                     # width only if all leads couldn't be read.

@@ -936,7 +936,39 @@ def _detect_arrhythmias_uncached(
     # peaks whose own timestamp falls inside this window's true
     # [start, end) are ever passed in, so this is strictly a detection-
     # quality fix, never a way to borrow beats from a neighboring window.
+    def _aligned_beat_shape_corr(signal, r_peaks, fs_):
+        """Median correlation of the beats (120 ms around each detected beat)
+        with their median template, each beat shifted up to +/-40 ms to its
+        best match first. None when fewer than 3 beats fit."""
+        x = np.asarray(signal, dtype=float)
+        h, lag = int(0.06 * fs_), int(0.04 * fs_)
+        peaks = [int(q) for q in r_peaks if q - h - lag >= 0 and q + h + lag <= x.size]
+        if len(peaks) < 3:
+            return None
+        snips = [x[q - h:q + h] - float(np.mean(x[q - h:q + h])) for q in peaks]
+        template = np.median(np.asarray(snips), axis=0)
+        t_norm = float(np.linalg.norm(template))
+        if t_norm <= 0:
+            return None
+        corrs = []
+        for q in peaks:
+            best = -1.0
+            for shift in range(-lag, lag + 1, 2):
+                seg = x[q + shift - h:q + shift + h]
+                seg = seg - float(np.mean(seg))
+                n = float(np.linalg.norm(seg))
+                if n > 0:
+                    best = max(best, float(np.dot(seg, template)) / (n * t_norm))
+            corrs.append(best)
+        return float(np.median(corrs))
+
+    # Which test called the last window VFib: 'coarse' when only the shape
+    # test below did (read right after the call; see the guard after the
+    # window loop).
+    _vfib_window_kind = {'last': None}
+
     def _is_vfib_window(window_signal, r_peaks, fs):
+        _vfib_window_kind['last'] = None
         if len(r_peaks) < 2:
             return False
         # VF is a chaotic, disorganized ventricular rhythm. A regular rhythm
@@ -972,7 +1004,31 @@ def _detect_arrhythmias_uncached(
         # show a P-wave reliably preceding QRS) is the meaningful check.
         no_p_follows_qrs = p_follows_qrs < max(1, len(beats) // 2)
         no_organized_qrs = organized_qrs < max(1, len(beats) // 2)
-        return no_p_follows_qrs and no_organized_qrs
+        if no_p_follows_qrs and no_organized_qrs:
+            return True
+        # Coarse, slow VFib: big rounded waves whose sides flatten enough for
+        # the QRS boundary search to "resolve" on half or more of them, so the
+        # organized-QRS test above fails although no two waves look alike
+        # (seen: ~100 s of VFib, 400-495 s, P before QRS on 0 beats, organized
+        # 5/11, 6/11, 7/8 ...). Such a window is VFib when NOT ONE beat has a P
+        # wave before it (irregular RR already required above) and the beats
+        # don't share one shape: median correlation, each beat aligned
+        # +/-40 ms to the window's own template (beat positions merged from
+        # several leads shift by 20-50 ms), below 0.95. Measured on windows
+        # reaching this rule: AFib and Flutter 0.97-1.00 (and they rarely have
+        # no P at all), the missed VFib 0.48-0.93; windows of other rhythms
+        # below 0.95 had P waves on 2-4 beats.
+        # A window called VFib only by this test is kept only when a window
+        # next to it is VFib too (see the coarse-VFib guard after the window
+        # loop): extra detections on P / T waves in one plain sinus window can
+        # look the same (seen: recording start, 12 "beats" for 10 real ones,
+        # P missed on the best lead, correlation 0.69 -- one lone window).
+        if p_follows_qrs == 0 and len(beats) >= 5:
+            shape_corr = _aligned_beat_shape_corr(window_signal, r_peaks, fs)
+            if shape_corr is not None and shape_corr < 0.95:
+                _vfib_window_kind['last'] = 'coarse'
+                return True
+        return False
 
     def _is_ventricular_tachycardia_window(window_signal, r_peaks, fs):
         """Detect an organized fast wide-complex ventricular run."""
@@ -2204,9 +2260,26 @@ def _detect_arrhythmias_uncached(
         if sum(1 for v in prs if abs(v - pr_median) <= 25.0) < required:
             return None
 
-        # One QRS shape throughout (SVT rule's template test).
+        # One QRS shape throughout (SVT rule's template test). Each beat's
+        # snippet is centred on the best lead's own dominant QRS deflection
+        # (largest excursion 40 ms before to 100 ms after the detected beat,
+        # the same anchoring as the P / PR measurement above), not on the
+        # detected beat itself: beat positions are merged from several leads,
+        # and in a wide bundle branch block QRS the lead that is found first
+        # changes from beat to beat, so the positions jumped by ~20 ms (seen:
+        # dominant deflection +30 ms after some beats, +50 ms after others).
+        # With a +/-50 ms snippet that misalignment alone dropped identical
+        # LBBB beats to correlation 0.74-0.92 and two windows failed, leaving a
+        # 5 s gap inside one LBBB episode.
         h = int(0.05 * fs_)
-        shapes = [best_signal[r - h:r + h] for r in core if r - h >= 0 and r + h <= best_signal.size]
+        median_best = float(np.median(best_signal)) if best_signal.size else 0.0
+        aligned = []
+        for r in core:
+            a_lo, a_hi = max(0, r - int(0.04 * fs_)), min(best_signal.size, r + int(0.10 * fs_))
+            if a_hi <= a_lo:
+                continue
+            aligned.append(a_lo + int(np.argmax(np.abs(best_signal[a_lo:a_hi] - median_best))))
+        shapes = [best_signal[r - h:r + h] for r in aligned if r - h >= 0 and r + h <= best_signal.size]
         if len(shapes) < required:
             return None
         shapes = np.array([s - np.mean(s) for s in shapes])
@@ -2410,6 +2483,8 @@ def _detect_arrhythmias_uncached(
     window_count = 0
 
     morphological_candidates = []
+    # Window starts called VFib only by the coarse-VFib shape test.
+    _coarse_vfib_window_starts = set()
     # Ventricular rate (bpm) of each Supraventricular Tachycardia (SVT)
     # window, keyed by id() of its candidate dict -- for the drop rule after
     # the loop only; never part of the output segments.
@@ -2527,6 +2602,8 @@ def _detect_arrhythmias_uncached(
                         elif (_is_vfib_window(padded_signal, core_r_peaks, fs)
                               and bundle_branch_block_result is None):
                             target_morph = ('Ventricular Fibrillation', '#FF3333')
+                            if _vfib_window_kind['last'] == 'coarse':
+                                _coarse_vfib_window_starts.add(current_time)
                         else:
                             # P waves are judged on Lead II (see the
                             # conduction_lead_idx comment above), beats still
@@ -2617,6 +2694,22 @@ def _detect_arrhythmias_uncached(
             progress = int((current_time / total_duration) * 100)
             progress_callback(progress)
 
+    # Coarse-VFib guard: a window called VFib only by the shape test in
+    # _is_vfib_window is dropped unless another VFib window (either test)
+    # starts within one window of it -- one lone window is not an episode
+    # (the missed VFib this test is for ran 16+ windows in a row).
+    if _coarse_vfib_window_starts:
+        # A VFib candidate starts at its window's start (current_time).
+        _vfib_window_starts = [m['start_sec'] for m in morphological_candidates
+                               if m['label'] == 'Ventricular Fibrillation']
+        morphological_candidates = [
+            m for m in morphological_candidates
+            if not (m['label'] == 'Ventricular Fibrillation'
+                    and m['start_sec'] in _coarse_vfib_window_starts
+                    and not any(o != m['start_sec'] and abs(o - m['start_sec']) <= window_size
+                                for o in _vfib_window_starts))
+        ]
+
     # AV conduction can't be graded during Atrial Fibrillation/Flutter --
     # there are no discrete P waves. Flutter whose conduction ratio changes
     # (RR 1000 -> 600 -> 400ms) reads as "dropped beats" and analyze_ecg()
@@ -2651,9 +2744,16 @@ def _detect_arrhythmias_uncached(
         rate = _svt_window_rate.get(id(m))
         return rate is None or 125.0 <= rate <= 175.0
 
+    # First-degree AV Block is not dropped here: its own rule already needs a
+    # regular atrial rhythm with every P wave conducted 1:1, no dropped beat
+    # and a constant PR (std <= 25 ms), which Flutter / AFib can't pass --
+    # the "dropped beats" misreading this guard is for is a 2nd / 3rd degree
+    # one. Seen: First-degree AV Block right after Atrial Flutter (PR 234-240
+    # ms, RR 750 ms, windows 235-245 s and 240-250 s) wiped out because the
+    # last Flutter windows started 10-15 s earlier.
     morphological_candidates = [
         m for m in morphological_candidates
-        if not (('av block' in m['label'].lower()
+        if not ((('av block' in m['label'].lower() and m['label'] != _AV_FIRST)
                  or (m['label'] == 'Supraventricular Tachycardia (SVT)' and _svt_could_be_2to1_flutter(m)))
                 and any(abs(m['start_sec'] - s) <= window_size * 2 for s in _atrial_starts))
     ]
@@ -2857,6 +2957,22 @@ def _detect_arrhythmias_uncached(
                     gap_start = _silent_gap_start(after_ts, require_narrow)
                     if gap_start is not None and gap_start <= boundary_sec:
                         return gap_start
+                # No beat detected at all from the last organized beat up to
+                # the window-vote boundary, and the next one more than a window
+                # away (seen: last First-degree beat 396.30 s, VFib waves from
+                # ~396.6 s, the R-peak pass found nothing until past 410 s, so
+                # the gap search above -- capped at one window -- gave up and
+                # VFib started at the 400.0 s window edge). That silence,
+                # longer than 1.5x the organized rhythm's RR (at least 2 s),
+                # is VFib too.
+                if organized_before:
+                    last_org = organized_before[-1]
+                    if not any(last_org < p <= boundary_sec for p in _sorted_peaks):
+                        prior = [p for p in _sorted_peaks if p <= last_org][-5:]
+                        prior_rr = np.diff(prior)
+                        threshold = max(2.0, 1.5 * float(np.median(prior_rr))) if prior_rr.size else 2.0
+                        if boundary_sec - last_org > threshold:
+                            return last_org
             return boundary_sec
 
         # VFib right after Ventricular Tachycardia: the start search above
@@ -3131,6 +3247,67 @@ def _detect_arrhythmias_uncached(
             noise_threshold = max(0.05, 0.15 * float(beat.get('qrs_amplitude') or 0.1))
             return float(np.ptp(lead_sig[tp_start:tp_end])) >= 0.3 * noise_threshold
 
+        # End of AFib / Flutter where the TP test can't decide: at a fast
+        # following rhythm the T wave runs into the next P / QRS and there is
+        # no TP segment to measure, so no two quiet beats were found and the
+        # end stayed on the window grid (seen: last AFib beat 666.63 s, a
+        # 160 bpm run of identical beats from 666.86 s, AFib drawn to 670.0 s).
+        # Then the rhythm that follows decides: if its beats in the next window
+        # are regular (RR CV <= 0.12), going backward from the boundary a beat
+        # belongs to that run while its RR is within 15% of the run's median
+        # and its QRS has the run's shape (correlation >= 0.90 with the run's
+        # median beat, about the same size). AFib ends at the run's first beat.
+        def _regular_run_first_beat(boundary_sec):
+            after = [p for p in _sorted_peaks if boundary_sec <= p <= boundary_sec + window_size]
+            if len(after) < 5:
+                return None
+            rr = np.diff(np.asarray(after, dtype=float))
+            run_rr = float(np.median(rr))
+            if run_rr <= 0 or float(np.std(rr)) / run_rr > 0.12:
+                return None
+            before = [p for p in _sorted_peaks if boundary_sec - window_size <= p < boundary_sec]
+            if not before:
+                return None
+            seg_start = max(0.0, before[0] - 0.5)
+            seg_end = min(total_duration, after[-1] + 0.5)
+            sig = reader.read_range(seg_start, seg_end)
+            if sig is None or best_lead_idx >= sig.shape[0]:
+                return None
+            lead_sig = np.asarray(sig[best_lead_idx], dtype=float)
+            try:
+                _b, _a = _butter(2, [0.5 / (float(fs) / 2.0), 40.0 / (float(fs) / 2.0)], btype='band')
+                lead_sig = _filtfilt(_b, _a, lead_sig)
+            except Exception:
+                pass
+            half_w = int(0.06 * fs)
+
+            def _snippet(t):
+                i = int(round((t - seg_start) * fs))
+                if i - half_w < 0 or i + half_w > len(lead_sig):
+                    return None
+                s = lead_sig[i - half_w:i + half_w]
+                return s - float(np.mean(s))
+
+            ref = [s for s in (_snippet(t) for t in after) if s is not None]
+            if len(ref) < 5:
+                return None
+            template = np.median(np.asarray(ref), axis=0)
+            t_norm, t_ptp = float(np.linalg.norm(template)), float(np.ptp(template))
+            if t_norm <= 0:
+                return None
+            first = after[0]
+            for p in reversed(before):
+                if abs((first - p) - run_rr) > 0.15 * run_rr:
+                    break
+                s = _snippet(p)
+                if s is None or not (0.5 * t_ptp <= float(np.ptp(s)) <= 2.0 * t_ptp):
+                    break
+                n = float(np.linalg.norm(s))
+                if n <= 0 or float(np.dot(s, template)) / (n * t_norm) < 0.90:
+                    break
+                first = p
+            return first
+
         def _refine_atrial_edge(boundary_sec, edge):
             lo, hi = boundary_sec - window_size, boundary_sec + window_size
             peaks = sorted(float(p) for p in all_r_peaks if lo - 5.0 <= p <= hi)
@@ -3142,6 +3319,9 @@ def _detect_arrhythmias_uncached(
                 for i in range(len(states) - 1):
                     if states[i][1] is False and states[i + 1][1] is False:
                         return states[i][0]
+                run_first = _regular_run_first_beat(boundary_sec)
+                if run_first is not None and run_first < boundary_sec:
+                    return run_first
             else:
                 for i in range(len(states) - 1, 0, -1):
                     if states[i][1] is False and states[i - 1][1] is False:
@@ -3268,6 +3448,39 @@ def _detect_arrhythmias_uncached(
             except Exception as e:
                 print(f"[Auto Arrhythmia Detect] Supraventricular Tachycardia (SVT) boundary refine error: {e}")
 
+        # SVT next to Atrial Fibrillation / Flutter: the SVT edge just found
+        # is beat-exact (its own RR band), the AFib / Flutter edge is still on
+        # the 5 s window grid -- the AFib / Flutter beat-exact edge search
+        # above only runs next to normal rhythm. Where the two overlap, the
+        # generic overlap trim below always cuts the FIRST region, which put a
+        # whole window of regular SVT under AFib (seen: SVT RR 300 ms steady
+        # until 114.95 s, AFib's irregular beats from 115.37 s, AFib drawn
+        # from 110.0 s because window 110-120 s mixed both). Here the SVT's
+        # beat edge wins: the AFib / Flutter region starts (or ends) at that
+        # SVT beat instead. Same for a short gap (up to one window) between
+        # them, which the gap bridging below would otherwise fill by
+        # stretching the SVT up to the AFib's window-grid start (seen: last SVT
+        # beat 184.35 s, first AFib beat 184.77 s, SVT drawn to 185.0 s). Only
+        # this boundary moves; the SVT and AFib / Flutter rules themselves are
+        # unchanged.
+        _svt_label = 'Supraventricular Tachycardia (SVT)'
+        _atrial_pair = ('Atrial Fibrillation', 'Atrial Flutter')
+        for idx in range(len(merged_morph) - 1):
+            cur, nxt = merged_morph[idx], merged_morph[idx + 1]
+            try:
+                if cur['label'] == _svt_label and nxt['label'] in _atrial_pair \
+                        and nxt['start_sec'] - window_size <= cur['end_sec'] < nxt['end_sec'] - 0.5 \
+                        and cur['end_sec'] != nxt['start_sec']:
+                    nxt['start_sec'] = cur['end_sec']
+                    nxt['start_time_str'], _ = make_time_strs(nxt['start_sec'], nxt['end_sec'])
+                elif cur['label'] in _atrial_pair and nxt['label'] == _svt_label \
+                        and cur['start_sec'] + 0.5 < nxt['start_sec'] <= cur['end_sec'] + window_size \
+                        and cur['end_sec'] != nxt['start_sec']:
+                    cur['end_sec'] = nxt['start_sec']
+                    _, cur['end_time_str'] = make_time_strs(cur['start_sec'], cur['end_sec'])
+            except Exception as e:
+                print(f"[Auto Arrhythmia Detect] SVT / atrial boundary error: {e}")
+
         # Beat-exact edges for Third-degree AV Block. The window right at the
         # onset holds P waves of both the old rhythm and the new atrial rhythm,
         # so it never reads as a regular atrial rhythm and the region starts
@@ -3367,6 +3580,100 @@ def _detect_arrhythmias_uncached(
         # genuine unclassified stretch, not a transition artifact, and is
         # left alone.
         #
+        # Beat-exact boundary where Atrial Fibrillation / Flutter is followed
+        # right away by First-degree AV Block. The window that mixes the last
+        # flutter beats with the first First-degree beats passes neither rule
+        # (its P waves aren't all regular/conducted), so those First-degree
+        # beats stayed inside the Flutter segment, which ends on the 5 s window
+        # grid (seen: beats at RR 850/750/750 ms with flat baseline and PR
+        # ~236 ms, 233-235 s, painted Flutter until 235.0 s). Per-beat P
+        # detection missed the P on two of those beats, so the beats are
+        # compared by shape instead: the block's own beats give a template of
+        # P wave + PR segment + QRS (Lead II, from PR + 80 ms before the R peak
+        # to 60 ms after it). Going backward from the block's start, a beat
+        # joins the block when it has that shape (correlation >= 0.90, about
+        # the same size) and an RR within 15% of the block's own median RR --
+        # a Flutter / AFib beat has flutter / fibrillation waves where the P
+        # wave is and doesn't match. The first beat that doesn't, stops it.
+        # The Flutter / AFib segment then ends where the block now starts.
+        # Only this one boundary moves; the Flutter / AFib and AV block rules
+        # themselves are unchanged.
+        _gate_metric_at = dict(zip((float(p) for p in all_r_peaks), rate_gate_metrics))
+
+        def _first_degree_first_beat(block, prev):
+            b_start = float(block['start_sec'])
+            ref = [p for p in _sorted_peaks if b_start - 0.05 <= p <= min(float(block['end_sec']), b_start + window_size)]
+            ref_pr = [float(_gate_metric_at[p]['pr_ms']) for p in ref
+                      if _gate_metric_at.get(p) and _gate_metric_at[p].get('pr_ms') is not None]
+            if len(ref) < 4 or len(ref_pr) < 3:
+                return None
+            pr_med = float(np.median(ref_pr))
+            rr_med = float(np.median(np.diff(np.asarray(ref, dtype=float))))
+            if rr_med <= 0:
+                return None
+            earlier = [p for p in _sorted_peaks
+                       if max(float(prev['start_sec']), b_start - window_size) <= p < ref[0] - 0.05]
+            if not earlier:
+                return None
+            pre = (pr_med + 80.0) / 1000.0
+            post = 0.06
+            seg_start = max(0.0, earlier[0] - pre - 0.5)
+            seg_end = min(total_duration, ref[-1] + post + 0.5)
+            sig = reader.read_range(seg_start, seg_end)
+            if sig is None or conduction_lead_idx >= sig.shape[0]:
+                return None
+            lead_sig = np.asarray(sig[conduction_lead_idx], dtype=float)
+            try:
+                _b, _a = _butter(2, [0.5 / (float(fs) / 2.0), 40.0 / (float(fs) / 2.0)], btype='band')
+                lead_sig = _filtfilt(_b, _a, lead_sig)
+            except Exception:
+                pass
+            n_pre, n_post = int(round(pre * fs)), int(round(post * fs))
+
+            def _beat_shape(t):
+                i = int(round((t - seg_start) * fs))
+                if i - n_pre < 0 or i + n_post > len(lead_sig):
+                    return None
+                s = lead_sig[i - n_pre:i + n_post]
+                return s - float(np.mean(s))
+
+            ref_shapes = [s for s in (_beat_shape(t) for t in ref) if s is not None]
+            if len(ref_shapes) < 4:
+                return None
+            template = np.median(np.asarray(ref_shapes), axis=0)
+            t_norm, t_ptp = float(np.linalg.norm(template)), float(np.ptp(template))
+            if t_norm <= 0:
+                return None
+            first = ref[0]
+            for p in reversed(earlier):
+                if abs((first - p) - rr_med) > 0.15 * rr_med:
+                    break
+                s = _beat_shape(p)
+                if s is None or not (0.5 * t_ptp <= float(np.ptp(s)) <= 2.0 * t_ptp):
+                    break
+                n = float(np.linalg.norm(s))
+                if n <= 0 or float(np.dot(s, template)) / (n * t_norm) < 0.90:
+                    break
+                first = p
+            return first
+
+        for idx in range(1, len(merged_morph)):
+            block, prev = merged_morph[idx], merged_morph[idx - 1]
+            if block['label'] != _AV_FIRST or prev['label'] not in ('Atrial Fibrillation', 'Atrial Flutter'):
+                continue
+            if block['start_sec'] - prev['end_sec'] > window_size:
+                continue
+            try:
+                first = _first_degree_first_beat(block, prev)
+                if first is not None and first < block['start_sec'] - 0.05 and first > prev['start_sec'] + 0.5:
+                    block['start_sec'] = first
+                    block['start_time_str'], _ = make_time_strs(first, block['end_sec'])
+                    if prev['end_sec'] > first:
+                        prev['end_sec'] = first
+                        _, prev['end_time_str'] = make_time_strs(prev['start_sec'], first)
+            except Exception as e:
+                print(f"[Auto Arrhythmia Detect] First-degree AV Block start refine error: {e}")
+
         # AV block regions are beat-exact and follow their own priority
         # instead: every non-AV rhythm outranks any AV block, and among AV
         # blocks the more severe degree wins (Third > Mobitz II > Mobitz I >
