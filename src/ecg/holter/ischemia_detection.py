@@ -24,12 +24,15 @@ Method, rhythm by rhythm, chunk by chunk:
   3. Per chunk: every lead filtered with the same SignalPreprocessor as the
      AFib/Flutter/AV-block/BBB rules (0.5-40 Hz zero-phase bandpass + 50 Hz
      notch); R-peaks found on the reference lead; beats aligned to each
-     other; one median beat per lead (noise averages out).
-  4. On the median beats: QRS onset and J point (QRS end) from the combined
+     other. The median beat of each lead is used only to locate the QRS.
+  4. QRS onset and J point (QRS end) from the median beats and the combined
      slope of all leads -- the same global multi-lead method the bundle
      branch block width uses. Baseline = PR segment (40-10 ms before QRS
      onset). ST level measured at J+40 ms (J+30 ms above 120 bpm), slope
-     from J+20 ms to that point, in mV relative to the baseline.
+     from J+20 ms to that point, in mV relative to the baseline. Measured on
+     every beat of the 10 s window; the value of a lead is the one that
+     occurs most often among those beats (0.5 mm bins, mean of the fullest
+     bin), not the value of an averaged beat.
      Why not at J or J+80: measured on normal sinus beats, the global J
      point sits 10-20 ms before the end of the QRS in V1-V3 (+0.09..+0.17 mV
      at J, ~0 at J+20), and by J+60..J+80 the T wave has started
@@ -79,6 +82,7 @@ _MIN_BEATS = 4
 _MIN_EPISODE_SEC = 60.0
 _MERGE_GAP_SEC = 60.0
 
+_MODE_BIN_MV = 0.05              # beats within 0.5 mm of each other count as the same value
 _MM_PER_MV = 10.0
 _ELEVATION_MV = {'limb': 0.10, 'chest': 0.20}     # 1 mm limb leads, 2 mm chest leads
 _DEPRESSION_MV = -0.10                            # 1 mm, limb and chest leads
@@ -170,6 +174,17 @@ def _qrs_bounds(median_beats: np.ndarray, r_idx: int, fs: float):
 def _median_beats(data: np.ndarray, peaks: List[int], ref_idx: int, fs: float):
     """Align beats on the reference lead (correlation, +/-20 ms) and return
     (median beat per lead, beat-centre index, beat-shape consistency)."""
+    built = _aligned_beats(data, peaks, ref_idx, fs)
+    if built is None:
+        return None
+    beats, pre, corr = built
+    return np.median(beats, axis=0), pre, corr
+
+
+def _aligned_beats(data: np.ndarray, peaks: List[int], ref_idx: int, fs: float):
+    """Align beats on the reference lead (correlation, +/-20 ms) and return
+    (every beat of every lead as an array [beat, lead, sample], beat-centre
+    index, beat-shape consistency)."""
     pre, post = int(0.35 * fs), int(0.55 * fs)
     max_lag = int(0.02 * fs)
     n = data.shape[1]
@@ -194,12 +209,28 @@ def _median_beats(data: np.ndarray, peaks: List[int], ref_idx: int, fs: float):
         aligned.append((p + best_lag, best_c))
     corr = float(np.median([c for _, c in aligned]))
     beats = np.array([[lead[p - pre:p + post] for lead in data] for p, _ in aligned], dtype=float)
-    return np.median(beats, axis=0), pre, corr
+    return beats, pre, corr
 
 
 def _lead_order(name: str) -> int:
     order = LIMB_LEADS + CHEST_LEADS
     return order.index(name) if name in order else len(order)
+
+
+def _modal_st(st_level: np.ndarray, st_early: np.ndarray):
+    """The ST value that occurs most often among the beats of one window (one
+    lead): the beats' ST levels are put in _MODE_BIN_MV wide bins, the fullest
+    bin wins (a tie goes to the bin nearest the median), and the value is the
+    mean of the beats in that bin -- ST level and ST at J+20 ms of the same
+    beats. Returns (st_level, st_early) in the units given."""
+    bins = np.floor(st_level / _MODE_BIN_MV).astype(int)
+    keys, counts = np.unique(bins, return_counts=True)
+    top = keys[counts == counts.max()]
+    if top.size > 1:
+        mid = float(np.median(st_level))
+        top = top[[int(np.argmin(np.abs((top + 0.5) * _MODE_BIN_MV - mid)))]]
+    pick = bins == top[0]
+    return float(np.mean(st_level[pick])), float(np.mean(st_early[pick]))
 
 
 def _lead_group(names: List[str], st_early: List[float], st_level: List[float]) -> Dict[str, Any]:
@@ -212,23 +243,28 @@ def _lead_group(names: List[str], st_early: List[float], st_level: List[float]) 
 
 def _chunk_st(data: np.ndarray, lead_names: List[str], fs: float, pan_tompkins,
               ref_idx: int, skip_leads: set):
-    """ST deviation (mV) of one chunk, limb leads and chest leads in separate
-    arrays: ({'limb': group, 'chest': group}, heart rate), or None when the
-    chunk can't be measured. group = see _lead_group (ST at J+20 ms and at
-    the ST point J+40 ms, J+30 ms above 120 bpm)."""
+    """ST deviation (mV) of one 10 s chunk, limb leads and chest leads in
+    separate arrays: ({'limb': group, 'chest': group}, heart rate), or None
+    when the chunk can't be measured. group = see _lead_group (ST at J+20 ms
+    and at the ST point J+40 ms, J+30 ms above 120 bpm). The ST value of a
+    lead is the value that occurs most often among the beats of the chunk
+    (_modal_st), not the value of an averaged beat."""
     peaks = [int(p) for p in pan_tompkins(np.asarray(data[ref_idx], dtype=float), fs=fs)]
     if len(peaks) < _MIN_BEATS:
         return None
     rr = np.diff(peaks) / float(fs)
     hr = 60.0 / float(np.median(rr)) if rr.size else 0.0
-    built = _median_beats(data, peaks, ref_idx, fs)
+    built = _aligned_beats(data, peaks, ref_idx, fs)
     if built is None:
         return None
-    med, r_idx, corr = built
-    # Beats that don't share one shape (ectopics, noise) don't make a
-    # meaningful median beat.
+    beats, r_idx, corr = built
+    # Beats that don't share one shape (ectopics, noise) don't give a
+    # meaningful ST reading.
     if corr < 0.9:
         return None
+    # The median beat is used only to LOCATE the QRS onset / J point; the ST
+    # values are measured on every beat (below).
+    med = np.median(beats, axis=0)
     bounds = _qrs_bounds(med, r_idx, fs)
     if bounds is None:
         return None
@@ -249,13 +285,14 @@ def _chunk_st(data: np.ndarray, lead_names: List[str], fs: float, pan_tompkins,
         group = limb if name in LIMB_LEADS else chest if name in CHEST_LEADS else None
         if group is None:
             continue
-        x = med[li]
-        baseline = float(np.mean(x[base_lo:base_hi]))
-        st_early = float(np.mean(x[early - half:early + half])) - baseline
-        st_level = float(np.mean(x[st_point - half:st_point + half])) - baseline
+        x = beats[:, li, :]                                   # [beat, sample]
+        baseline = x[:, base_lo:base_hi].mean(axis=1)
+        beat_early = (x[:, early - half:early + half].mean(axis=1) - baseline) * _ADC_TO_MV
+        beat_level = (x[:, st_point - half:st_point + half].mean(axis=1) - baseline) * _ADC_TO_MV
+        st_level, st_early = _modal_st(beat_level, beat_early)
         group[0].append(name)
-        group[1].append(st_early * _ADC_TO_MV)
-        group[2].append(st_level * _ADC_TO_MV)
+        group[1].append(st_early)
+        group[2].append(st_level)
     return {'limb': _lead_group(*limb), 'chest': _lead_group(*chest)}, hr
 
 
