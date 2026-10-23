@@ -2217,53 +2217,36 @@ class HolterMainWindow(QDialog):
             self._refresh_ui()
 
     def _refresh_st_episodes(self):
-        """Put the ST Elevation / ST Depression episodes of this recording
-        (ischemia_detection, run inside detect_arrhythmias()) into the summary
-        as 'st_episodes' and redraw the OVERVIEW and REPLAY tables. ST is
-        calculated from the recording's own data for any recording; it does
-        not depend on the "Auto Arrhythmia Detection" button, which only
-        controls whether rhythm marks are drawn. Uses the cached result; if
-        there is none yet, the calculation runs in the background and the
-        rows ("-" meanwhile) fill in when it is done."""
+        """Put the ST Elevation / ST Depression and T Inversion episodes of
+        this recording into the summary ('st_episodes', 't_episodes') and
+        redraw the OVERVIEW and REPLAY tables. They are values, not auto
+        arrhythmia marks: ischemia_detection reads the recording itself and
+        has nothing to do with the auto arrhythmia detection or its button.
+        Uses the cached result; if there is none yet, the calculation runs in
+        the background and the rows ("-" meanwhile) fill in when it is done."""
         session_dir = getattr(self, 'session_dir', '') or ''
         ecgh_path = os.path.join(session_dir, 'recording.ecgh') if session_dir else ''
-        episodes = None
-        segments = None
+        st_eps, t_eps = None, None
         try:
-            from .auto_segment_arrthymia_detection import (
-                detect_arrhythmias_async, get_cached_detection)
-            from .ischemia_detection import ST_LABELS
+            from .ischemia_detection import get_cached_ischemia, ischemia_async
             if ecgh_path and os.path.exists(ecgh_path):
-                segments = get_cached_detection(ecgh_path)
-                if segments is not None:
-                    episodes = [seg for seg in segments if seg.get('label') in ST_LABELS]
-                elif not getattr(self, '_st_detection_pending', False):
-                    self._st_detection_pending = True
+                cached = get_cached_ischemia(ecgh_path)
+                if cached is not None:
+                    st_eps, t_eps = cached.get('st', []), cached.get('t', [])
+                elif not getattr(self, '_ischemia_pending', False):
+                    self._ischemia_pending = True
 
-                    def _done(_segments, path=ecgh_path):
-                        self._st_detection_pending = False
+                    def _done(result, path=ecgh_path):
+                        self._ischemia_pending = False
                         if getattr(self, 'session_dir', '') and                                 os.path.join(self.session_dir, 'recording.ecgh') == path:
-                            self._refresh_st_episodes()
-                    detect_arrhythmias_async(ecgh_path, _done)
-            # T Inversion: its own calculation (not an arrhythmia mark). It
-            # uses the rhythm segments only to go rhythm by rhythm.
-            if segments is not None:
-                from .ischemia_detection import get_cached_t_inversion, t_inversion_async
-                t_cached = get_cached_t_inversion(ecgh_path)
-                if t_cached is not None:
-                    self._t_episodes = t_cached
-                elif not getattr(self, '_t_detection_pending', False):
-                    self._t_detection_pending = True
-
-                    def _t_done(t_eps, path=ecgh_path):
-                        self._t_detection_pending = False
-                        if getattr(self, 'session_dir', '') and os.path.join(self.session_dir, 'recording.ecgh') == path:
-                            self._t_episodes = t_eps
+                            self._st_episodes = result.get('st', [])
+                            self._t_episodes = result.get('t', [])
                             self._push_ischemia_to_panels()
-                    t_inversion_async(ecgh_path, segments, _t_done)
+                    ischemia_async(ecgh_path, _done)
         except Exception as e:
-            print(f"[Holter UI] ST episodes unavailable: {e}")
-        self._st_episodes = episodes
+            print(f"[Holter UI] ST / T Inversion unavailable: {e}")
+        self._st_episodes = st_eps
+        self._t_episodes = t_eps
         self._push_ischemia_to_panels()
 
     def _push_ischemia_to_panels(self):

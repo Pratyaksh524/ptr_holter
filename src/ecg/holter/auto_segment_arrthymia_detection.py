@@ -2859,6 +2859,96 @@ def _detect_arrhythmias_uncached(
                         return gap_start
             return boundary_sec
 
+        # VFib right after Ventricular Tachycardia: the start search above
+        # counts every wide beat as disorganized (require_narrow), and VT
+        # beats are wide by definition, so it pulled VFib's start back a whole
+        # window into the still-regular VT run and cut the VT short (seen:
+        # identical VT beats, RR 374 ms, shape correlation 1.00, until 174.96 s
+        # and ~781 s; VFib drawn from 165.2 s and 770 s, where every window up
+        # to 175-185 s / 775-785 s had itself passed the VT rule). VFib's
+        # start is not moved before the last beat that still continues that
+        # VT run: same RR (within 15% of the VT's own median RR, as the VT
+        # rule's stable core) and same QRS shape (correlation >= 0.90 with the
+        # VT's median beat). A single extra detection inside the run is
+        # skipped when the next beat continues it. Only this one VT -> VFib
+        # boundary is affected; it can only give back beats to VT, never take
+        # any, and the VT / VFib rules themselves are unchanged.
+        def _vt_run_last_beat(vt_region, vfib_start_sec):
+            ref_lo = max(float(vt_region['start_sec']), vfib_start_sec - window_size)
+            ref = [p for p in _sorted_peaks if ref_lo <= p < vfib_start_sec]
+            if len(ref) < 5:
+                return None
+            ref_rr = np.diff(np.asarray(ref, dtype=float))
+            vt_rr = float(np.median(ref_rr))
+            if vt_rr <= 0 or float(np.std(ref_rr)) / vt_rr > 0.12:
+                return None
+            limit = max(float(vt_region['end_sec']), vfib_start_sec) + window_size
+            ahead = [p for p in _sorted_peaks if vfib_start_sec <= p <= limit]
+            if not ahead:
+                return None
+            seg_start = max(0.0, ref[0] - 0.5)
+            seg_end = min(total_duration, ahead[-1] + 0.5)
+            sig = reader.read_range(seg_start, seg_end)
+            if sig is None or best_lead_idx >= sig.shape[0]:
+                return None
+            lead_sig = np.asarray(sig[best_lead_idx], dtype=float)
+            try:
+                _b, _a = _butter(2, [0.5 / (float(fs) / 2.0), 40.0 / (float(fs) / 2.0)], btype='band')
+                lead_sig = _filtfilt(_b, _a, lead_sig)
+            except Exception:
+                pass
+            half_w = int(0.12 * fs)
+
+            def _snippet(t):
+                i = int(round((t - seg_start) * fs))
+                if i - half_w < 0 or i + half_w > len(lead_sig):
+                    return None
+                s = lead_sig[i - half_w:i + half_w]
+                return s - float(np.mean(s))
+
+            ref_snips = [s for s in (_snippet(t) for t in ref) if s is not None]
+            if len(ref_snips) < 5:
+                return None
+            template = np.median(np.asarray(ref_snips), axis=0)
+            t_norm = float(np.linalg.norm(template))
+            if t_norm <= 0:
+                return None
+
+            t_ptp = float(np.ptp(template))
+
+            def _same_shape(t):
+                s = _snippet(t)
+                if s is None:
+                    return False
+                # same shape AND about the same size (correlation alone
+                # ignores size)
+                if not (0.5 * t_ptp <= float(np.ptp(s)) <= 2.0 * t_ptp):
+                    return False
+                n = float(np.linalg.norm(s))
+                return n > 0 and float(np.dot(s, template)) / (n * t_norm) >= 0.90
+
+            def _in_run(prev_t, t):
+                return abs((t - prev_t) - vt_rr) <= 0.15 * vt_rr and _same_shape(t)
+
+            last = ref[-1]
+            i = 0
+            while i < len(ahead):
+                t = ahead[i]
+                if t <= last:
+                    i += 1
+                    continue
+                if _in_run(last, t):
+                    last = t
+                    i += 1
+                    continue
+                # one extra (false) detection inside the run
+                if i + 1 < len(ahead) and _in_run(last, ahead[i + 1]):
+                    last = ahead[i + 1]
+                    i += 2
+                    continue
+                break
+            return last
+
         for idx, region in enumerate(merged_morph):
             if region['label'] != 'Ventricular Fibrillation':
                 continue
@@ -2869,6 +2959,11 @@ def _detect_arrhythmias_uncached(
                 next_atrial = idx + 1 < len(merged_morph) and merged_morph[idx + 1]['label'] in atrial and \
                     merged_morph[idx + 1]['start_sec'] - region['end_sec'] <= window_size
                 new_start = _refine_vfib_edge(region['start_sec'], 'start', require_narrow=not prev_atrial)
+                if idx > 0 and merged_morph[idx - 1]['label'] == 'Ventricular Tachycardia' \
+                        and region['start_sec'] - merged_morph[idx - 1]['end_sec'] <= window_size:
+                    vt_last = _vt_run_last_beat(merged_morph[idx - 1], new_start)
+                    if vt_last is not None and vt_last > new_start:
+                        new_start = vt_last
                 new_end = _refine_vfib_edge(region['end_sec'], 'end', require_narrow=not next_atrial)
                 if new_start < new_end - 0.5:
                     region['start_sec'], region['end_sec'] = new_start, new_end
@@ -2886,6 +2981,111 @@ def _detect_arrhythmias_uncached(
                         merged_morph[idx + 1]['start_sec'] = new_end
             except Exception as e:
                 print(f"[Auto Arrhythmia Detect] VFib boundary refine error: {e}")
+
+        # Beat-exact START of Ventricular Tachycardia. Its window vote can't
+        # see the first VT beats when Pan-Tompkins finds no peak at all in the
+        # window holding the onset -- small sinus beats followed by large VT
+        # complexes upset its thresholds (seen: window 690-700 s with 0 peaks,
+        # VT drawn from 695.36 s while identical VT beats ran from ~691 s).
+        # So the onset is searched on the signal itself instead of on R-peaks:
+        # the VT's own first confirmed beats give its QRS template and RR, and
+        # going backward one RR at a time (+/-15%, the VT rule's stable-core
+        # tolerance) the template is looked for in the signal; a match
+        # (correlation >= 0.90) is one more VT beat, the first miss ends the
+        # search. Everything comes from that VT's own beats, nothing fixed.
+        # The search reaches back at most one window. Only the VT start can
+        # move, only earlier, and only over beats with this VT's shape and
+        # rate; the VT rule itself is unchanged.
+        def _vt_run_first_beat(vt_region, floor_sec):
+            v_start = float(vt_region['start_sec'])
+            ref = [p for p in _sorted_peaks if v_start - 0.05 <= p < v_start + window_size]
+            if len(ref) < 5:
+                # The whole-recording R-peak pass (60 s chunks) can miss the
+                # VT beats too (seen: none at all in 695-705 s while the
+                # window pass found 26). Re-detect them on just this VT's
+                # first window, as the window vote itself did.
+                r_start = max(0.0, v_start - 0.5)
+                r_data = reader.read_range(r_start, min(total_duration, v_start + window_size))
+                if r_data is None or best_lead_idx >= r_data.shape[0]:
+                    return None
+                ref = sorted(r_start + float(q) / float(fs)
+                             for q in pan_tompkins(np.asarray(r_data[best_lead_idx], dtype=float), fs=fs))
+                ref = [p for p in ref if v_start - 0.05 <= p < v_start + window_size]
+            if len(ref) < 5:
+                return None
+            ref_rr = np.diff(np.asarray(ref, dtype=float))
+            vt_rr = float(np.median(ref_rr))
+            if vt_rr <= 0 or float(np.std(ref_rr)) / vt_rr > 0.12:
+                return None
+            seg_start = max(0.0, v_start - window_size - 1.0)
+            seg_end = min(total_duration, ref[-1] + 0.5)
+            sig = reader.read_range(seg_start, seg_end)
+            if sig is None or best_lead_idx >= sig.shape[0]:
+                return None
+            lead_sig = np.asarray(sig[best_lead_idx], dtype=float)
+            try:
+                _b, _a = _butter(2, [0.5 / (float(fs) / 2.0), 40.0 / (float(fs) / 2.0)], btype='band')
+                lead_sig = _filtfilt(_b, _a, lead_sig)
+            except Exception:
+                pass
+            half_w = int(0.12 * fs)
+
+            def _snippet_at(i):
+                if i - half_w < 0 or i + half_w > len(lead_sig):
+                    return None
+                s = lead_sig[i - half_w:i + half_w]
+                return s - float(np.mean(s))
+
+            ref_snips = [s for s in (_snippet_at(int(round((t - seg_start) * fs))) for t in ref) if s is not None]
+            if len(ref_snips) < 5:
+                return None
+            template = np.median(np.asarray(ref_snips), axis=0)
+            t_norm = float(np.linalg.norm(template))
+            if t_norm <= 0:
+                return None
+
+            first = ref[0]
+            tol = 0.15 * vt_rr
+            t_ptp = float(np.ptp(template))
+            while first - vt_rr >= max(v_start - window_size, floor_sec):
+                lo_i = int(round((first - vt_rr - tol - seg_start) * fs))
+                hi_i = int(round((first - vt_rr + tol - seg_start) * fs))
+                best_c, best_i = -1.0, None
+                for i in range(max(0, lo_i), max(0, hi_i) + 1):
+                    s = _snippet_at(i)
+                    if s is None:
+                        continue
+                    n = float(np.linalg.norm(s))
+                    if n <= 0:
+                        continue
+                    # Correlation ignores size: the previous beat's T wave is
+                    # a smooth hump too and matched a sine-like VT complex at
+                    # 0.96 (seen: 690.17 s, ~7x smaller). A VT beat is about
+                    # the VT's own size.
+                    if not (0.5 * t_ptp <= float(np.ptp(s)) <= 2.0 * t_ptp):
+                        continue
+                    c = float(np.dot(s, template)) / (n * t_norm)
+                    if c > best_c:
+                        best_c, best_i = c, i
+                if best_i is None or best_c < 0.90:
+                    break
+                first = seg_start + best_i / float(fs)
+            return first
+
+        for idx, region in enumerate(merged_morph):
+            if region['label'] != 'Ventricular Tachycardia':
+                continue
+            try:
+                # Never into another morphological label: the walk stops at
+                # the end of the region before (VFib, AFib, a block, ...), so
+                # no other rhythm's segment is shortened by this.
+                floor_sec = float(merged_morph[idx - 1]['end_sec']) if idx > 0 else 0.0
+                vt_first = _vt_run_first_beat(region, floor_sec)
+                if vt_first is not None and vt_first < region['start_sec'] - 0.05:
+                    region['start_sec'] = vt_first
+                    region['start_time_str'], _ = make_time_strs(vt_first, region['end_sec'])
+            except Exception as e:
+                print(f"[Auto Arrhythmia Detect] VT start refine error: {e}")
 
         # Beat-exact edges for Atrial Fibrillation / Atrial Flutter where they
         # border normal rhythm (no other morphological region within one
@@ -3404,17 +3604,6 @@ def _detect_arrhythmias_uncached(
 
     final_segments.extend(bundle_branch_block_segments)
     final_segments.sort(key=lambda x: x['start_sec'])
-
-    # Ischemia (ST Elevation / ST Depression): its own layer, after every
-    # rhythm segment is final. It reads the rhythm segments only to go
-    # rhythm by rhythm and to skip VT/VFib/LBBB; it never changes them.
-    try:
-        from .ischemia_detection import detect_st_episodes
-        final_segments.extend(detect_st_episodes(
-            reader, rhythm_segments=list(final_segments), make_time_strs=make_time_strs))
-        final_segments.sort(key=lambda x: x['start_sec'])
-    except Exception as e:
-        print(f"[Auto Arrhythmia Detect] Ischemia detection error: {e}")
 
     print(f"[Auto Arrhythmia Detect] Found {len(final_segments)} exact rhythm segments:")
     for s in final_segments:

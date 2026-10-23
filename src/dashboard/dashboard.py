@@ -2025,7 +2025,10 @@ class Dashboard(QWidget):
                     self.ecg_test_page.start_live_holter_from_dashboard()
             
             elif msg.clickedButton() == btn_prev:
-                self.page_stack.setCurrentWidget(self.ecg_test_page)
+                # Stay on the main dashboard: the Holter workspace opens as
+                # its own window, so closing it (X) brings the user back here
+                # and not to the 12-lead ECG test page. Reviewing recordings
+                # needs no acquisition page underneath.
                 # Open up Holter workspace on Record Management tab
                 if hasattr(self.ecg_test_page, '_show_holter_ui'):
                     self.ecg_test_page._show_holter_ui(is_recording=False, ecgh_path=None, show_record_mgmt=True)

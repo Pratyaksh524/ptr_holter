@@ -1,29 +1,26 @@
 """
-Ischemia (ST elevation / ST depression) episode detection for Holter
-recordings.
+Ischemia findings for Holter recordings: ST Elevation / ST Depression and T
+Inversion. These are VALUES shown in the Overview / Replay tables and the
+report -- not auto arrhythmia marks.
 
-Called from auto_segment_arrthymia_detection._detect_arrhythmias_uncached()
-after the rhythm segments are final, and runs on the same recording data the
-Full Disclosure view shows (ECGHFileReader.read_range). It is its own layer:
-it never changes, trims or suppresses any rhythm segment; the rhythm segments
-are only used to split the recording rhythm by rhythm and to skip stretches
-where the ST segment can't be read.
+Independent of the auto arrhythmia detection (auto marking): it is not called
+from it and does not read its rhythm segments. It reads the recording itself
+(ECGHFileReader.read_range, the raw 12 leads the Full Disclosure view shows)
+and filters every lead exactly as the Full Disclosure strip does
+(_fd_filter): 0.5 Hz DFT high-pass (zero-phase, 2 s mirror padding), 3-point
+median, Gaussian low-pass 35 Hz twice (zero-phase).
 
-Method, rhythm by rhythm, chunk by chunk:
-  1. The recording is split wherever the rhythm label changes (the rhythm
-     segments passed in, plus the unlabeled stretches between them). Each
-     rhythm stretch is read in 10 s chunks aligned to its own start, so no
-     chunk mixes two rhythms.
-  2. Skipped: Ventricular Fibrillation, Ventricular Tachycardia and every
-     Bundle Branch Block (right/left, complete/incomplete), and any chunk
-     whose median beat has QRS >= 120 ms even without such a label (an
-     undetected bundle branch block, a ventricular escape rhythm, paced
-     beats). A wide QRS has secondary ST-T changes, and its J point sits in
-     the slurred end of the QRS (seen: RBBB/LBBB stretches reading
-     +1.3..+3.1 mV "ST elevation").
-  3. Per chunk: every lead filtered with the same SignalPreprocessor as the
-     AFib/Flutter/AV-block/BBB rules (0.5-40 Hz zero-phase bandpass + 50 Hz
-     notch); R-peaks found on the reference lead; beats aligned to each
+Method, chunk by chunk:
+  1. The recording is read in 10 s chunks (1.5 s padding each side).
+  2. Skipped chunks -- where the ST segment / T wave can't be read -- decided
+     from the chunk's own beats, not from any rhythm label:
+       - beats that don't share one shape (median correlation < 0.9 with the
+         chunk's template): ectopics, noise, Ventricular Fibrillation;
+       - median beat with QRS >= 120 ms: bundle branch block, ventricular
+         rhythm, paced beats. A wide QRS has secondary ST-T changes, and its
+         J point sits in the slurred end of the QRS (seen: RBBB/LBBB reading
+         +1.3..+3.1 mV "ST elevation").
+  3. Per chunk: R-peaks found on the reference lead; beats aligned to each
      other. The median beat of each lead is used only to locate the QRS.
   4. QRS onset and J point (QRS end) from the median beats and the combined
      slope of all leads -- the same global multi-lead method the bundle
@@ -94,11 +91,6 @@ _MIN_LEADS_IN_GROUP = 2
 LIMB_LEADS = ('I', 'II', 'III', 'aVR', 'aVL', 'aVF')
 CHEST_LEADS = ('V1', 'V2', 'V3', 'V4', 'V5', 'V6')
 
-_SKIP_RHYTHMS = (
-    'ventricular fibrillation',
-    'ventricular tachycardia',
-    'bundle branch block',
-)
 _MAX_QRS_MS = 120.0
 
 # T inversion (detect_t_inversion_episodes)
@@ -107,32 +99,48 @@ _T_MAX_HR = 120.0                # above this the T wave runs into the next P wa
 _T_START_AFTER_J_SEC = 0.06      # T search window starts here after the J point
 _T_MIN_PROMINENCE_MV = 0.02      # a real T wave is a turning point, not a slope
 _T_NOT_JUDGED = {'limb': ('aVR',), 'chest': ('V1',)}   # inverted T is normal there
-# AFib / Flutter: the f-waves / flutter waves (seen up to -2 mV deflections in
-# the T window) are not T waves and would read as T inversion.
-_T_SKIP_RHYTHMS = _SKIP_RHYTHMS + ('atrial fibrillation', 'atrial flutter')
 
 
-def _rhythm_chunks(total_duration: float, rhythm_segments: List[Dict[str, Any]]):
-    """Split [0, total_duration] wherever any rhythm segment starts or ends,
-    and return (start, end, labels-active) for each piece."""
-    cuts = {0.0, float(total_duration)}
-    for seg in rhythm_segments:
-        s = float(seg.get('start_sec', 0.0))
-        e = float(seg.get('end_sec', s))
-        if 0.0 < s < total_duration:
-            cuts.add(s)
-        if 0.0 < e < total_duration:
-            cuts.add(e)
-    edges = sorted(cuts)
-    out = []
-    for a, b in zip(edges, edges[1:]):
-        if b - a <= 0:
-            continue
-        mid = 0.5 * (a + b)
-        labels = [str(seg.get('label', '')) for seg in rhythm_segments
-                  if float(seg.get('start_sec', 0.0)) <= mid < float(seg.get('end_sec', 0.0))]
-        out.append((a, b, labels))
-    return out
+def _fd_filter(x: np.ndarray, fs: float) -> np.ndarray:
+    """One lead filtered exactly as the Full Disclosure strip displays it
+    (panels/holter_widgets.ECGStripCanvas.set_data): 0.5 Hz DFT high-pass
+    (zero-phase, mirrored 2 s padding), 3-point median, Gaussian low-pass
+    35 Hz twice (zero-phase, no ringing at the J point)."""
+    from ..ecg_filters import apply_dft_filter
+    from ..enhanced_filter import gaussian_lowpass
+    x = np.asarray(x, dtype=float)
+    if x.size > 30:
+        pad = int(min(x.size - 1, 2.0 * fs))
+        mirrored = np.pad(x, (pad, pad), mode='reflect')
+        x = np.asarray(apply_dft_filter(mirrored, float(fs), "0.5"), dtype=float)[pad:pad + x.size]
+    if x.size >= 3:
+        p = np.pad(x, (1, 1), mode='edge')
+        x = np.median(np.stack((p[:-2], p[1:-1], p[2:]), axis=0), axis=0)
+    x = gaussian_lowpass(x, 35.0, float(fs))
+    return gaussian_lowpass(x, 35.0, float(fs))
+
+
+def _read_chunk(reader, t: float, t_end: float, total: float, fs: float):
+    """The chunk [t, t_end) plus _CHUNK_PAD_SEC padding, every lead through
+    _fd_filter, or None when too short."""
+    p0 = max(0.0, t - _CHUNK_PAD_SEC)
+    p1 = min(total, t_end + _CHUNK_PAD_SEC)
+    raw = reader.read_range(p0, p1)
+    if raw is None or raw.shape[1] < int(fs * _MIN_CHUNK_SEC):
+        return None
+    return np.vstack([_fd_filter(x, fs) for x in np.asarray(raw, dtype=float)])
+
+
+def _chunks(total: float):
+    """10 s chunks over the whole recording (a shorter last piece >= 5 s is
+    kept)."""
+    t = 0.0
+    while t < total:
+        t_end = min(t + _CHUNK_SEC, total)
+        if t_end - t < _MIN_CHUNK_SEC:
+            break
+        yield t, t_end
+        t = t_end
 
 
 def _qrs_bounds(median_beats: np.ndarray, r_idx: int, fs: float):
@@ -337,23 +345,16 @@ def _chunk_all_leads_mv(st: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
 
 def detect_st_episodes(
     reader,
-    rhythm_segments: Optional[List[Dict[str, Any]]] = None,
     make_time_strs: Optional[Callable[[float, float], tuple]] = None,
 ) -> List[Dict[str, Any]]:
-    """Return ST Elevation / ST Depression episodes as segment dicts in the
-    same format as the rhythm segments (start_sec, end_sec, label, color,
-    start_time_str, end_time_str, detected_rhythm), plus 'st_leads' and
-    'st_mv' (worst deviation, mV)."""
+    """Return ST Elevation / ST Depression episodes (start_sec, end_sec,
+    label, color, start_time_str, end_time_str, plus 'st_leads', 'st_mv' =
+    worst deviation in mV, 'st_lead_mm' = qualifying leads, 'st_all_mm' = all
+    leads). Reads the recording itself; see the module docstring."""
     try:
         from ecg.pan_tompkins import pan_tompkins
     except ImportError:  # pragma: no cover
         from ..pan_tompkins import pan_tompkins
-    try:
-        from .analysis_pipeline import SignalPreprocessor, HolterConfig
-        fs0 = getattr(reader, 'fs', 500) or 500
-        preproc = SignalPreprocessor(fs=fs0, config=HolterConfig.from_clinical_config())
-    except Exception:
-        preproc = None
 
     fs = float(getattr(reader, 'fs', 500) or 500)
     total = float(getattr(reader, 'duration_sec', 0.0) or 0.0)
@@ -362,7 +363,6 @@ def detect_st_episodes(
         return []
     ref_name = next((n for n in ('II', 'V5', 'I', 'V6') if n in lead_names), lead_names[0])
     ref_idx = lead_names.index(ref_name)
-    rhythm_segments = list(rhythm_segments or [])
 
     if make_time_strs is None:
         def make_time_strs(s_sec, e_sec):
@@ -372,35 +372,19 @@ def detect_st_episodes(
 
     # Positive chunks: (start, end, label, {lead: ST mV})
     positives = []
-    for c_start, c_end, labels in _rhythm_chunks(total, rhythm_segments):
-        low = [l.lower() for l in labels]
-        if any(skip in l for l in low for skip in _SKIP_RHYTHMS):
-            continue
-        skip_leads = set()
-        t = c_start
-        while t < c_end:
-            t_end = min(t + _CHUNK_SEC, c_end)
-            if t_end - t < _MIN_CHUNK_SEC:
-                break
-            try:
-                p0 = max(0.0, t - _CHUNK_PAD_SEC)
-                p1 = min(total, t_end + _CHUNK_PAD_SEC)
-                raw = reader.read_range(p0, p1)
-                if raw is None or raw.shape[1] < int(fs * _MIN_CHUNK_SEC):
-                    t = t_end
-                    continue
-                data = np.asarray(raw, dtype=float)
-                if preproc is not None:
-                    data = np.vstack([np.asarray(preproc.process(x), dtype=float) for x in data])
-                result = _chunk_st(data, lead_names[:data.shape[0]], fs, pan_tompkins, ref_idx, skip_leads)
-                if result is not None:
-                    st, _hr = result
-                    label, lead_mv = _chunk_label(st)
-                    if label is not None:
-                        positives.append((t, t_end, label, lead_mv, _chunk_all_leads_mv(st)))
-            except Exception as e:
-                print(f"[Ischemia Detect] Chunk error {t:.1f}s: {e}")
-            t = t_end
+    for t, t_end in _chunks(total):
+        try:
+            data = _read_chunk(reader, t, t_end, total, fs)
+            if data is None:
+                continue
+            result = _chunk_st(data, lead_names[:data.shape[0]], fs, pan_tompkins, ref_idx, set())
+            if result is not None:
+                st, _hr = result
+                label, lead_mv = _chunk_label(st)
+                if label is not None:
+                    positives.append((t, t_end, label, lead_mv, _chunk_all_leads_mv(st)))
+        except Exception as e:
+            print(f"[Ischemia Detect] Chunk error {t:.1f}s: {e}")
 
     # Episodes: same label, gaps up to _MERGE_GAP_SEC joined. Per lead the
     # worst value over the episode is kept.
@@ -523,7 +507,6 @@ def _t_chunk_label(t_mv: Dict[str, Dict[str, float]]):
 
 def detect_t_inversion_episodes(
     reader,
-    rhythm_segments: Optional[List[Dict[str, Any]]] = None,
     make_time_strs: Optional[Callable[[float, float], tuple]] = None,
 ) -> List[Dict[str, Any]]:
     """Return T Inversion episodes as segment dicts, same format as
@@ -531,23 +514,14 @@ def detect_t_inversion_episodes(
     leads, 'st_all_mm' = T amplitude of all 12 leads, all in mm / worst = most
     negative).
 
-    Runs on the same Full Disclosure recording data (all 12 leads, same
-    SignalPreprocessor filter), rhythm by rhythm in 10 s chunks, exactly like
-    the ST detection: VT / VFib / bundle branch block stretches and wide-QRS
-    chunks are skipped; episodes need >= _MIN_EPISODE_SEC and gaps up to
-    _MERGE_GAP_SEC are joined. It never changes any other segment.
-
-    Pass the RHYTHM segments only (without ST / T episodes)."""
+    Reads the recording itself in 10 s chunks, every lead through the Full
+    Disclosure filter, exactly like detect_st_episodes(); chunks whose beats
+    differ in shape, with a wide QRS or above _T_MAX_HR are skipped; episodes
+    need >= _MIN_EPISODE_SEC and gaps up to _MERGE_GAP_SEC are joined."""
     try:
         from ecg.pan_tompkins import pan_tompkins
     except ImportError:  # pragma: no cover
         from ..pan_tompkins import pan_tompkins
-    try:
-        from .analysis_pipeline import SignalPreprocessor, HolterConfig
-        fs0 = getattr(reader, 'fs', 500) or 500
-        preproc = SignalPreprocessor(fs=fs0, config=HolterConfig.from_clinical_config())
-    except Exception:
-        preproc = None
 
     fs = float(getattr(reader, 'fs', 500) or 500)
     total = float(getattr(reader, 'duration_sec', 0.0) or 0.0)
@@ -556,7 +530,6 @@ def detect_t_inversion_episodes(
         return []
     ref_name = next((n for n in ('II', 'V5', 'I', 'V6') if n in lead_names), lead_names[0])
     ref_idx = lead_names.index(ref_name)
-    rhythm_segments = [s for s in (rhythm_segments or []) if s.get('label') not in ST_LABELS]
 
     if make_time_strs is None:
         def make_time_strs(s_sec, e_sec):
@@ -565,35 +538,20 @@ def detect_t_inversion_episodes(
             return fmt(s_sec), fmt(e_sec)
 
     positives = []     # (start, end, {lead: mV qualifying}, {lead: mV all})
-    for c_start, c_end, labels in _rhythm_chunks(total, rhythm_segments):
-        low = [l.lower() for l in labels]
-        if any(skip in l for l in low for skip in _T_SKIP_RHYTHMS):
-            continue
-        t = c_start
-        while t < c_end:
-            t_end = min(t + _CHUNK_SEC, c_end)
-            if t_end - t < _MIN_CHUNK_SEC:
-                break
-            try:
-                p0 = max(0.0, t - _CHUNK_PAD_SEC)
-                p1 = min(total, t_end + _CHUNK_PAD_SEC)
-                raw = reader.read_range(p0, p1)
-                if raw is None or raw.shape[1] < int(fs * _MIN_CHUNK_SEC):
-                    t = t_end
-                    continue
-                data = np.asarray(raw, dtype=float)
-                if preproc is not None:
-                    data = np.vstack([np.asarray(preproc.process(x), dtype=float) for x in data])
-                result = _chunk_t_wave(data, lead_names[:data.shape[0]], fs, pan_tompkins, ref_idx)
-                if result is not None:
-                    t_mv, _hr = result
-                    label, lead_mv = _t_chunk_label(t_mv)
-                    if label is not None:
-                        all_mv = {**t_mv['limb'], **t_mv['chest']}
-                        positives.append((t, t_end, lead_mv, all_mv))
-            except Exception as e:
-                print(f"[T Inversion Detect] Chunk error {t:.1f}s: {e}")
-            t = t_end
+    for t, t_end in _chunks(total):
+        try:
+            data = _read_chunk(reader, t, t_end, total, fs)
+            if data is None:
+                continue
+            result = _chunk_t_wave(data, lead_names[:data.shape[0]], fs, pan_tompkins, ref_idx)
+            if result is not None:
+                t_mv, _hr = result
+                label, lead_mv = _t_chunk_label(t_mv)
+                if label is not None:
+                    all_mv = {**t_mv['limb'], **t_mv['chest']}
+                    positives.append((t, t_end, lead_mv, all_mv))
+        except Exception as e:
+            print(f"[T Inversion Detect] Chunk error {t:.1f}s: {e}")
 
     # Episodes: gaps up to _MERGE_GAP_SEC joined; per lead the most negative T
     # of the episode is kept.
@@ -633,87 +591,102 @@ def detect_t_inversion_episodes(
     return out
 
 
-_T_CACHE_FILENAME = 't_inversion_cache.json'
-_t_memory_cache: Dict[str, List[Dict[str, Any]]] = {}
-_t_jobs: Dict[str, Any] = {}
+_CACHE_FILENAME = 'ischemia_cache.json'
+_memory_cache: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+_jobs: Dict[str, Any] = {}
+_code_hash: Optional[str] = None
 
 
-def _t_cache_key(path: str) -> Optional[str]:
-    """Same key as the arrhythmia detection cache (file size / mtime / code
-    fingerprint), so the result is recomputed when the recording or any code
-    changes."""
+def _cache_key(path: str) -> Optional[str]:
+    """Recording file (path / size / mtime) + the code this result depends
+    on (this module, the filters, the R-peak detector), so it is recomputed
+    when either changes. Nothing from the arrhythmia detection."""
+    import hashlib
+    import os
+    global _code_hash
     try:
-        from .auto_segment_arrthymia_detection import _cache_key
-        return _cache_key(path)
-    except Exception:
+        st = os.stat(path)
+    except OSError:
         return None
+    if _code_hash is None:
+        here = os.path.dirname(os.path.abspath(__file__))
+        h = hashlib.sha1()
+        for f in (os.path.join(here, 'ischemia_detection.py'),
+                  os.path.join(here, '..', 'ecg_filters.py'),
+                  os.path.join(here, '..', 'enhanced_filter.py'),
+                  os.path.join(here, '..', 'pan_tompkins.py')):
+            try:
+                with open(f, 'rb') as fh:
+                    h.update(fh.read())
+            except OSError:
+                pass
+        _code_hash = h.hexdigest()
+    return f"{os.path.abspath(path)}|{st.st_size}|{st.st_mtime_ns}|{_code_hash}"
 
 
-def get_cached_t_inversion(path: str) -> Optional[List[Dict[str, Any]]]:
-    """Cached detect_t_inversion_episodes() result for this recording, or
-    None. Cheap."""
+def get_cached_ischemia(path: str) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+    """Cached compute_ischemia() result for this recording --
+    {'st': ST episodes, 't': T Inversion episodes} -- or None. Cheap."""
     import copy
     import json
     import os
-    key = _t_cache_key(path)
+    key = _cache_key(path)
     if key is None:
         return None
-    if key in _t_memory_cache:
-        return copy.deepcopy(_t_memory_cache[key])
+    if key in _memory_cache:
+        return copy.deepcopy(_memory_cache[key])
     try:
-        with open(os.path.join(os.path.dirname(os.path.abspath(path)), _T_CACHE_FILENAME), 'r', encoding='utf-8') as f:
+        with open(os.path.join(os.path.dirname(os.path.abspath(path)), _CACHE_FILENAME), 'r', encoding='utf-8') as f:
             saved = json.load(f)
     except (OSError, ValueError):
         return None
-    if saved.get('key') != key:
+    if saved.get('key') != key or not isinstance(saved.get('result'), dict):
         return None
-    _t_memory_cache[key] = saved.get('episodes', [])
-    return copy.deepcopy(_t_memory_cache[key])
+    _memory_cache[key] = saved['result']
+    return copy.deepcopy(_memory_cache[key])
 
 
-def compute_t_inversion(path: str, rhythm_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """detect_t_inversion_episodes() on the recording at `path` (opens and
-    closes the reader), cached in memory and next to the recording. Blocking;
-    t_inversion_async() runs it on a worker thread."""
+def compute_ischemia(path: str) -> Dict[str, List[Dict[str, Any]]]:
+    """ST and T Inversion episodes of the recording at `path`:
+    {'st': [...], 't': [...]} (opens and closes the reader), cached in memory
+    and next to the recording. Blocking; ischemia_async() runs it on a worker
+    thread."""
     import json
     import os
     from .file_format import ECGHFileReader
     reader = ECGHFileReader(path)
     try:
-        episodes = detect_t_inversion_episodes(reader, rhythm_segments=list(rhythm_segments or []))
+        result = {'st': detect_st_episodes(reader), 't': detect_t_inversion_episodes(reader)}
     finally:
         reader.close()
-    ck = _t_cache_key(path)
-    if ck is not None:
-        _t_memory_cache[ck] = episodes
+    key = _cache_key(path)
+    if key is not None:
+        _memory_cache[key] = result
         try:
-            cache_path = os.path.join(os.path.dirname(os.path.abspath(path)), _T_CACHE_FILENAME)
+            cache_path = os.path.join(os.path.dirname(os.path.abspath(path)), _CACHE_FILENAME)
             with open(cache_path + '.tmp', 'w', encoding='utf-8') as f:
-                json.dump({'key': ck, 'episodes': episodes}, f, default=float)
+                json.dump({'key': key, 'result': result}, f, default=float)
             os.replace(cache_path + '.tmp', cache_path)
         except OSError:
             pass
-    return episodes
+    return result
 
 
-def t_inversion_async(path: str, rhythm_segments: List[Dict[str, Any]],
-                      on_done: Callable[[List[Dict[str, Any]]], None]) -> None:
-    """Run detect_t_inversion_episodes() on the recording at `path` on a
-    worker thread and call on_done(episodes) on the Qt main thread (the
-    result is cached in memory and next to the recording). Must be called
-    from the Qt main thread."""
+def ischemia_async(path: str, on_done: Callable[[Dict[str, List[Dict[str, Any]]]], None]) -> None:
+    """Run compute_ischemia() for the recording at `path` on a worker thread
+    and call on_done(result) on the Qt main thread. Must be called from the Qt
+    main thread."""
     import copy
-    import json
     import os
     import threading
     from PyQt5.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
 
-    cached = get_cached_t_inversion(path)
+    cached = get_cached_ischemia(path)
     if cached is not None:
         QTimer.singleShot(0, lambda: on_done(cached))
         return
-    key = _t_cache_key(path) or os.path.abspath(path)
-    job = _t_jobs.get(key)
+    key = _cache_key(path) or os.path.abspath(path)
+    job = _jobs.get(key)
     if job is not None:
         job.callbacks.append(on_done)
         return
@@ -727,29 +700,28 @@ def t_inversion_async(path: str, rhythm_segments: List[Dict[str, Any]],
             self.done.connect(self._deliver)
 
         @pyqtSlot(object)
-        def _deliver(self, episodes):
-            _t_jobs.pop(key, None)
+        def _deliver(self, result):
+            _jobs.pop(key, None)
             for cb in self.callbacks:
                 try:
-                    cb(copy.deepcopy(episodes))
+                    cb(copy.deepcopy(result))
                 except RuntimeError:
                     pass  # the receiving widget was closed meanwhile
                 except Exception as e:
-                    print(f"[T Inversion Detect] Callback error: {e}")
+                    print(f"[Ischemia Detect] Callback error: {e}")
 
     job = _Job()
-    _t_jobs[key] = job
-    segments = copy.deepcopy(list(rhythm_segments or []))
+    _jobs[key] = job
 
     def _run():
-        episodes = []
+        result = {'st': [], 't': []}
         try:
-            episodes = compute_t_inversion(path, segments)
+            result = compute_ischemia(path)
         except Exception as e:
-            print(f"[T Inversion Detect] Failed: {e}")
-        job.done.emit(episodes)
+            print(f"[Ischemia Detect] Failed: {e}")
+        job.done.emit(result)
 
-    threading.Thread(target=_run, daemon=True, name='t-inversion-detect').start()
+    threading.Thread(target=_run, daemon=True, name='ischemia-detect').start()
 
 
 def format_st_summary(episodes: Optional[List[Dict[str, Any]]], label: str, multiline: bool = False) -> str:

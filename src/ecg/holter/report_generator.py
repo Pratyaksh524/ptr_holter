@@ -118,62 +118,34 @@ def _load_auto_segment_events(session_dir: str) -> List[Dict[str, object]]:
         return []
 
 
-def _load_st_episodes(session_dir: str) -> List[Dict[str, object]]:
-    """ST Elevation / ST Depression episodes of this recording
-    (ischemia_detection, run inside detect_arrhythmias()), for the ST
-    ANALYSIS page. Calculated from the recording's 12 leads whether or not
-    "Auto Arrhythmia Detection" was clicked -- that button only gates the
-    rhythm marks. Uses the cached detection result when there is one."""
+def _load_ischemia(session_dir: str) -> Dict[str, List[Dict[str, object]]]:
+    """{'st': ST episodes, 't': T Inversion episodes} of this recording from
+    ischemia_detection (reads the recording itself; nothing to do with the
+    auto arrhythmia detection). Uses the cached result when there is one."""
     ecgh_path = os.path.join(session_dir, 'recording.ecgh')
     if not os.path.exists(ecgh_path):
-        return []
+        return {'st': [], 't': []}
     try:
-        from .auto_segment_arrthymia_detection import detect_arrhythmias, get_cached_detection
-        # T Inversion episodes are not on the ST ANALYSIS page (yet)
-        from .ischemia_detection import ST_DEPRESSION, ST_ELEVATION
-        ST_LABELS = (ST_ELEVATION, ST_DEPRESSION)
-        segments = get_cached_detection(ecgh_path)
-        if segments is None:
-            from .file_format import ECGHFileReader
-            reader = ECGHFileReader(ecgh_path)
-            try:
-                segments = detect_arrhythmias(reader)
-            finally:
-                reader.close()
-        episodes = [s for s in segments if s.get('label') in ST_LABELS]
-        return sorted(episodes, key=lambda s: float(s.get('start_sec', 0.0) or 0.0))
+        from .ischemia_detection import compute_ischemia, get_cached_ischemia
+        result = get_cached_ischemia(ecgh_path)
+        if result is None:
+            result = compute_ischemia(ecgh_path)
+        return result
     except Exception as exc:
-        print(f"[HolterReport] Could not load ST episodes: {exc}")
-        return []
+        print(f"[HolterReport] Could not load ST / T Inversion episodes: {exc}")
+        return {'st': [], 't': []}
+
+
+def _load_st_episodes(session_dir: str) -> List[Dict[str, object]]:
+    """ST Elevation / ST Depression episodes, for the ST ANALYSIS page."""
+    episodes = _load_ischemia(session_dir).get('st', [])
+    return sorted(episodes, key=lambda s: float(s.get('start_sec', 0.0) or 0.0))
 
 
 def _load_t_episodes(session_dir: str) -> List[Dict[str, object]]:
-    """T Inversion episodes of this recording (ischemia_detection.
-    detect_t_inversion_episodes), for the T wave section of the ST ANALYSIS
-    page. Uses the cached result when there is one; otherwise calculates it
-    from the recording's 12 leads (the rhythm segments only split it rhythm
-    by rhythm)."""
-    ecgh_path = os.path.join(session_dir, 'recording.ecgh')
-    if not os.path.exists(ecgh_path):
-        return []
-    try:
-        from .auto_segment_arrthymia_detection import detect_arrhythmias, get_cached_detection
-        from .ischemia_detection import compute_t_inversion, get_cached_t_inversion
-        episodes = get_cached_t_inversion(ecgh_path)
-        if episodes is None:
-            segments = get_cached_detection(ecgh_path)
-            if segments is None:
-                from .file_format import ECGHFileReader
-                reader = ECGHFileReader(ecgh_path)
-                try:
-                    segments = detect_arrhythmias(reader)
-                finally:
-                    reader.close()
-            episodes = compute_t_inversion(ecgh_path, segments)
-        return sorted(episodes, key=lambda s: float(s.get('start_sec', 0.0) or 0.0))
-    except Exception as exc:
-        print(f"[HolterReport] Could not load T inversion episodes: {exc}")
-        return []
+    """T Inversion episodes, for the T wave section of the ST ANALYSIS page."""
+    episodes = _load_ischemia(session_dir).get('t', [])
+    return sorted(episodes, key=lambda s: float(s.get('start_sec', 0.0) or 0.0))
 
 
 def generate_holter_report(session_dir: str,
