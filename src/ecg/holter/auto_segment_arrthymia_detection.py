@@ -965,10 +965,11 @@ def _detect_arrhythmias_uncached(
     # Which test called the last window VFib: 'coarse' when only the shape
     # test below did (read right after the call; see the guard after the
     # window loop).
-    _vfib_window_kind = {'last': None}
+    _vfib_window_kind = {'last': None, 'beats': 0}
 
     def _is_vfib_window(window_signal, r_peaks, fs):
         _vfib_window_kind['last'] = None
+        _vfib_window_kind['beats'] = 0
         if len(r_peaks) < 2:
             return False
         # VF is a chaotic, disorganized ventricular rhythm. A regular rhythm
@@ -981,6 +982,7 @@ def _detect_arrhythmias_uncached(
         beats = [b for b in (measure_beat(window_signal, int(p), fs) for p in r_peaks) if b is not None]
         if not beats:
             return False
+        _vfib_window_kind['beats'] = len(beats)
 
         # A P wave only counts as reliably preceding QRS when that same
         # beat's QRS boundary was genuinely resolved. The P-search window is
@@ -2602,7 +2604,11 @@ def _detect_arrhythmias_uncached(
                         elif (_is_vfib_window(padded_signal, core_r_peaks, fs)
                               and bundle_branch_block_result is None):
                             target_morph = ('Ventricular Fibrillation', '#FF3333')
-                            if _vfib_window_kind['last'] == 'coarse':
+                            # Called VFib on fewer than 4 measured beats: same
+                            # neighbor guard (seen: the recording's last,
+                            # 3 s window held 2 cut-off normal beats -- read
+                            # as "no P, no organized QRS" -- and became VFib).
+                            if _vfib_window_kind['last'] == 'coarse' or _vfib_window_kind['beats'] < 4:
                                 _coarse_vfib_window_starts.add(current_time)
                         else:
                             # P waves are judged on Lead II (see the
@@ -2694,10 +2700,12 @@ def _detect_arrhythmias_uncached(
             progress = int((current_time / total_duration) * 100)
             progress_callback(progress)
 
-    # Coarse-VFib guard: a window called VFib only by the shape test in
-    # _is_vfib_window is dropped unless another VFib window (either test)
-    # starts within one window of it -- one lone window is not an episode
-    # (the missed VFib this test is for ran 16+ windows in a row).
+    # VFib neighbor guard: a window called VFib only by the shape test in
+    # _is_vfib_window, or called VFib on fewer than 4 measured beats, is
+    # dropped unless another VFib window starts within one window of it --
+    # one lone window is not an episode (the missed VFib the shape test is
+    # for ran 16+ windows in a row; real VFib windows with 2-3 beats sat next
+    # to other VFib windows, at a VFib's end or inside it).
     if _coarse_vfib_window_starts:
         # A VFib candidate starts at its window's start (current_time).
         _vfib_window_starts = [m['start_sec'] for m in morphological_candidates
