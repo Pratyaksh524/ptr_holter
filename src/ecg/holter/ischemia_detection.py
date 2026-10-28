@@ -783,7 +783,7 @@ def format_st_summary(episodes: Optional[List[Dict[str, Any]]], label: str, mult
     when detection hasn't run -- then "-".
 
     ST: the event list -- per event its system start - end time, duration
-    and the qualifying leads as "<lead> <average>/<max>" in screen mm; the
+    and the qualifying leads as "<lead> <average>" in screen mm; the
     longest _ST_OVERVIEW_EVENTS events, in time order, then "+N more". `info`
     (detect_st_episodes) turns "None" into "Recording too short" / "Not
     measurable" where that is why.
@@ -819,14 +819,13 @@ def format_st_summary(episodes: Optional[List[Dict[str, Any]]], label: str, mult
         total = sum(max(0.0, float(e['end_sec']) - float(e['start_sec'])) for e in eps)
         longest = sorted(eps, key=lambda e: float(e['start_sec']) - float(e['end_sec']))[:_ST_OVERVIEW_EVENTS]
         shown = sorted(longest, key=lambda e: float(e['start_sec']))
-        lines = [f"{len(eps)} event{'s' if len(eps) != 1 else ''}, {dur(total)} (mm avg/max)"]
+        lines = [f"{len(eps)} event{'s' if len(eps) != 1 else ''}, {dur(total)} (mm)"]
         for i, e in enumerate(shown, 1):
             avg = e.get('st_lead_mm') or {}
-            mx = e.get('st_lead_max_mm') or avg
             s, en = float(e['start_sec']), float(e['end_sec'])
             lines.append(f"{i}) {clock(s)} - {clock(en)} ({dur(en - s)})")
             for group, names in (('Limb', LIMB_LEADS), ('Chest', CHEST_LEADS)):
-                leads = ", ".join(f"{lead} {float(avg[lead]):+.1f}/{float(mx.get(lead, avg[lead])):+.1f}"
+                leads = ", ".join(f"{lead} {float(avg[lead]):+.1f}"
                                   for lead in names if lead in avg)
                 if leads:
                     lines.append(f"    {group}: {leads}")
