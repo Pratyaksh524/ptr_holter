@@ -12,10 +12,12 @@ This module provides:
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-from scipy.signal import butter, filtfilt, find_peaks, savgol_filter
+from scipy.ndimage import convolve1d
+from scipy.signal import butter, filtfilt, find_peaks, savgol_coeffs, savgol_filter
 
 from ecg.holter.clinical_config import ClinicalConfig, load_clinical_config
 
@@ -251,14 +253,52 @@ def _first_baseline_crossing(signal: np.ndarray, baseline: float, start: int, st
     return min(max(idx, 0), signal.size - 1)
 
 
+@lru_cache(maxsize=None)
+def _savgol_cubic_coeffs(window: int) -> np.ndarray:
+    coeffs = savgol_coeffs(window, 3)
+    coeffs.setflags(write=False)
+    return coeffs
+
+
+def _savgol_cubic_span(signal: np.ndarray, window: int, lo: int, hi: int) -> np.ndarray:
+    """savgol_filter(signal, window, 3, mode="interp")[lo:hi], filtering only
+    the samples [lo, hi) need instead of the whole signal.
+
+    Bit-identical to the full call: savgol_filter is convolve1d with the
+    savgol_coeffs kernel, plus a polynomial fit for the window // 2 samples at
+    each end. Away from the ends each output depends only on its own window of
+    inputs, so convolve1d over just that neighbourhood gives the same numbers.
+    A span reaching into either end region takes the full call.
+    """
+    half = window // 2
+    if lo < half or hi > signal.size - half:
+        return savgol_filter(signal, window, 3, mode="interp")[lo:hi]
+    x = signal[lo - half:hi + half]
+    if x.dtype != np.float64 and x.dtype != np.float32:
+        x = x.astype(np.float64)
+    return convolve1d(x, _savgol_cubic_coeffs(window), mode="constant")[half:half + hi - lo]
+
+
 def _qrs_bounds(signal: np.ndarray, r_idx: int, fs: float) -> Tuple[int, int, float, bool]:
     if signal.size == 0:
         return 0, 0, 0.0, False
     qrs_left = max(0, r_idx - _ms_to_samples(80, fs))
     qrs_right = min(signal.size - 1, r_idx + _ms_to_samples(80, fs))
     smooth_window = _ensure_odd(min(11, signal.size - (1 - signal.size % 2)))
-    smoothed = savgol_filter(signal, smooth_window, 3, mode="interp") if signal.size >= smooth_window else signal
+    # Only smoothed[qrs_left:qrs_right + 1] and its slopes are read below, so
+    # filter just that span plus one sample each side for np.gradient's
+    # central difference (one-sided only where the span meets the signal end,
+    # exactly as on the full array). Smoothing the whole window signal for
+    # every beat was most of the auto arrhythmia detection run time.
+    span_lo = max(0, qrs_left - 1)
+    span_hi = min(signal.size, qrs_right + 2)
+    if signal.size >= smooth_window:
+        smoothed = _savgol_cubic_span(signal, smooth_window, span_lo, span_hi)
+    else:
+        smoothed = signal[span_lo:span_hi]
     slopes = np.gradient(smoothed)
+    # smoothed / slopes index i holds signal sample span_lo + i
+    off = span_lo
     # Pre-QRS local baseline: at high heart rates (e.g. tachycardia >100 BPM),
     # r_idx - 400ms falls directly onto the preceding beat's R/T wave,
     # causing baseline to be hundreds of counts too high and preventing
@@ -270,7 +310,7 @@ def _qrs_bounds(signal: np.ndarray, r_idx: int, fs: float) -> Tuple[int, int, fl
         baseline = float(np.median(signal[pre_qrs_start:pre_qrs_end]))
     else:
         baseline = _median_baseline(signal, r_idx - _ms_to_samples(400, fs), _ms_to_samples(100, fs))
-    local_slopes = np.abs(slopes[qrs_left:qrs_right + 1])
+    local_slopes = np.abs(slopes[qrs_left - off:qrs_right + 1 - off])
     slope_threshold = max(float(np.percentile(local_slopes, 35)) if local_slopes.size else 0.0, 1e-4)
     baseline_threshold = max(0.15 * max(float(np.ptp(signal[qrs_left:qrs_right + 1])), 0.05), 0.015)
     amplitude_threshold = max(0.05 * max(float(np.ptp(signal[qrs_left:qrs_right + 1])), 0.1), 0.02)
@@ -284,7 +324,7 @@ def _qrs_bounds(signal: np.ndarray, r_idx: int, fs: float) -> Tuple[int, int, fl
     q_onset = qrs_left
     q_resolved = False
     for idx in range(r_idx, qrs_left - 1, -1):
-        if abs(slopes[idx]) <= slope_threshold and abs(smoothed[idx] - baseline) <= baseline_threshold:
+        if abs(slopes[idx - off]) <= slope_threshold and abs(smoothed[idx - off] - baseline) <= baseline_threshold:
             q_onset = idx
             q_resolved = True
             break
@@ -292,7 +332,7 @@ def _qrs_bounds(signal: np.ndarray, r_idx: int, fs: float) -> Tuple[int, int, fl
     j_point = qrs_right
     j_resolved = False
     for idx in range(r_idx, qrs_right + 1):
-        if abs(slopes[idx]) <= slope_threshold and abs(smoothed[idx] - baseline) <= baseline_threshold:
+        if abs(slopes[idx - off]) <= slope_threshold and abs(smoothed[idx - off] - baseline) <= baseline_threshold:
             j_point = idx
             j_resolved = True
             break
@@ -317,7 +357,7 @@ def _qrs_bounds(signal: np.ndarray, r_idx: int, fs: float) -> Tuple[int, int, fl
     # the same rhythm. Walking outward from r_idx and stopping at the first
     # non-active sample keeps this widening local to the beat's own QRS,
     # the same way it would if there were no neighboring wave in range.
-    active_mask = np.abs(smoothed[qrs_left:qrs_right + 1] - baseline) > amplitude_threshold
+    active_mask = np.abs(smoothed[qrs_left - off:qrs_right + 1 - off] - baseline) > amplitude_threshold
     if active_mask.size:
         r_rel = r_idx - qrs_left
         left_rel = r_rel

@@ -38,7 +38,26 @@ import os
 import numpy as np
 from datetime import datetime
 from typing import List, Dict, Any, Callable, Optional
-from scipy.signal import find_peaks, savgol_filter
+from scipy.ndimage import convolve1d
+from scipy.signal import find_peaks, savgol_coeffs, savgol_filter
+
+
+# savgol_filter(x, 11, 3) (mode "interp") for the per-beat QRS width in the
+# Bundle Branch Block rule, called for every beat on 3-7 leads. scipy rebuilds
+# the kernel and solves two least-squares edge fits on every call; both are
+# fixed linear maps of the samples, so they are built once here: the kernel,
+# and each edge's output-from-input matrix (savgol_filter of the identity).
+# Same filter, without the per-call setup.
+_SAVGOL_11_3_KERNEL = savgol_coeffs(11, 3)
+_SAVGOL_11_3_EDGES = savgol_filter(np.eye(11), 11, 3, axis=0)
+
+
+def _savgol_11_3(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    y = convolve1d(x, _SAVGOL_11_3_KERNEL, mode='constant')
+    y[:5] = _SAVGOL_11_3_EDGES[:5] @ x[:11]
+    y[-5:] = _SAVGOL_11_3_EDGES[6:] @ x[-11:]
+    return y
 
 
 # Detection takes ~50s on a 23-minute recording and was being run again by
@@ -254,9 +273,126 @@ def detect_arrhythmias_async(path: str, on_done: Callable[[List[Dict[str, Any]]]
     threading.Thread(target=_run, name='auto-segment-detection', daemon=True).start()
 
 
+# Long recordings: the morphological window loop in _detect_arrhythmias_uncached
+# (10 s windows, 5 s step) is ~90% of the run time and every window is judged
+# on its own samples only, so it is split into jobs of consecutive windows and
+# run in worker processes. Each worker calls _detect_arrhythmias_uncached with
+# _window_job=(first, stop) window indices: it skips the whole-recording R-peak
+# pass and rate rules and returns just its windows' raw votes, which are put
+# back together in window order -- the same lists the serial loop builds, so
+# the cleanup after the loop and the output segments are unchanged. The jobs
+# start before the whole-recording pass so both run at the same time.
+# Processes, not threads: the per-beat work is small numpy/scipy calls that
+# hold the GIL. Short recordings, or any failure here, use the serial loop.
+_PARALLEL_MIN_DURATION_SEC = 15 * 60.0
+_PARALLEL_WINDOW_STEP_SEC = 5.0       # must equal step_size in the window loop
+_PARALLEL_JOB_WINDOWS = 120           # 10 minutes of recording per job
+_PARALLEL_MAX_WORKERS = 8
+# A worker peaks at ~215 MB (numpy/scipy ~100 MB, plus one job's working
+# set). Workers are limited by memory free at that moment, two ways:
+#   - commit (RAM + page file) is a hard limit: running out of it fails
+#     allocations ("Unable to allocate ...") in every process on the PC, so
+#     _PARALLEL_COMMIT_RESERVE always stays free;
+#   - physical RAM is a soft limit: past it Windows pages idle programs out
+#     and everything slows, so no more workers than fit, but at least 2.
+_PARALLEL_WORKER_RAM = 250 * 2**20
+_PARALLEL_COMMIT_RESERVE = 1024 * 2**20
+_PARALLEL_RAM_RESERVE = 256 * 2**20
+
+
+def _parallel_worker_limit() -> Optional[int]:
+    """Most workers free memory allows right now, or None if it can't be read."""
+    commit, ram = _available_memory_bytes()
+    if commit is None:
+        return None
+    by_commit = (commit - _PARALLEL_COMMIT_RESERVE) // _PARALLEL_WORKER_RAM
+    by_ram = (ram - _PARALLEL_RAM_RESERVE) // _PARALLEL_WORKER_RAM if ram is not None else by_commit
+    return int(min(by_commit, max(2, by_ram)))
+
+
+def _available_memory_bytes() -> tuple:
+    """(commit, physical RAM) free right now in bytes; None where it can't be read."""
+    try:
+        if os.name == 'nt':
+            import ctypes
+
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
+                            ('ullTotalPhys', ctypes.c_ulonglong), ('ullAvailPhys', ctypes.c_ulonglong),
+                            ('ullTotalPageFile', ctypes.c_ulonglong), ('ullAvailPageFile', ctypes.c_ulonglong),
+                            ('ullTotalVirtual', ctypes.c_ulonglong), ('ullAvailVirtual', ctypes.c_ulonglong),
+                            ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+
+            status = _MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return None, None
+            return int(status.ullAvailPageFile), int(status.ullAvailPhys)
+        ram = int(os.sysconf('SC_AVPHYS_PAGES') * os.sysconf('SC_PAGE_SIZE'))
+        return ram, ram
+    except Exception:
+        return None, None
+
+
+def _window_loop_job(path: str, first_window: int, stop_window: int) -> Dict[str, Any]:
+    from .file_format import ECGHFileReader
+    with ECGHFileReader(path) as reader:
+        return _detect_arrhythmias_uncached(reader, None, _window_job=(first_window, stop_window))
+
+
+def _start_parallel_window_loop(reader, total_duration: float):
+    """Submit the window loop's jobs to a process pool, or None to run it serially."""
+    path = getattr(reader, 'path', None)
+    if not path or not os.path.isfile(path) or total_duration < _PARALLEL_MIN_DURATION_SEC:
+        return None
+    workers = min(_PARALLEL_MAX_WORKERS, (os.cpu_count() or 1) - 1)   # one core left for the UI
+    memory_limit = _parallel_worker_limit()
+    if memory_limit is not None:
+        workers = min(workers, memory_limit)
+    if workers < 2:
+        if memory_limit is not None:
+            print("[Auto Arrhythmia Detect] Not enough free memory for worker processes, running serially")
+        return None
+    try:
+        import math
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        n_windows = int(math.ceil(total_duration / _PARALLEL_WINDOW_STEP_SEC))
+        pool = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context('spawn'))
+        futures = [
+            pool.submit(_window_loop_job, path, first, min(first + _PARALLEL_JOB_WINDOWS, n_windows))
+            for first in range(0, n_windows, _PARALLEL_JOB_WINDOWS)
+        ]
+        print(f"[Auto Arrhythmia Detect] {n_windows} windows in {len(futures)} jobs on {workers} processes")
+        return pool, futures
+    except Exception as e:
+        print(f"[Auto Arrhythmia Detect] Parallel window loop unavailable, running serially: {e}")
+        return None
+
+
+def _collect_parallel_window_loop(handle, progress_callback=None) -> Optional[List[Dict[str, Any]]]:
+    """Each job's window votes in window order, or None if any job failed."""
+    from concurrent.futures import as_completed
+    pool, futures = handle
+    try:
+        done = 0
+        for future in as_completed(futures):
+            future.result()
+            done += 1
+            if progress_callback:
+                progress_callback(int(done * 100 / len(futures)))
+        return [future.result() for future in futures]
+    except Exception as e:
+        print(f"[Auto Arrhythmia Detect] Parallel window loop failed, running serially: {e}")
+        return None
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 def _detect_arrhythmias_uncached(
     reader,
-    progress_callback: Optional[Callable[[int], None]] = None
+    progress_callback: Optional[Callable[[int], None]] = None,
+    _window_job: Optional[tuple] = None,
 ) -> List[Dict[str, Any]]:
     """
     Auto-detect arrhythmias and rate-based rhythm segments (Sinus Tachycardia / Sinus Bradycardia)
@@ -265,6 +401,9 @@ def _detect_arrhythmias_uncached(
     Args:
         reader: ECGHFileReader instance with read_range method
         progress_callback: Optional callback function(int) for progress updates (0-100)
+        _window_job: internal, set only in a worker process of the parallel
+            window loop (see _start_parallel_window_loop): (first, stop)
+            window indices; returns those windows' raw votes, not segments.
 
     Returns:
         List of detected arrhythmia segments with:
@@ -326,6 +465,12 @@ def _detect_arrhythmias_uncached(
     if not lead_names:
         lead_names = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
 
+    # Long recording: the window loop below starts now in worker processes
+    # and runs alongside the whole-recording pass (see _PARALLEL_* above).
+    _parallel_window_handle = None
+    if _window_job is None:
+        _parallel_window_handle = _start_parallel_window_loop(reader, total_duration)
+
     # ------------------------------------------------------------------
     # 1. Detect all R-peaks across the entire recording using best rhythm lead
     # ------------------------------------------------------------------
@@ -376,7 +521,9 @@ def _detect_arrhythmias_uncached(
     all_r_peaks = []
     t_cursor = 0.0
 
-    while t_cursor < total_duration:
+    # A window-loop worker needs none of the whole-recording beats: with no
+    # R-peaks, the beat measurements and the rate rules below are skipped too.
+    while _window_job is None and t_cursor < total_duration:
         t_end = min(t_cursor + chunk_len_sec, total_duration)
         pad_start = max(0.0, t_cursor - chunk_pad_sec)
         pad_end = min(total_duration, t_end + chunk_pad_sec)
@@ -2334,7 +2481,7 @@ def _detect_arrhythmias_uncached(
             for li in width_leads:
                 x = measured[li][w_lo:w_hi]
                 if x.size >= 11:
-                    x = savgol_filter(x, 11, 3)
+                    x = _savgol_11_3(x)
                 size = float(np.ptp(x[int(0.07 * fs_):int(0.27 * fs_)])) or 1.0
                 velocity += np.abs(np.gradient(x)) / size
             p_lo, p_hi = int(0.07 * fs_), int(0.27 * fs_)
@@ -2506,7 +2653,32 @@ def _detect_arrhythmias_uncached(
     # edge beats correctly, never to borrow beats from the next window over.
     morph_pad_sec = 2.0
 
-    while current_time < total_duration:
+    # Parallel window loop (see _PARALLEL_* above): a worker judges only its
+    # own windows; the main process takes all workers' votes, in window
+    # order, instead of running the loop itself.
+    window_loop_end = total_duration
+    if _window_job is not None:
+        current_time = _window_job[0] * step_size
+        window_loop_end = min(total_duration, _window_job[1] * step_size)
+    elif _parallel_window_handle is not None:
+        job_votes = None
+        if step_size == _PARALLEL_WINDOW_STEP_SEC:
+            job_votes = _collect_parallel_window_loop(_parallel_window_handle, progress_callback)
+        else:
+            _parallel_window_handle[0].shutdown(wait=False, cancel_futures=True)
+        if job_votes is not None:
+            for votes in job_votes:
+                for candidate, svt_rate in zip(votes['morphological_candidates'], votes['svt_window_rate']):
+                    morphological_candidates.append(candidate)
+                    if svt_rate is not None:
+                        _svt_window_rate[id(candidate)] = svt_rate
+                _coarse_vfib_window_starts.update(votes['coarse_vfib_window_starts'])
+                bundle_branch_block_candidates.extend(votes['bundle_branch_block_candidates'])
+                for beat_time, beat_votes in votes['bundle_branch_block_beat_votes']:
+                    bundle_branch_block_beat_votes.setdefault(beat_time, []).extend(beat_votes)
+            current_time = total_duration   # windows already judged
+
+    while current_time < window_loop_end:
         window_end = min(current_time + window_size, total_duration)
         try:
             pad_start = max(0.0, current_time - morph_pad_sec)
@@ -2699,6 +2871,15 @@ def _detect_arrhythmias_uncached(
         if window_count % 10 == 0 and progress_callback:
             progress = int((current_time / total_duration) * 100)
             progress_callback(progress)
+
+    if _window_job is not None:
+        return {
+            'morphological_candidates': morphological_candidates,
+            'svt_window_rate': [_svt_window_rate.get(id(m)) for m in morphological_candidates],
+            'coarse_vfib_window_starts': sorted(_coarse_vfib_window_starts),
+            'bundle_branch_block_candidates': bundle_branch_block_candidates,
+            'bundle_branch_block_beat_votes': list(bundle_branch_block_beat_votes.items()),
+        }
 
     # VFib neighbor guard: a window called VFib only by the shape test in
     # _is_vfib_window, or called VFib on fewer than 4 measured beats, is

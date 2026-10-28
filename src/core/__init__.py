@@ -1,3 +1,0 @@
-"""
-Core ECG processing modules
-"""

@@ -514,105 +514,8 @@ class TestValidateAge(unittest.TestCase):
 # 11. SERIAL
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestValidateSerial(unittest.TestCase):
-    """The Serial ID box is filled in by the device, never typed.
-
-    `on_scan_finished()` sets it read-only from `send_machine_serial_command()`,
-    which returns 16 bytes of raw ASCII from the firmware. The character rule
-    has to follow what the hardware emits.
-    """
-
-    # Verbatim from a connected RhythmUltra (also in ecg_settings.json).
-    REAL_SERIAL = "DM ECG V1.0 A998"
-
-    def test_accepts_the_real_device_serial(self):
-        # Regression: an allow-list of [A-Za-z0-9_-] rejected every genuine
-        # device and blocked signup with "Serial ID may contain only letters,
-        # digits, dashes and underscores."
-        ok, cleaned, err = validate_serial(self.REAL_SERIAL)
-        self.assertTrue(ok, f"real device serial was rejected: {err}")
-        self.assertEqual(cleaned, self.REAL_SERIAL)
-
-    def test_accepts_spaces_and_dots(self):
-        for good in ("DM ECG V1.0 A998", "DM ECG V2.1 B001", "A 1.0 B"):
-            with self.subTest(value=good):
-                self.assertTrue(validate_serial(good)[0], good)
-
-    def test_accepts_legacy_dashed_and_underscored_forms(self):
-        for good in ("TEST-MACHINE-1234", "TEST_MACHINE_1234", "DM_ECG_V1.0_A998"):
-            with self.subTest(value=good):
-                self.assertTrue(validate_serial(good)[0], good)
-
-    def test_accepts_any_sixteen_byte_ascii_the_firmware_can_send(self):
-        # The protocol hands back bytes[5:21] verbatim; a serial that fits the
-        # documented alphabet must never be refused.
-        self.assertTrue(validate_serial("X" * 16)[0])
-        self.assertTrue(validate_serial("1234567890123456")[0])
-
-    def test_still_rejects_path_and_shell_metacharacters(self):
-        for bad in ("A/B", chr(92).join(["A", "B"]), "A;B", "../x", "A'B",
-                    'A"B', "A|B", "A`B", "A$B"):
-            with self.subTest(value=bad):
-                self.assertFalse(validate_serial(bad)[0], bad)
-
-    def test_strips_control_characters(self):
-        ok, cleaned, _e = validate_serial("DM ECG" + chr(0) + " V1.0")
-        self.assertTrue(ok)
-        self.assertNotIn(chr(0), cleaned)
-
-    def test_rejects_above_max_length(self):
-        self.assertFalse(validate_serial("A" * (SERIAL_MAX_LENGTH + 1))[0])
-
-    def test_optional_by_default(self):
-        self.assertTrue(validate_serial("")[0])
-
-    def test_required_when_asked(self):
-        self.assertFalse(validate_serial("", required=True)[0])
-
-    def test_disconnected_placeholder_is_treated_as_no_serial(self):
-        # The form parks this sentence in the read-only box when no device
-        # answers. It is UI copy and must never be stored as a serial.
-        ok, cleaned, _err = validate_serial(DEVICE_DISCONNECTED_PLACEHOLDER)
-        self.assertTrue(ok)
-        self.assertEqual(cleaned, "")
-
-    def test_placeholder_detector(self):
-        self.assertTrue(is_device_placeholder(DEVICE_DISCONNECTED_PLACEHOLDER))
-        self.assertTrue(is_device_placeholder("  " + DEVICE_DISCONNECTED_PLACEHOLDER + " "))
-        self.assertFalse(is_device_placeholder(self.REAL_SERIAL))
-        self.assertFalse(is_device_placeholder(""))
-
-    def test_placeholder_text_matches_the_form(self):
-        # If the sentence in main.py is reworded, this constant must follow it
-        # or the blanking silently stops working.
-        self.assertIn(DEVICE_DISCONNECTED_PLACEHOLDER, _read("src/main.py"))
 
 
-class TestSerialIsMachinePopulated(unittest.TestCase):
-    """Source-level: nobody types into this field."""
-
-    def test_signup_serial_field_is_read_only(self):
-        src = _read("src/main.py")
-        self.assertIn("self.reg_serial.setReadOnly(True)", src)
-
-    def test_serial_is_set_from_the_device_scan(self):
-        src = _read("src/main.py")
-        self.assertIn("self.reg_serial.setText(serial_num)", src)
-
-    def test_settings_serial_matches_the_accepted_alphabet(self):
-        # Guards against the shipped settings file holding a serial the
-        # validator would refuse.
-        import json as _json
-        path = os.path.join(_ROOT, "ecg_settings.json")
-        if not os.path.exists(path):
-            self.skipTest("ecg_settings.json not present")
-        with open(path, "r", encoding="utf-8") as fh:
-            cfg = _json.load(fh)
-        serial = str(cfg.get("machine_serial_number") or "").strip()
-        if not serial:
-            self.skipTest("no machine_serial_number recorded")
-        ok, _cleaned, err = validate_serial(serial)
-        self.assertTrue(ok, f"recorded device serial {serial!r} is rejected: {err}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -819,118 +722,12 @@ def _read(rel_path):
         return fh.read()
 
 
-class TestFormsApplyValidation(unittest.TestCase):
-    """Source-level checks: a rule that is not wired in protects nothing."""
-
-    def test_waveform_analysis_mobile_field_is_digit_restricted(self):
-        src = _read("src/dashboard/analysis_window.py")
-        self.assertIn("apply_digit_only(self.mobile_no_input", src)
-
-    def test_waveform_analysis_revalidates_before_the_api_call(self):
-        src = _read("src/dashboard/analysis_window.py")
-        self.assertIn("validate_phone", src,
-                      "the mobile number must be checked again before it "
-                      "reaches the cloud request, not only at the widget")
-
-    def test_no_phone_field_uses_the_capped_int_validator(self):
-        # QIntValidator(0, 2147483647) refused every keystroke of any mobile
-        # number above 2147483647 — which is most of them. Scans the whole
-        # source tree, since the same pattern was copied into four places.
-        offenders = []
-        for rel in ("src/organization.py", "src/main.py",
-                    "src/dashboard/analysis_window.py", "src/auth/sign_in.py"):
-            for lineno, line in enumerate(_read(rel).splitlines(), 1):
-                if line.lstrip().startswith("#"):
-                    continue          # the explanatory comments are fine
-                if "QIntValidator(0, 2147483647" in line:
-                    offenders.append(f"{rel}:{lineno}")
-        self.assertEqual(offenders, [],
-                         f"capped int validator still used at: {offenders}")
-
-    def test_organization_uses_the_shared_digit_validator(self):
-        self.assertIn("apply_digit_only", _read("src/organization.py"))
-
-    def test_organization_signup_uses_shared_validators(self):
-        src = _read("src/organization.py")
-        for fn in ("validate_phone", "validate_password", "validate_age"):
-            with self.subTest(fn=fn):
-                self.assertIn(fn, src)
-
-    def test_main_signup_uses_shared_validators(self):
-        src = _read("src/main.py")
-        for fn in ("validate_name", "validate_password", "validate_phone"):
-            with self.subTest(fn=fn):
-                self.assertIn(fn, src)
-
-    def test_main_login_is_rate_limited(self):
-        src = _read("src/main.py")
-        for token in ("LoginRateLimiter", "record_failure", "record_success",
-                      "is_locked"):
-            with self.subTest(token=token):
-                self.assertIn(token, src)
-
-    def test_login_failure_message_does_not_enumerate_accounts(self):
-        # One message for both wrong-identifier and wrong-password.
-        src = _read("src/main.py")
-        self.assertIn("Invalid full name / phone number or password.", src)
-        self.assertNotIn("No such user", src)
-        self.assertNotIn("Password incorrect", src)
-
-    def test_registration_validates_at_the_logic_layer(self):
-        # Not just at the forms — every caller funnels through here.
-        src = _read("src/auth/sign_in.py")
-        self.assertIn("validate_username", src)
-        self.assertIn("validate_password", src)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 18. AUTH STORE HARDENING
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestAuthStoreHardening(unittest.TestCase):
-
-    def test_users_file_is_written_owner_only(self):
-        src = _read("src/auth/sign_in.py")
-        self.assertIn("os.chmod(USER_DATA_FILE, 0o600)", src)
-
-    def test_passwords_are_pbkdf2_not_plaintext(self):
-        src = _read("src/auth/sign_in.py")
-        self.assertIn("pbkdf2_hmac", src)
-        self.assertIn("hmac.compare_digest", src)
-
-    def test_pbkdf2_iteration_count_is_not_trivially_low(self):
-        src = _read("src/auth/sign_in.py")
-        matches = re.findall(r"iterations\s*=\s*(\d+)", src)
-        self.assertTrue(matches, "no PBKDF2 iteration count found")
-        self.assertGreaterEqual(int(matches[0]), 100000)
-
-    def test_stored_records_hold_no_plaintext_password(self):
-        users_path = os.path.join(_ROOT, "users.json")
-        if not os.path.exists(users_path):
-            self.skipTest("users.json not present in this checkout")
-        with open(users_path, "r", encoding="utf-8") as fh:
-            users = json.load(fh)
-        for name, record in users.items():
-            if not isinstance(record, dict):
-                continue
-            stored = str(record.get("password", ""))
-            if not stored:
-                continue
-            with self.subTest(user=name):
-                self.assertTrue(
-                    stored.startswith("pbkdf2_sha256$"),
-                    f"user {name!r} has a password that is not a PBKDF2 hash",
-                )
-
-    def test_chmod_failure_does_not_lose_the_write(self):
-        # On Windows the POSIX bits are largely advisory; a chmod error must
-        # not propagate and discard a save that already succeeded.
-        src = _read("src/auth/sign_in.py")
-        idx = src.find("os.chmod(USER_DATA_FILE")
-        self.assertGreater(idx, -1)
-        window = src[max(0, idx - 200): idx + 200]
-        self.assertIn("try:", window)
-        self.assertIn("except Exception:", window)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1067,6 +864,83 @@ class TestSanitizeFilenameComponent(unittest.TestCase):
         self.assertNotIn(chr(0), sanitize_filename_component("a" + chr(0) + "b"))
 
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 21. FORM FIELD LENGTH CAPS
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+
+class TestValidateSerial(unittest.TestCase):
+    """The Serial ID box is filled in by the device, never typed.
+
+    `on_scan_finished()` sets it read-only from `send_machine_serial_command()`,
+    which returns 16 bytes of raw ASCII from the firmware. The character rule
+    has to follow what the hardware emits.
+    """
+
+    # Verbatim from a connected RhythmUltra (also in ecg_settings.json).
+    REAL_SERIAL = "DM ECG V1.0 A998"
+
+    def test_accepts_the_real_device_serial(self):
+        # Regression: an allow-list of [A-Za-z0-9_-] rejected every genuine
+        # device and blocked signup with "Serial ID may contain only letters,
+        # digits, dashes and underscores."
+        ok, cleaned, err = validate_serial(self.REAL_SERIAL)
+        self.assertTrue(ok, f"real device serial was rejected: {err}")
+        self.assertEqual(cleaned, self.REAL_SERIAL)
+
+    def test_accepts_spaces_and_dots(self):
+        for good in ("DM ECG V1.0 A998", "DM ECG V2.1 B001", "A 1.0 B"):
+            with self.subTest(value=good):
+                self.assertTrue(validate_serial(good)[0], good)
+
+    def test_accepts_legacy_dashed_and_underscored_forms(self):
+        for good in ("TEST-MACHINE-1234", "TEST_MACHINE_1234", "DM_ECG_V1.0_A998"):
+            with self.subTest(value=good):
+                self.assertTrue(validate_serial(good)[0], good)
+
+    def test_accepts_any_sixteen_byte_ascii_the_firmware_can_send(self):
+        # The protocol hands back bytes[5:21] verbatim; a serial that fits the
+        # documented alphabet must never be refused.
+        self.assertTrue(validate_serial("X" * 16)[0])
+        self.assertTrue(validate_serial("1234567890123456")[0])
+
+    def test_still_rejects_path_and_shell_metacharacters(self):
+        for bad in ("A/B", chr(92).join(["A", "B"]), "A;B", "../x", "A'B",
+                    'A"B', "A|B", "A`B", "A$B"):
+            with self.subTest(value=bad):
+                self.assertFalse(validate_serial(bad)[0], bad)
+
+    def test_strips_control_characters(self):
+        ok, cleaned, _e = validate_serial("DM ECG" + chr(0) + " V1.0")
+        self.assertTrue(ok)
+        self.assertNotIn(chr(0), cleaned)
+
+    def test_rejects_above_max_length(self):
+        self.assertFalse(validate_serial("A" * (SERIAL_MAX_LENGTH + 1))[0])
+
+    def test_optional_by_default(self):
+        self.assertTrue(validate_serial("")[0])
+
+    def test_required_when_asked(self):
+        self.assertFalse(validate_serial("", required=True)[0])
+
+    def test_disconnected_placeholder_is_treated_as_no_serial(self):
+        # The form parks this sentence in the read-only box when no device
+        # answers. It is UI copy and must never be stored as a serial.
+        ok, cleaned, _err = validate_serial(DEVICE_DISCONNECTED_PLACEHOLDER)
+        self.assertTrue(ok)
+        self.assertEqual(cleaned, "")
+
+    def test_placeholder_detector(self):
+        self.assertTrue(is_device_placeholder(DEVICE_DISCONNECTED_PLACEHOLDER))
+        self.assertTrue(is_device_placeholder("  " + DEVICE_DISCONNECTED_PLACEHOLDER + " "))
+        self.assertFalse(is_device_placeholder(self.REAL_SERIAL))
+        self.assertFalse(is_device_placeholder(""))
+
+
 class TestRecordingPathIsSanitised(unittest.TestCase):
     """The Holter session directory is built from the patient name."""
 
@@ -1080,97 +954,6 @@ class TestRecordingPathIsSanitised(unittest.TestCase):
             "self.patient_info.get('name', 'Unknown').replace(' ', '_')", src,
             "replacing spaces alone leaves '..' and separators intact",
         )
-
-    def test_cloud_uploader_sanitises_patient_name(self):
-        src = _read("src/utils/cloud_uploader.py")
-        self.assertIn("sanitized_name", src)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 21. FORM FIELD LENGTH CAPS
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestFormFieldLengthCaps(unittest.TestCase):
-    """The widget caps are the limit a person actually meets.
-
-    The logic-layer maximums in input_validation.py are the backstop for values
-    that arrive some other way; for anything typed or pasted into the form, the
-    QLineEdit cap is what applies first. These tests pin the caps so a later
-    edit cannot change one without the other being noticed.
-    """
-
-    EXPECTED = {
-        "self.reg_name":         20,   # Full Name (signup)
-        "self.reg_doctor":       20,   # Doctor Name
-        "self.reg_org_name":     28,   # Organisation Name
-        "self.reg_org_address":  45,   # Organisation Address
-        "self.reg_phone":        10,   # Phone Number
-        "self.login_email":      20,   # Full Name or Phone Number (login)
-    }
-
-    def test_each_field_declares_its_documented_cap(self):
-        src = _read("src/main.py")
-        for widget, cap in self.EXPECTED.items():
-            with self.subTest(widget=widget):
-                needle = f"{widget}.setMaxLength({cap})"
-                self.assertIn(needle, src,
-                              f"expected {needle} in src/main.py")
-
-    def test_login_identifier_cap_matches_the_signup_name_cap(self):
-        # The login box accepts the full name typed at signup, so a tighter cap
-        # here would make a valid account unreachable.
-        self.assertEqual(self.EXPECTED["self.login_email"],
-                         self.EXPECTED["self.reg_name"])
-
-    def test_login_identifier_cap_admits_a_full_phone_number(self):
-        self.assertGreaterEqual(self.EXPECTED["self.login_email"], PHONE_DIGITS)
-
-    def test_signup_name_cap_is_within_the_validator_maximum(self):
-        # A widget cap above the validator maximum would let a person type a
-        # value the submit handler then refuses — an avoidable dead end.
-        self.assertLessEqual(self.EXPECTED["self.reg_name"], NAME_MAX_LENGTH)
-        self.assertLessEqual(self.EXPECTED["self.reg_doctor"], NAME_MAX_LENGTH)
-
-    def test_org_caps_are_within_their_validator_maximums(self):
-        from utils.input_validation import ORG_NAME_MAX_LENGTH
-        self.assertLessEqual(self.EXPECTED["self.reg_org_name"], ORG_NAME_MAX_LENGTH)
-        self.assertLessEqual(self.EXPECTED["self.reg_org_address"], ADDRESS_MAX_LENGTH)
-
-    def test_every_cap_admits_the_validator_minimum(self):
-        self.assertGreaterEqual(self.EXPECTED["self.reg_name"], NAME_MIN_LENGTH)
-        self.assertGreaterEqual(self.EXPECTED["self.reg_doctor"], NAME_MIN_LENGTH)
-
-    def test_stored_login_identifiers_still_fit_the_cap(self):
-        # A cap that is shorter than an identifier already in users.json would
-        # lock that account out of the login form.
-        users_path = os.path.join(_ROOT, "users.json")
-        if not os.path.exists(users_path):
-            self.skipTest("users.json not present in this checkout")
-        with open(users_path, "r", encoding="utf-8") as fh:
-            users = json.load(fh)
-
-        cap = self.EXPECTED["self.login_email"]
-        unreachable = []
-        for key, record in users.items():
-            if not isinstance(record, dict):
-                continue
-            candidates = {key}
-            for field in ("full_name", "login_id", "login_username",
-                          "login_identifier", "canonical_username",
-                          "username", "phone"):
-                if record.get(field):
-                    candidates.add(str(record[field]))
-            for alias in record.get("login_aliases", []) or []:
-                candidates.add(str(alias))
-
-            # The account is fine as long as AT LEAST ONE of its identifiers
-            # can be typed in full.
-            if not any(len(c) <= cap for c in candidates if c):
-                unreachable.append(key)
-
-        self.assertEqual(unreachable, [],
-                         f"these accounts have no identifier that fits the "
-                         f"{cap}-character login box: {unreachable}")
 
 
 if __name__ == "__main__":

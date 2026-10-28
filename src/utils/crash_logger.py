@@ -58,7 +58,7 @@ def _load_env_if_present():
 class CrashLogger:
     """Comprehensive crash logging and email reporting system"""
     
-    def __init__(self, app_name="CardioX", log_dir="logs"):
+    def __init__(self, app_name="Comprehensive", log_dir="logs"):
         self.app_name = app_name
         self.log_dir = log_dir
         self.crash_log_file = os.path.join(log_dir, "crash_logs.json")
