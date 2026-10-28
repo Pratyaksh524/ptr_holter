@@ -257,18 +257,18 @@ class HolterRecordSettingsPanel(QWidget):
         bottom_bar = QHBoxLayout()
         bottom_bar.setSpacing(10)
 
-        self._btn_wave_grid = QPushButton("Wave/Grid setting")
-        self._btn_wave_grid.setStyleSheet(_style_btn())
-        self._btn_wave_grid.setCursor(Qt.PointingHandCursor)
-        self._btn_wave_grid.setFixedHeight(34)
-        bottom_bar.addWidget(self._btn_wave_grid)
-
         self._btn_reset = QPushButton("Reset")
         self._btn_reset.setStyleSheet(_style_btn())
         self._btn_reset.setCursor(Qt.PointingHandCursor)
         self._btn_reset.setFixedHeight(34)
         self._btn_reset.clicked.connect(self._on_reset_clicked)
         bottom_bar.addWidget(self._btn_reset)
+
+        self._btn_reanalysis = QPushButton("Reanalysis")
+        self._btn_reanalysis.setStyleSheet(_style_btn())
+        self._btn_reanalysis.setCursor(Qt.PointingHandCursor)
+        self._btn_reanalysis.setFixedHeight(34)
+        bottom_bar.addWidget(self._btn_reanalysis)
 
         bottom_bar.addStretch(1)
 
@@ -600,17 +600,6 @@ class HolterRecordSettingsPanel(QWidget):
         left_grid.addWidget(self._spin_st_reset, 6, 1)
         left_grid.addWidget(_hint("s(1~300)"), 6, 2)
 
-        # Row 7 – bottom buttons
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-        for btn_lbl in ("Reanalysis", "Advanced", "Default"):
-            btn = QPushButton(btn_lbl)
-            btn.setStyleSheet(_style_btn())
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setFixedHeight(30)
-            btn_row.addWidget(btn)
-        btn_row.addStretch(1)
-        left_grid.addLayout(btn_row, 7, 0, 1, 3)
         left_grid.setRowStretch(8, 1)
 
         body_row.addWidget(left_widget)
