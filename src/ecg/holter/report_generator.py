@@ -118,6 +118,46 @@ def _load_auto_segment_events(session_dir: str) -> List[Dict[str, object]]:
         return []
 
 
+def _load_asystole_events(session_dir: str) -> List[Dict[str, object]]:
+    """Asystole (sustained flatline) segments for this recording, from the
+    fully independent detector in auto_segment_arrthymia_detection.py (see
+    the banner comment above detect_asystole_segments_async there).
+
+    Unlike _load_auto_segment_events() above, this is NOT gated by
+    is_auto_marking_enabled() -- Asystole is deliberately not part of the
+    "Auto Arrhythmia Detection" pipeline, so it belongs in the Event
+    Timeline whether or not that button was ever clicked for this session.
+    """
+    ecgh_path = os.path.join(session_dir, 'recording.ecgh')
+    if not os.path.exists(ecgh_path):
+        return []
+    try:
+        from .file_format import ECGHFileReader
+        from .auto_segment_arrthymia_detection import detect_asystole_segments
+        reader = ECGHFileReader(ecgh_path)
+        events = []
+        for segment in detect_asystole_segments(reader):
+            start_sec = float(segment.get('start_sec', 0.0) or 0.0)
+            end_sec = float(segment.get('end_sec', 0.0) or 0.0)
+            events.append({
+                'timestamp': start_sec,
+                'start_sec': start_sec,
+                'end_sec': end_sec,
+                'end_timestamp': end_sec,
+                'label': 'Asystole',
+                'event_type': 'Asystole',
+                'start_time_str': segment.get('start_time_str', ''),
+                'end_time_str': segment.get('end_time_str', ''),
+                'duration': max(0.0, end_sec - start_sec),
+                'source': 'Auto',
+                'confidence': 1.0,
+            })
+        return events
+    except Exception as exc:
+        print(f"[HolterReport] Could not load Asystole segments: {exc}")
+        return []
+
+
 def _load_ischemia(session_dir: str) -> Dict[str, List[Dict[str, object]]]:
     """{'st': ST episodes, 't': T Inversion episodes} of this recording from
     ischemia_detection (reads the recording itself; nothing to do with the
@@ -272,7 +312,8 @@ def first_confirmed_nsr_beat(reader, t_from: float, t_to: float):
 
 def _build_timeline_events(session_dir: str,
                            auto_segment_events=None,
-                           metrics=None) -> List[Dict[str, object]]:
+                           metrics=None,
+                           asystole_events=None) -> List[Dict[str, object]]:
     """
     Builds a clean, streamlined event timeline for the report:
     1. Loads manual markings (manual_segments.json and manual_beats.json) - EXACT MANUAL MARKING LOGIC.
@@ -280,6 +321,11 @@ def _build_timeline_events(session_dir: str,
     3. Creates structured start/end markers for rhythm segments.
     4. Establishes baseline Normal Sinus Rhythm transitions outside segments without repetitive periodic polling spam.
     5. Loads auto-detected badge events (SVT, VT, Couplet, Bigeminy, PVC, PAC, etc.) outside manual/segment areas.
+    5b. Loads Asystole events from the independent flatline detector (see
+        _load_asystole_events) -- shown as its own overlay rows the same
+        way Bundle Branch Block is, never gated by "Auto Arrhythmia
+        Detection" and never suppressing or suppressed by the rhythm
+        segment rows above.
     6. Appends manual beat and segment markings (unaltered).
     7. Chronologically sorts and deduplicates timeline events.
     """
@@ -415,6 +461,50 @@ def _build_timeline_events(session_dir: str,
                 'source': 'Auto'
             })
 
+    # 5b. Asystole events (independent flatline detector -- see
+    # _load_asystole_events). Treated exactly like Bundle Branch Block
+    # above: its own start/end rows, held back only by a manual segment,
+    # never added to active_segments_ranges so it can never suppress (or be
+    # suppressed by) a rhythm segment row -- an Asystole stretch can sit
+    # inside any auto rhythm segment (including one this module doesn't
+    # otherwise touch) and still get its own timeline rows.
+    asystole_segs = (
+        asystole_events
+        if asystole_events is not None
+        else _load_asystole_events(session_dir)
+    )
+    # Ranges actually shown as Asystole rows below (manual-segment overlap
+    # already excluded) -- used only by the baseline Normal Sinus Rhythm
+    # fill-in further down, so a real flatline never gets mislabeled as a
+    # "resumed to sinus rhythm" row just because it widened the gap between
+    # two rhythm segments (e.g. the VFib-flatline-edge trim in
+    # auto_segment_arrthymia_detection.py's _vfib_flatline_start_trim can
+    # now leave such a gap where the flatline used to be swallowed whole
+    # into the VFib region).
+    asystole_ranges = []
+    for seg in asystole_segs:
+        s_t = float(seg.get('start_sec', seg.get('timestamp', 0.0)) or 0.0)
+        e_t = float(seg.get('end_sec', seg.get('end_timestamp', s_t)) or s_t)
+        lbl = str(seg.get('label', 'Asystole'))
+        if any(ms < e_t and s_t < me for ms, me in manual_segment_ranges):
+            continue
+        asystole_ranges.append((s_t, e_t))
+        timeline_events.append({
+            'timestamp': s_t,
+            'sort_ts': s_t,
+            'label': f"Auto segment marked ({lbl})",
+            'event_type': lbl,
+            'source': 'Auto'
+        })
+        if e_t > s_t + 0.1:
+            timeline_events.append({
+                'timestamp': e_t,
+                'sort_ts': e_t,
+                'label': f"Auto segment marked end ({lbl})",
+                'event_type': lbl,
+                'source': 'Auto'
+            })
+
     # 6. Baseline rhythm / transition events
     # Start with baseline Normal Sinus Rhythm at t=0 if recording has data and t=0 is not in a segment
     if metrics or auto_segments or manual_segments:
@@ -444,7 +534,8 @@ def _build_timeline_events(session_dir: str,
                 + [float(seg.get('end_sec', 0.0) or 0.0) for seg in manual_segments]
                 + [0.0]
             )
-        starts_in_segment = any(ms <= 0.5 and me > 0.0 for ms, me in active_segments_ranges)
+        starts_in_segment = any(ms <= 0.5 and me > 0.0 for ms, me in active_segments_ranges) \
+            or any(a_s <= 0.5 < a_e for a_s, a_e in asystole_ranges)
 
         # Normal Sinus Rhythm rows are placed at the first CONFIRMED sinus
         # beat (_first_confirmed_nsr_beat: P with PR 120-200 ms, QRS < 120
@@ -500,7 +591,14 @@ def _build_timeline_events(session_dir: str,
             if recording_end_sec > 0.0 and t_resume >= recording_end_sec - 0.05:
                 continue
             in_another = any(other_s <= t_resume <= other_e for other_s, other_e in active_segments_ranges if (other_s, other_e) != (ms, me))
-            if not in_another:
+            # A confirmed flatline (Asystole) right where this fallback
+            # would otherwise place an unconfirmed "resumed to Normal Sinus
+            # Rhythm" row (no beats at all were found to confirm sinus rhythm
+            # there in the first place -- see the comment above
+            # _next_segment_start) is not sinus rhythm. See the comment
+            # above asystole_ranges.
+            in_asystole = any(a_s <= t_resume <= a_e for a_s, a_e in asystole_ranges)
+            if not in_another and not in_asystole:
                 if (ms, me) in manual_segment_ranges:
                     manual_resume_times.add(t_resume)
                 timeline_events.append({
@@ -535,7 +633,8 @@ def _build_timeline_events(session_dir: str,
                 if recording_end_sec > 0.0 and t_resume >= recording_end_sec - 0.05:
                     continue
                 if any(other_s <= t_resume <= other_e for other_s, other_e in active_segments_ranges) \
-                        or _in_bundle_branch_block(t_resume):
+                        or _in_bundle_branch_block(t_resume) \
+                        or any(a_s <= t_resume <= a_e for a_s, a_e in asystole_ranges):
                     continue
                 timeline_events.append({
                     'timestamp': t_resume,

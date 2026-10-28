@@ -254,6 +254,326 @@ def detect_arrhythmias_async(path: str, on_done: Callable[[List[Dict[str, Any]]]
     threading.Thread(target=_run, name='auto-segment-detection', daemon=True).start()
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# ASYSTOLE DETECTION -- intentionally separate from the pipeline below
+# ──────────────────────────────────────────────────────────────────────────
+# A flatline (no P, no QRS, no T -- the ECG goes silent) sustained for
+# several seconds is its own finding. It must not be decided, or even
+# touched, by the morphological rules in _detect_arrhythmias_uncached():
+# _is_vfib_window() there only ever looks at beats Pan-Tompkins actually
+# found inside its own 10s window, so a silent run with zero detected beats
+# is invisible to it and simply gets inherited into whichever window it
+# falls inside -- confirmed directly on a recording where a ~5s flatline
+# right after a Ventricular Tachycardia run, followed a few seconds later
+# by the first chaotic beats, got folded whole into that window's
+# Ventricular Fibrillation call, purely because the window vote has no way
+# to "see" the silence itself, only the beats on either side of it.
+#
+# Per the architecture rule (see this module's own docstring and the
+# arrhythmia-change-rules memory), a fix for one arrhythmia's logic must
+# not touch any other arrhythmia's output -- teaching _is_vfib_window()
+# about silence would risk exactly that kind of cross-label regression.
+# Asystole is reported here instead as a fully independent finding: its
+# own detector, its own cache file, never called by detect_arrhythmias()/
+# _detect_arrhythmias_uncached() and never merged by
+# apply_auto_segments_to_engine() into engine._structured_events -- so it
+# cannot change a single byte of what the pipeline above outputs, and is
+# not gated by (or counted as part of) "Auto Arrhythmia Detection" /
+# _auto_marking_visible either. Callers that want it (the Full Disclosure
+# rhythm label, the report's Event Timeline) call
+# detect_asystole_segments()/detect_asystole_segments_async() directly and
+# display its result on their own, alongside -- never inside -- the
+# auto-marking pipeline.
+
+_ASYSTOLE_CACHE_FILENAME = 'asystole_segments_cache.json'
+_asystole_memory_cache: Dict[str, List[Dict[str, Any]]] = {}
+_asystole_async_jobs: Dict[str, Dict[str, Any]] = {}
+
+# Minimum sustained flatline duration to call it Asystole rather than a
+# brief dropout/artifact blip.
+_ASYSTOLE_MIN_SEC = 3.0
+
+
+def _asystole_disk_cache_path(path: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(path)), _ASYSTOLE_CACHE_FILENAME)
+
+
+def get_cached_asystole(path: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+    """Cached detect_asystole_segments() result for this recording, or
+    None. Mirrors get_cached_detection(), but reads/writes its own cache
+    file -- entirely independent of the morphological pipeline's cache."""
+    key = _cache_key(path)
+    if key is None:
+        return None
+    if key in _asystole_memory_cache:
+        return copy.deepcopy(_asystole_memory_cache[key])
+    if not _code_fingerprint():
+        return None
+    try:
+        with open(_asystole_disk_cache_path(path), 'r', encoding='utf-8') as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if saved.get('key') != key or not isinstance(saved.get('segments'), list):
+        return None
+    _asystole_memory_cache[key] = saved['segments']
+    return copy.deepcopy(saved['segments'])
+
+
+def _asystole_time_strs(reader, s_sec: float, e_sec: float):
+    """HH:MM:SS start/end strings for a [s_sec, e_sec) span -- same format
+    detect_arrhythmias()'s own make_time_strs() produces."""
+    try:
+        if hasattr(reader, 'start_time') and reader.start_time is not None:
+            s_real = datetime.fromtimestamp(reader.start_time + s_sec)
+            e_real = datetime.fromtimestamp(reader.start_time + e_sec)
+            return s_real.strftime('%H:%M:%S'), e_real.strftime('%H:%M:%S')
+    except Exception:
+        pass
+
+    def _hms(sec):
+        sec = max(0.0, sec)
+        h = int(sec // 3600)
+        m = int((sec % 3600) // 60)
+        s = int(sec % 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    return _hms(s_sec), _hms(e_sec)
+
+
+def _detect_asystole_uncached(reader) -> List[Dict[str, Any]]:
+    """Standalone flatline scan -- see the banner comment above this
+    section for why this is deliberately independent of
+    _detect_arrhythmias_uncached()."""
+    fs = getattr(reader, 'fs', 500)
+    if fs is None or fs <= 0:
+        fs = 500
+    total_duration = getattr(reader, 'duration_sec', 0)
+    if total_duration <= 0:
+        return []
+
+    lead_names = getattr(reader, 'lead_names', []) or [
+        "I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"
+    ]
+    # Pick the lead with the largest early amplitude, the same ranking
+    # detect_arrhythmias() uses for its own best_lead_idx -- a strong lead
+    # gives a reliable reference amplitude for "normal" beats below, so the
+    # flatline threshold scales with this recording's own signal instead of
+    # a fixed count (this reader returns raw ADC counts, not calibrated mV,
+    # so a fixed-unit floor like is_asystole()'s in arrhythmia_detector.py
+    # does not transfer here).
+    lead_candidates = [l for l in ['II', 'V5', 'V6', 'V4', 'V1', 'I'] if l in lead_names] or lead_names
+    test_chunk = reader.read_range(0.0, min(30.0, total_duration))
+    best_lead_idx, best_ptp = 0, 0.0
+    for cand in lead_candidates:
+        idx = lead_names.index(cand)
+        if test_chunk is not None and idx < test_chunk.shape[0]:
+            ptp = float(np.ptp(test_chunk[idx]))
+            if ptp > best_ptp:
+                best_ptp, best_lead_idx = ptp, idx
+
+    block_sec = 1.0
+    chunk_len_sec = 120.0
+    block_samples = max(1, int(round(block_sec * fs)))
+    blocks = []  # (block_start_sec, ptp, std)
+    t_cursor = 0.0
+    while t_cursor < total_duration:
+        t_end = min(t_cursor + chunk_len_sec, total_duration)
+        chunk = reader.read_range(t_cursor, t_end)
+        if chunk is not None and best_lead_idx < chunk.shape[0]:
+            sig = np.asarray(chunk[best_lead_idx], dtype=float)
+            for b_start in range(0, sig.size, block_samples):
+                seg = sig[b_start:b_start + block_samples]
+                if seg.size < block_samples * 0.5:
+                    continue
+                blocks.append((t_cursor + b_start / fs, float(np.ptp(seg)), float(np.std(seg))))
+        t_cursor += chunk_len_sec
+
+    if not blocks:
+        return []
+
+    # Reference amplitude: the 75th percentile of 1s-block peak-to-peak
+    # values across the whole recording -- what a normal beating stretch
+    # looks like on this lead/device, whatever its raw units happen to be.
+    all_ptp = np.asarray([b[1] for b in blocks], dtype=float)
+    reference_ptp = float(np.percentile(all_ptp, 75))
+    if reference_ptp <= 0:
+        return []
+
+    # A block is flat when BOTH its peak-to-peak and its std sit well below
+    # that reference -- the same two-sided amplitude check is_asystole()
+    # (arrhythmia_detector.py) uses, scaled to this recording's own signal
+    # rather than that function's fixed mV floor.
+    flat_ptp_limit = max(1.0, 0.08 * reference_ptp)
+    flat_std_limit = max(1.0, 0.04 * reference_ptp)
+
+    runs = []
+    run_start = None
+    run_end = None
+    for b_start, ptp, std in blocks:
+        is_flat = ptp < flat_ptp_limit and std < flat_std_limit
+        b_end = b_start + block_sec
+        if is_flat:
+            if run_start is None:
+                run_start = b_start
+            run_end = b_end
+        elif run_start is not None:
+            runs.append((run_start, run_end))
+            run_start = None
+    if run_start is not None:
+        runs.append((run_start, run_end))
+
+    # Each run's edges above are only accurate to the whole second (the
+    # scan runs in 1s blocks), even though the real flat-to-chaos
+    # transition usually sits partway through the first/last block -- the
+    # exact same limitation _vfib_flatline_start_trim/_vt_flatline_end_trim
+    # (auto_segment_arrthymia_detection.py's VFib/VT edge trims) hit on
+    # their own copy of this same boundary, and fix the same way: finish in
+    # smaller 0.2s steps from here. Kept in sync deliberately -- those two
+    # trims report where a VFib/VT region's own edge leaves a confirmed
+    # flatline, and an Asystole run reported here can sit right next to
+    # one; without this, the two independent detectors could disagree by
+    # up to a second on exactly the same transition, leaving a sliver where
+    # neither claims the flatline (or neither claims the rhythm after it).
+    def _ptp_std(t0, t1):
+        seg = reader.read_range(max(0.0, t0), min(total_duration, t1))
+        if seg is None or best_lead_idx >= seg.shape[0]:
+            return None
+        x = np.asarray(seg[best_lead_idx], dtype=float)
+        if x.size == 0:
+            return None
+        return float(np.ptp(x)), float(np.std(x))
+
+    fine_step = 0.2
+
+    def _refine_run_start(s, hi_bound):
+        t = s
+        limit = max(0.0, t - 1.0)
+        while t > limit:
+            blk = _ptp_std(t - fine_step, t)
+            if blk is None or not (blk[0] < flat_ptp_limit and blk[1] < flat_std_limit):
+                break
+            t -= fine_step
+        return min(t, hi_bound)
+
+    def _refine_run_end(e, lo_bound):
+        t = e
+        limit = min(total_duration, t + 1.0)
+        while t < limit:
+            blk = _ptp_std(t, t + fine_step)
+            if blk is None or not (blk[0] < flat_ptp_limit and blk[1] < flat_std_limit):
+                break
+            t += fine_step
+        return max(t, lo_bound)
+
+    runs = [
+        (_refine_run_start(s, e - fine_step), _refine_run_end(e, s + fine_step))
+        for s, e in runs
+    ]
+
+    segments = []
+    for start_sec, end_sec in runs:
+        if end_sec - start_sec < _ASYSTOLE_MIN_SEC:
+            continue
+        s_str, e_str = _asystole_time_strs(reader, start_sec, end_sec)
+        segments.append({
+            'start_sec': start_sec,
+            'end_sec': end_sec,
+            'label': 'Asystole',
+            'color': '#777777',
+            'start_time_str': s_str,
+            'end_time_str': e_str,
+            'detected_rhythm': 'Asystole',
+        })
+    return segments
+
+
+def detect_asystole_segments(reader) -> List[Dict[str, Any]]:
+    """Cached wrapper around _detect_asystole_uncached(). Entirely separate
+    from detect_arrhythmias(): its own cache file, never invoked by or
+    merged into the morphological/rate pipeline above."""
+    path = getattr(reader, 'path', None)
+    key = _cache_key(path)
+    if key is None:
+        return _detect_asystole_uncached(reader)
+
+    cached = get_cached_asystole(path)
+    if cached is not None:
+        return cached
+
+    segments = _detect_asystole_uncached(reader)
+    _asystole_memory_cache[key] = copy.deepcopy(segments)
+    if _code_fingerprint():
+        cache_path = _asystole_disk_cache_path(path)
+        try:
+            tmp_path = cache_path + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump({'key': key, 'segments': segments}, f, default=float)
+            os.replace(tmp_path, cache_path)
+        except (OSError, TypeError, ValueError) as e:
+            print(f"[Asystole Detect] Could not save cache: {e}")
+    return segments
+
+
+def detect_asystole_segments_async(path: str, on_done: Callable[[List[Dict[str, Any]]], None]) -> None:
+    """Run detect_asystole_segments() for the recording at `path` on a
+    worker thread and call on_done(segments) on the Qt main thread. Must be
+    called from the Qt main thread. Mirrors detect_arrhythmias_async(), with
+    its own job table so neither detector's background run can block or be
+    confused with the other's."""
+    import threading
+    from PyQt5.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
+
+    cached = get_cached_asystole(path)
+    if cached is not None:
+        QTimer.singleShot(0, lambda: on_done(cached))
+        return
+
+    key = _cache_key(path) or os.path.abspath(path)
+    job = _asystole_async_jobs.get(key)
+    if job is not None:
+        job.callbacks.append(on_done)
+        return
+
+    class _AsystoleJob(QObject):
+        done = pyqtSignal(object)
+
+        def __init__(self):
+            super().__init__()
+            self.callbacks = [on_done]
+            self.done.connect(self._deliver)
+
+        @pyqtSlot(object)
+        def _deliver(self, segments):
+            _asystole_async_jobs.pop(key, None)
+            for cb in self.callbacks:
+                try:
+                    cb(copy.deepcopy(segments))
+                except RuntimeError:
+                    pass  # the receiving widget was closed meanwhile
+                except Exception as e:
+                    print(f"[Asystole Detect] Callback error: {e}")
+
+    job = _AsystoleJob()
+    _asystole_async_jobs[key] = job
+    notifier = job
+
+    def _run():
+        try:
+            from .file_format import ECGHFileReader
+            reader = ECGHFileReader(path)
+            try:
+                segments = detect_asystole_segments(reader)
+            finally:
+                reader.close()
+        except Exception as e:
+            print(f"[Asystole Detect] Background detection failed: {e}")
+            segments = []
+        notifier.done.emit(segments)
+
+    threading.Thread(target=_run, name='asystole-detection', daemon=True).start()
+
+
 def _detect_arrhythmias_uncached(
     reader,
     progress_callback: Optional[Callable[[int], None]] = None
@@ -3073,6 +3393,94 @@ def _detect_arrhythmias_uncached(
                 break
             return last
 
+        # A sustained FLATLINE (no cardiac activity at all -- not chaotic
+        # activity) sitting right at a VFib region's own start must not be
+        # credited to VFib. _is_vfib_window() only ever looks at the beats
+        # Pan-Tompkins actually found inside its 10s window, so a silent
+        # run with zero detected beats is invisible to it and simply gets
+        # inherited whole into whichever window it falls inside -- confirmed
+        # directly on a recording where ~5s of true flatline right after a
+        # Ventricular Tachycardia run, followed a few seconds later by the
+        # first chaotic beats, got drawn as VFib starting at the window
+        # edge (the flat stretch itself), not at the first chaotic beat.
+        # The _refine_vfib_edge()/_silent_gap_start() search above already
+        # tries to snap the start to a real beat transition, but it needs an
+        # "organized" reference beat before the gap and (with
+        # require_narrow=True, as used coming out of a VT run) a wide VT
+        # beat never qualifies as organized -- so it has nothing to search
+        # from and leaves the boundary at the window edge.
+        #
+        # This walks forward from the already-refined start in 1s blocks,
+        # using the signal's own amplitude in the 2s right before the region
+        # (the rhythm this VFib call followed) as the reference for what
+        # "normal" looks like here -- same scaling detect_asystole_segments()
+        # uses, just computed locally instead of over the whole recording,
+        # since this only ever needs to look at one region's own edge. Only
+        # acts on a flat stretch at least _ASYSTOLE_MIN_SEC long (the same
+        # bar used to call something Asystole at all -- see the Asystole
+        # section of this module), so an ordinary quiet beat gap inside
+        # VFib's own chaos is never mistaken for this. If trimming it away
+        # would leave less than 2s of region, the trim is skipped instead
+        # (a boundary call this module isn't confident enough to make) --
+        # the existing refinement above still stands. Only a Ventricular
+        # Fibrillation region's own start can move, only later, and only
+        # over a confirmed flat stretch; the VFib rule and every other
+        # label are untouched.
+        def _vfib_flatline_start_trim(start_sec, end_sec):
+            if best_lead_idx is None or fs <= 0:
+                return start_sec
+
+            def _ptp_std(t0, t1):
+                seg = reader.read_range(max(0.0, t0), min(total_duration, t1))
+                if seg is None or best_lead_idx >= seg.shape[0]:
+                    return None
+                x = np.asarray(seg[best_lead_idx], dtype=float)
+                if x.size == 0:
+                    return None
+                return float(np.ptp(x)), float(np.std(x))
+
+            ref = _ptp_std(start_sec - 2.0, start_sec)
+            if ref is None or ref[0] <= 0:
+                return start_sec
+            ref_ptp = ref[0]
+            flat_ptp_limit = 0.08 * ref_ptp
+            flat_std_limit = 0.04 * ref_ptp
+
+            t = start_sec
+            flat_run = 0.0
+            while t < end_sec - 1.0:
+                blk = _ptp_std(t, t + 1.0)
+                if blk is None or not (blk[0] < flat_ptp_limit and blk[1] < flat_std_limit):
+                    break
+                t += 1.0
+                flat_run += 1.0
+            if flat_run < _ASYSTOLE_MIN_SEC:
+                return start_sec
+            # `t` is only accurate to the whole second: the walk above stops
+            # at the first 1s block that ISN'T entirely flat, even when the
+            # real flat-to-chaos transition sits partway through that block
+            # -- confirmed directly on a recording where the signal was
+            # flat (<1.5% of reference) right up to 295.3s and then rose
+            # sharply (>20% of reference by 295.4s, >55% by 295.6s), while
+            # this walk alone reported 295.0s, a full second early. Finish
+            # the walk in smaller 0.2s steps from here (capped at one more
+            # whole second) so the boundary lands within ~0.2s of where the
+            # signal actually leaves the flat threshold instead of up to 1s
+            # early. Same thresholds, just finer steps; nothing about what
+            # counts as "flat" changes.
+            fine_step = 0.2
+            fine_limit = min(end_sec - fine_step, t + 1.0)
+            tf = t
+            while tf < fine_limit:
+                blk = _ptp_std(tf, tf + fine_step)
+                if blk is None or not (blk[0] < flat_ptp_limit and blk[1] < flat_std_limit):
+                    break
+                tf += fine_step
+            t = tf
+            if end_sec - t < 2.0:
+                return start_sec
+            return t
+
         for idx, region in enumerate(merged_morph):
             if region['label'] != 'Ventricular Fibrillation':
                 continue
@@ -3089,9 +3497,24 @@ def _detect_arrhythmias_uncached(
                     if vt_last is not None and vt_last > new_start:
                         new_start = vt_last
                 new_end = _refine_vfib_edge(region['end_sec'], 'end', require_narrow=not next_atrial)
+                trimmed_start = _vfib_flatline_start_trim(new_start, new_end)
+                flatline_trimmed = trimmed_start > new_start + 0.01
+                new_start = trimmed_start
                 if new_start < new_end - 0.5:
                     region['start_sec'], region['end_sec'] = new_start, new_end
                     region['start_time_str'], region['end_time_str'] = make_time_strs(new_start, new_end)
+                    if flatline_trimmed:
+                        # A confirmed flatline, not VFib's own chaos, now
+                        # sits in the gap this trim opened up before this
+                        # region's start (see _vfib_flatline_start_trim).
+                        # Tagged so the generic gap-closing pass further
+                        # below -- which otherwise stretches the PREVIOUS
+                        # region across any gap up to one window long --
+                        # leaves this one alone instead of re-absorbing the
+                        # flatline into whatever rhythm preceded it. Only
+                        # read where that pass checks this exact flag; every
+                        # other label's gap-closing is unaffected.
+                        region['_flatline_gap_before'] = True
                     # Pull the immediate neighbors' own edge in to meet this
                     # freshly beat-verified boundary too -- otherwise the
                     # generic overlap-trim pass right below, which always
@@ -3196,6 +3619,73 @@ def _detect_arrhythmias_uncached(
                 first = seg_start + best_i / float(fs)
             return first
 
+        # A sustained FLATLINE at a Ventricular Tachycardia region's own END
+        # is the same window-vote inheritance issue as
+        # _vfib_flatline_start_trim above (see its own comment), just at
+        # VT's trailing edge instead of VFib's leading edge: a window whose
+        # core VT beats stop partway through still has its full
+        # [start, window_end) span merged into the VT candidate, so a
+        # silent run after those beats (confirmed directly: VT's own last
+        # real beat at ~289.65s, then true flatline to ~295s, immediately
+        # before the next window's first chaotic VFib beats) gets credited
+        # to VT instead of being left out of every rhythm label -- which is
+        # exactly what would happen here if only VFib's own leading edge
+        # were trimmed: the flatline would simply end up inside VT instead
+        # of VFib. Same reference-amplitude scaling and _ASYSTOLE_MIN_SEC
+        # bar as that function (here taken from the 2s right AFTER this
+        # region, i.e. whatever follows the flatline -- typically VFib's
+        # own already-start-trimmed chaotic activity). Only a VT region's
+        # own end can move, only earlier, over a confirmed flat stretch;
+        # the VT rule itself is unchanged.
+        def _vt_flatline_end_trim(start_sec, end_sec):
+            if best_lead_idx is None or fs <= 0:
+                return end_sec
+
+            def _ptp_std(t0, t1):
+                seg = reader.read_range(max(0.0, t0), min(total_duration, t1))
+                if seg is None or best_lead_idx >= seg.shape[0]:
+                    return None
+                x = np.asarray(seg[best_lead_idx], dtype=float)
+                if x.size == 0:
+                    return None
+                return float(np.ptp(x)), float(np.std(x))
+
+            ref = _ptp_std(end_sec, end_sec + 2.0)
+            if ref is None or ref[0] <= 0:
+                return end_sec
+            ref_ptp = ref[0]
+            flat_ptp_limit = 0.08 * ref_ptp
+            flat_std_limit = 0.04 * ref_ptp
+
+            t = end_sec
+            flat_run = 0.0
+            while t > start_sec + 1.0:
+                blk = _ptp_std(t - 1.0, t)
+                if blk is None or not (blk[0] < flat_ptp_limit and blk[1] < flat_std_limit):
+                    break
+                t -= 1.0
+                flat_run += 1.0
+            if flat_run < _ASYSTOLE_MIN_SEC:
+                return end_sec
+            # Same whole-second-only limitation as
+            # _vfib_flatline_start_trim's own walk, and the same fix: finish
+            # in smaller 0.2s steps (backward here) from `t`, capped at one
+            # more whole second, so this boundary lands within ~0.2s of
+            # where the signal actually enters the flat threshold instead
+            # of up to 1s late. Same thresholds, just finer steps.
+            fine_step = 0.2
+            fine_limit = max(start_sec + fine_step, t - 1.0)
+            tf = t
+            while tf > fine_limit:
+                blk = _ptp_std(tf - fine_step, tf)
+                if blk is None or not (blk[0] < flat_ptp_limit and blk[1] < flat_std_limit):
+                    break
+                tf -= fine_step
+            t = tf
+            if t - start_sec < 2.0:
+                return end_sec
+            return t
+
         for idx, region in enumerate(merged_morph):
             if region['label'] != 'Ventricular Tachycardia':
                 continue
@@ -3208,6 +3698,15 @@ def _detect_arrhythmias_uncached(
                 if vt_first is not None and vt_first < region['start_sec'] - 0.05:
                     region['start_sec'] = vt_first
                     region['start_time_str'], _ = make_time_strs(vt_first, region['end_sec'])
+                trimmed_end = _vt_flatline_end_trim(region['start_sec'], region['end_sec'])
+                if trimmed_end < region['end_sec'] - 0.01:
+                    region['end_sec'] = trimmed_end
+                    _, region['end_time_str'] = make_time_strs(region['start_sec'], trimmed_end)
+                    if idx + 1 < len(merged_morph):
+                        # Same flag _vfib_flatline_start_trim sets, read by
+                        # the same generic gap-closing pass -- see its
+                        # comment there.
+                        merged_morph[idx + 1]['_flatline_gap_before'] = True
             except Exception as e:
                 print(f"[Auto Arrhythmia Detect] VT start refine error: {e}")
 
@@ -3726,6 +4225,16 @@ def _detect_arrhythmias_uncached(
                 cur['end_sec'] = nxt['start_sec']
                 _, cur['end_time_str'] = make_time_strs(cur['start_sec'], cur['end_sec'])
             elif cur['label'] in _AV_LABELS or nxt['label'] in _AV_LABELS:
+                continue
+            # A gap just before a region whose own leading edge was trimmed
+            # back off a confirmed flatline (_vfib_flatline_start_trim) --
+            # or just after a region whose own trailing edge was
+            # (_vt_flatline_end_trim) -- is left alone instead of being
+            # closed like an ordinary detection gap: closing it would just
+            # hand the flatline right back to whichever rhythm happened to
+            # border it, which is exactly what those trims were for. Only
+            # read here; it never changes any other pair's gap-closing.
+            elif nxt.get('_flatline_gap_before'):
                 continue
             elif 0.0 < (nxt['start_sec'] - cur['end_sec']) <= window_size:
                 cur['end_sec'] = nxt['start_sec']
