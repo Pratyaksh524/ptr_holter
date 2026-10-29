@@ -845,6 +845,14 @@ class HolterFullDisclosureDialog(QDialog):
             self._update_time_and_arrhythmia_labels(self._current_start, self._current_start + self._window_sec)
         except Exception as e:
             print(f"[Full Disclosure] Error refreshing Asystole label: {e}")
+        # Auto regions on screen are drawn with Asystole spans cut out
+        # (_without_asystole_spans) -- redraw them now that the spans are known.
+        if getattr(self, '_auto_marking_visible', False):
+            try:
+                self._update_canvases(self._current_start)
+                self._refresh_segment_overlay()
+            except Exception as e:
+                print(f"[Full Disclosure] Error redrawing auto regions after Asystole scan: {e}")
 
     def _persist_auto_marking_enabled(self):
         """Record on disk that auto arrhythmia marking was enabled for this
@@ -3683,7 +3691,74 @@ class HolterFullDisclosureDialog(QDialog):
         # pass through untouched.
         if not self._auto_marking_visible:
             combined = [e for e in combined if 'manual' in str(e.get('source', '')).lower()]
+        else:
+            combined = self._without_asystole_spans(combined)
         return combined
+
+    # A piece of an auto region left over next to an Asystole span shorter
+    # than this is dropped rather than drawn: no rhythm is established in
+    # under a second, it is only the detector's window edge spilling past
+    # the flatline.
+    _ASYSTOLE_REMNANT_MIN_SEC = 1.0
+
+    def _without_asystole_spans(self, events):
+        """Auto (non-manual) events with every Asystole span cut out of them.
+
+        Display-only: Asystole comes from its own detector
+        (self._asystole_segments) and is never merged into the auto-marking
+        pipeline, so an auto rhythm region can still run straight across a
+        flatline -- seen: Atrial Flutter 340.0-420.9 s over Asystole
+        410.8-420.2 s, tinting the flatline and labelling it "Atrial Flutter
+        | Asystole". With auto marking off the flatline shows only Asystole;
+        this makes auto marking show it the same way. Returns copies --
+        self._engine._structured_events, the detection cache and the report
+        are untouched. Manual markings pass through as they are.
+        """
+        spans = []
+        for seg in getattr(self, '_asystole_segments', []) or []:
+            try:
+                a_s = float(seg.get('start_sec', 0.0) or 0.0)
+                a_e = float(seg.get('end_sec', a_s) or a_s)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if a_e > a_s:
+                spans.append((a_s, a_e))
+        if not spans:
+            return events
+        spans.sort()
+
+        result = []
+        for ev in events:
+            if not isinstance(ev, dict) or 'manual' in str(ev.get('source', '')).lower():
+                result.append(ev)
+                continue
+            try:
+                ev_s = float(ev.get('timestamp', 0.0) or 0.0)
+                ev_e = float(ev.get('end_timestamp', ev.get('end_ts', ev_s)) or ev_s)
+            except (TypeError, ValueError):
+                result.append(ev)
+                continue
+            if not any(a_s < ev_e and a_e > ev_s for a_s, a_e in spans):
+                result.append(ev)
+                continue
+            pieces = []
+            cur = ev_s
+            for a_s, a_e in spans:
+                if a_e <= cur or a_s >= ev_e:
+                    continue
+                pieces.append((cur, a_s))
+                cur = a_e
+            pieces.append((cur, ev_e))
+            for p_s, p_e in pieces:
+                if p_e - p_s < self._ASYSTOLE_REMNANT_MIN_SEC:
+                    continue
+                piece = dict(ev)
+                piece['timestamp'] = p_s
+                piece['end_timestamp'] = p_e
+                if 'end_ts' in piece:
+                    piece['end_ts'] = p_e
+                result.append(piece)
+        return result
 
     def _add_auto_arrhythmia_segments(self, ref, visible_events, ref_end, span):
         """Add visual-only auto-arrhythmia regions; manual segments remain separate."""
@@ -4293,7 +4368,11 @@ class HolterFullDisclosureDialog(QDialog):
             # Same gate as _structured_events_for_canvas: no auto-detected
             # rhythm label until "Auto Arrhythmia Detection" has been
             # clicked (self._auto_marking_visible, see __init__).
-            events_for_label = getattr(self._engine, '_structured_events', []) or [] if self._auto_marking_visible else []
+            # Asystole spans are cut out the same way as for the canvases
+            # (_without_asystole_spans).
+            events_for_label = self._without_asystole_spans(
+                getattr(self._engine, '_structured_events', []) or []
+            ) if self._auto_marking_visible else []
             for event in events_for_label:
                 source = str(event.get('source', '')).lower()
                 if 'manual' in source:
@@ -4434,7 +4513,7 @@ class HolterFullDisclosureDialog(QDialog):
                     'complete left bundle branch block', 'incomplete left bundle branch block',
                 }
                 reader_start_bbb = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
-                for event in getattr(self._engine, '_structured_events', []) or []:
+                for event in self._without_asystole_spans(getattr(self._engine, '_structured_events', []) or []):
                     if not isinstance(event, dict) or 'manual' in str(event.get('source', '')).lower():
                         continue
                     label = str(event.get('label', event.get('type', '')) or '')
