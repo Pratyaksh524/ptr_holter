@@ -4429,6 +4429,226 @@ def _detect_arrhythmias_uncached(
     final_segments.extend(bundle_branch_block_segments)
     final_segments.sort(key=lambda x: x['start_sec'])
 
+    # Atrial Flutter continuing at a faster conduction ratio. The Flutter
+    # rule (_classify_atrial_window) reads F waves in each beat's TP
+    # segment, which needs RR >= ~530 ms: at 2:1 (RR ~400 ms, 150 bpm) no
+    # beat has TP room, the window gets no verdict and a Flutter episode
+    # that speeds up from 4:1 / 3:1 to 2:1 ends at the last slow window
+    # (seen: 3:1 -> 2:1 at 105.0 s, the 2:1 beats to 109.7 s unmarked). That
+    # rule is unchanged; this step only lengthens an Atrial Flutter segment
+    # it already found, beat by beat from its end, into time no other
+    # segment covers. A beat continues the Flutter when, against the last
+    # 10 s of the segment (lead II, 0.5-40 Hz):
+    #   - its waveform after the QRS (R + 60..340 ms) correlates >= 0.90 with
+    #     the segment's: the ventricle is triggered by an F wave, so the
+    #     sawtooth after the QRS repeats at every conduction ratio. Sinus
+    #     Tachycardia there has T + P instead -- at most 0.55 against the
+    #     Flutter segments of the recordings, 2:1 Flutter 0.97-0.98;
+    #   - its RR is k x the flutter cycle (k 2-5, within 0.10 k), the cycle
+    #     measured in the segment (F-wave autocorrelation, 170-250 ms, as the
+    #     AFib / Flutter edge refinement);
+    #   - its QRS correlates >= 0.90 with the segment's (same conduction).
+    # Extended only when at least _FLUTTER_CONT_MIN_BEATS beats in a row
+    # pass; it ends at the last beat that passes.
+    _FLUTTER_CONT_MIN_BEATS = 3
+
+    def _extend_atrial_flutter_end(region, limit_sec):
+        ref_lo = max(region['start_sec'], region['end_sec'] - 10.0)
+        read_lo = max(0.0, ref_lo - 1.0)
+        read_hi = min(total_duration, limit_sec + 1.5)
+        sig = reader.read_range(read_lo, read_hi)
+        if sig is None or conduction_lead_idx >= sig.shape[0]:
+            return None
+        x = np.asarray(sig[conduction_lead_idx], dtype=float)
+        if len(x) < int(2.0 * fs):
+            return None
+        _b, _a = _butter(2, [0.5 / (float(fs) / 2.0), 40.0 / (float(fs) / 2.0)], btype='band')
+        x = _filtfilt(_b, _a, x)
+        idx = lambda t: int(round((t - read_lo) * fs))
+
+        def _snip(t, w0, w1):
+            i0, i1 = idx(t) + int(w0 * fs), idx(t) + int(w1 * fs)
+            if i0 < 0 or i1 > len(x):
+                return None
+            s = x[i0:i1]
+            return s - float(np.mean(s))
+
+        def _corr(a, b):
+            na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+            return float(np.dot(a, b)) / (na * nb) if na > 0 and nb > 0 else -1.0
+
+        ref_peaks = [p for p in all_r_peaks if ref_lo <= p <= region['end_sec']]
+        lags = []
+        for p0, p1 in zip(ref_peaks[:-1], ref_peaks[1:]):
+            i0, i1 = idx(p0) + int(0.12 * fs), idx(p1) - int(0.08 * fs)
+            if i1 - i0 < int(0.4 * fs) or i0 < 0 or i1 > len(x):
+                continue
+            seg = x[i0:i1]
+            n = np.arange(len(seg))
+            seg = seg - np.polyval(np.polyfit(n, seg, 1), n)
+            ac = np.correlate(seg, seg, 'full')[len(seg) - 1:]
+            if ac[0] <= 0:
+                continue
+            ac = ac / ac[0]
+            lo_lag, hi_lag = int(0.15 * fs), int(0.35 * fs)
+            lag = lo_lag + int(np.argmax(ac[lo_lag:hi_lag]))
+            if ac[lag] >= 0.4 and 0.17 * fs <= lag <= 0.25 * fs:
+                lags.append(lag / float(fs))
+        if len(lags) < 3 or max(lags) - min(lags) > 0.02:
+            return None
+        cycle = float(np.median(lags))
+        after_ref = [s for s in (_snip(p, 0.06, 0.34) for p in ref_peaks) if s is not None]
+        qrs_ref = [s for s in (_snip(p, -0.06, 0.06) for p in ref_peaks) if s is not None]
+        if len(after_ref) < 4 or len(qrs_ref) < 4:
+            return None
+        after_tpl = np.median(np.asarray(after_ref), axis=0)
+        qrs_tpl = np.median(np.asarray(qrs_ref), axis=0)
+
+        cand = [p for p in all_r_peaks if region['end_sec'] < p <= limit_sec]
+        passed = []
+        for p0, p1 in zip(cand[:-1], cand[1:]):
+            rr = p1 - p0
+            k = rr / cycle
+            s_after, s_qrs = _snip(p0, 0.06, 0.34), _snip(p0, -0.06, 0.06)
+            if (rr < 0.36 or s_after is None or s_qrs is None
+                    or not 2 <= round(k) <= 5 or abs(k - round(k)) > 0.10
+                    or _corr(s_after, after_tpl) < 0.90 or _corr(s_qrs, qrs_tpl) < 0.90):
+                break
+            passed.append(p0)
+        if len(passed) < _FLUTTER_CONT_MIN_BEATS:
+            return None
+        return passed[-1]
+
+    for region in final_segments:
+        if region['label'] != 'Atrial Flutter':
+            continue
+        try:
+            # up to the next segment of any label (or the recording end)
+            limit_sec = min([o['start_sec'] for o in final_segments
+                             if o is not region and o['end_sec'] > region['end_sec']]
+                            + [total_duration])
+            if limit_sec <= region['end_sec'] + 0.5:
+                continue
+            new_end = _extend_atrial_flutter_end(region, limit_sec)
+            if new_end is not None and new_end > region['end_sec']:
+                region['end_sec'] = float(new_end)
+                _, region['end_time_str'] = make_time_strs(region['start_sec'], region['end_sec'])
+        except Exception as e:
+            print(f"[Auto Arrhythmia Detect] Atrial Flutter continuation error: {e}")
+
+    # Ventricular Fibrillation in time no segment covers. The VFib rule
+    # (_is_vfib_window) votes on the beats Pan-Tompkins finds in a 10 s
+    # window; its threshold, set by the sharp QRS before, picks up only a
+    # few of the rounded VF waves, so a short VF episode between two other
+    # rhythms is outvoted by their beats in every window (seen: ~7.5 s of VF
+    # between Sinus Bradycardia and AFib, 3 of ~30 waves detected, 3 of 5
+    # beats with a P wave -> no VFib). That rule is unchanged; this step
+    # judges the waveform itself, without R-peaks, on 2 s windows (1 s step,
+    # 0.5-40 Hz) of the unlabelled stretches. A window is VF-like on a lead
+    # when all hold (values over the labelled rhythms of the recordings):
+    #   - < 0.45 of the samples near the baseline (within 10% of its
+    #     peak-to-peak of the median): no isoelectric line (VFib <= 0.42,
+    #     every rhythm with QRS complexes >= 0.49);
+    #   - steepest slope < 40 x peak-to-peak per second: rounded waves, no
+    #     sharp QRS (VFib <= 34, narrow-QRS rhythms >= 46);
+    #   - >= 0.6 of the 1-30 Hz power at 2.5-7 Hz (VFib >= 0.65, sinus /
+    #     AFib / Flutter <= 0.45);
+    #   - autocorrelation (lag 0.12-0.5 s) < 0.70: not a regular rhythm
+    #     (VFib median 0.34, Ventricular Tachycardia >= 0.80).
+    # VFib where >= 3 of the leads I, II, V1, V3, V5 agree (artefact is
+    # rarely in every lead) for >= 4 windows in a row. Over all unlabelled
+    # time of the recordings this found only real VF (4 stretches), no other
+    # rhythm.
+    _VF_GAP_LEADS = ('I', 'II', 'V1', 'V3', 'V5')
+    _VF_GAP_MIN_LEADS = 3
+    _VF_GAP_MIN_WINDOWS = 4
+    _VF_GAP_WIN = 2.0
+
+    def _vf_like_window(w):
+        w = w - float(np.median(w))
+        ptp = float(np.ptp(w))
+        if ptp <= 0:
+            return False
+        if float(np.mean(np.abs(w) < 0.1 * ptp)) >= 0.45:
+            return False
+        if float(np.max(np.abs(np.diff(w)))) * float(fs) / ptp >= 40.0:
+            return False
+        spec = np.abs(np.fft.rfft(w * np.hanning(len(w)))) ** 2
+        freqs = np.fft.rfftfreq(len(w), 1.0 / float(fs))
+        total = float(spec[(freqs >= 1.0) & (freqs <= 30.0)].sum())
+        if total <= 0 or float(spec[(freqs >= 2.5) & (freqs <= 7.0)].sum()) / total < 0.6:
+            return False
+        ac = np.correlate(w, w, 'full')[len(w) - 1:]
+        if ac[0] <= 0:
+            return False
+        ac = ac / ac[0]
+        return float(np.max(ac[int(0.12 * fs):int(0.5 * fs)])) < 0.70
+
+    def _vf_runs_in_gap(gap_start, gap_end):
+        if gap_end - gap_start < _VF_GAP_WIN + (_VF_GAP_MIN_WINDOWS - 1):
+            return []
+        leads = [lead_names.index(n) for n in _VF_GAP_LEADS if n in lead_names]
+        if len(leads) < _VF_GAP_MIN_LEADS:
+            return []
+        read_lo = max(0.0, gap_start - 1.0)
+        sig = reader.read_range(read_lo, min(total_duration, gap_end + 1.0))
+        if sig is None:
+            return []
+        _b, _a = _butter(2, [0.5 / (float(fs) / 2.0), 40.0 / (float(fs) / 2.0)], btype='band')
+        filtered = {li: _filtfilt(_b, _a, np.asarray(sig[li], dtype=float)) for li in leads if li < sig.shape[0]}
+        n_win = int(_VF_GAP_WIN * fs)
+        runs, run = [], []
+        t = gap_start
+        while t + _VF_GAP_WIN <= gap_end:
+            i = int(round((t - read_lo) * fs))
+            votes = sum(1 for x in filtered.values()
+                        if i + n_win <= len(x) and _vf_like_window(x[i:i + n_win]))
+            if votes >= _VF_GAP_MIN_LEADS:
+                run.append(t)
+            else:
+                if len(run) >= _VF_GAP_MIN_WINDOWS:
+                    runs.append((run[0], run[-1] + _VF_GAP_WIN))
+                run = []
+            t += 1.0
+        if len(run) >= _VF_GAP_MIN_WINDOWS:
+            runs.append((run[0], run[-1] + _VF_GAP_WIN))
+        return runs
+
+    try:
+        covered = sorted((s['start_sec'], s['end_sec']) for s in final_segments)
+        gaps, cursor = [], 0.0
+        for c_start, c_end in covered:
+            if c_start > cursor:
+                gaps.append((cursor, c_start))
+            cursor = max(cursor, c_end)
+        if cursor < total_duration:
+            gaps.append((cursor, total_duration))
+        for gap_start, gap_end in gaps:
+            for vf_start, vf_end in _vf_runs_in_gap(gap_start, gap_end):
+                vf_end = min(vf_end, gap_end)
+                # touching an existing VFib segment: lengthen that one
+                touching = [s for s in final_segments if s['label'] == 'Ventricular Fibrillation'
+                            and (abs(s['end_sec'] - vf_start) <= 1.0 or abs(s['start_sec'] - vf_end) <= 1.0)]
+                if touching:
+                    seg = touching[0]
+                    seg['start_sec'] = min(seg['start_sec'], vf_start)
+                    seg['end_sec'] = max(seg['end_sec'], vf_end)
+                    seg['start_time_str'], seg['end_time_str'] = make_time_strs(seg['start_sec'], seg['end_sec'])
+                    continue
+                s_str, e_str = make_time_strs(vf_start, vf_end)
+                final_segments.append({
+                    'start_sec': float(vf_start),
+                    'end_sec': float(vf_end),
+                    'label': 'Ventricular Fibrillation',
+                    'color': '#FF3333',
+                    'start_time_str': s_str,
+                    'end_time_str': e_str,
+                    'detected_rhythm': 'Ventricular Fibrillation'
+                })
+        final_segments.sort(key=lambda x: x['start_sec'])
+    except Exception as e:
+        print(f"[Auto Arrhythmia Detect] Ventricular Fibrillation gap check error: {e}")
+
     print(f"[Auto Arrhythmia Detect] Found {len(final_segments)} exact rhythm segments:")
     for s in final_segments:
         print(f"  - {s['label']}: {s['start_sec']:.2f}s to {s['end_sec']:.2f}s ({s['start_time_str']} - {s['end_time_str']})")

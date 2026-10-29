@@ -1883,6 +1883,22 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         else:
             int_data.append([label, '--', '--', '--', '--', ref])
 
+    # QRS axis (axis_detection, with the ischemia findings): Mean = dominant
+    # axis, Std = spread around it, Min / Max = 5th - 95th percentile.
+    from .axis_detection import AXIS_NORMAL_RANGE, AXIS_SHORT
+    _axis = _load_ischemia(session_dir).get('axis') or {}
+    if _axis.get('dominant') is not None:
+        _lo, _hi = _axis.get('range') or (_axis['dominant'], _axis['dominant'])
+
+        def _axis_deg(v):
+            return f"{(float(v) + 180.0) % 360.0 - 180.0:+.0f}°"
+        int_data.append(['QRS Axis',
+                         f"{_axis_deg(_axis['dominant'])} {AXIS_SHORT.get(_axis.get('category'), '')}",
+                         f"{float(_axis.get('sd', 0.0) or 0.0):.0f}°",
+                         _axis_deg(_lo), _axis_deg(_hi), AXIS_NORMAL_RANGE])
+    else:
+        int_data.append(['QRS Axis', '--', '--', '--', '--', AXIS_NORMAL_RANGE])
+
     int_table = Table(int_data, colWidths=[35*mm, 22*mm, 22*mm, 22*mm, 22*mm, 32*mm])
     int_table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), TEAL),
@@ -1895,6 +1911,34 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         ('PADDING', (0, 0), (-1, -1), 7),
     ]))
     story.append(int_table)
+
+    # Axis Deviation events (>= 30 s outside -30 to +90 deg), only when there are any.
+    _axis_events = _axis.get('events') or []
+    if _axis_events:
+        story.append(Spacer(1, 4*mm))
+        story.append(Paragraph("QRS Axis Deviation", h2_style))
+        _ax_rows = [['Index', 'Type', 'Axis', 'Lowest', 'Highest', 'Start - End', 'Duration']]
+        for _i, _e in enumerate(_axis_events, start=1):
+            _ax_rows.append([
+                str(_i), _e.get('label', ''), _axis_deg(_e['axis']),
+                _axis_deg(_e['axis_min']), _axis_deg(_e['axis_max']),
+                f"{_format_system_time(session_dir, float(_e['start_sec']))} - "
+                f"{_format_system_time(session_dir, float(_e['end_sec']))}",
+                _sec_to_hms(float(_e['end_sec']) - float(_e['start_sec'])),
+            ])
+        _ax_table = Table(_ax_rows, colWidths=[12*mm, 36*mm, 16*mm, 16*mm, 16*mm, 40*mm, 20*mm],
+                          repeatRows=1)
+        _ax_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), TEAL),
+            ('TEXTCOLOR',  (0, 0), (-1, 0), colors.white),
+            ('FONTNAME',   (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE',   (0, 0), (-1, -1), 8),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, LIGHT]),
+            ('GRID', (0, 0), (-1, -1), 0.5, BORDER),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('PADDING', (0, 0), (-1, -1), 4),
+        ]))
+        story.append(_ax_table)
 
     #    FULL DISCLOSURE ECG STRIPS                                              
     # User requested: "all waves should be attached to the report for how many time it has run all 12 lead data should go with time stamp"

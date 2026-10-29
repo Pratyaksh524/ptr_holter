@@ -48,6 +48,10 @@ from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, Magni
 
 # 4. HOLTER OVERVIEW PANEL
 from ..ischemia_detection import ST_DEPRESSION, ST_ELEVATION, T_INVERSION, format_st_summary
+from ..axis_detection import format_axis_events, format_axis_summary
+
+# rows whose value is several lines, sized to their wrapped text
+_MULTILINE_ROWS = ('T Inversion', 'ST Elevation', 'ST Depression', 'QRS Axis', 'Axis Deviation')
 
 class HolterOverviewPanel(QWidget):
     def __init__(self, parent=None):
@@ -398,6 +402,9 @@ class HolterExpertReviewPanel(QWidget):
                                                info=summary.get('st_info'))),
             ("ST Depression", format_st_summary(summary.get('st_episodes'), ST_DEPRESSION, multiline=True,
                                                 info=summary.get('st_info'))),
+            # QRS axis: dominant / range / time outside Normal, and the deviation events
+            ("QRS Axis", format_axis_summary(summary.get('qrs_axis'), multiline=True)),
+            ("Axis Deviation", format_axis_events(summary.get('qrs_axis'), multiline=True)),
         ]
         self._overview.setRowCount(len(rows))
         for i, (k, v) in enumerate(rows):
@@ -412,7 +419,7 @@ class HolterExpertReviewPanel(QWidget):
             vi.setForeground(QColor(UI_TEXT))
             self._overview.setItem(i, 0, ki)
             self._overview.setItem(i, 1, vi)
-            if k in ('T Inversion', 'ST Elevation', 'ST Depression') and "\n" in str(v):
+            if k in _MULTILINE_ROWS and "\n" in str(v):
                 # limb leads on one line, chest leads below; wrapped to the column
                 self._overview.resizeRowToContents(i)
                 self._overview.setRowHeight(i, max(self._overview.rowHeight(i), 24))
@@ -426,7 +433,7 @@ class HolterExpertReviewPanel(QWidget):
             name_item, value_item = table.item(r, 0), table.item(r, 1)
             if name_item is None or value_item is None:
                 continue
-            if name_item.text() in ('T Inversion', 'ST Elevation', 'ST Depression') and "\n" in value_item.text():
+            if name_item.text() in _MULTILINE_ROWS and "\n" in value_item.text():
                 table.resizeRowToContents(r)
                 table.setRowHeight(r, max(table.rowHeight(r), 24))
 

@@ -748,6 +748,7 @@ def _cache_key(path: str) -> Optional[str]:
         here = os.path.dirname(os.path.abspath(__file__))
         h = hashlib.sha1()
         for f in (os.path.join(here, 'ischemia_detection.py'),
+                  os.path.join(here, 'axis_detection.py'),
                   os.path.join(here, '..', 'ecg_filters.py'),
                   os.path.join(here, '..', 'enhanced_filter.py'),
                   os.path.join(here, '..', 'pan_tompkins.py')):
@@ -783,8 +784,9 @@ def get_cached_ischemia(path: str) -> Optional[Dict[str, List[Dict[str, Any]]]]:
 
 
 def compute_ischemia(path: str) -> Dict[str, List[Dict[str, Any]]]:
-    """ST and T Inversion episodes of the recording at `path`:
-    {'st': [...], 't': [...], 'st_info': {...}} (opens and closes the reader), cached in memory
+    """ST and T Inversion episodes and the QRS axis (axis_detection) of the
+    recording at `path`: {'st': [...], 't': [...], 'st_info': {...},
+    'axis': {...}} (opens and closes the reader), cached in memory
     and next to the recording. Blocking; ischemia_async() runs it on a worker
     thread."""
     import json
@@ -793,8 +795,10 @@ def compute_ischemia(path: str) -> Dict[str, List[Dict[str, Any]]]:
     reader = ECGHFileReader(path)
     try:
         st_info: Dict[str, Any] = {}
+        from .axis_detection import detect_qrs_axis
         result = {'st': detect_st_episodes(reader, info=st_info),
-                  't': detect_t_inversion_episodes(reader), 'st_info': st_info}
+                  't': detect_t_inversion_episodes(reader), 'st_info': st_info,
+                  'axis': detect_qrs_axis(reader)}
     finally:
         reader.close()
     key = _cache_key(path)
