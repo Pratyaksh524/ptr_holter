@@ -4269,6 +4269,9 @@ class HolterFullDisclosureDialog(QDialog):
                     break
         
         arrhythmia_label = ""
+        # End (s) of the auto rhythm segment shown in the label, if any --
+        # read by the Asystole block below.
+        active_rhythm_end = None
 
         # Full-disclosure auto regions are the source of truth for the
         # bottom-right rhythm indicator.  Beat badges alone cannot represent
@@ -4327,6 +4330,7 @@ class HolterFullDisclosureDialog(QDialog):
                         active_auto.append((event_start, event_end, label))
             if active_auto:
                 event_start, event_end, event_label = min(active_auto, key=lambda item: item[0])
+                active_rhythm_end = event_end
                 if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
                     # Same as the Normal Sinus Rhythm label below: the time
                     # follows the scroll position, but stays inside this
@@ -4488,7 +4492,16 @@ class HolterFullDisclosureDialog(QDialog):
                     asys_text = f"Asystole at {asys_time}"
                 else:
                     asys_text = "Asystole"
+                # A rhythm segment that ended where this Asystole starts is
+                # only still in the label because its end falls in the same
+                # on-screen second (see _shown_second above) -- it is over,
+                # Asystole replaces it. Seen: VT ending 128.600 s, Asystole
+                # starting 128.600 s, label "VT at 14:39:25 | Asystole at
+                # 14:39:25".
+                rhythm_already_ended = (active_rhythm_end is not None
+                                        and active_rhythm_end <= seg_start + 1e-3)
                 if (not arrhythmia_label
+                        or rhythm_already_ended
                         or arrhythmia_label.startswith("Arrhythmia: Normal Sinus Rhythm")
                         or arrhythmia_label == "Arrhythmia: Analyzing recording..."):
                     arrhythmia_label = f"Arrhythmia: {asys_text}"
