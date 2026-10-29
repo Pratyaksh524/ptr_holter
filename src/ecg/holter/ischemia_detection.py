@@ -40,8 +40,13 @@ ST Elevation / ST Depression (detect_st_episodes), frame by frame:
        ST Depression: limb and chest <= -1 mm, horizontal or downsloping
                       (not rising more than 0.5 mm from J+20 to the ST
                       point).
-     aVR is not judged. A frame with both is ST Elevation (the depression
-     is reciprocal).
+     aVR is not judged. A frame with both is ST Elevation; its depression
+     is shown with the event, not as an ST Depression event:
+       Reciprocal: leads facing the wall opposite an elevated wall
+         (inferior II/III/aVF <-> I/aVL, anterior V1-V4 -> II/III/aVF,
+         lateral V5-V6 -> III/aVF), one lead is enough;
+       Reciprocal (posterior): V1-V3 with inferior / lateral elevation;
+       Additional depression: other leads, any 2 of one group.
   6. Events: consecutive frames of one label, a gap of up to one frame
      (10 s) joined, kept when the qualifying frames add up to >= 30 s.
      Per event and per lead that qualified: the average over all frames of
@@ -108,6 +113,33 @@ _ST_MIN_EVENT_SEC = 30.0
 # (limb leads: frontal plane; chest leads: horizontal plane).
 LIMB_LEADS = ('I', 'II', 'III', 'aVR', 'aVL', 'aVF')
 CHEST_LEADS = ('V1', 'V2', 'V3', 'V4', 'V5', 'V6')
+
+# Depression shown with an ST Elevation event (_depression_kinds), sorted by
+# the wall each lead faces. A wall is elevated when at least _MIN_WALL_LEADS
+# of its leads are among the event's elevated leads (contiguous leads).
+_WALL_LEADS = {
+    'inferior': ('II', 'III', 'aVF'),
+    'high lateral': ('I', 'aVL'),
+    'anterior': ('V1', 'V2', 'V3', 'V4'),
+    'lateral': ('V5', 'V6'),
+}
+_MIN_WALL_LEADS = 2
+# Leads facing the wall opposite an elevated wall: their depression is the
+# mirror image of the same injury (reciprocal).
+_RECIPROCAL_LEADS = {
+    'inferior': ('I', 'aVL'),
+    'high lateral': ('II', 'III', 'aVF'),
+    'anterior': ('II', 'III', 'aVF'),
+    'lateral': ('III', 'aVF'),
+}
+# V1-V3 face the front of the heart: with inferior / lateral elevation their
+# depression is the mirror image of the posterior wall.
+_POSTERIOR_LEADS = ('V1', 'V2', 'V3')
+_POSTERIOR_WITH = ('inferior', 'lateral')
+DEP_RECIPROCAL = 'Reciprocal'
+DEP_POSTERIOR = 'Reciprocal (posterior)'
+DEP_ADDITIONAL = 'Additional depression'
+DEP_KINDS = (DEP_RECIPROCAL, DEP_POSTERIOR, DEP_ADDITIONAL)
 
 _MAX_QRS_MS = 120.0
 
@@ -342,14 +374,17 @@ def _chunk_st(data: np.ndarray, lead_names: List[str], fs: float, pan_tompkins,
 
 
 def _chunk_label(st: Dict[str, Dict[str, Any]]):
-    """('ST Elevation' | 'ST Depression' | None, {lead: ST mm}) for one frame.
+    """('ST Elevation' | 'ST Depression' | None, {lead: ST mm}, {lead: ST mm})
+    for one frame.
 
     The limb-lead array and the chest-lead array are judged separately; a
     label needs at least _MIN_LEADS_IN_GROUP leads of ONE group past its
-    threshold. Noisy leads and aVR are not judged. The returned dict holds
-    the leads of the groups that qualified.
+    threshold. Noisy leads and aVR are not judged. The first dict holds
+    the leads of the groups that qualified. The second, only for an ST
+    Elevation frame, holds every lead past the depression criteria (each lead
+    on its own, no group count) -- sorted per event by _depression_kinds.
     """
-    elevated, depressed = {}, {}
+    elevated, depressed, dep_any = {}, {}, {}
     for key in ('limb', 'chest'):
         group = st[key]
         elev, dep = {}, {}
@@ -361,15 +396,53 @@ def _chunk_label(st: Dict[str, Dict[str, Any]]):
                 elev[name] = float(st_level)
             if st_level <= _DEPRESSION_MM and (st_level - st_early) <= _UPSLOPE_LIMIT_MM:
                 dep[name] = float(st_level)
+        dep_any.update(dep)
         if len(elev) >= _MIN_LEADS_IN_GROUP:
             elevated.update(elev)
         if len(dep) >= _MIN_LEADS_IN_GROUP:
             depressed.update(dep)
     if elevated:
-        return ST_ELEVATION, elevated
+        return ST_ELEVATION, elevated, dep_any
     if depressed:
-        return ST_DEPRESSION, depressed
-    return None, {}
+        return ST_DEPRESSION, depressed, {}
+    return None, {}, {}
+
+
+def _depression_kinds(elevated_leads, dep_frames: List[Dict[str, float]]) -> Dict[str, str]:
+    """Depression in the frames of one ST Elevation event: {lead: kind}.
+
+    Walls elevated: _WALL_LEADS with at least _MIN_WALL_LEADS of their leads
+    among the event's elevated leads.
+      Reciprocal: the lead faces the wall opposite an elevated wall
+        (_RECIPROCAL_LEADS) -- one lead is enough, it is the mirror image of
+        the injury already found.
+      Reciprocal (posterior): V1-V3 with inferior / lateral elevation.
+      Additional depression: any other lead; like an ST Depression frame it
+        needs _MIN_LEADS_IN_GROUP such leads of one group in the same frame.
+    A lead elevated in the event is left out."""
+    elevated = set(elevated_leads)
+    walls = [w for w, names in _WALL_LEADS.items()
+             if sum(n in elevated for n in names) >= _MIN_WALL_LEADS]
+    mirror = {n for w in walls for n in _RECIPROCAL_LEADS[w]}
+    posterior = set(_POSTERIOR_LEADS) if any(w in _POSTERIOR_WITH for w in walls) else set()
+    kinds: Dict[str, str] = {}
+    for dep in dep_frames:
+        other = []
+        for name in dep:
+            if name in elevated:
+                continue
+            if name in mirror:
+                kinds[name] = DEP_RECIPROCAL
+            elif name in posterior:
+                kinds[name] = DEP_POSTERIOR
+            else:
+                other.append(name)
+        for names in (LIMB_LEADS, CHEST_LEADS):
+            group = [n for n in other if n in names]
+            if len(group) >= _MIN_LEADS_IN_GROUP:
+                for n in group:
+                    kinds[n] = DEP_ADDITIONAL
+    return kinds
 
 
 def _chunk_all_leads_mm(st: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
@@ -391,7 +464,9 @@ def detect_st_episodes(
     qualifying leads, average over all the event's frames,
     'st_lead_max_mm' = their largest value in the frames they qualified in,
     'st_mv' = the largest value in mV, 'st_all_mm' = every lead, average
-    over the event's frames). Graph-paper mm. When `info` is given it is filled with 'duration_sec', 'start_time',
+    over the event's frames; ST Elevation events also 'st_dep_kind' /
+    'st_dep_mm' / 'st_dep_max_mm' = the depressed leads with their kind
+    (_depression_kinds), average and deepest value). Graph-paper mm. When `info` is given it is filled with 'duration_sec', 'start_time',
     'frames' and 'measured' (frames that could be read). See the module
     docstring."""
     try:
@@ -416,7 +491,8 @@ def detect_st_episodes(
                 return f"{int(t // 3600):02d}:{int((t % 3600) // 60):02d}:{int(t % 60):02d}"
             return fmt(s_sec), fmt(e_sec)
 
-    # Positive frames: (start, end, label, {lead: mm}, {every lead: mm})
+    # Positive frames: (start, end, label, {lead: mm}, {every lead: mm},
+    # {depressed lead: mm} -- ST Elevation frames only)
     positives = []
     n_frames = n_measured = 0
     for t, t_end in _chunks(total):
@@ -430,9 +506,9 @@ def detect_st_episodes(
                 continue
             n_measured += 1
             st, _hr = result
-            label, lead_mm = _chunk_label(st)
+            label, lead_mm, dep_mm = _chunk_label(st)
             if label is not None:
-                positives.append((t, t_end, label, lead_mm, _chunk_all_leads_mm(st)))
+                positives.append((t, t_end, label, lead_mm, _chunk_all_leads_mm(st), dep_mm))
         except Exception as e:
             print(f"[Ischemia Detect] Chunk error {t:.1f}s: {e}")
     if info is not None:
@@ -440,12 +516,13 @@ def detect_st_episodes(
 
     # Events: same label, a gap of up to one frame joined.
     events = []
-    for s_sec, e_sec, label, lead_mm, all_mm in positives:
+    for s_sec, e_sec, label, lead_mm, all_mm, dep_mm in positives:
         ev = events[-1] if events else None
         if ev is None or ev['label'] != label or s_sec - ev['end_sec'] > _ST_EVENT_GAP_SEC + 1e-6:
             ev = {'start_sec': s_sec, 'end_sec': e_sec, 'label': label,
-                  'qual_sec': 0.0, 'lead': {}, 'all': {}}
+                  'qual_sec': 0.0, 'lead': {}, 'all': {}, 'dep_frames': []}
             events.append(ev)
+        ev['dep_frames'].append(dep_mm)
         ev['end_sec'] = e_sec
         ev['qual_sec'] += e_sec - s_sec
         for lead, v in lead_mm.items():
@@ -462,6 +539,12 @@ def detect_st_episodes(
         leads = sorted(ev['lead'], key=_lead_order)
         peak = {lead: (max(v) if elevation else min(v)) for lead, v in ev['lead'].items()}
         worst = max(peak.values()) if elevation else min(peak.values())
+        # Depression with an ST Elevation event (empty for ST Depression):
+        # kind per lead, average over all frames of the event (as
+        # 'st_lead_mm'), deepest value in the frames the lead was depressed.
+        dep_kind = _depression_kinds(leads, ev['dep_frames']) if elevation else {}
+        dep_leads = sorted(dep_kind, key=_lead_order)
+        dep_deepest = {lead: min(d[lead] for d in ev['dep_frames'] if lead in d) for lead in dep_leads}
         out.append({
             'start_sec': float(ev['start_sec']),
             'end_sec': float(ev['end_sec']),
@@ -476,6 +559,9 @@ def detect_st_episodes(
             'st_lead_max_mm': {lead: round(float(peak[lead]), 1) for lead in leads},
             'st_all_mm': {lead: round(float(np.mean(v)), 1) for lead, v in
                           sorted(ev['all'].items(), key=lambda kv: _lead_order(kv[0]))},
+            'st_dep_kind': {lead: dep_kind[lead] for lead in dep_leads},
+            'st_dep_mm': {lead: round(float(np.mean(ev['all'][lead])), 1) for lead in dep_leads},
+            'st_dep_max_mm': {lead: round(float(dep_deepest[lead]), 1) for lead in dep_leads},
         })
     return out
 
@@ -832,6 +918,12 @@ def format_st_summary(episodes: Optional[List[Dict[str, Any]]], label: str, mult
                                   for lead in names if lead in avg)
                 if leads:
                     lines.append(f"    {group}: {leads}")
+            dep_mm, dep_kind = e.get('st_dep_mm') or {}, e.get('st_dep_kind') or {}
+            for kind in DEP_KINDS:
+                leads = ", ".join(f"{lead} {float(dep_mm[lead]):+.1f}"
+                                  for lead in dep_mm if dep_kind.get(lead) == kind)
+                if leads:
+                    lines.append(f"    {kind}: {leads}")
         if len(eps) > len(shown):
             lines.append(f"+{len(eps) - len(shown)} more (report)")
         return sep.join(lines)

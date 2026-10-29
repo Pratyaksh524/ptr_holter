@@ -1488,6 +1488,10 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     # mV, the lead name (At), the episode's start - end system time, and
     # whether it is an elevation or a depression.
     _st_lead_order = ('I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6')
+    # fits the 26 mm "ST slope" column
+    _ST_DEP_KIND_SHORT = {'Reciprocal': 'Reciprocal',
+                          'Reciprocal (posterior)': 'Recip. posterior',
+                          'Additional depression': 'Add. depression'}
     _st_event_rows = [['Index', 'Channel', 'Type', 'mV', 'At', 'Duration', 'ST slope']]
     _st_idx = 0
     for _event in _st_episodes:
@@ -1500,6 +1504,16 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
             _st_event_rows.append([
                 str(_st_idx), _st_channel, '12 lead', f"{float(_lead_mm[_lead]) / 10.0:+.2f}",
                 _lead, _span, _slope,
+            ])
+        # Depression with an ST Elevation event, under its elevated leads
+        # (ischemia_detection._depression_kinds).
+        _dep_mm = _event.get('st_dep_mm') or {}
+        _dep_kind = _event.get('st_dep_kind') or {}
+        for _lead in _dep_mm:
+            _st_idx += 1
+            _st_event_rows.append([
+                str(_st_idx), _st_channel, '12 lead', f"{float(_dep_mm[_lead]) / 10.0:+.2f}",
+                _lead, _span, _ST_DEP_KIND_SHORT.get(_dep_kind.get(_lead), 'Depression'),
             ])
     # 20 rows (was 28) so the T wave section below fits on this page
     for _ in range(max(0, 20 - _st_idx)):
