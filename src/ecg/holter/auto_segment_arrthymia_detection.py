@@ -1584,6 +1584,7 @@ def _detect_arrhythmias_uncached(
 
         quiet_count = 0
         scored = 0
+        scored_rr = []
         total_waves = 0
         total_active_sec = 0.0
 
@@ -1620,6 +1621,7 @@ def _detect_arrhythmias_uncached(
                 continue  # no room left in this RR interval to judge
 
             scored += 1
+            scored_rr.append(rr_local)
             segment = window_signal[tp_start:tp_end]
             if float(np.ptp(segment)) < noise_threshold:
                 quiet_count += 1
@@ -1653,6 +1655,9 @@ def _detect_arrhythmias_uncached(
             'scored': scored,
             'total_waves': total_waves,
             'total_active_sec': total_active_sec,
+            # ventricular rate of the beats whose TP segment was judged --
+            # the same beats the atrial rate comes from
+            'scored_ventricular_rate': 60.0 * float(fs) / float(np.mean(scored_rr)),
         }
 
     def _classify_atrial_flutter_window(context):
@@ -1661,7 +1666,16 @@ def _detect_arrhythmias_uncached(
         scored = context['scored']
         total_active_sec = context['total_active_sec']
         total_waves = context['total_waves']
-        ventricular_rate = context['ventricular_rate']
+        # The atrial rate is counted only on the beats whose TP segment could
+        # be judged, so the ventricular rate it is compared with comes from
+        # those same beats. With the rate of every beat in the window, a
+        # window straddling a fast regular rhythm and AFib compared AFib's
+        # f waves (judged on the few slow AFib beats) with mostly the fast
+        # beats' rate (seen: SVT 200 bpm -> AFib, 4 of 24 beats judged,
+        # 471/min vs 148 bpm = 3.18 -> "Flutter" on the SVT beats). Over all
+        # recordings only 4 of 114 Flutter-voting windows change, all at an
+        # atrial rate of 442-471/min (AFib f waves, not Flutter).
+        ventricular_rate = context['scored_ventricular_rate']
 
         if (quiet_count / scored) < 0.4 and total_active_sec > 0:
             atrial_rate = (total_waves / total_active_sec) * 60.0
@@ -4648,6 +4662,104 @@ def _detect_arrhythmias_uncached(
         final_segments.sort(key=lambda x: x['start_sec'])
     except Exception as e:
         print(f"[Auto Arrhythmia Detect] Ventricular Fibrillation gap check error: {e}")
+
+    # Supraventricular Tachycardia (SVT) in time no segment covers. The SVT
+    # rule (_is_atrial_tachycardia_window) judges 10 s windows, and one lone
+    # SVT window is dropped as "not an episode" (the isolated-window guard):
+    # a ~10 s SVT episode between two other rhythms fills only one window
+    # completely, the windows across its edges mix in the other rhythm's RR
+    # (seen: Flutter -> SVT 200 bpm 87.3-97.8 s -> VFib: only 90-100 s
+    # passed, dropped). That rule and that guard are unchanged; this step
+    # marks, beat-exact, a run of R-peaks in an unlabelled stretch when
+    #   - >= _SVT_GAP_MIN_BEATS beats over >= _SVT_GAP_MIN_SEC,
+    #   - every RR 200-333 ms (180-300 bpm, the SVT rule's rate band; Sinus
+    #     Tachycardia and 2:1 Flutter stay below 180) and within 8% of the
+    #     run's median RR (regular; AFib / variable Flutter are not),
+    #   - one QRS shape (median correlation >= 0.9 with the run's median
+    #     QRS, as the SVT rule),
+    #   - sharp narrow QRS: steepest slope >= 40 x peak-to-peak per second
+    #     on 2 s stretches of the run (SVT 50-54 on the recordings,
+    #     Ventricular Tachycardia 14-17, LBBB ~25).
+    # Over the recordings it fired only on SVT: every labelled SVT run, no
+    # Sinus Tachycardia / VT / AFib / Flutter region, and 3 unlabelled SVT
+    # runs.
+    _SVT_GAP_MIN_BEATS = 15
+    _SVT_GAP_MIN_SEC = 5.0
+
+    def _svt_runs_in_gap(gap_start, gap_end):
+        peaks = [p for p in all_r_peaks if gap_start <= p < gap_end]
+        if len(peaks) < _SVT_GAP_MIN_BEATS:
+            return []
+        read_lo = max(0.0, gap_start - 1.0)
+        sig = reader.read_range(read_lo, min(total_duration, gap_end + 2.5))
+        if sig is None or best_lead_idx >= sig.shape[0]:
+            return []
+        _b, _a = _butter(2, [0.5 / (float(fs) / 2.0), 40.0 / (float(fs) / 2.0)], btype='band')
+        x = _filtfilt(_b, _a, np.asarray(sig[best_lead_idx], dtype=float))
+        half = int(0.05 * fs)
+        runs, i = [], 0
+        while i < len(peaks) - 1:
+            j, rrs = i, []
+            while j + 1 < len(peaks):
+                rr = peaks[j + 1] - peaks[j]
+                if not (0.200 <= rr <= 0.3334):
+                    break
+                if len(rrs) >= 3 and abs(rr - float(np.median(rrs))) > 0.08 * float(np.median(rrs)):
+                    break
+                rrs.append(rr)
+                j += 1
+            run = peaks[i:j + 1]
+            if len(run) >= _SVT_GAP_MIN_BEATS and run[-1] - run[0] >= _SVT_GAP_MIN_SEC:
+                idx = [int(round((p - read_lo) * fs)) for p in run]
+                shapes = np.array([x[k - half:k + half] - float(np.mean(x[k - half:k + half]))
+                                   for k in idx if k - half >= 0 and k + half <= len(x)])
+                sharp = []
+                for k in idx[::4]:
+                    w = x[k - half:k - half + int(2.0 * fs)] if k - half >= 0 and k - half + int(2.0 * fs) <= len(x) else None
+                    if w is not None and float(np.ptp(w)) > 0:
+                        sharp.append(float(np.max(np.abs(np.diff(w)))) * float(fs) / float(np.ptp(w)))
+                if len(shapes) >= 3 and sharp:
+                    template = np.median(shapes, axis=0)
+                    corrs = [float(np.corrcoef(s, template)[0, 1]) for s in shapes if np.any(s)]
+                    if corrs and float(np.median(corrs)) >= 0.9 and float(np.median(sharp)) >= 40.0:
+                        runs.append((run[0], run[-1]))
+            i = max(j, i + 1)
+        return runs
+
+    try:
+        covered = sorted((s['start_sec'], s['end_sec']) for s in final_segments)
+        gaps, cursor = [], 0.0
+        for c_start, c_end in covered:
+            if c_start > cursor:
+                gaps.append((cursor, c_start))
+            cursor = max(cursor, c_end)
+        if cursor < total_duration:
+            gaps.append((cursor, total_duration))
+        _svt_label = 'Supraventricular Tachycardia (SVT)'
+        for gap_start, gap_end in gaps:
+            for svt_start, svt_end in _svt_runs_in_gap(gap_start, gap_end):
+                # touching an existing SVT segment: lengthen that one
+                touching = [s for s in final_segments if s['label'] == _svt_label
+                            and (abs(s['end_sec'] - svt_start) <= 1.0 or abs(s['start_sec'] - svt_end) <= 1.0)]
+                if touching:
+                    seg = touching[0]
+                    seg['start_sec'] = min(seg['start_sec'], svt_start)
+                    seg['end_sec'] = max(seg['end_sec'], svt_end)
+                    seg['start_time_str'], seg['end_time_str'] = make_time_strs(seg['start_sec'], seg['end_sec'])
+                    continue
+                s_str, e_str = make_time_strs(svt_start, svt_end)
+                final_segments.append({
+                    'start_sec': float(svt_start),
+                    'end_sec': float(svt_end),
+                    'label': _svt_label,
+                    'color': '#FFA500',
+                    'start_time_str': s_str,
+                    'end_time_str': e_str,
+                    'detected_rhythm': _svt_label
+                })
+        final_segments.sort(key=lambda x: x['start_sec'])
+    except Exception as e:
+        print(f"[Auto Arrhythmia Detect] Supraventricular Tachycardia gap check error: {e}")
 
     print(f"[Auto Arrhythmia Detect] Found {len(final_segments)} exact rhythm segments:")
     for s in final_segments:
