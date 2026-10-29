@@ -31,8 +31,8 @@ ST Elevation / ST Depression (detect_st_episodes), frame by frame:
      among its beats (0.1 mm bins, mean of the fullest bin). A lead whose
      beats spread more than 1 mm (interquartile range) is noisy in that
      frame and is not judged there.
-     All in the millimetres of the Full Disclosure screen (10 mm/mV,
-     _SCREEN_ADC_PER_MV).
+     All in the millimetres of the Full Disclosure graph paper
+     (_SCREEN_ADC_PER_MV).
   5. Criteria per frame, limb leads and chest leads judged separately:
        limb group  (I, II, III, aVL, aVF), any 2 leads
        chest group (V1-V6), any 2 leads
@@ -44,9 +44,9 @@ ST Elevation / ST Depression (detect_st_episodes), frame by frame:
      is reciprocal).
   6. Events: consecutive frames of one label, a gap of up to one frame
      (10 s) joined, kept when the qualifying frames add up to >= 30 s.
-     Per event and per lead that qualified: the average over the frames in
-     which it qualified, and the largest value (max elevation / deepest
-     depression).
+     Per event and per lead that qualified: the average over all frames of
+     the event, and the largest value in the frames in which it qualified
+     (max elevation / deepest depression).
   7. A recording shorter than 30 s can't hold an event; the Overview says
      so instead of "None".
 """
@@ -83,12 +83,15 @@ _MODE_BIN_MV = 0.05              # T Inversion
 
 _MM_PER_MV = 10.0
 
-# ST is measured in the millimetres of the Full Disclosure strip: it draws
-# 4096 ADC over its row height (8 rows fill the screen), which at 10 mm/mV
-# comes to ~933 ADC per mV on a 2560x1440 screen at 100 % scale (row 166 px =
-# 43.9 mm -> 93.3 ADC per mm). A fixed number, so the values don't change
-# with the window size.
-_SCREEN_ADC_PER_MV = 933.0
+# ST is measured in the millimetres of the Full Disclosure graph paper. The
+# strip draws 4096 ADC over its plot height (row height - 8 px margin,
+# holter_widgets.ECGStripCanvas), and the graph paper draws 1 mm from the
+# monitor's physical DPI. On a 2560x1440 27" monitor at 100 % scale: row
+# 163 px -> plot 155 px = 26.4 ADC per px, 1 mm = 4.29 px (~109 DPI) ->
+# ~113 ADC per graph-paper mm. Checked against a recording on that screen
+# (V2 / V3 / V5 / aVF peak-to-peak: 111-116 ADC per mm). A fixed number, so
+# the values don't change with the window size.
+_SCREEN_ADC_PER_MV = 1133.0
 _ADC_TO_MM = _MM_PER_MV / _SCREEN_ADC_PER_MV
 
 _ST_MODE_BIN_MM = 0.1            # beats within 0.1 mm of each other count as the same value
@@ -385,10 +388,10 @@ def detect_st_episodes(
 ) -> List[Dict[str, Any]]:
     """Return ST Elevation / ST Depression events (start_sec, end_sec, label,
     color, start_time_str, end_time_str, plus 'st_leads', 'st_lead_mm' =
-    qualifying leads, average over the frames they qualified in,
-    'st_lead_max_mm' = their largest value, 'st_mv' = the largest value in
-    mV, 'st_all_mm' = every lead, average over the event's frames). Screen
-    mm. When `info` is given it is filled with 'duration_sec', 'start_time',
+    qualifying leads, average over all the event's frames,
+    'st_lead_max_mm' = their largest value in the frames they qualified in,
+    'st_mv' = the largest value in mV, 'st_all_mm' = every lead, average
+    over the event's frames). Graph-paper mm. When `info` is given it is filled with 'duration_sec', 'start_time',
     'frames' and 'measured' (frames that could be read). See the module
     docstring."""
     try:
@@ -469,7 +472,7 @@ def detect_st_episodes(
             'detected_rhythm': ev['label'],
             'st_leads': leads,
             'st_mv': round(float(worst) / _MM_PER_MV, 3),
-            'st_lead_mm': {lead: round(float(np.mean(ev['lead'][lead])), 1) for lead in leads},
+            'st_lead_mm': {lead: round(float(np.mean(ev['all'][lead])), 1) for lead in leads},
             'st_lead_max_mm': {lead: round(float(peak[lead]), 1) for lead in leads},
             'st_all_mm': {lead: round(float(np.mean(v)), 1) for lead, v in
                           sorted(ev['all'].items(), key=lambda kv: _lead_order(kv[0]))},
@@ -783,7 +786,7 @@ def format_st_summary(episodes: Optional[List[Dict[str, Any]]], label: str, mult
     when detection hasn't run -- then "-".
 
     ST: the event list -- per event its system start - end time, duration
-    and the qualifying leads as "<lead> <average>" in screen mm; the
+    and the qualifying leads as "<lead> <average>" in graph-paper mm; the
     longest _ST_OVERVIEW_EVENTS events, in time order, then "+N more". `info`
     (detect_st_episodes) turns "None" into "Recording too short" / "Not
     measurable" where that is why.

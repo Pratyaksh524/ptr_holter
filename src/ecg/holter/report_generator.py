@@ -1430,11 +1430,11 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     story.append(Paragraph("ST ANALYSIS", title_style))
     story.append(HRFlowable(width="100%", thickness=2, color=ORANGE, spaceAfter=4*mm))
 
-    # ST events from ischemia_detection (12 leads, Full Disclosure screen mm;
-    # per 10 s frame limb leads >= 1 mm, chest leads >= 2 mm elevation,
+    # ST events from ischemia_detection (12 leads, Full Disclosure graph-paper
+    # mm; per 10 s frame limb leads >= 1 mm, chest leads >= 2 mm elevation,
     # >= 1 mm depression, any 2 leads of one group; >= 30 s). Per event
-    # 'st_lead_mm' holds the leads that met the criteria with their average,
-    # 'st_lead_max_mm' their largest value (10 mm = 1 mV).
+    # 'st_lead_mm' holds the leads that met the criteria with their average
+    # over the whole event, 'st_lead_max_mm' their largest value (10 mm = 1 mV).
     _st_episodes = _load_st_episodes(session_dir)
     _st_dep = [e for e in _st_episodes if e.get('label') == 'ST Depression']
     _st_elev = [e for e in _st_episodes if e.get('label') == 'ST Elevation']
