@@ -4083,7 +4083,7 @@ class HolterFullDisclosureDialog(QDialog):
             # fallback, before the canvas has received its data.
             #
             # Measure from the canvas's pre-filter _raw_data, not its
-            # display-smoothed _data: the strip's double Gaussian pass
+            # display-smoothed _data: the strip's Gaussian pass
             # (see ECGStripCanvas.set_data) shifts P-wave/QRS onsets enough
             # to move this readout.
             lead_ii_canvas = next(

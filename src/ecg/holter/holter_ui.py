@@ -2432,10 +2432,11 @@ class HolterMainWindow(QDialog):
         progress = QProgressDialog("Generating Comprehensive ECG Analysis Report. Please wait...", None, 0, 0, self)
         progress.setWindowTitle("Please Wait")
         progress.setWindowModality(Qt.WindowModal)
-        progress.setStyleSheet(f"QProgressDialog{{background:{COL_DARK};color:{COL_GREEN};}}")
+        progress.setStyleSheet(f"QProgressDialog{{background:{COL_DARK};color:{COL_GREEN};}}"
+                               "QProgressDialog QLabel{color:#FFFFFF;}")
         progress.setRange(0, 0)
         progress.show()
-        
+
         class ReportWorker(QThread):
             finished = pyqtSignal(str)
             error = pyqtSignal(str)

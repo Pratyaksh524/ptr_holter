@@ -1001,7 +1001,7 @@ class ECGStripCanvas(QWidget):
                     padded, lead_in = self._padded_raw(raw_data, fs)
                     # Mains removal for display: the recording file holds the
                     # raw serial samples (the acquisition-page AC notch only
-                    # filters the live trace), and the double 35 Hz Gaussian
+                    # filters the live trace), and the 25 Hz Gaussian
                     # below still passes ~13% of 50 Hz.
                     padded = _remove_mains(padded, fs)
                     if apply_dft_filter is not None:
@@ -1023,12 +1023,11 @@ class ECGStripCanvas(QWidget):
                         )
                     else:
                         display_data = display_input
-                    # Keep a second Gaussian pass display-only. Cascading
-                    # Gaussian stages suppresses residual fine noise without
-                    # the overshoot/ringing that the old Butterworth path
-                    # produced around the QRS-to-ST transition.
-                    display_data = gaussian_lowpass(display_data, 35.0, self._fs)
-                    self._data = gaussian_lowpass(display_data, 35.0, self._fs)
+                    # One zero-phase 25 Hz Gaussian pass, display-only. A
+                    # Gaussian has no overshoot/ringing, so unlike the old
+                    # Butterworth path it adds no false notch at the
+                    # QRS-to-ST transition (J point).
+                    self._data = gaussian_lowpass(display_data, 25.0, self._fs)
                 else:
                     self._data = display_input
             except Exception:
