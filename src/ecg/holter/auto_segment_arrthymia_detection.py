@@ -5205,6 +5205,9 @@ def _detect_arrhythmias_uncached(
     _ART_CLEAN_MIN_AMP = 0.30
     _ART_MIN_CLEAN_LEADS = 1
     _ART_MIN_SEC = 4.0
+    # Artifact marking is switched off for now: no Artifact segments are
+    # added. Set True to bring the rule back unchanged.
+    _ARTIFACT_RULE_ON = False
     _art_label = 'Artifact'
     _art_beat_leads = [lead_names.index(n) for n in ('I', 'II', 'III', 'V1', 'V3', 'V5') if n in lead_names]
 
@@ -5282,7 +5285,7 @@ def _detect_arrhythmias_uncached(
 
     try:
         _art_segments = []
-        for b0, b1, leads in _artifact_blocks():
+        for b0, b1, leads in (_artifact_blocks() if _ARTIFACT_RULE_ON else []):
             if _art_segments and b0 <= _art_segments[-1]['end_sec'] + _ART_BLOCK_SEC + 1e-6:
                 last = _art_segments[-1]
                 last['end_sec'] = float(b1)
