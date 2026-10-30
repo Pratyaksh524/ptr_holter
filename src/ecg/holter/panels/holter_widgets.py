@@ -63,6 +63,26 @@ try:
 except ImportError:
     apply_dft_filter = None
 
+try:
+    # Mains (50/60 Hz) notch for the full-disclosure display strip.
+    from ...enhanced_filter import make_notch
+    from scipy.signal import filtfilt as scipy_filtfilt
+except ImportError:
+    make_notch = None
+    scipy_filtfilt = None
+
+
+def _remove_mains(x, fs):
+    """Zero-phase 50 and 60 Hz notches (Q=25). Recordings do not store which
+    mains frequency was in use, so both run; each removes only ~2 Hz."""
+    if make_notch is None or scipy_filtfilt is None:
+        return x
+    for mains_hz in (50.0, 60.0):
+        if mains_hz < fs / 2.0:
+            bq = make_notch(mains_hz, fs)
+            x = scipy_filtfilt(bq.b, bq.a, x)
+    return x
+
 
 # 6. HOLTER RR / HR TREND CANVAS
 class HolterRRTrendCanvas(QWidget):
@@ -941,19 +961,27 @@ class ECGStripCanvas(QWidget):
         self._clicked_beat_x_pos = None
         self.update()
 
-    def set_data(self, *args, beat_annotations=None, start_sec=0.0, structured_events=None, fast_preview=False):
+    def set_data(self, *args, beat_annotations=None, start_sec=0.0, structured_events=None, fast_preview=False,
+                 context_before=None, context_after=None):
         if len(args) == 2:
             raw_data = np.asarray(args[1], dtype=float)
         elif len(args) == 1:
             raw_data = np.asarray(args[0], dtype=float)
         else:
             raw_data = np.zeros(0)
+        # Real recording samples just outside this strip (up to ~2 s each
+        # side), used to pad the mains notch and baseline high-pass. Mirror
+        # padding breaks the 50 Hz sine's phase at the strip edge and the
+        # notch rings there for ~0.15 s; real neighbouring samples do not.
+        before = np.asarray(context_before if context_before is not None else [], dtype=float)
+        after = np.asarray(context_after if context_after is not None else [], dtype=float)
+        self._raw_context_before = before
+        self._raw_context_after = after
 
         # Filtering always runs for display.  Use the shared enhanced-filter
         # Gaussian low-pass instead of a zero-phase Butterworth: the latter
-        # can ring around QRS edges and create a false J-point notch.  AC is
-        # intentionally off here; mains removal should only be enabled when
-        # the recording has confirmed mains interference.
+        # can ring around QRS edges and create a false J-point notch.  50/60 Hz
+        # mains is removed by narrow notches ahead of the Gaussian (see below).
         if len(raw_data) > 15:
             try:
                 # Baseline drift (breathing, movement) removed for display with
@@ -965,12 +993,17 @@ class ECGStripCanvas(QWidget):
                 # Display-only: _raw_data below stays unfiltered for PR/QRS
                 # measurement, and detection reads the recording itself.
                 display_input = raw_data
-                if apply_dft_filter is not None and raw_data.size > 30:
-                    pad = int(min(raw_data.size - 1, 2.0 * float(self._fs or 500)))
-                    mirrored = np.pad(raw_data, (pad, pad), mode="reflect")
-                    display_input = np.asarray(
-                        apply_dft_filter(mirrored, float(self._fs or 500), "0.5"), dtype=float
-                    )[pad:pad + raw_data.size]
+                if raw_data.size > 30 and (apply_dft_filter is not None or make_notch is not None):
+                    fs = float(self._fs or 500)
+                    padded, lead_in = self._padded_raw(raw_data, fs)
+                    # Mains removal for display: the recording file holds the
+                    # raw serial samples (the acquisition-page AC notch only
+                    # filters the live trace), and the double 35 Hz Gaussian
+                    # below still passes ~13% of 50 Hz.
+                    padded = _remove_mains(padded, fs)
+                    if apply_dft_filter is not None:
+                        padded = np.asarray(apply_dft_filter(padded, fs, "0.5"), dtype=float)
+                    display_input = np.asarray(padded, dtype=float)[lead_in:lead_in + raw_data.size]
                     # Keep the strip's own level: the high-pass removes the
                     # DC offset too, and the vertical placement below works
                     # from the signal's median.
@@ -1010,7 +1043,33 @@ class ECGStripCanvas(QWidget):
         self._start_sec = start_sec
         self._rr_intervals = self._calculate_rr_intervals() if beat_annotations else []
         self.update()
-    
+
+    def _padded_raw(self, raw_data, fs):
+        """raw_data with ~2 s on each side: the real neighbouring samples
+        passed to set_data, topped up by mirroring only where the recording
+        itself starts or ends. Returns (padded, index of raw_data[0])."""
+        want = int(min(raw_data.size - 1, 2.0 * fs))
+        before = getattr(self, '_raw_context_before', np.zeros(0))[-want:] if want > 0 else np.zeros(0)
+        after = getattr(self, '_raw_context_after', np.zeros(0))[:want] if want > 0 else np.zeros(0)
+        padded = np.concatenate((before, raw_data, after))
+        extra_l = min(want - before.size, padded.size - 1)
+        extra_r = min(want - after.size, padded.size - 1)
+        if extra_l > 0 or extra_r > 0:
+            padded = np.pad(padded, (max(0, extra_l), max(0, extra_r)), mode="reflect")
+        return padded, before.size + max(0, extra_l)
+
+    def mains_free_raw(self):
+        """This strip's unfiltered samples with only the 50/60 Hz notches
+        applied (padded the same way as the display), for measurements that
+        read _raw_data -- e.g. the Full Disclosure PR/QRS header. None if
+        there is no data."""
+        raw = getattr(self, '_raw_data', None)
+        if raw is None or len(raw) <= 30:
+            return raw
+        fs = float(self._fs or 500)
+        padded, lead_in = self._padded_raw(np.asarray(raw, dtype=float), fs)
+        return np.asarray(_remove_mains(padded, fs), dtype=float)[lead_in:lead_in + len(raw)]
+
     def _calculate_rr_intervals(self):
         """Calculate RR intervals (N-N intervals) between consecutive R-peaks."""
         if not self._beat_annotations:
@@ -1605,7 +1664,7 @@ class ECGStripCanvas(QWidget):
                 elif ev_lbl == 'x':
                     active_label = 'X'
                 # Check for full label names (from auto-detection)
-                elif 'asystole' in ev_lbl:
+                elif 'asystole' in ev_lbl or 'artifact' in ev_lbl:
                     active_label = 'X'
                 elif 'ventricular fibrillation' in ev_lbl or 'vfib' in ev_lbl:
                     active_label = 'V'
@@ -1623,6 +1682,8 @@ class ECGStripCanvas(QWidget):
                 elif 'sinus bradycardia' in ev_lbl:
                     active_label = 'S'
                 elif 'sinus tachycardia' in ev_lbl:
+                    active_label = 'S'
+                elif 'sinus arrhythmia' in ev_lbl:
                     active_label = 'S'
                 elif 'bradycardia (non-sinus)' in ev_lbl:
                     active_label = 'S'

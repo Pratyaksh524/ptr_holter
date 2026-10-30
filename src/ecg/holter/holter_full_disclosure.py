@@ -723,6 +723,27 @@ class HolterFullDisclosureDialog(QDialog):
         # 'classified') sources are affected.
         self._auto_marking_visible = False
 
+        # Asystole (sustained flatline) detection. Deliberately NOT part of
+        # the "Auto Arrhythmia Detection" pipeline above: it runs its own
+        # independent detector (detect_asystole_segments_async, in
+        # auto_segment_arrthymia_detection.py), is never gated by
+        # _auto_marking_visible, never merged into
+        # self._engine._structured_events, and never touches the segment
+        # overlay / apply_auto_segments_to_engine(). It only feeds the
+        # bottom-right rhythm label in _update_time_and_arrhythmia_labels
+        # (see the Asystole block there), shown with its own system time as
+        # soon as the background scan finishes. See the banner comment
+        # above detect_asystole_segments_async() for why it is kept
+        # separate from the morphological pipeline.
+        self._asystole_segments = []
+        try:
+            reader_path_asys = getattr(getattr(self._engine, '_reader', None), 'path', None)
+            if reader_path_asys:
+                from .auto_segment_arrthymia_detection import detect_asystole_segments_async
+                detect_asystole_segments_async(reader_path_asys, self._on_asystole_segments_ready)
+        except Exception as e:
+            print(f"[Full Disclosure] Asystole detection unavailable: {e}")
+
         # If the user already clicked "Auto Arrhythmia Detection" earlier in
         # this session (persisted flag, see _persist_auto_marking_enabled),
         # reopening Full Disclosure should show that marking again right
@@ -813,6 +834,25 @@ class HolterFullDisclosureDialog(QDialog):
         self._event_index_dirty = True
         self._update_canvases(self._current_start)
         self._refresh_segment_overlay()
+
+    def _on_asystole_segments_ready(self, segments):
+        """Background Asystole scan finished (see the Asystole block in
+        __init__). Entirely separate from auto-marking: only refreshes the
+        bottom-right rhythm label, never the segment overlay or
+        self._engine._structured_events."""
+        self._asystole_segments = segments or []
+        try:
+            self._update_time_and_arrhythmia_labels(self._current_start, self._current_start + self._window_sec)
+        except Exception as e:
+            print(f"[Full Disclosure] Error refreshing Asystole label: {e}")
+        # Auto regions on screen are drawn with Asystole spans cut out
+        # (_without_asystole_spans) -- redraw them now that the spans are known.
+        if getattr(self, '_auto_marking_visible', False):
+            try:
+                self._update_canvases(self._current_start)
+                self._refresh_segment_overlay()
+            except Exception as e:
+                print(f"[Full Disclosure] Error redrawing auto regions after Asystole scan: {e}")
 
     def _persist_auto_marking_enabled(self):
         """Record on disk that auto arrhythmia marking was enabled for this
@@ -2468,6 +2508,8 @@ class HolterFullDisclosureDialog(QDialog):
                 'bradycardia': 'Sinus Bradycardia',
                 'sinus tachycardia': 'Sinus Tachycardia',
                 'tachycardia': 'Sinus Tachycardia',
+                'sinus arrhythmia': 'Sinus Arrhythmia',
+                'artifact': 'Artifact',
             }
 
             def _matches_this_auto_segment(ev):
@@ -3651,7 +3693,74 @@ class HolterFullDisclosureDialog(QDialog):
         # pass through untouched.
         if not self._auto_marking_visible:
             combined = [e for e in combined if 'manual' in str(e.get('source', '')).lower()]
+        else:
+            combined = self._without_asystole_spans(combined)
         return combined
+
+    # A piece of an auto region left over next to an Asystole span shorter
+    # than this is dropped rather than drawn: no rhythm is established in
+    # under a second, it is only the detector's window edge spilling past
+    # the flatline.
+    _ASYSTOLE_REMNANT_MIN_SEC = 1.0
+
+    def _without_asystole_spans(self, events):
+        """Auto (non-manual) events with every Asystole span cut out of them.
+
+        Display-only: Asystole comes from its own detector
+        (self._asystole_segments) and is never merged into the auto-marking
+        pipeline, so an auto rhythm region can still run straight across a
+        flatline -- seen: Atrial Flutter 340.0-420.9 s over Asystole
+        410.8-420.2 s, tinting the flatline and labelling it "Atrial Flutter
+        | Asystole". With auto marking off the flatline shows only Asystole;
+        this makes auto marking show it the same way. Returns copies --
+        self._engine._structured_events, the detection cache and the report
+        are untouched. Manual markings pass through as they are.
+        """
+        spans = []
+        for seg in getattr(self, '_asystole_segments', []) or []:
+            try:
+                a_s = float(seg.get('start_sec', 0.0) or 0.0)
+                a_e = float(seg.get('end_sec', a_s) or a_s)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if a_e > a_s:
+                spans.append((a_s, a_e))
+        if not spans:
+            return events
+        spans.sort()
+
+        result = []
+        for ev in events:
+            if not isinstance(ev, dict) or 'manual' in str(ev.get('source', '')).lower():
+                result.append(ev)
+                continue
+            try:
+                ev_s = float(ev.get('timestamp', 0.0) or 0.0)
+                ev_e = float(ev.get('end_timestamp', ev.get('end_ts', ev_s)) or ev_s)
+            except (TypeError, ValueError):
+                result.append(ev)
+                continue
+            if not any(a_s < ev_e and a_e > ev_s for a_s, a_e in spans):
+                result.append(ev)
+                continue
+            pieces = []
+            cur = ev_s
+            for a_s, a_e in spans:
+                if a_e <= cur or a_s >= ev_e:
+                    continue
+                pieces.append((cur, a_s))
+                cur = a_e
+            pieces.append((cur, ev_e))
+            for p_s, p_e in pieces:
+                if p_e - p_s < self._ASYSTOLE_REMNANT_MIN_SEC:
+                    continue
+                piece = dict(ev)
+                piece['timestamp'] = p_s
+                piece['end_timestamp'] = p_e
+                if 'end_ts' in piece:
+                    piece['end_ts'] = p_e
+                result.append(piece)
+        return result
 
     def _add_auto_arrhythmia_segments(self, ref, visible_events, ref_end, span):
         """Add visual-only auto-arrhythmia regions; manual segments remain separate."""
@@ -3680,6 +3789,7 @@ class HolterFullDisclosureDialog(QDialog):
             'bradycardia': ('Sinus Bradycardia', '#00BFFF'),
             'sinus tachycardia': ('Sinus Tachycardia', '#00FFFF'),
             'tachycardia': ('Sinus Tachycardia', '#00FFFF'),
+            'sinus arrhythmia': ('Sinus Arrhythmia', '#F5DEB3'),
             # AV conduction blocks (auto_segment_arrthymia_detection.py's
             # _AV_COLORS). Exact full labels only, so a stored replay entry
             # like a bare "AV Block" isn't drawn as one of these degrees.
@@ -3698,6 +3808,10 @@ class HolterFullDisclosureDialog(QDialog):
             'incomplete left bundle branch block': ('Incomplete Left Bundle Branch Block', '#76D7C4'),
             'complete right bundle branch block': ('Complete Right Bundle Branch Block', '#E0E0E0'),
             'complete left bundle branch block': ('Complete Left Bundle Branch Block', '#1ABC9C'),
+            # Artifact (auto_segment_arrthymia_detection.py's Artifact rule)
+            # is a signal-quality layer drawn alongside the rhythm, like the
+            # bundle branch blocks, so it rides in their layer.
+            'artifact': ('Artifact', '#A0A0A0'),
         }
         reader_start = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
         regions = []
@@ -3983,6 +4097,19 @@ class HolterFullDisclosureDialog(QDialog):
                 # display-only Gaussian filter cannot change these values.
                 if getattr(lead_ii_canvas, '_raw_data', None) is not None:
                     try:
+                        # 50/60 Hz notches first: the recording holds raw
+                        # serial samples, and the 25 Hz Butterworth alone
+                        # leaves ~6% of the mains hum -- every 20 ms ripple
+                        # peak then passes the P search's prominence gate and
+                        # the strict search (closest wave to the QRS) takes
+                        # one for the P, so PR read "--" on every beat (seen:
+                        # 0/10 beats, 10/10 at 168 ms with the notch). The
+                        # canvas pads the notch with real neighbouring
+                        # samples, so it does not ring at the strip edges.
+                        if hasattr(lead_ii_canvas, 'mains_free_raw'):
+                            mains_free = lead_ii_canvas.mains_free_raw()
+                            if mains_free is not None and len(mains_free) == sig.size:
+                                sig = np.asarray(mains_free, dtype=float)
                         from scipy.signal import butter, filtfilt
                         b, a = butter(2, 25.0 / (fs / 2.0), btype='lowpass')
                         sig = filtfilt(b, a, sig)
@@ -4224,6 +4351,9 @@ class HolterFullDisclosureDialog(QDialog):
                     break
         
         arrhythmia_label = ""
+        # End (s) of the auto rhythm segment shown in the label, if any --
+        # read by the Asystole block below.
+        active_rhythm_end = None
 
         # Full-disclosure auto regions are the source of truth for the
         # bottom-right rhythm indicator.  Beat badges alone cannot represent
@@ -4245,7 +4375,11 @@ class HolterFullDisclosureDialog(QDialog):
             # Same gate as _structured_events_for_canvas: no auto-detected
             # rhythm label until "Auto Arrhythmia Detection" has been
             # clicked (self._auto_marking_visible, see __init__).
-            events_for_label = getattr(self._engine, '_structured_events', []) or [] if self._auto_marking_visible else []
+            # Asystole spans are cut out the same way as for the canvases
+            # (_without_asystole_spans).
+            events_for_label = self._without_asystole_spans(
+                getattr(self._engine, '_structured_events', []) or []
+            ) if self._auto_marking_visible else []
             for event in events_for_label:
                 source = str(event.get('source', '')).lower()
                 if 'manual' in source:
@@ -4271,6 +4405,7 @@ class HolterFullDisclosureDialog(QDialog):
                     if label.lower() in {
                         'sinus bradycardia', 'bradycardia',
                         'sinus tachycardia', 'tachycardia',
+                        'sinus arrhythmia',
                         'ventricular fibrillation', 'ventricular tachycardia',
                         'atrial fibrillation', 'atrial flutter',
                         'supraventricular tachycardia (svt)',
@@ -4282,6 +4417,7 @@ class HolterFullDisclosureDialog(QDialog):
                         active_auto.append((event_start, event_end, label))
             if active_auto:
                 event_start, event_end, event_label = min(active_auto, key=lambda item: item[0])
+                active_rhythm_end = event_end
                 if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
                     # Same as the Normal Sinus Rhythm label below: the time
                     # follows the scroll position, but stays inside this
@@ -4385,7 +4521,7 @@ class HolterFullDisclosureDialog(QDialog):
                     'complete left bundle branch block', 'incomplete left bundle branch block',
                 }
                 reader_start_bbb = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
-                for event in getattr(self._engine, '_structured_events', []) or []:
+                for event in self._without_asystole_spans(getattr(self._engine, '_structured_events', []) or []):
                     if not isinstance(event, dict) or 'manual' in str(event.get('source', '')).lower():
                         continue
                     label = str(event.get('label', event.get('type', '')) or '')
@@ -4417,6 +4553,51 @@ class HolterFullDisclosureDialog(QDialog):
         if getattr(self, '_auto_segments_pending', False):
             arrhythmia_label = "Arrhythmia: Analyzing recording..."
 
+        # Asystole: a fully independent flatline detector (see
+        # detect_asystole_segments in auto_segment_arrthymia_detection.py).
+        # It never participates in the auto-marking pipeline above
+        # (self._engine._structured_events, _auto_marking_visible,
+        # apply_auto_segments_to_engine) -- layered onto the rhythm label
+        # here, with its own system time, the same way Bundle Branch Block
+        # is layered on above. Shown regardless of whether "Auto Arrhythmia
+        # Detection" has been clicked, and even while that pipeline is
+        # still analyzing in the background.
+        try:
+            reader_start_asys = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
+            for seg in getattr(self, '_asystole_segments', []) or []:
+                seg_start = float(seg.get('start_sec', 0.0) or 0.0)
+                seg_end = float(seg.get('end_sec', seg_start) or seg_start)
+                if reader_start_asys:
+                    still_on = math.floor(reader_start_asys + seg_end) >= math.floor(reader_start_asys + start_sec)
+                else:
+                    still_on = seg_end >= start_sec
+                if not (seg_start <= start_sec and still_on):
+                    continue
+                if reader_start_asys:
+                    shown_sec = min(max(start_sec, seg_start), seg_end)
+                    asys_time = datetime.fromtimestamp(reader_start_asys + shown_sec).strftime('%H:%M:%S')
+                    asys_text = f"Asystole at {asys_time}"
+                else:
+                    asys_text = "Asystole"
+                # A rhythm segment that ended where this Asystole starts is
+                # only still in the label because its end falls in the same
+                # on-screen second (see _shown_second above) -- it is over,
+                # Asystole replaces it. Seen: VT ending 128.600 s, Asystole
+                # starting 128.600 s, label "VT at 14:39:25 | Asystole at
+                # 14:39:25".
+                rhythm_already_ended = (active_rhythm_end is not None
+                                        and active_rhythm_end <= seg_start + 1e-3)
+                if (not arrhythmia_label
+                        or rhythm_already_ended
+                        or arrhythmia_label.startswith("Arrhythmia: Normal Sinus Rhythm")
+                        or arrhythmia_label == "Arrhythmia: Analyzing recording..."):
+                    arrhythmia_label = f"Arrhythmia: {asys_text}"
+                else:
+                    arrhythmia_label = f"{arrhythmia_label} | {asys_text}"
+                break
+        except Exception as e:
+            print(f"[Full Disclosure] Error updating Asystole label: {e}")
+
         self.lbl_arrhythmia.setText(arrhythmia_label)
 
     def _update_canvases(self, start_sec: float, update_extras: bool = True):
@@ -4435,8 +4616,26 @@ class HolterFullDisclosureDialog(QDialog):
 
         read_end_sec = min(end_sec, eff_dur)
         
-        # Read data efficiently
-        data = self._reader.read_range(start_sec, read_end_sec)
+        # Read data efficiently -- plus up to 2 s of real samples on each
+        # side, which the strips use to pad their mains notch / high-pass
+        # (see ECGStripCanvas.set_data). The window slice is sample-for-sample
+        # what read_range(start_sec, read_end_sec) returns: both index frames
+        # as int(sec * fs).
+        ctx_before = ctx_after = None
+        try:
+            fs_ctx = float(self._engine.fs)
+            ctx_start = max(0.0, start_sec - 2.0)
+            ctx = self._reader.read_range(ctx_start, min(eff_dur, read_end_sec + 2.0))
+            lead_in = int(start_sec * fs_ctx) - int(ctx_start * fs_ctx)
+            n_win = int((min(read_end_sec, self._reader.duration_sec) - start_sec) * fs_ctx)
+            if n_win > 0 and ctx.shape[1] >= lead_in + n_win:
+                data = ctx[:, lead_in:lead_in + n_win]
+                ctx_before = ctx[:, :lead_in]
+                ctx_after = ctx[:, lead_in + n_win:]
+            else:
+                data = self._reader.read_range(start_sec, read_end_sec)
+        except Exception:
+            data = self._reader.read_range(start_sec, read_end_sec)
         expected_len = int(self._window_sec * self._engine.fs)
         
         # Get beat annotations for this window
@@ -4692,9 +4891,13 @@ class HolterFullDisclosureDialog(QDialog):
         for i, c in enumerate(self._canvases):
             if i < data.shape[0] and data.shape[1] > 0:
                 d_i = data[i]
+                before_i = ctx_before[i] if ctx_before is not None else None
+                after_i = ctx_after[i] if ctx_after is not None else None
                 # Use numpy slicing instead of padding for better performance
                 if len(d_i) != expected_len:
                     if len(d_i) > expected_len:
+                        if after_i is not None:
+                            after_i = np.concatenate((d_i[expected_len:], after_i))
                         d_i = d_i[:expected_len]
                     else:
                         # Create padded array more efficiently
@@ -4703,7 +4906,8 @@ class HolterFullDisclosureDialog(QDialog):
                         padded[len(d_i):] = d_i[-1] if len(d_i) > 0 else 0
                         d_i = padded
                 # Convert to float32 for faster rendering and pass beat annotations
-                c.set_data(x, np.asarray(d_i, dtype=np.float32), beat_annotations=beat_annotations, start_sec=start_sec, structured_events=visible_structured_events, fast_preview=not update_extras)
+                c.set_data(x, np.asarray(d_i, dtype=np.float32), beat_annotations=beat_annotations, start_sec=start_sec, structured_events=visible_structured_events, fast_preview=not update_extras,
+                           context_before=before_i, context_after=after_i)
             else:
                 c.set_data(x, np.zeros(expected_len, dtype=np.float32), beat_annotations=beat_annotations, start_sec=start_sec, structured_events=visible_structured_events, fast_preview=not update_extras)
 

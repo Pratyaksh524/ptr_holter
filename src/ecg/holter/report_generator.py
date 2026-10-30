@@ -39,6 +39,7 @@ def _detector_owns_label(label: str) -> bool:
     return lower in {
         'ventricular fibrillation', 'ventricular tachycardia', 'atrial fibrillation', 'atrial flutter',
         'supraventricular tachycardia (svt)', 'sinus bradycardia', 'sinus tachycardia',
+        'sinus arrhythmia', 'artifact',
     } or 'av block' in lower or 'bundle branch block' in lower
 
 
@@ -115,6 +116,46 @@ def _load_auto_segment_events(session_dir: str) -> List[Dict[str, object]]:
         return events
     except Exception as exc:
         print(f"[HolterReport] Could not load auto segments: {exc}")
+        return []
+
+
+def _load_asystole_events(session_dir: str) -> List[Dict[str, object]]:
+    """Asystole (sustained flatline) segments for this recording, from the
+    fully independent detector in auto_segment_arrthymia_detection.py (see
+    the banner comment above detect_asystole_segments_async there).
+
+    Unlike _load_auto_segment_events() above, this is NOT gated by
+    is_auto_marking_enabled() -- Asystole is deliberately not part of the
+    "Auto Arrhythmia Detection" pipeline, so it belongs in the Event
+    Timeline whether or not that button was ever clicked for this session.
+    """
+    ecgh_path = os.path.join(session_dir, 'recording.ecgh')
+    if not os.path.exists(ecgh_path):
+        return []
+    try:
+        from .file_format import ECGHFileReader
+        from .auto_segment_arrthymia_detection import detect_asystole_segments
+        reader = ECGHFileReader(ecgh_path)
+        events = []
+        for segment in detect_asystole_segments(reader):
+            start_sec = float(segment.get('start_sec', 0.0) or 0.0)
+            end_sec = float(segment.get('end_sec', 0.0) or 0.0)
+            events.append({
+                'timestamp': start_sec,
+                'start_sec': start_sec,
+                'end_sec': end_sec,
+                'end_timestamp': end_sec,
+                'label': 'Asystole',
+                'event_type': 'Asystole',
+                'start_time_str': segment.get('start_time_str', ''),
+                'end_time_str': segment.get('end_time_str', ''),
+                'duration': max(0.0, end_sec - start_sec),
+                'source': 'Auto',
+                'confidence': 1.0,
+            })
+        return events
+    except Exception as exc:
+        print(f"[HolterReport] Could not load Asystole segments: {exc}")
         return []
 
 
@@ -272,7 +313,8 @@ def first_confirmed_nsr_beat(reader, t_from: float, t_to: float):
 
 def _build_timeline_events(session_dir: str,
                            auto_segment_events=None,
-                           metrics=None) -> List[Dict[str, object]]:
+                           metrics=None,
+                           asystole_events=None) -> List[Dict[str, object]]:
     """
     Builds a clean, streamlined event timeline for the report:
     1. Loads manual markings (manual_segments.json and manual_beats.json) - EXACT MANUAL MARKING LOGIC.
@@ -280,6 +322,11 @@ def _build_timeline_events(session_dir: str,
     3. Creates structured start/end markers for rhythm segments.
     4. Establishes baseline Normal Sinus Rhythm transitions outside segments without repetitive periodic polling spam.
     5. Loads auto-detected badge events (SVT, VT, Couplet, Bigeminy, PVC, PAC, etc.) outside manual/segment areas.
+    5b. Loads Asystole events from the independent flatline detector (see
+        _load_asystole_events) -- shown as its own overlay rows the same
+        way Bundle Branch Block is, never gated by "Auto Arrhythmia
+        Detection" and never suppressing or suppressed by the rhythm
+        segment rows above.
     6. Appends manual beat and segment markings (unaltered).
     7. Chronologically sorts and deduplicates timeline events.
     """
@@ -415,6 +462,50 @@ def _build_timeline_events(session_dir: str,
                 'source': 'Auto'
             })
 
+    # 5b. Asystole events (independent flatline detector -- see
+    # _load_asystole_events). Treated exactly like Bundle Branch Block
+    # above: its own start/end rows, held back only by a manual segment,
+    # never added to active_segments_ranges so it can never suppress (or be
+    # suppressed by) a rhythm segment row -- an Asystole stretch can sit
+    # inside any auto rhythm segment (including one this module doesn't
+    # otherwise touch) and still get its own timeline rows.
+    asystole_segs = (
+        asystole_events
+        if asystole_events is not None
+        else _load_asystole_events(session_dir)
+    )
+    # Ranges actually shown as Asystole rows below (manual-segment overlap
+    # already excluded) -- used only by the baseline Normal Sinus Rhythm
+    # fill-in further down, so a real flatline never gets mislabeled as a
+    # "resumed to sinus rhythm" row just because it widened the gap between
+    # two rhythm segments (e.g. the VFib-flatline-edge trim in
+    # auto_segment_arrthymia_detection.py's _vfib_flatline_start_trim can
+    # now leave such a gap where the flatline used to be swallowed whole
+    # into the VFib region).
+    asystole_ranges = []
+    for seg in asystole_segs:
+        s_t = float(seg.get('start_sec', seg.get('timestamp', 0.0)) or 0.0)
+        e_t = float(seg.get('end_sec', seg.get('end_timestamp', s_t)) or s_t)
+        lbl = str(seg.get('label', 'Asystole'))
+        if any(ms < e_t and s_t < me for ms, me in manual_segment_ranges):
+            continue
+        asystole_ranges.append((s_t, e_t))
+        timeline_events.append({
+            'timestamp': s_t,
+            'sort_ts': s_t,
+            'label': f"Auto segment marked ({lbl})",
+            'event_type': lbl,
+            'source': 'Auto'
+        })
+        if e_t > s_t + 0.1:
+            timeline_events.append({
+                'timestamp': e_t,
+                'sort_ts': e_t,
+                'label': f"Auto segment marked end ({lbl})",
+                'event_type': lbl,
+                'source': 'Auto'
+            })
+
     # 6. Baseline rhythm / transition events
     # Start with baseline Normal Sinus Rhythm at t=0 if recording has data and t=0 is not in a segment
     if metrics or auto_segments or manual_segments:
@@ -444,7 +535,8 @@ def _build_timeline_events(session_dir: str,
                 + [float(seg.get('end_sec', 0.0) or 0.0) for seg in manual_segments]
                 + [0.0]
             )
-        starts_in_segment = any(ms <= 0.5 and me > 0.0 for ms, me in active_segments_ranges)
+        starts_in_segment = any(ms <= 0.5 and me > 0.0 for ms, me in active_segments_ranges) \
+            or any(a_s <= 0.5 < a_e for a_s, a_e in asystole_ranges)
 
         # Normal Sinus Rhythm rows are placed at the first CONFIRMED sinus
         # beat (_first_confirmed_nsr_beat: P with PR 120-200 ms, QRS < 120
@@ -500,7 +592,14 @@ def _build_timeline_events(session_dir: str,
             if recording_end_sec > 0.0 and t_resume >= recording_end_sec - 0.05:
                 continue
             in_another = any(other_s <= t_resume <= other_e for other_s, other_e in active_segments_ranges if (other_s, other_e) != (ms, me))
-            if not in_another:
+            # A confirmed flatline (Asystole) right where this fallback
+            # would otherwise place an unconfirmed "resumed to Normal Sinus
+            # Rhythm" row (no beats at all were found to confirm sinus rhythm
+            # there in the first place -- see the comment above
+            # _next_segment_start) is not sinus rhythm. See the comment
+            # above asystole_ranges.
+            in_asystole = any(a_s <= t_resume <= a_e for a_s, a_e in asystole_ranges)
+            if not in_another and not in_asystole:
                 if (ms, me) in manual_segment_ranges:
                     manual_resume_times.add(t_resume)
                 timeline_events.append({
@@ -535,7 +634,8 @@ def _build_timeline_events(session_dir: str,
                 if recording_end_sec > 0.0 and t_resume >= recording_end_sec - 0.05:
                     continue
                 if any(other_s <= t_resume <= other_e for other_s, other_e in active_segments_ranges) \
-                        or _in_bundle_branch_block(t_resume):
+                        or _in_bundle_branch_block(t_resume) \
+                        or any(a_s <= t_resume <= a_e for a_s, a_e in asystole_ranges):
                     continue
                 timeline_events.append({
                     'timestamp': t_resume,
@@ -1331,11 +1431,11 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     story.append(Paragraph("ST ANALYSIS", title_style))
     story.append(HRFlowable(width="100%", thickness=2, color=ORANGE, spaceAfter=4*mm))
 
-    # ST events from ischemia_detection (12 leads, Full Disclosure screen mm;
-    # per 10 s frame limb leads >= 1 mm, chest leads >= 2 mm elevation,
+    # ST events from ischemia_detection (12 leads, Full Disclosure graph-paper
+    # mm; per 10 s frame limb leads >= 1 mm, chest leads >= 2 mm elevation,
     # >= 1 mm depression, any 2 leads of one group; >= 30 s). Per event
-    # 'st_lead_mm' holds the leads that met the criteria with their average,
-    # 'st_lead_max_mm' their largest value (10 mm = 1 mV).
+    # 'st_lead_mm' holds the leads that met the criteria with their average
+    # over the whole event, 'st_lead_max_mm' their largest value (10 mm = 1 mV).
     _st_episodes = _load_st_episodes(session_dir)
     _st_dep = [e for e in _st_episodes if e.get('label') == 'ST Depression']
     _st_elev = [e for e in _st_episodes if e.get('label') == 'ST Elevation']
@@ -1389,6 +1489,10 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     # mV, the lead name (At), the episode's start - end system time, and
     # whether it is an elevation or a depression.
     _st_lead_order = ('I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6')
+    # fits the 26 mm "ST slope" column
+    _ST_DEP_KIND_SHORT = {'Reciprocal': 'Reciprocal',
+                          'Reciprocal (posterior)': 'Recip. posterior',
+                          'Additional depression': 'Add. depression'}
     _st_event_rows = [['Index', 'Channel', 'Type', 'mV', 'At', 'Duration', 'ST slope']]
     _st_idx = 0
     for _event in _st_episodes:
@@ -1401,6 +1505,16 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
             _st_event_rows.append([
                 str(_st_idx), _st_channel, '12 lead', f"{float(_lead_mm[_lead]) / 10.0:+.2f}",
                 _lead, _span, _slope,
+            ])
+        # Depression with an ST Elevation event, under its elevated leads
+        # (ischemia_detection._depression_kinds).
+        _dep_mm = _event.get('st_dep_mm') or {}
+        _dep_kind = _event.get('st_dep_kind') or {}
+        for _lead in _dep_mm:
+            _st_idx += 1
+            _st_event_rows.append([
+                str(_st_idx), _st_channel, '12 lead', f"{float(_dep_mm[_lead]) / 10.0:+.2f}",
+                _lead, _span, _ST_DEP_KIND_SHORT.get(_dep_kind.get(_lead), 'Depression'),
             ])
     # 20 rows (was 28) so the T wave section below fits on this page
     for _ in range(max(0, 20 - _st_idx)):
@@ -1770,6 +1884,22 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         else:
             int_data.append([label, '--', '--', '--', '--', ref])
 
+    # QRS axis (axis_detection, with the ischemia findings): Mean = dominant
+    # axis, Std = spread around it, Min / Max = 5th - 95th percentile.
+    from .axis_detection import AXIS_NORMAL_RANGE, AXIS_SHORT
+    _axis = _load_ischemia(session_dir).get('axis') or {}
+    if _axis.get('dominant') is not None:
+        _lo, _hi = _axis.get('range') or (_axis['dominant'], _axis['dominant'])
+
+        def _axis_deg(v):
+            return f"{(float(v) + 180.0) % 360.0 - 180.0:+.0f}°"
+        int_data.append(['QRS Axis',
+                         f"{_axis_deg(_axis['dominant'])} {AXIS_SHORT.get(_axis.get('category'), '')}",
+                         f"{float(_axis.get('sd', 0.0) or 0.0):.0f}°",
+                         _axis_deg(_lo), _axis_deg(_hi), AXIS_NORMAL_RANGE])
+    else:
+        int_data.append(['QRS Axis', '--', '--', '--', '--', AXIS_NORMAL_RANGE])
+
     int_table = Table(int_data, colWidths=[35*mm, 22*mm, 22*mm, 22*mm, 22*mm, 32*mm])
     int_table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), TEAL),
@@ -1782,6 +1912,34 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         ('PADDING', (0, 0), (-1, -1), 7),
     ]))
     story.append(int_table)
+
+    # Axis Deviation events (>= 30 s outside -30 to +90 deg), only when there are any.
+    _axis_events = _axis.get('events') or []
+    if _axis_events:
+        story.append(Spacer(1, 4*mm))
+        story.append(Paragraph("QRS Axis Deviation", h2_style))
+        _ax_rows = [['Index', 'Type', 'Axis', 'Lowest', 'Highest', 'Start - End', 'Duration']]
+        for _i, _e in enumerate(_axis_events, start=1):
+            _ax_rows.append([
+                str(_i), _e.get('label', ''), _axis_deg(_e['axis']),
+                _axis_deg(_e['axis_min']), _axis_deg(_e['axis_max']),
+                f"{_format_system_time(session_dir, float(_e['start_sec']))} - "
+                f"{_format_system_time(session_dir, float(_e['end_sec']))}",
+                _sec_to_hms(float(_e['end_sec']) - float(_e['start_sec'])),
+            ])
+        _ax_table = Table(_ax_rows, colWidths=[12*mm, 36*mm, 16*mm, 16*mm, 16*mm, 40*mm, 20*mm],
+                          repeatRows=1)
+        _ax_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), TEAL),
+            ('TEXTCOLOR',  (0, 0), (-1, 0), colors.white),
+            ('FONTNAME',   (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE',   (0, 0), (-1, -1), 8),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, LIGHT]),
+            ('GRID', (0, 0), (-1, -1), 0.5, BORDER),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('PADDING', (0, 0), (-1, -1), 4),
+        ]))
+        story.append(_ax_table)
 
     #    FULL DISCLOSURE ECG STRIPS                                              
     # User requested: "all waves should be attached to the report for how many time it has run all 12 lead data should go with time stamp"

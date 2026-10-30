@@ -2234,6 +2234,7 @@ class HolterMainWindow(QDialog):
                 if cached is not None:
                     st_eps, t_eps = cached.get('st', []), cached.get('t', [])
                     self._st_info = cached.get('st_info')
+                    self._qrs_axis = cached.get('axis')
                 elif not getattr(self, '_ischemia_pending', False):
                     self._ischemia_pending = True
 
@@ -2243,6 +2244,7 @@ class HolterMainWindow(QDialog):
                             self._st_episodes = result.get('st', [])
                             self._t_episodes = result.get('t', [])
                             self._st_info = result.get('st_info')
+                            self._qrs_axis = result.get('axis')
                             self._push_ischemia_to_panels()
                     ischemia_async(ecgh_path, _done)
         except Exception as e:
@@ -2251,6 +2253,7 @@ class HolterMainWindow(QDialog):
         self._t_episodes = t_eps
         if st_eps is None:
             self._st_info = None
+            self._qrs_axis = None
         self._push_ischemia_to_panels()
 
     def _push_ischemia_to_panels(self):
@@ -2260,6 +2263,7 @@ class HolterMainWindow(QDialog):
             self._summary['st_episodes'] = getattr(self, '_st_episodes', None)
             self._summary['t_episodes'] = getattr(self, '_t_episodes', None)
             self._summary['st_info'] = getattr(self, '_st_info', None)
+            self._summary['qrs_axis'] = getattr(self, '_qrs_axis', None)
             if hasattr(self, '_expert_panel'):
                 self._expert_panel.update_from_metrics(self._metrics_list, self._summary)
             if hasattr(self, '_replay_panel'):
@@ -2270,6 +2274,7 @@ class HolterMainWindow(QDialog):
             self._summary['st_episodes'] = self._st_episodes
             self._summary['t_episodes'] = getattr(self, '_t_episodes', None)
             self._summary['st_info'] = getattr(self, '_st_info', None)
+            self._summary['qrs_axis'] = getattr(self, '_qrs_axis', None)
         if hasattr(self, '_summary_cards'):
             self._summary_cards.update_summary(self._summary)
         if hasattr(self, '_insight_panel'):
