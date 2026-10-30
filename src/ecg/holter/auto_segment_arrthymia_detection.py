@@ -599,8 +599,15 @@ def _detect_asystole_uncached(reader) -> List[Dict[str, Any]]:
             t += fine_step
         return max(t, lo_bound)
 
+    # Keep each run's whole-second core too: the all-leads check below runs
+    # on the core, not the refined edges. The refinement only looks at
+    # best_lead_idx, so it can pull in the first 0.2 s where the signal is
+    # back -- seen: lead II 129 counts (under its 165 limit) at 787.0-787.2 s
+    # while the other 11 leads were already at 750-2100 counts. That partial
+    # last block then failed on every lead and dropped a 130 s flatline
+    # (658-787 s, ptp 0 on all 12 leads) as 0/12 flat.
     runs = [
-        (_refine_run_start(s, e - fine_step), _refine_run_end(e, s + fine_step))
+        ((_refine_run_start(s, e - fine_step), _refine_run_end(e, s + fine_step)), (s, e))
         for s, e in runs
     ]
 
@@ -643,10 +650,10 @@ def _detect_asystole_uncached(reader) -> List[Dict[str, Any]]:
         return flat_leads * 2 >= data.shape[0]
 
     segments = []
-    for start_sec, end_sec in runs:
+    for (start_sec, end_sec), (core_start, core_end) in runs:
         if end_sec - start_sec < _ASYSTOLE_MIN_SEC:
             continue
-        if not _flat_on_most_leads(start_sec, end_sec):
+        if not _flat_on_most_leads(core_start, core_end):
             continue
         s_str, e_str = _asystole_time_strs(reader, start_sec, end_sec)
         segments.append({

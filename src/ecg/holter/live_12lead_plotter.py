@@ -46,13 +46,12 @@ ADC_MIN, ADC_MAX, ADC_BASELINE = 0, 4096, 2048
 DFT_CUTOFF_HZ = 0.5
 DFT_SIGMA_SAMPLES = _GAUSSIAN_SIGMA_AT_MINUS_3DB * FS / DFT_CUTOFF_HZ
 
-# Display-only smoothing, same chain as the workspace strips
-# (holter_widgets.ECGStripCanvas.set_data): 50 and 60 Hz notches, then after
-# the DFT filter a 3-point median and a 35 Hz Gaussian low-pass run twice. A
+# Display-only smoothing for the live screen: 50 and 60 Hz notches, then after
+# the DFT filter a 3-point median and one zero-phase 25 Hz Gaussian low-pass. A
 # Gaussian has no overshoot, so it adds no false J-point notch after the QRS
 # the way a Butterworth low-pass does. Never applied to the recorded data.
 MAINS_NOTCHES = [make_notch(hz, FS) for hz in (50.0, 60.0)]
-SMOOTH_CUTOFF_HZ = 35.0
+SMOOTH_CUTOFF_HZ = 25.0
 SMOOTH_SIGMA_SAMPLES = FS / (2.0 * np.pi * SMOOTH_CUTOFF_HZ)
 
 # Paper speed sets how many seconds fit across the sheet (10 s at 25 mm/s).
@@ -92,13 +91,11 @@ def remove_mains(block: np.ndarray) -> np.ndarray:
 
 
 def smooth_for_display(block: np.ndarray) -> np.ndarray:
-    """3-point median, then the 35 Hz Gaussian low-pass twice, per lead."""
+    """3-point median, then the 25 Hz Gaussian low-pass once, per lead."""
     p = np.pad(block, ((0, 0), (1, 1)), mode="edge")
     block = np.median(np.stack((p[:, :-2], p[:, 1:-1], p[:, 2:])), axis=0)
-    for _ in range(2):
-        block = gaussian_filter1d(block, SMOOTH_SIGMA_SAMPLES, axis=-1, mode="mirror",
-                                  truncate=_GAUSSIAN_HALF_WIDTH_SIGMAS)
-    return block
+    return gaussian_filter1d(block, SMOOTH_SIGMA_SAMPLES, axis=-1, mode="mirror",
+                             truncate=_GAUSSIAN_HALF_WIDTH_SIGMAS)
 
 
 # -----------------------------------------------------------------------------

@@ -2348,12 +2348,24 @@ class ECGStripCanvas(QWidget):
             def _in_vfib_region(a, b):
                 return any(a <= v_end and b >= v_start for v_start, v_end in vfib_regions)
 
+            # Asystole is a flatline: no beats, so no RR/HR either. Any
+            # "interval" touching an Asystole span is Pan-Tompkins picking
+            # peaks out of a flat line (seen: 109/549, 44/1374 ... drawn over
+            # a 130 s all-lead flatline). Spans come from Full Disclosure's
+            # own Asystole detector (_asystole_segments), set on every canvas.
+            asystole_spans = getattr(self, '_asystole_spans', None) or []
+
+            def _in_asystole_span(a, b):
+                return any(a < a_end and b > a_start for a_start, a_end in asystole_spans)
+
             for interval in self._rr_intervals:
                 start_ts = interval['start_ts']
                 end_ts = interval['end_ts']
                 rr_ms = interval['rr_ms']
 
                 if vfib_regions and _in_vfib_region(start_ts, end_ts):
+                    continue
+                if asystole_spans and _in_asystole_span(start_ts, end_ts):
                     continue
 
                 # Check if interval is within visible window

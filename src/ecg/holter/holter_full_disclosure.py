@@ -841,6 +841,12 @@ class HolterFullDisclosureDialog(QDialog):
         bottom-right rhythm label, never the segment overlay or
         self._engine._structured_events."""
         self._asystole_segments = segments or []
+        # Lead I's RR/HR numbers are hidden inside Asystole spans
+        # (ECGStripCanvas.paintEvent) -- hand the spans over and repaint.
+        spans = self._asystole_spans()
+        for c in getattr(self, '_canvases', []) or []:
+            c._asystole_spans = spans
+            c.update()
         try:
             self._update_time_and_arrhythmia_labels(self._current_start, self._current_start + self._window_sec)
         except Exception as e:
@@ -3703,6 +3709,21 @@ class HolterFullDisclosureDialog(QDialog):
     # the flatline.
     _ASYSTOLE_REMNANT_MIN_SEC = 1.0
 
+    def _asystole_spans(self):
+        """Sorted (start_sec, end_sec) of every Asystole segment found by
+        the independent Asystole detector (self._asystole_segments)."""
+        spans = []
+        for seg in getattr(self, '_asystole_segments', []) or []:
+            try:
+                a_s = float(seg.get('start_sec', 0.0) or 0.0)
+                a_e = float(seg.get('end_sec', a_s) or a_s)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if a_e > a_s:
+                spans.append((a_s, a_e))
+        spans.sort()
+        return spans
+
     def _without_asystole_spans(self, events):
         """Auto (non-manual) events with every Asystole span cut out of them.
 
@@ -3716,18 +3737,9 @@ class HolterFullDisclosureDialog(QDialog):
         self._engine._structured_events, the detection cache and the report
         are untouched. Manual markings pass through as they are.
         """
-        spans = []
-        for seg in getattr(self, '_asystole_segments', []) or []:
-            try:
-                a_s = float(seg.get('start_sec', 0.0) or 0.0)
-                a_e = float(seg.get('end_sec', a_s) or a_s)
-            except (TypeError, ValueError, AttributeError):
-                continue
-            if a_e > a_s:
-                spans.append((a_s, a_e))
+        spans = self._asystole_spans()
         if not spans:
             return events
-        spans.sort()
 
         result = []
         for ev in events:
@@ -4885,9 +4897,11 @@ class HolterFullDisclosureDialog(QDialog):
         # visible window. Windowing it here is the actual fix for the lag
         # on large recordings.
         visible_structured_events = self._structured_events_for_canvas(start_sec, end_sec)
+        asystole_spans = self._asystole_spans()
 
         # Optimization: Process data in parallel using numpy vectorization
         for i, c in enumerate(self._canvases):
+            c._asystole_spans = asystole_spans
             if i < data.shape[0] and data.shape[1] > 0:
                 d_i = data[i]
                 before_i = ctx_before[i] if ctx_before is not None else None
