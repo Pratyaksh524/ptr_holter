@@ -932,6 +932,29 @@ def _detect_arrhythmias_uncached(
             return _filtfilt(_gate_ba[0], _gate_ba[1], x)
         except Exception:
             return x
+
+    # The Sinus Bradycardia / Tachycardia gate reads sinus_gate_metrics:
+    # the same beats, the same 25 Hz low-pass, plus the 0.5 Hz DFT high-pass
+    # the Full Disclosure strip draws with (ecg_filters.apply_dft_filter).
+    # The recording holds raw samples, and without the high-pass a ~0.36 Hz
+    # baseline wander moved the P / QRS boundaries beat to beat -- seen: 150
+    # bpm sinus, lead II baseline swinging ~1265 ADC, PR 96-300 ms and P
+    # polarity flipping inside 6-beat runs, so no run passed the PR +-25 ms
+    # check. rate_gate_metrics stays as it was: the First-degree AV Block
+    # boundary step reads its PR.
+    sinus_gate_metrics = [None] * len(all_r_peaks)
+    try:
+        from ..ecg_filters import apply_dft_filter as _apply_dft_filter
+    except Exception:
+        _apply_dft_filter = None
+
+    def _sinus_gate_filter(x):
+        if _apply_dft_filter is not None:
+            try:
+                x = np.asarray(_apply_dft_filter(x, float(fs), "0.5"), dtype=float)
+            except Exception:
+                pass
+        return _gate_filter(x)
     # Lead II is the preferred conduction lead: it is the most reliable lead
     # for visible P waves and PR intervals in these recordings. R-peaks still
     # come from the strongest detection lead, but P/PR/QRS gating must not be
@@ -953,6 +976,7 @@ def _detect_arrhythmias_uncached(
             continue
         metric_signal = np.asarray(metric_data[conduction_lead_idx], dtype=float)
         gate_signal = _gate_filter(metric_signal)
+        sinus_signal = _sinus_gate_filter(metric_signal)
         while metric_cursor < len(all_r_peaks):
             peak_sec = all_r_peaks[metric_cursor]
             if peak_sec >= metric_end - metric_pad_sec and metric_end < total_duration:
@@ -979,6 +1003,14 @@ def _detect_arrhythmias_uncached(
                     gate_metric['_p_time_sec'] = metric_start + float(gate_metric['p_peak']) / float(fs)
                 if gate_metric:
                     gate_metric['_r_time_sec'] = peak_sec
+                sinus_metric = measure_beat(
+                    sinus_signal, local_peak, fs, strict_pr=True, prev_rr_ms=prev_rr_ms
+                )
+                sinus_gate_metrics[metric_cursor] = sinus_metric
+                if sinus_metric and sinus_metric.get('p_peak') is not None:
+                    sinus_metric['_p_time_sec'] = metric_start + float(sinus_metric['p_peak']) / float(fs)
+                if sinus_metric:
+                    sinus_metric['_r_time_sec'] = peak_sec
             metric_cursor += 1
 
     # Calculate beat-to-beat RR intervals
@@ -1026,7 +1058,7 @@ def _detect_arrhythmias_uncached(
         its own list, see brady_r_peaks below.
         """
         if metrics is None:
-            metrics = rate_gate_metrics
+            metrics = sinus_gate_metrics
         if start_idx is None or end_idx is None:
             return False
         left = max(0, int(start_idx))
@@ -1145,6 +1177,58 @@ def _detect_arrhythmias_uncached(
             return False
         return True
 
+    def _sinus_beat(b):
+        """One beat's own sinus evidence: a P with onset/end, a resolved QRS
+        of 40-200 ms and a measured PR -- sinus_conduction_gate()'s per-beat
+        "valid" test plus the PR it needs."""
+        return bool(
+            b
+            and b.get('p_present')
+            and b.get('p_onset') is not None
+            and b.get('p_end') is not None
+            and b.get('qrs_bounds_resolved')
+            and b.get('q_onset') is not None
+            and 40.0 <= float(b.get('qrs_ms') or 0.0) <= 200.0
+            and b.get('pr_ms') is not None
+        )
+
+    def append_sinus_rate_segments(start_idx, end_idx, peaks, metrics, min_dur_sec, label, color):
+        """Sinus Tachycardia / Bradycardia judged beat by beat inside one
+        rate run (beats start_idx..end_idx of `peaks`): a beat that fails
+        _sinus_beat() ends the current segment and the next passing beat
+        starts a new one. Each segment needs >= 3 beats, >= min_dur_sec and
+        sinus_conduction_gate() on its own beats (PR / QRS / P-P / P shape
+        consistency). Was: the gate on the whole run at once, so one bad
+        stretch dropped the good one with it -- seen: Sinus Tachycardia 150
+        bpm 100.1-148.6 s, 37 of 122 beats valid (92 needed) because P was
+        rejected on every beat after 120 s, while 101-111 s alone had 21
+        of 25 and got no label."""
+        k = start_idx
+        while k <= end_idx:
+            if not _sinus_beat(metrics[k]):
+                k += 1
+                continue
+            seg_start = k
+            while k + 1 <= end_idx and _sinus_beat(metrics[k + 1]):
+                k += 1
+            seg_end = k
+            k += 1
+            if seg_end - seg_start + 1 >= 3 \
+                    and peaks[seg_end] - peaks[seg_start] >= min_dur_sec \
+                    and sinus_conduction_gate(seg_start, seg_end, metrics):
+                s_sec = peaks[seg_start]
+                e_sec = peaks[seg_end]
+                s_str, e_str = make_time_strs(s_sec, e_sec)
+                detected_segments.append({
+                    'start_sec': s_sec,
+                    'end_sec': e_sec,
+                    'label': label,
+                    'color': color,
+                    'start_time_str': s_str,
+                    'end_time_str': e_str,
+                    'detected_rhythm': label
+                })
+
     def suppress_rate_overlap(rate_segments, morph_segments):
         """
         Morphological rhythms (VFib, VTach, AFib, Flutter, AV Block) are detected
@@ -1234,44 +1318,14 @@ def _detect_arrhythmias_uncached(
                     tachy_start_idx = i
             else:
                 if in_tachy:
-                    tachy_end_idx = i
-                    beat_count = tachy_end_idx - tachy_start_idx + 1
-                    dur = all_r_peaks[tachy_end_idx] - all_r_peaks[tachy_start_idx]
-                    if beat_count >= 3 and dur >= 1.0 \
-                            and sinus_conduction_gate(tachy_start_idx, tachy_end_idx):
-                        s_sec = all_r_peaks[tachy_start_idx]
-                        e_sec = all_r_peaks[tachy_end_idx]
-                        s_str, e_str = make_time_strs(s_sec, e_sec)
-                        detected_segments.append({
-                            'start_sec': s_sec,
-                            'end_sec': e_sec,
-                            'label': 'Sinus Tachycardia',
-                            'color': '#00FFFF',
-                            'start_time_str': s_str,
-                            'end_time_str': e_str,
-                            'detected_rhythm': 'Sinus Tachycardia'
-                        })
+                    append_sinus_rate_segments(tachy_start_idx, i, all_r_peaks, sinus_gate_metrics,
+                                               1.0, 'Sinus Tachycardia', '#00FFFF')
                     in_tachy = False
                     tachy_start_idx = None
 
         if in_tachy and tachy_start_idx is not None:
-            tachy_end_idx = len(all_rr_ms)
-            beat_count = tachy_end_idx - tachy_start_idx + 1
-            dur = all_r_peaks[tachy_end_idx] - all_r_peaks[tachy_start_idx]
-            if beat_count >= 3 and dur >= 1.0 \
-                    and sinus_conduction_gate(tachy_start_idx, tachy_end_idx):
-                s_sec = all_r_peaks[tachy_start_idx]
-                e_sec = all_r_peaks[tachy_end_idx]
-                s_str, e_str = make_time_strs(s_sec, e_sec)
-                detected_segments.append({
-                    'start_sec': s_sec,
-                    'end_sec': e_sec,
-                    'label': 'Sinus Tachycardia',
-                    'color': '#00FFFF',
-                    'start_time_str': s_str,
-                    'end_time_str': e_str,
-                    'detected_rhythm': 'Sinus Tachycardia'
-                })
+            append_sinus_rate_segments(tachy_start_idx, len(all_rr_ms), all_r_peaks, sinus_gate_metrics,
+                                       1.0, 'Sinus Tachycardia', '#00FFFF')
 
         # B. Sinus Bradycardia: first pass through the same P/PR/QRS sinus
         # gate, then consecutive beats with RR >= 1050ms (HR < 57.1 bpm)
@@ -1337,20 +1391,21 @@ def _detect_arrhythmias_uncached(
 
         if _recovered_beats:
             brady_r_peaks = sorted(set(all_r_peaks) | set(_recovered_beats))
-            _metric_at = dict(zip(all_r_peaks, rate_gate_metrics))
+            _metric_at = dict(zip(all_r_peaks, sinus_gate_metrics))
             brady_beat_metrics = []
             for k, peak_sec in enumerate(brady_r_peaks):
                 if peak_sec in _metric_at:
                     brady_beat_metrics.append(_metric_at[peak_sec])
                     continue
-                # Same measurement as rate_beat_metrics above: conduction
-                # lead, strict P/PR, 1 s of signal on each side.
+                # Same measurement as sinus_gate_metrics above: conduction
+                # lead, strict P/PR, 0.5 Hz high-pass + 25 Hz low-pass; 3 s
+                # of signal on each side so the high-pass has room to settle.
                 metric = None
-                m_start = max(0.0, peak_sec - 1.0)
-                m_end = min(total_duration, peak_sec + 1.0)
+                m_start = max(0.0, peak_sec - 3.0)
+                m_end = min(total_duration, peak_sec + 3.0)
                 m_data = reader.read_range(m_start, m_end)
                 if m_data is not None and conduction_lead_idx < m_data.shape[0]:
-                    m_sig = _gate_filter(np.asarray(m_data[conduction_lead_idx], dtype=float))
+                    m_sig = _sinus_gate_filter(np.asarray(m_data[conduction_lead_idx], dtype=float))
                     local_peak = int(round((peak_sec - m_start) * fs))
                     prev_rr_ms = (peak_sec - brady_r_peaks[k - 1]) * 1000.0 if k > 0 else None
                     if 0 < local_peak < len(m_sig):
@@ -1365,7 +1420,7 @@ def _detect_arrhythmias_uncached(
                 for k in range(len(brady_r_peaks) - 1)
             ]
         else:
-            brady_r_peaks, brady_beat_metrics, brady_rr_ms = all_r_peaks, rate_gate_metrics, all_rr_ms
+            brady_r_peaks, brady_beat_metrics, brady_rr_ms = all_r_peaks, sinus_gate_metrics, all_rr_ms
 
         in_brady = False
         brady_start_idx = None
@@ -1385,44 +1440,14 @@ def _detect_arrhythmias_uncached(
                     brady_start_idx = i
             else:
                 if in_brady:
-                    brady_end_idx = i
-                    beat_count = brady_end_idx - brady_start_idx + 1
-                    dur = brady_r_peaks[brady_end_idx] - brady_r_peaks[brady_start_idx]
-                    if beat_count >= 3 and dur >= 2.5 \
-                            and sinus_conduction_gate(brady_start_idx, brady_end_idx, brady_beat_metrics):
-                        s_sec = brady_r_peaks[brady_start_idx]
-                        e_sec = brady_r_peaks[brady_end_idx]
-                        s_str, e_str = make_time_strs(s_sec, e_sec)
-                        detected_segments.append({
-                            'start_sec': s_sec,
-                            'end_sec': e_sec,
-                            'label': 'Sinus Bradycardia',
-                            'color': '#00BFFF',
-                            'start_time_str': s_str,
-                            'end_time_str': e_str,
-                            'detected_rhythm': 'Sinus Bradycardia'
-                        })
+                    append_sinus_rate_segments(brady_start_idx, i, brady_r_peaks, brady_beat_metrics,
+                                               2.5, 'Sinus Bradycardia', '#00BFFF')
                     in_brady = False
                     brady_start_idx = None
 
         if in_brady and brady_start_idx is not None:
-            brady_end_idx = len(brady_rr_ms)
-            beat_count = brady_end_idx - brady_start_idx + 1
-            dur = brady_r_peaks[brady_end_idx] - brady_r_peaks[brady_start_idx]
-            if beat_count >= 3 and dur >= 2.5 \
-                    and sinus_conduction_gate(brady_start_idx, brady_end_idx, brady_beat_metrics):
-                s_sec = brady_r_peaks[brady_start_idx]
-                e_sec = brady_r_peaks[brady_end_idx]
-                s_str, e_str = make_time_strs(s_sec, e_sec)
-                detected_segments.append({
-                    'start_sec': s_sec,
-                    'end_sec': e_sec,
-                    'label': 'Sinus Bradycardia',
-                    'color': '#00BFFF',
-                    'start_time_str': s_str,
-                    'end_time_str': e_str,
-                    'detected_rhythm': 'Sinus Bradycardia'
-                })
+            append_sinus_rate_segments(brady_start_idx, len(brady_rr_ms), brady_r_peaks, brady_beat_metrics,
+                                       2.5, 'Sinus Bradycardia', '#00BFFF')
 
     # ------------------------------------------------------------------
     # 3. Detect Morphological Arrhythmias (VFib, VT, AFib, Flutter, AV Block)
@@ -5400,6 +5425,27 @@ def _detect_arrhythmias_uncached(
     except Exception as e:
         print(f"[Auto Arrhythmia Detect] Sinus Arrhythmia check error: {e}")
 
+    # Plain Bradycardia / Tachycardia: rate runs no other label claimed (no
+    # sinus P/PR/QRS, so not Sinus Bradycardia / Tachycardia). Added last, on
+    # beats outside every rhythm segment above, so it never shortens or
+    # blocks another label (e.g. the Atrial Flutter 2:1 extension into
+    # uncovered time). See _plain_rate_segments.
+    try:
+        rhythm_spans = [
+            (float(s['start_sec']), float(s['end_sec'])) for s in final_segments
+            if 'bundle branch block' not in s['label'].lower()
+        ]
+        plain_brady_peaks = brady_r_peaks if len(all_rr_ms) >= 3 else all_r_peaks
+        final_segments.extend(_plain_rate_segments(
+            plain_brady_peaks, lambda hr: _PLAIN_BRADY_HR[0] < hr < _PLAIN_BRADY_HR[1],
+            2.5, 'Bradycardia', '#20B2AA', rhythm_spans, make_time_strs))
+        final_segments.extend(_plain_rate_segments(
+            all_r_peaks, lambda hr: hr > _PLAIN_TACHY_HR,
+            1.0, 'Tachycardia', '#F08080', rhythm_spans, make_time_strs))
+        final_segments.sort(key=lambda x: x['start_sec'])
+    except Exception as e:
+        print(f"[Auto Arrhythmia Detect] Bradycardia / Tachycardia check error: {e}")
+
     # ------------------------------------------------------------------
     # Noise gate, applied to every label above: no auto marking where the
     # signal is not clean. Per 10 s block, every lead's SQI is computed on
@@ -5471,6 +5517,54 @@ def _detect_arrhythmias_uncached(
         print(f"  - {s['label']}: {s['start_sec']:.2f}s to {s['end_sec']:.2f}s ({s['start_time_str']} - {s['end_time_str']})")
 
     return final_segments
+
+
+_PLAIN_BRADY_HR = (10.0, 57.0)    # Bradycardia: 10 < HR < 57 bpm
+# Tachycardia: HR > 100 bpm, no upper limit. Above 180 bpm the SVT rules
+# get there first (their segments block this label); a capped band left
+# beats alternating 179.6 / 180.7 bpm (RR 334 / 332 ms) with no label at all.
+_PLAIN_TACHY_HR = 100.0
+
+
+def _plain_rate_segments(peaks, hr_ok, min_dur_sec, label, color, blocked_spans, make_time_strs):
+    """Plain 'Bradycardia' / 'Tachycardia' segments, beat by beat: a beat
+    joins the current segment while its RR gives hr_ok(60000 / RR) and the
+    RR lies outside every blocked span (the other rhythm segments); the
+    first beat that fails ends the segment. Kept with >= 3 beats over
+    >= min_dur_sec, edges on the R peaks. Rate only -- no P/PR/QRS check:
+    a run with sinus evidence is already Sinus Bradycardia / Tachycardia
+    and is among the blocked spans."""
+    def beat_ok(i):
+        a, b = peaks[i], peaks[i + 1]
+        rr_ms = (b - a) * 1000.0
+        if rr_ms <= 0 or not hr_ok(60000.0 / rr_ms):
+            return False
+        return not any(a < s_end and b > s_start for s_start, s_end in blocked_spans)
+
+    segments = []
+    n = len(peaks) - 1
+    i = 0
+    while i < n:
+        if not beat_ok(i):
+            i += 1
+            continue
+        first = i
+        while i + 1 < n and beat_ok(i + 1):
+            i += 1
+        s_sec, e_sec = peaks[first], peaks[i + 1]
+        if i - first + 2 >= 3 and e_sec - s_sec >= min_dur_sec:
+            s_str, e_str = make_time_strs(s_sec, e_sec)
+            segments.append({
+                'start_sec': s_sec,
+                'end_sec': e_sec,
+                'label': label,
+                'color': color,
+                'start_time_str': s_str,
+                'end_time_str': e_str,
+                'detected_rhythm': label,
+            })
+        i += 1
+    return segments
 
 
 def convert_to_structured_events(detected_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

@@ -2529,6 +2529,11 @@ class HolterFullDisclosureDialog(QDialog):
                     return False
                 
                 ev_label = str(ev.get('label', ev.get('type', ''))).strip().lower()
+                # Plain Bradycardia / Tachycardia sit right next to Sinus
+                # Bradycardia / Tachycardia: match the exact label only, so
+                # deleting one never deletes its sinus neighbour.
+                if target_label in ('bradycardia', 'tachycardia'):
+                    return ev_label == target_label
                 canonical = next((v for k, v in targets.items() if k in ev_label), None)
                 if canonical and canonical.lower() == target_label:
                     return True
@@ -3824,6 +3829,14 @@ class HolterFullDisclosureDialog(QDialog):
             # gets no segment band: ECGStripCanvas colours its waveform and
             # puts an "A" above lead I instead.
         }
+        # The auto detector's plain rate labels (no sinus P/PR/QRS): exact
+        # label, 'Auto' source only -- the 'bradycardia' / 'tachycardia'
+        # fallbacks above still draw any other source's bare label as
+        # Sinus Bradycardia / Tachycardia.
+        plain_rate_targets = {
+            'bradycardia': ('Bradycardia', '#20B2AA'),
+            'tachycardia': ('Tachycardia', '#F08080'),
+        }
         reader_start = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
         regions = []
         bundle_branch_block_regions = []
@@ -3831,7 +3844,10 @@ class HolterFullDisclosureDialog(QDialog):
             label_raw = str(ev.get('label', ev.get('type', '')) or '')
             label_lower = label_raw.lower()
             bundle_branch_block_match = next((value for key, value in bundle_branch_block_targets.items() if key in label_lower), None)
-            match = bundle_branch_block_match or next((value for key, value in targets.items() if key in label_lower), None)
+            plain_rate_match = (plain_rate_targets.get(label_lower.strip())
+                                if str(ev.get('source', '')).lower() == 'auto' else None)
+            match = bundle_branch_block_match or plain_rate_match \
+                or next((value for key, value in targets.items() if key in label_lower), None)
             if match is None:
                 continue
             start_sec = float(ev.get('timestamp', 0.0) or 0.0)
