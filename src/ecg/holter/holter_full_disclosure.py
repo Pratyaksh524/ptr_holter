@@ -2508,6 +2508,8 @@ class HolterFullDisclosureDialog(QDialog):
                 'bradycardia': 'Sinus Bradycardia',
                 'sinus tachycardia': 'Sinus Tachycardia',
                 'tachycardia': 'Sinus Tachycardia',
+                'sinus arrhythmia': 'Sinus Arrhythmia',
+                'artifact': 'Artifact',
             }
 
             def _matches_this_auto_segment(ev):
@@ -3787,6 +3789,7 @@ class HolterFullDisclosureDialog(QDialog):
             'bradycardia': ('Sinus Bradycardia', '#00BFFF'),
             'sinus tachycardia': ('Sinus Tachycardia', '#00FFFF'),
             'tachycardia': ('Sinus Tachycardia', '#00FFFF'),
+            'sinus arrhythmia': ('Sinus Arrhythmia', '#F5DEB3'),
             # AV conduction blocks (auto_segment_arrthymia_detection.py's
             # _AV_COLORS). Exact full labels only, so a stored replay entry
             # like a bare "AV Block" isn't drawn as one of these degrees.
@@ -3805,6 +3808,10 @@ class HolterFullDisclosureDialog(QDialog):
             'incomplete left bundle branch block': ('Incomplete Left Bundle Branch Block', '#76D7C4'),
             'complete right bundle branch block': ('Complete Right Bundle Branch Block', '#E0E0E0'),
             'complete left bundle branch block': ('Complete Left Bundle Branch Block', '#1ABC9C'),
+            # Artifact (auto_segment_arrthymia_detection.py's Artifact rule)
+            # is a signal-quality layer drawn alongside the rhythm, like the
+            # bundle branch blocks, so it rides in their layer.
+            'artifact': ('Artifact', '#A0A0A0'),
         }
         reader_start = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
         regions = []
@@ -4398,6 +4405,7 @@ class HolterFullDisclosureDialog(QDialog):
                     if label.lower() in {
                         'sinus bradycardia', 'bradycardia',
                         'sinus tachycardia', 'tachycardia',
+                        'sinus arrhythmia',
                         'ventricular fibrillation', 'ventricular tachycardia',
                         'atrial fibrillation', 'atrial flutter',
                         'supraventricular tachycardia (svt)',

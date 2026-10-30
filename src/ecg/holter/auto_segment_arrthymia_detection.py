@@ -471,9 +471,49 @@ def _detect_asystole_uncached(reader) -> List[Dict[str, Any]]:
         for s, e in runs
     ]
 
+    # The flatline must be on most leads, not only on best_lead_idx: a
+    # loose / detached electrode flattens just the leads it feeds while the
+    # heart keeps beating on the rest. Seen on a human recording: V4 flat
+    # for 4.2 s (270.8-275.0 s) after its electrode lost contact, normal
+    # P-QRS-T on the other 11 leads -- called Asystole. Each lead is judged
+    # with the same 1 s block test, against its own 90th-percentile block
+    # amplitude in the 60 s around the run (75th over 30 s was too low
+    # where the run sits among other pauses -- seen: 15 bpm with 3 s pauses,
+    # most 1 s blocks around the run flat themselves). Measured: every
+    # Asystole run on the test recordings was flat on 9-12 of 12 leads; the
+    # electrode one on 1 of 12.
+    asystole_context_sec = 60.0
+
+    def _flat_on_most_leads(start_sec, end_sec):
+        c0 = max(0.0, start_sec - asystole_context_sec)
+        c1 = min(total_duration, end_sec + asystole_context_sec)
+        data = reader.read_range(c0, c1)
+        if data is None or data.shape[0] == 0:
+            return True
+        i0, i1 = int(round((start_sec - c0) * fs)), int(round((end_sec - c0) * fs))
+        flat_leads = 0
+        for li in range(data.shape[0]):
+            x = np.asarray(data[li], dtype=float)
+            ref = [float(np.ptp(x[b:b + block_samples]))
+                   for b in range(0, x.size - block_samples + 1, block_samples)]
+            if not ref:
+                continue
+            lead_ref = float(np.percentile(ref, 90))
+            ptp_limit = max(1.0, 0.08 * lead_ref)
+            std_limit = max(1.0, 0.04 * lead_ref)
+            run = x[i0:i1]
+            blocks = [run[b:b + block_samples] for b in range(0, run.size, block_samples)]
+            blocks = [blk for blk in blocks if blk.size >= block_samples * 0.5]
+            if blocks and all(float(np.ptp(blk)) < ptp_limit and float(np.std(blk)) < std_limit
+                              for blk in blocks):
+                flat_leads += 1
+        return flat_leads * 2 >= data.shape[0]
+
     segments = []
     for start_sec, end_sec in runs:
         if end_sec - start_sec < _ASYSTOLE_MIN_SEC:
+            continue
+        if not _flat_on_most_leads(start_sec, end_sec):
             continue
         s_str, e_str = _asystole_time_strs(reader, start_sec, end_sec)
         segments.append({
@@ -1726,6 +1766,174 @@ def _detect_arrhythmias_uncached(
             return flutter_label
         return _classify_atrial_fibrillation_window(context)
 
+    # Beat-by-beat check on all 12 leads, run only on a window the VFib or the
+    # AFib / Atrial Flutter rule has already called. Those rules judge one
+    # lead (the best-amplitude lead), so an artifact on that lead alone (a
+    # loose electrode, motion) or one mis-picked P wave per window made plain
+    # sinus rhythm read as VFib / AFib / Flutter. Seen on a 30 min human
+    # recording (24 y, sinus rhythm with respiratory sinus arrhythmia, RR
+    # 540-1070 ms): 13 min of AFib, 23 s of VFib and 8 s of Flutter, while
+    # Lead II showed a P wave at a fixed PR before every QRS throughout.
+    # Per lead (filtered like _classify_atrial_window), per beat:
+    #   organized QRS -- QRS boundary resolved (measure_beat) and the beat's
+    #     QRS (120 ms) correlates >= 0.9 with the lead's own median QRS of the
+    #     window, each beat aligned +/-40 ms first;
+    #   sinus beat -- the stretch 300-70 ms before the R peak (where the P wave
+    #     sits) correlates >= 0.7 with the lead's median of that stretch, AND
+    #     the diastole before it (after the previous beat's T: max(300 ms,
+    #     45% RR) after its R, up to 300 ms before this R) is quiet:
+    #     detrended peak-to-peak < 0.7 x the median P stretch's own.
+    #     One repeated P wave on an otherwise flat baseline. Fibrillatory
+    #     waves don't repeat at a fixed place before each QRS; Flutter waves
+    #     do (fixed conduction), but they fill the diastole too -- measured
+    #     on the Flutter test recordings, diastole / P stretch 0.93-0.97.
+    #     (Diastole from 38% RR instead still held the end of the T wave:
+    #     with a small P wave (V4, P ~3% of QRS) that alone failed the quiet
+    #     test on clean sinus beats.)
+    # A beat is sinus when it is on any lead; undecided when it isn't, and
+    # every lead where its P stretch matched had no diastole left to judge
+    # (rate ~100/min and up: T runs into P); otherwise fibrillatory / flutter.
+    # Undecided beats don't vote; with fewer than 3 deciding beats the old
+    # rule's label stands.
+    # Measured over every window the old rules called (all recordings):
+    #   AFib  -- sinus share of deciding beats in windows kept in the output:
+    #            at most 33%; the human recordings' false windows: >= 50% in
+    #            all but 2 lone windows (dropped by the lone-window guard).
+    #   Flutter -- 0% on the test recordings.
+    #   VFib  -- the lead with the most organized beats: at most 56% in
+    #            windows kept in the output; 75% and 83% (Lead II) in the
+    #            human recording's two false windows.
+    _BEAT_QRS_CORR = 0.9
+    _BEAT_P_CORR = 0.7
+    _BEAT_DIASTOLE_TO_P = 0.7
+    _BEAT_SINUS_MAJORITY = 0.5
+    _BEAT_MIN_DECIDING = 3
+    _BEAT_FLUTTER_LOCKED = 0.4
+    _BEAT_VFIB_ORGANIZED = 0.7
+
+    def _detrended(x):
+        x = np.asarray(x, dtype=float)
+        if x.size < 2:
+            return x - (float(x.mean()) if x.size else 0.0)
+        idx = np.arange(x.size)
+        return x - np.polyval(np.polyfit(idx, x, 1), idx)
+
+    def _beat_by_beat_evidence(padded_array, r_peaks, fs_):
+        """Per beat of r_peaks: 'atrial' -- 'sinus' / 'undecided' /
+        'fibrillatory' (None for the first beat, which has no diastole);
+        'organized_by_lead' -- per lead, the organized-QRS flag per beat."""
+        n = len(r_peaks)
+        sinus = [False] * n
+        locked_leads = [0] * n          # leads whose P stretch matched (corr only)
+        p_match_judged = [False] * n    # P stretch matched on a lead with diastole to judge
+        p_match_unjudged = [False] * n  # ... on a lead without
+        organized_by_lead = []
+        h, lag = int(0.06 * fs_), int(0.04 * fs_)
+        p_lo, p_hi = int(0.30 * fs_), int(0.07 * fs_)
+        for li in range(padded_array.shape[0]):
+            x = np.asarray(padded_array[li], dtype=float)
+            if _atrial_preproc is not None:
+                try:
+                    x = np.asarray(_atrial_preproc.process(x), dtype=float)
+                except Exception:
+                    pass
+            organized = [False] * n
+            organized_by_lead.append(organized)
+            fits = [k for k, q in enumerate(r_peaks) if q - h - lag >= 0 and q + h + lag <= x.size]
+            if len(fits) < 3:
+                continue
+            snips = [x[int(r_peaks[k]) - h:int(r_peaks[k]) + h] for k in fits]
+            template = np.median(np.asarray([s - float(np.mean(s)) for s in snips]), axis=0)
+            t_norm = float(np.linalg.norm(template))
+            if t_norm <= 0:
+                continue
+            aligned_r = {}
+            for k in fits:
+                q = int(r_peaks[k])
+                best, best_shift = -1.0, 0
+                for shift in range(-lag, lag + 1, 2):
+                    seg = x[q + shift - h:q + shift + h]
+                    seg = seg - float(np.mean(seg))
+                    nrm = float(np.linalg.norm(seg))
+                    if nrm > 0:
+                        c = float(np.dot(seg, template)) / (nrm * t_norm)
+                        if c > best:
+                            best, best_shift = c, shift
+                aligned_r[k] = q + best_shift
+                if best >= _BEAT_QRS_CORR:
+                    beat = measure_beat(x, q, fs_)
+                    organized[k] = bool(beat and beat.get('qrs_bounds_resolved'))
+
+            p_segs = {k: _detrended(x[r - p_lo:r - p_hi]) for k, r in aligned_r.items() if r - p_lo >= 0}
+            if len(p_segs) < 4:
+                continue
+            p_template = np.median(np.asarray(list(p_segs.values())), axis=0)
+            p_norm = float(np.linalg.norm(p_template))
+            p_ptp = float(np.ptp(p_template))
+            if p_norm <= 0 or p_ptp <= 0:
+                continue
+            for k in range(1, n):
+                if k not in p_segs or (k - 1) not in aligned_r:
+                    continue
+                seg = p_segs[k]
+                nrm = float(np.linalg.norm(seg))
+                if nrm <= 0 or float(np.dot(seg, p_template)) / (nrm * p_norm) < _BEAT_P_CORR:
+                    continue
+                locked_leads[k] += 1
+                if sinus[k]:
+                    continue
+                r_prev, r_cur = aligned_r[k - 1], aligned_r[k]
+                d_start = r_prev + max(int(0.30 * fs_), int(0.45 * (r_cur - r_prev)))
+                d_end = r_cur - p_lo
+                if d_end - d_start < int(0.04 * fs_):
+                    p_match_unjudged[k] = True  # no diastole left at this rate
+                    continue
+                p_match_judged[k] = True
+                if float(np.ptp(_detrended(x[d_start:d_end]))) < _BEAT_DIASTOLE_TO_P * p_ptp:
+                    sinus[k] = True
+        atrial = [None] + [
+            'sinus' if sinus[k]
+            else 'undecided' if (p_match_unjudged[k] and not p_match_judged[k])
+            else 'fibrillatory'
+            for k in range(1, n)
+        ]
+        return {'atrial': atrial, 'organized_by_lead': organized_by_lead,
+                'locked_leads': locked_leads, 'n_leads': padded_array.shape[0]}
+
+    def _flutter_waves_locked(padded_array, r_peaks, fs_):
+        """True when >= 40% of the window's beats have the stretch before
+        their QRS matching on at least half the leads.
+
+        Flutter waves are conducted at a fixed ratio, so each QRS sits at
+        the same place in the F wave cycle on every lead -- measured on the
+        Flutter test recordings: 50-100% of beats (mostly 100%) matched on
+        >= 6 of 12 leads. Motion artifact runs independently of the heart:
+        a 2 min human recording with ~5 Hz artifact on I / II / V1 read as
+        Flutter for 47 s with only 6-24% of beats matching."""
+        if len(r_peaks) < 3:
+            return True
+        ev = _beat_by_beat_evidence(padded_array, r_peaks, fs_)
+        locked = sum(1 for c in ev['locked_leads'][1:] if c * 2 >= ev['n_leads'])
+        return locked >= _BEAT_FLUTTER_LOCKED * (len(r_peaks) - 1)
+
+    def _atrial_beats_mostly_sinus(padded_array, r_peaks, fs_):
+        """True when >= half the window's deciding beats are sinus beats --
+        the window is not AFib / Flutter."""
+        if len(r_peaks) < 3:
+            return False
+        atrial = _beat_by_beat_evidence(padded_array, r_peaks, fs_)['atrial']
+        n_sinus = atrial.count('sinus')
+        n_deciding = n_sinus + atrial.count('fibrillatory')
+        return n_deciding >= _BEAT_MIN_DECIDING and n_sinus >= _BEAT_SINUS_MAJORITY * n_deciding
+
+    def _vfib_beats_organized(padded_array, r_peaks, fs_):
+        """True when one lead shows an organized QRS on >= 70% of the
+        window's beats -- the window is not VFib."""
+        if len(r_peaks) < 3:
+            return False
+        by_lead = _beat_by_beat_evidence(padded_array, r_peaks, fs_)['organized_by_lead']
+        return any(sum(flags) >= _BEAT_VFIB_ORGANIZED * len(r_peaks) for flags in by_lead)
+
     # Supraventricular Tachycardia (SVT) rule (own function, checked only after the VFib and
     # AFib/Flutter rules found nothing). Textbook picture: a regular narrow-
     # complex rhythm at 100-250/min, QRS complexes the same shape as the
@@ -2935,8 +3143,12 @@ def _detect_arrhythmias_uncached(
                         # spread was large and the wide QRS never 'resolved'.
                         # _is_vfib_window itself is unchanged; a vetoed
                         # window goes on through the rest of the chain.
+                        # Nor where one lead shows an organized QRS on most
+                        # beats (_vfib_beats_organized, beat by beat on all
+                        # 12 leads); such a window goes on through the chain.
                         elif (_is_vfib_window(padded_signal, core_r_peaks, fs)
-                              and bundle_branch_block_result is None):
+                              and bundle_branch_block_result is None
+                              and not _vfib_beats_organized(padded_array, core_r_peaks, fs)):
                             target_morph = ('Ventricular Fibrillation', '#FF3333')
                             # Called VFib on fewer than 4 measured beats: same
                             # neighbor guard (seen: the recording's last,
@@ -2962,6 +3174,16 @@ def _detect_arrhythmias_uncached(
                             # "irregular RR, no consistent PR" = AFib.
                             if atrial_label and av_ctx is not None and av_ctx['atrial_regular_for_afib_veto'] \
                                     and av_ctx['qrs_resolved_majority']:
+                                atrial_label = None
+                            # AFib / Flutter only when most beats show the
+                            # fibrillatory / flutter pattern, not a sinus P
+                            # (_atrial_beats_mostly_sinus, beat by beat).
+                            if atrial_label and _atrial_beats_mostly_sinus(padded_array, core_r_peaks, fs):
+                                atrial_label = None
+                            # Flutter waves must be locked to the QRS on most
+                            # leads (_flutter_waves_locked), not artifact.
+                            if atrial_label == 'Atrial Flutter' \
+                                    and not _flutter_waves_locked(padded_array, core_r_peaks, fs):
                                 atrial_label = None
                             if atrial_label:
                                 target_morph = (atrial_label, '#FF00FF')
@@ -4761,6 +4983,234 @@ def _detect_arrhythmias_uncached(
     except Exception as e:
         print(f"[Auto Arrhythmia Detect] Supraventricular Tachycardia gap check error: {e}")
 
+    # ------------------------------------------------------------------
+    # Artifact: its own rule. Marks stretches where some leads carry
+    # non-cardiac signal (electrode motion, a loose / detached electrode,
+    # muscle tremor) while the other leads still show the heart beating
+    # normally. Its segments are added alongside the rhythm labels (like
+    # the bundle branch block layer) and never change them.
+    # Per 10 s window:
+    #   beats -- R-peaks found by Pan-Tompkins on at least 3 of the leads
+    #     I, II, III, V1, V3, V5 within 80 ms (between them these see every
+    #     electrode, so an artifact from one electrode can't make or hide a
+    #     beat on its own);
+    #   per lead, every beat (250 ms before to 450 ms after R) minus the
+    #     median of the lead's beats within 3 s of it = the non-cardiac
+    #     residual (the median of the whole window instead mixed two
+    #     morphologies where a test recording switched rhythm);
+    #   per 2 s block, a lead is
+    #     noisy  -- residual RMS >= 25% of the window's median QRS amplitude
+    #               (all leads), or flat (lead-off: peak-to-peak < 8% of
+    #               that median) while the heart beats on the others;
+    #     clean  -- residual RMS < 15% of its own QRS amplitude, and that
+    #               QRS >= 30% of the median one.
+    #   A block is Artifact when >= 1 lead is noisy AND >= 1 lead is
+    #   clean. In VFib (and any rhythm without one repeating beat) no lead
+    #   is clean, so it is never called Artifact.
+    # Blocks merge across a gap of up to one block; a segment is kept when
+    # >= 4 s (two blocks): a lone 2 s block was a rhythm change or one
+    # ectopic beat changing shape more on some leads than others (test
+    # recordings), electrode artifact runs on. Each segment records its
+    # noisy leads ('artifact_leads').
+    # Measured on a 30 min human recording: electrode artifact at 140-170 s
+    # (I, III, aVL, V1, V4...; Lead II clean), V4 lead-off at 270-275 s,
+    # RA electrode artifact at 750-780 s (I, II, aVR; III clean). The
+    # test recordings' VFib windows: no clean lead.
+    # ------------------------------------------------------------------
+    _ART_WIN_SEC = 10.0
+    _ART_LOCAL_SEC = 3.0
+    _ART_BLOCK_SEC = 2.0
+    _ART_NOISY = 0.25
+    _ART_FLAT = 0.08
+    _ART_CLEAN = 0.15
+    _ART_CLEAN_MIN_AMP = 0.30
+    _ART_MIN_CLEAN_LEADS = 1
+    _ART_MIN_SEC = 4.0
+    _art_label = 'Artifact'
+    _art_beat_leads = [lead_names.index(n) for n in ('I', 'II', 'III', 'V1', 'V3', 'V5') if n in lead_names]
+
+    def _artifact_blocks():
+        """[(block_start_sec, block_end_sec, [noisy lead names])]"""
+        out = []
+        h0, h1 = int(0.25 * fs), int(0.45 * fs)
+        qrs_half = int(0.08 * fs)
+        _ab, _aa = _butter(2, [0.5 / (float(fs) / 2.0), 40.0 / (float(fs) / 2.0)], btype='band')
+        t = 0.0
+        while t < total_duration:
+            w_end = min(total_duration, t + _ART_WIN_SEC)
+            if w_end - t < _ART_BLOCK_SEC:
+                break
+            pad_lo, pad_hi = max(0.0, t - 1.0), min(total_duration, w_end + 1.0)
+            data = reader.read_range(pad_lo, pad_hi)
+            t_next = t + _ART_WIN_SEC
+            if data is None or data.shape[1] < int(fs):
+                t = t_next
+                continue
+            sig = np.asarray([_filtfilt(_ab, _aa, np.asarray(data[i], dtype=float))
+                              for i in range(data.shape[0])])
+            found = []
+            for li in _art_beat_leads:
+                if li < sig.shape[0]:
+                    found.extend((int(p), li) for p in pan_tompkins(sig[li], fs=fs))
+            found.sort()
+            groups = []
+            for p, li in found:
+                if groups and p - groups[-1][0] <= int(0.08 * fs):
+                    groups[-1][1].add(li)
+                    groups[-1][2].append(p)
+                else:
+                    groups.append([p, {li}, [p]])
+            peaks = [int(np.median(g[2])) for g in groups if len(g[1]) >= 3]
+            peaks = [p for p in peaks if p - h0 >= 0 and p + h1 <= sig.shape[1]
+                     and t <= pad_lo + p / fs < w_end]
+            if len(peaks) < 3:
+                t = t_next
+                continue
+            beat_t = np.asarray([pad_lo + p / fs for p in peaks])
+            per_lead = []
+            for li in range(sig.shape[0]):
+                beats = np.asarray([sig[li][p - h0:p + h1] for p in peaks])
+                beats = beats - np.median(beats, axis=1, keepdims=True)
+                template = np.median(beats, axis=0)
+                q_amp = float(np.ptp(template[h0 - qrs_half:h0 + qrs_half]))
+                residual = []
+                for j in range(len(peaks)):
+                    near = np.abs(beat_t - beat_t[j]) <= _ART_LOCAL_SEC
+                    local = np.median(beats[near], axis=0) if int(np.sum(near)) >= 3 else template
+                    residual.append(float(np.sqrt(np.mean((beats[j] - local) ** 2))))
+                residual_rms = np.asarray(residual)
+                per_lead.append((q_amp, residual_rms, sig[li]))
+            ref_amp = float(np.median([q for q, _, _ in per_lead])) or 1.0
+            b0 = t
+            while b0 + 0.5 * _ART_BLOCK_SEC <= w_end:
+                b1 = min(w_end, b0 + _ART_BLOCK_SEC)
+                sel = (beat_t >= b0) & (beat_t < b1)
+                i0, i1 = int((b0 - pad_lo) * fs), int((b1 - pad_lo) * fs)
+                noisy, clean = [], 0
+                for li, (q_amp, res, x) in enumerate(per_lead):
+                    flat = float(np.ptp(x[i0:i1])) < _ART_FLAT * ref_amp
+                    res_b = float(np.sqrt(np.mean(res[sel] ** 2))) if np.any(sel) else None
+                    if flat or (res_b is not None and res_b >= _ART_NOISY * ref_amp):
+                        noisy.append(lead_names[li] if li < len(lead_names) else str(li))
+                    elif (res_b is not None and q_amp >= _ART_CLEAN_MIN_AMP * ref_amp
+                          and res_b < _ART_CLEAN * q_amp):
+                        clean += 1
+                if noisy and clean >= _ART_MIN_CLEAN_LEADS:
+                    out.append((b0, b1, noisy))
+                b0 = b1
+            t = t_next
+        return out
+
+    try:
+        _art_segments = []
+        for b0, b1, leads in _artifact_blocks():
+            if _art_segments and b0 <= _art_segments[-1]['end_sec'] + _ART_BLOCK_SEC + 1e-6:
+                last = _art_segments[-1]
+                last['end_sec'] = float(b1)
+                last['artifact_leads'] = sorted(set(last['artifact_leads']) | set(leads),
+                                                key=lambda n: lead_names.index(n) if n in lead_names else 99)
+            else:
+                _art_segments.append({'start_sec': float(b0), 'end_sec': float(b1), 'artifact_leads': list(leads)})
+        _art_segments = [seg for seg in _art_segments
+                         if seg['end_sec'] - seg['start_sec'] >= _ART_MIN_SEC - 1e-6]
+        for seg in _art_segments:
+            s_str, e_str = make_time_strs(seg['start_sec'], seg['end_sec'])
+            seg.update({'label': _art_label, 'color': '#A0A0A0', 'start_time_str': s_str,
+                        'end_time_str': e_str, 'detected_rhythm': _art_label})
+        final_segments.extend(_art_segments)
+        final_segments.sort(key=lambda x: x['start_sec'])
+    except Exception as e:
+        print(f"[Auto Arrhythmia Detect] Artifact check error: {e}")
+
+    # ------------------------------------------------------------------
+    # Sinus Arrhythmia: its own rule, run last, only in time no other label
+    # covers -- so it never changes any other label's segments.
+    # Sinus rhythm whose rate rises and falls (respiratory, mostly in the
+    # young): every QRS still has its P wave at a constant PR, only the
+    # cycle length changes. Per run of 10 consecutive beats:
+    #   1. sinus conduction -- sinus_conduction_gate (the same P / PR / QRS
+    #      gate as Sinus Bradycardia / Tachycardia);
+    #   2. RR varies: longest - shortest >= 120 ms (the usual P-P > 0.12 s
+    #      definition);
+    #   3. gradually: no beat-to-beat change > 20% of the run's median RR
+    #      and no RR outside 0.7-1.4x median -- a premature beat, a pause or
+    #      a missed / extra R-peak is not sinus arrhythmia;
+    #   4. phasic: >= 3 beat-to-beat changes of >= 40 ms, both lengthening
+    #      and shortening -- the rate rises and falls. One rate step (seen:
+    #      a test recording going 60 -> 70 bpm, RR 1000 -> 856 ms once, flat
+    #      on both sides) is a rate change, not sinus arrhythmia.
+    # Qualifying runs are merged (gap <= 3 s), cut out of any other label's
+    # time, and kept when >= 8 s long.
+    # ------------------------------------------------------------------
+    _SA_BEATS = 10
+    _SA_MIN_RANGE_MS = 120.0
+    _SA_MAX_STEP = 0.20
+    _SA_RR_BOUNDS = (0.7, 1.4)
+    _SA_MIN_STEP_MS = 40.0
+    _SA_MIN_STEPS = 3
+    _SA_MERGE_GAP_SEC = 3.0
+    _SA_MIN_SEC = 8.0
+    _sa_label = 'Sinus Arrhythmia'
+
+    def _sinus_arrhythmia_runs():
+        runs = []
+        for i in range(0, len(all_r_peaks) - _SA_BEATS + 1):
+            j = i + _SA_BEATS - 1
+            rr = np.diff(np.asarray(all_r_peaks[i:j + 1], dtype=float)) * 1000.0
+            med = float(np.median(rr))
+            if med <= 0:
+                continue
+            if float(rr.max() - rr.min()) < _SA_MIN_RANGE_MS:
+                continue
+            if rr.min() < _SA_RR_BOUNDS[0] * med or rr.max() > _SA_RR_BOUNDS[1] * med:
+                continue
+            steps = np.diff(rr)
+            if steps.size and float(np.max(np.abs(steps))) > _SA_MAX_STEP * med:
+                continue
+            big = steps[np.abs(steps) >= _SA_MIN_STEP_MS]
+            if big.size < _SA_MIN_STEPS or not (np.any(big > 0) and np.any(big < 0)):
+                continue
+            if not sinus_conduction_gate(i, j):
+                continue
+            s, e = all_r_peaks[i], all_r_peaks[j]
+            if runs and s <= runs[-1][1] + _SA_MERGE_GAP_SEC:
+                runs[-1][1] = max(runs[-1][1], e)
+            else:
+                runs.append([s, e])
+        return runs
+
+    try:
+        _sa_covered = sorted((s['start_sec'], s['end_sec']) for s in final_segments)
+        for sa_start, sa_end in _sinus_arrhythmia_runs():
+            pieces = [(sa_start, sa_end)]
+            for c_start, c_end in _sa_covered:
+                next_pieces = []
+                for p_start, p_end in pieces:
+                    if c_end <= p_start or c_start >= p_end:
+                        next_pieces.append((p_start, p_end))
+                        continue
+                    if c_start > p_start:
+                        next_pieces.append((p_start, c_start))
+                    if c_end < p_end:
+                        next_pieces.append((c_end, p_end))
+                pieces = next_pieces
+            for p_start, p_end in pieces:
+                if p_end - p_start < _SA_MIN_SEC:
+                    continue
+                s_str, e_str = make_time_strs(p_start, p_end)
+                final_segments.append({
+                    'start_sec': float(p_start),
+                    'end_sec': float(p_end),
+                    'label': _sa_label,
+                    'color': '#7FFFD4',
+                    'start_time_str': s_str,
+                    'end_time_str': e_str,
+                    'detected_rhythm': _sa_label,
+                })
+        final_segments.sort(key=lambda x: x['start_sec'])
+    except Exception as e:
+        print(f"[Auto Arrhythmia Detect] Sinus Arrhythmia check error: {e}")
+
     print(f"[Auto Arrhythmia Detect] Found {len(final_segments)} exact rhythm segments:")
     for s in final_segments:
         print(f"  - {s['label']}: {s['start_sec']:.2f}s to {s['end_sec']:.2f}s ({s['start_time_str']} - {s['end_time_str']})")
@@ -4958,6 +5408,8 @@ def apply_auto_segments_to_engine(
         'fibrillation', 'vfib', 'afib', 'flutter',
         'ventricular tachycardia', 'vtach',
         'bradycardia', 'tachycardia',
+        'sinus arrhythmia',
+        'artifact',
         'av block',
         'bundle branch block',
     )

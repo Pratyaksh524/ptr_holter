@@ -39,6 +39,7 @@ def _detector_owns_label(label: str) -> bool:
     return lower in {
         'ventricular fibrillation', 'ventricular tachycardia', 'atrial fibrillation', 'atrial flutter',
         'supraventricular tachycardia (svt)', 'sinus bradycardia', 'sinus tachycardia',
+        'sinus arrhythmia', 'artifact',
     } or 'av block' in lower or 'bundle branch block' in lower
 
 

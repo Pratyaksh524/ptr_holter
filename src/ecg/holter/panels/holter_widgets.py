@@ -1664,7 +1664,7 @@ class ECGStripCanvas(QWidget):
                 elif ev_lbl == 'x':
                     active_label = 'X'
                 # Check for full label names (from auto-detection)
-                elif 'asystole' in ev_lbl:
+                elif 'asystole' in ev_lbl or 'artifact' in ev_lbl:
                     active_label = 'X'
                 elif 'ventricular fibrillation' in ev_lbl or 'vfib' in ev_lbl:
                     active_label = 'V'
@@ -1682,6 +1682,8 @@ class ECGStripCanvas(QWidget):
                 elif 'sinus bradycardia' in ev_lbl:
                     active_label = 'S'
                 elif 'sinus tachycardia' in ev_lbl:
+                    active_label = 'S'
+                elif 'sinus arrhythmia' in ev_lbl:
                     active_label = 'S'
                 elif 'bradycardia (non-sinus)' in ev_lbl:
                     active_label = 'S'
