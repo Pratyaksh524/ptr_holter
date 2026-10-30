@@ -3809,9 +3809,8 @@ class HolterFullDisclosureDialog(QDialog):
             'complete right bundle branch block': ('Complete Right Bundle Branch Block', '#E0E0E0'),
             'complete left bundle branch block': ('Complete Left Bundle Branch Block', '#1ABC9C'),
             # Artifact (auto_segment_arrthymia_detection.py's Artifact rule)
-            # is a signal-quality layer drawn alongside the rhythm, like the
-            # bundle branch blocks, so it rides in their layer.
-            'artifact': ('Artifact', '#A0A0A0'),
+            # gets no segment band: ECGStripCanvas colours its waveform and
+            # puts an "A" above lead I instead.
         }
         reader_start = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
         regions = []

@@ -26,8 +26,10 @@ from PyQt5.QtCore import QEvent
 from PyQt5.QtWidgets import (QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QScrollArea,
                              QVBoxLayout, QWidget)
 from scipy.ndimage import gaussian_filter1d
+from scipy.signal import filtfilt
 
 from ..ecg_filters import _GAUSSIAN_HALF_WIDTH_SIGMAS, _GAUSSIAN_SIGMA_AT_MINUS_3DB
+from ..enhanced_filter import make_notch
 from .file_format import LEAD_NAMES
 
 FS = 500
@@ -44,22 +46,25 @@ ADC_MIN, ADC_MAX, ADC_BASELINE = 0, 4096, 2048
 DFT_CUTOFF_HZ = 0.5
 DFT_SIGMA_SAMPLES = _GAUSSIAN_SIGMA_AT_MINUS_3DB * FS / DFT_CUTOFF_HZ
 
+# Display-only smoothing, same chain as the workspace strips
+# (holter_widgets.ECGStripCanvas.set_data): 50 and 60 Hz notches, then after
+# the DFT filter a 3-point median and a 35 Hz Gaussian low-pass run twice. A
+# Gaussian has no overshoot, so it adds no false J-point notch after the QRS
+# the way a Butterworth low-pass does. Never applied to the recorded data.
+MAINS_NOTCHES = [make_notch(hz, FS) for hz in (50.0, 60.0)]
+SMOOTH_CUTOFF_HZ = 35.0
+SMOOTH_SIGMA_SAMPLES = FS / (2.0 * np.pi * SMOOTH_CUTOFF_HZ)
+
 # Paper speed sets how many seconds fit across the sheet (10 s at 25 mm/s).
 MM_PER_SEC_CHOICES = (12.5, 25.0, 50.0)
 SHEET_SECONDS_AT_25 = 10.0
 
-# Monitor style: black screen, light grey grid, only the ECG trace is green.
+# Monitor style: black screen, no grid, only the ECG trace is green.
 PAPER_BG = "#000000"
-GRID_MINOR = (45, 45, 45)
-GRID_MAJOR = (90, 90, 90)
-BASELINE_COLOR = (130, 130, 130)
 TRACE = "#00FF00"
 LABEL_COLOR = "#D0D0D0"
-AXIS_COLOR = "#B0B0B0"
 LEAD_OFF_COLOR = "#FF3333"
 ROWS_PER_PAGE = 6                # lead rows visible at once; more rows scroll vertically
-TIME_MINOR_S, TIME_MAJOR_S = 0.04, 0.2       # 1 mm / 5 mm at 25 mm/s
-ADC_MINOR, ADC_MAJOR = 256, 1024
 
 # Lead placement: list of columns, each column a list of leads top to bottom.
 LAYOUTS = {
@@ -77,6 +82,23 @@ def dft_filter_gaussian(block: np.ndarray, fs: float = FS, cutoff_hz: float = DF
     baseline = gaussian_filter1d(block, sigma, axis=-1, mode="mirror",
                                  truncate=_GAUSSIAN_HALF_WIDTH_SIGMAS)
     return block - baseline
+
+
+def remove_mains(block: np.ndarray) -> np.ndarray:
+    """Zero-phase 50 and 60 Hz notches on (leads, samples)."""
+    for bq in MAINS_NOTCHES:
+        block = filtfilt(bq.b, bq.a, block, axis=-1)
+    return block
+
+
+def smooth_for_display(block: np.ndarray) -> np.ndarray:
+    """3-point median, then the 35 Hz Gaussian low-pass twice, per lead."""
+    p = np.pad(block, ((0, 0), (1, 1)), mode="edge")
+    block = np.median(np.stack((p[:, :-2], p[:, 1:-1], p[:, 2:])), axis=0)
+    for _ in range(2):
+        block = gaussian_filter1d(block, SMOOTH_SIGMA_SAMPLES, axis=-1, mode="mirror",
+                                  truncate=_GAUSSIAN_HALF_WIDTH_SIGMAS)
+    return block
 
 
 # -----------------------------------------------------------------------------
@@ -198,7 +220,7 @@ class _ScrollFriendlyLayoutWidget(pg.GraphicsLayoutWidget):
 class Live12LeadPlotter(QWidget):
     """12-lead live view, one ADC axis (0-4096, baseline 2048) per lead."""
 
-    def __init__(self, parent=None, layout_name: str = "3x4"):
+    def __init__(self, parent=None, layout_name: str = "12x1"):
         super().__init__(parent)
         self._n = FS * BUFFER_SECONDS
         self._ring = np.zeros((len(LEAD_NAMES), self._n))
@@ -218,6 +240,33 @@ class Live12LeadPlotter(QWidget):
         self._redraw_timer = QTimer(self)
         self._redraw_timer.timeout.connect(self._redraw)
         self._redraw_timer.start(REDRAW_MS)
+
+        self._elapsed_t0 = None
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.timeout.connect(self._update_elapsed)
+
+    # ---- elapsed timer (runs from Connect & Start to Stop) -------------------
+
+    def start_elapsed_timer(self):
+        self._elapsed_t0 = time.monotonic()
+        self._update_elapsed()
+        self._elapsed_timer.start(500)
+
+    def stop_elapsed_timer(self):
+        """Stop counting; the label keeps the final time."""
+        if self._elapsed_t0 is not None:
+            self._update_elapsed()
+        self._elapsed_timer.stop()
+        self._elapsed_t0 = None
+
+    def _update_elapsed(self):
+        if self._elapsed_t0 is None:
+            return
+        secs = int(time.monotonic() - self._elapsed_t0)
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        # mm:ss up to 60 min, then hh:mm:ss
+        self._elapsed_label.setText(f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}")
 
     # ---- live_source interface (read by HolterMainWindow) -------------------
 
@@ -294,7 +343,9 @@ class Live12LeadPlotter(QWidget):
             bar.addSpacing(12)
         bar.addWidget(self._filter_chk)
         bar.addStretch(1)
-        bar.addWidget(QLabel(f"Y: {ADC_MIN}-{ADC_MAX} ADC, baseline {ADC_BASELINE}"))
+        self._elapsed_label = QLabel("00:00")
+        self._elapsed_label.setStyleSheet("font-weight:bold;")
+        bar.addWidget(self._elapsed_label)
         root.addLayout(bar)
 
         self._view = _ScrollFriendlyLayoutWidget()
@@ -346,7 +397,6 @@ class Live12LeadPlotter(QWidget):
         cols = LAYOUTS[self._layout_name]
         n_rows = max(len(c) for c in cols)
         secs = self._seconds_per_column()
-        axis_pen = pg.mkPen(AXIS_COLOR)
 
         for r in range(n_rows):
             for c, leads in enumerate(cols):
@@ -358,17 +408,9 @@ class Live12LeadPlotter(QWidget):
                 plot.hideButtons()
                 plot.setMenuEnabled(False)
                 plot.hideAxis("bottom")
-                left = plot.getAxis("left")
-                if c == 0:
-                    left.setTicks([[(v, str(v)) for v in (ADC_MIN, ADC_BASELINE, ADC_MAX)]])
-                    left.setPen(axis_pen)
-                    left.setTextPen(axis_pen)
-                    left.setWidth(40)
-                else:
-                    plot.hideAxis("left")
+                plot.hideAxis("left")
                 plot.setXRange(0, secs, padding=0)
                 plot.setYRange(ADC_MIN, ADC_MAX, padding=0)
-                self._add_grid(plot, secs)
 
                 label = pg.TextItem(name, color=LABEL_COLOR, anchor=(0, 0))
                 label.setPos(0.02 * secs, ADC_MAX)
@@ -383,22 +425,6 @@ class Live12LeadPlotter(QWidget):
                 plot.addItem(curve)
                 self._curves[name] = curve
 
-    @staticmethod
-    def _add_grid(plot, secs):
-        def lines(t_step, a_step, pen, z):
-            xs = np.arange(0, secs + 1e-9, t_step)
-            ys = np.arange(ADC_MIN, ADC_MAX + 1, a_step)
-            x = np.concatenate([np.repeat(xs, 2), np.tile([0, secs], len(ys))])
-            y = np.concatenate([np.tile([ADC_MIN, ADC_MAX], len(xs)), np.repeat(ys, 2)])
-            item = pg.PlotCurveItem(x=x, y=y, connect="pairs", pen=pen)
-            item.setZValue(z)
-            plot.addItem(item)
-        lines(TIME_MINOR_S, ADC_MINOR, pg.mkPen(GRID_MINOR, width=0.5), -12)
-        lines(TIME_MAJOR_S, ADC_MAJOR, pg.mkPen(GRID_MAJOR, width=1.0), -11)
-        base = pg.InfiniteLine(pos=ADC_BASELINE, angle=0, pen=pg.mkPen(BASELINE_COLOR, width=1, style=Qt.DashLine))
-        base.setZValue(-10)
-        plot.addItem(base)
-
     # ---- drawing ---------------------------------------------------------
 
     def _redraw(self):
@@ -412,10 +438,13 @@ class Live12LeadPlotter(QWidget):
         if n_ctx < 2:
             return
         window = self._latest(n_ctx)
+        if n_ctx > 15:
+            window = remove_mains(window)
         if self._filter_on:
             sig = dft_filter_gaussian(window)
         else:
             sig = window - np.median(window, axis=1, keepdims=True)
+        sig = smooth_for_display(sig)
         sig = np.clip(sig[:, -n_show:] + ADC_BASELINE, ADC_MIN, ADC_MAX)
         x = np.arange(sig.shape[1]) / FS
         for i, name in enumerate(LEAD_NAMES):

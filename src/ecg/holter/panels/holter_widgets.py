@@ -71,6 +71,9 @@ except ImportError:
     make_notch = None
     scipy_filtfilt = None
 
+# Waveform colour and "A" mark for an auto-detected Artifact stretch.
+AUTO_ARTIFACT_COLOR = "#FF3333"
+
 
 def _remove_mains(x, fs):
     """Zero-phase 50 and 60 Hz notches (Q=25). Recordings do not store which
@@ -1603,6 +1606,7 @@ class ECGStripCanvas(QWidget):
         
         # Determine colored intervals based on annotations and structured events
         colored_intervals = []
+        artifact_marks = []   # sample index where each auto Artifact stretch starts in view
         end_sec = self._start_sec + len(d) / self._fs
         
         # 1. Color full regions for arrhythmias from _structured_events
@@ -1712,6 +1716,17 @@ class ECGStripCanvas(QWidget):
                         active_label = 'P'
                     elif ev_lbl_orig == 'X':
                         active_label = 'X'
+
+                # Auto-detected Artifact has no Full Disclosure segment band;
+                # its waveform is coloured over the whole stretch instead,
+                # and lead I gets an "A" above it (drawn after the trace).
+                if not is_manual_structured and ev_lbl == 'artifact' and ev.get('end_timestamp') is not None:
+                    start_idx = max(0, int((region_start_ts - self._start_sec) * self._fs))
+                    end_idx = min(len(d) - 1, int((region_end_ts - self._start_sec) * self._fs))
+                    if start_idx < end_idx:
+                        colored_intervals.append((start_idx, end_idx, AUTO_ARTIFACT_COLOR))
+                        artifact_marks.append(start_idx)
+                    continue
 
                 # Automatic arrhythmia regions are represented by the
                 # Full Disclosure segment overlay. Keep this canvas pass for
@@ -1902,6 +1917,18 @@ class ECGStripCanvas(QWidget):
             for xv, yv in zip(xs[start_idx + 1:end_idx + 1], ys[start_idx + 1:end_idx + 1]):
                 seg_path.lineTo(xv, yv)
             painter.drawPath(seg_path)
+
+        if artifact_marks and getattr(self, 'lead_name', '') == 'I':
+            painter.save()
+            mark_font = painter.font()
+            mark_font.setBold(True)
+            mark_font.setPointSize(10)
+            painter.setFont(mark_font)
+            painter.setPen(QColor(AUTO_ARTIFACT_COLOR))
+            fm = painter.fontMetrics()
+            for idx in artifact_marks:
+                painter.drawText(int(xs[min(idx, n - 1)]) + 2, fm.ascent(), "A")
+            painter.restore()
 
         # --- Draw Auto-Detected Arrhythmia Labels ---
         # (REMOVED: Floating overlay labels have been migrated to the ArrhythmiaBadgeBar at the bottom of the window)

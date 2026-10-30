@@ -2,13 +2,15 @@
 
     python src/main.py
 
-Main window: device connection + live 12-lead plotter. "Start Recording"
-opens a Holter session (HolterStreamWriter + HolterAnalysisWorker) and the
-analysis workspace (HolterMainWindow) with this window's plotter as its live
-source. "Previous Recordings" opens the workspace on saved sessions.
+Main window: device connection + live 12-lead plotter. "Connect & Start"
+also opens a Holter session (HolterStreamWriter + HolterAnalysisWorker), so
+everything shown from connect to "Stop" is saved for all 12 leads.
+"Previous Recordings" opens the analysis workspace (HolterMainWindow) on the
+saved-recordings list.
 See ARCHITECTURE.md at the repo root.
 """
 
+import json
 import multiprocessing
 import os
 import sys
@@ -33,11 +35,12 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtWidgets import (QApplication, QComboBox, QHBoxLayout, QLabel, QMainWindow,
+from PyQt5.QtWidgets import (QApplication, QComboBox, QDialog, QHBoxLayout, QLabel, QMainWindow,
                              QMessageBox, QPushButton, QVBoxLayout, QWidget)
 
 from ecg.holter.analysis_worker import HolterAnalysisWorker
-from ecg.holter.holter_ui import HolterMainWindow, _find_latest_completed_session, _resolve_recordings_dir
+from ecg.holter.holter_ui import (HolterMainWindow, HolterStartDialog, _find_latest_completed_session,
+                                  _resolve_recordings_dir)
 from ecg.holter.live_12lead_plotter import FS, DeviceAcquisition, Live12LeadPlotter
 from ecg.holter.stream_writer import HolterStreamWriter
 
@@ -61,6 +64,7 @@ class ComprehensiveMainWindow(QMainWindow):
         self._worker = None
         self._workspace = None
         self._last_valid = {}
+        self._user_stopping = False
 
         self._build_ui()
         self._refresh_ports()
@@ -85,10 +89,6 @@ class ComprehensiveMainWindow(QMainWindow):
         self._connect_btn.clicked.connect(self._start_acquisition)
         self._stop_btn = QPushButton("Stop")
         self._stop_btn.clicked.connect(self._stop_acquisition)
-        self._rec_btn = QPushButton("Start Recording")
-        self._rec_btn.clicked.connect(self._toggle_recording)
-        self._workspace_btn = QPushButton("Open Workspace")
-        self._workspace_btn.clicked.connect(self._open_workspace)
         prev_btn = QPushButton("Previous Recordings")
         prev_btn.clicked.connect(self._open_previous)
 
@@ -96,7 +96,7 @@ class ComprehensiveMainWindow(QMainWindow):
         bar.addWidget(self._port_box)
         bar.addWidget(refresh)
         bar.addSpacing(16)
-        for b in (self._connect_btn, self._stop_btn, self._rec_btn, self._workspace_btn, prev_btn):
+        for b in (self._connect_btn, self._stop_btn, prev_btn):
             bar.addWidget(b)
         bar.addStretch(1)
         self._rec_label = QLabel("")
@@ -126,11 +126,8 @@ class ComprehensiveMainWindow(QMainWindow):
         running = self._acq.is_running
         recording = bool(self._writer and self._writer.is_running)
         self._connect_btn.setEnabled(not running)
-        self._stop_btn.setEnabled(running and not recording)
+        self._stop_btn.setEnabled(running or recording)
         self._port_box.setEnabled(not running)
-        self._rec_btn.setEnabled(running or recording)
-        self._rec_btn.setText("Stop Recording" if recording else "Start Recording")
-        self._workspace_btn.setEnabled(recording)
         self._rec_label.setText("● REC" if recording else "")
 
     def _update_status(self):
@@ -156,6 +153,10 @@ class ComprehensiveMainWindow(QMainWindow):
         if not ok:
             self.statusBar().showMessage("Not connected")
             QMessageBox.warning(self, APP_NAME, f"Could not connect to the ECG device.\n\n{err}")
+        else:
+            self._plotter.start_elapsed_timer()
+            if not (self._writer and self._writer.is_running):
+                self._start_recording()
         self._update_buttons()
 
     def _on_device_info(self, version, serial_no):
@@ -168,23 +169,28 @@ class ComprehensiveMainWindow(QMainWindow):
                 self._writer.push(Live12LeadPlotter.fill_lead_off(p, self._last_valid))
 
     def _stop_acquisition(self):
-        self._acq.stop()
+        # Stop the device first, so nothing is acquired while the save dialog
+        # is open. The flag keeps that "stopped" signal from reading as the
+        # device dropping out mid-recording.
+        self._plotter.stop_elapsed_timer()
+        self._user_stopping = True
+        try:
+            self._acq.stop()
+        finally:
+            self._user_stopping = False
+        if self._writer and self._writer.is_running:
+            self._stop_recording()
         self._update_buttons()
 
     def _on_acq_stopped(self):
-        if self._writer and self._writer.is_running:
+        self._plotter.stop_elapsed_timer()
+        if self._writer and self._writer.is_running and not self._user_stopping:
             QMessageBox.warning(self, APP_NAME, "The device stopped sending data. The recording has been stopped.")
             self._stop_recording()
         self.statusBar().showMessage("Not connected")
         self._update_buttons()
 
     # ---- recording --------------------------------------------------------
-
-    def _toggle_recording(self):
-        if self._writer and self._writer.is_running:
-            self._stop_recording()
-        else:
-            self._start_recording()
 
     def _start_recording(self):
         out_dir = _resolve_recordings_dir("")
@@ -200,7 +206,6 @@ class ComprehensiveMainWindow(QMainWindow):
         self._writer.attach_analysis_worker(self._worker)
         self._worker.start()
         print(f"[Comprehensive] recording started in {session_dir}")
-        self._open_workspace()
         self._update_buttons()
 
     def _stop_recording(self):
@@ -208,32 +213,31 @@ class ComprehensiveMainWindow(QMainWindow):
         # + load the finished session). Fall back to stopping the writer here.
         if self._workspace is not None and getattr(self._workspace, "_writer", None) is self._writer:
             self._workspace._stop_recording()
-        elif self._writer:
-            self._writer.stop()
+        elif self._writer and self._writer.is_running:
+            self._save_capture(self._writer.stop())
         self._writer = None
         self._worker = None
         self._update_buttons()
 
-    def _open_workspace(self):
-        recording = bool(self._writer and self._writer.is_running)
-        if self._workspace is None or not self._workspace.isVisible():
-            self._workspace = HolterMainWindow(
-                parent=self,
-                session_dir=self._writer.session_dir if recording else "",
-                patient_info={},
-                writer=self._writer if recording else None,
-                live_source=self._plotter if recording else None,
-                duration_hours=24,
-            )
-        elif recording:
-            self._workspace.attach_writer(self._writer, self._writer.session_dir, {})
-        self._workspace.showMaximized()
-        self._workspace.raise_()
-        self._workspace.activateWindow()
+    def _save_capture(self, summary):
+        """Ask for the patient details of a capture saved without the workspace open."""
+        session_dir = summary.get("session_dir", "")
+        if not session_dir:
+            return
+        dialog = HolterStartDialog(self, patient_info={}, output_dir=session_dir)
+        dialog.setWindowTitle("Save Comprehensive ECG Analysis Recording Details")
+        if dialog.exec_() == QDialog.Accepted and dialog.get_result():
+            patient_info = dialog.get_result()[0]
+            try:
+                with open(os.path.join(session_dir, "patient.json"), "w") as f:
+                    json.dump(patient_info, f, indent=4)
+            except Exception as e:
+                print(f"[Comprehensive] could not save patient.json: {e}")
+        QMessageBox.information(self, APP_NAME, f"Recording saved to:\n{session_dir}")
 
     def _open_previous(self):
         if self._writer and self._writer.is_running:
-            QMessageBox.information(self, APP_NAME, "Stop the current recording first.")
+            QMessageBox.information(self, APP_NAME, "Press Stop first to save the current recording.")
             return
         ws = HolterMainWindow(parent=self, session_dir="", patient_info={}, writer=None, live_source=None)
         try:
@@ -242,6 +246,7 @@ class ComprehensiveMainWindow(QMainWindow):
                 ws.load_completed_session(latest)
         except Exception as e:
             print(f"[Comprehensive] could not load latest session: {e}")
+        ws._focus_tab("RECORDINGS")
         self._workspace = ws
         ws.showMaximized()
         ws.raise_()
