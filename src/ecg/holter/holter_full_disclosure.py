@@ -25,22 +25,24 @@ Classes:
 import os
 import json
 import copy
+import math
 import numpy as np
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
     QWidget, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QSpinBox, QScrollBar, QSizePolicy, QApplication, QTabBar,
+    QScrollArea,
 )
 from PyQt5.QtCore import Qt, QEvent, QRect, QTimer
 from PyQt5.QtGui import QPainter, QPen, QColor
 
 try:
-    from .theme import (COL_BLACK, COL_DARK, COL_GREEN, COL_GREEN_DRK, COL_WHITE, COL_GRID_MAJOR,
+    from .theme import (COL_BLACK, COL_DARK, COL_GREEN, COL_GREEN_DRK, COL_WHITE, COL_GRID_MAJOR, COL_GRID_MINOR,
                         TOOL_RULER, TOOL_CALIPER, TOOL_MAGNIFY, TOOL_SELECT)
     from .holter_ui import ECGStripCanvas, MagnifierOverlay
 except ImportError:
-    from ecg.holter.theme import (COL_BLACK, COL_DARK, COL_GREEN, COL_GREEN_DRK, COL_WHITE, COL_GRID_MAJOR,
+    from ecg.holter.theme import (COL_BLACK, COL_DARK, COL_GREEN, COL_GREEN_DRK, COL_WHITE, COL_GRID_MAJOR, COL_GRID_MINOR,
                                    TOOL_RULER, TOOL_CALIPER, TOOL_MAGNIFY, TOOL_SELECT)
     from ecg.holter.holter_ui import ECGStripCanvas, MagnifierOverlay
 
@@ -192,6 +194,121 @@ class VerticalLineOverlay(QWidget):
         painter.end()
 
 
+class PageGridBackground(QWidget):
+    """
+    Draws the ECG graph-paper grid once across the whole canvas area, sitting
+    behind every per-lead canvas. Same minor/major spacing and colors as
+    ECGStripCanvas's own grid (see panels/holter_widgets.py), just drawn on
+    one widget spanning all 12 leads instead of restarting inside each lead's
+    own small container -- so it reads as one continuous sheet of paper
+    instead of 12 separate patches with the grid resetting at each row.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        # TODO: Testing mode toggle: 'dark' (default) or 'graph' (medical ECG paper)
+        self._mode = 'dark'
+
+    def set_mode(self, mode: str):
+        self._mode = mode
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        w, h = self.width(), self.height()
+
+        if self._mode == 'graph':
+            # Medical Standard ECG Graph Paper Mode — 3-level grid matching Image 1:
+            #   Level 1 (tiny)  : 8px  = 1mm  → very faint pink lines
+            #   Level 2 (small) : 40px = 5mm  → 5 tiny boxes per small box
+            #   Level 3 (large) : 200px= 25mm → 5 small boxes per large block
+            painter.fillRect(self.rect(), QColor("#FFE8EA"))
+
+            # Level 1: Faint pink tiny grid (8px)
+            pen_tiny = QPen(QColor("#FFCDD2"))
+            pen_tiny.setWidth(1)
+
+            # Level 2: Slightly more visible small box grid (40px)
+            pen_small = QPen(QColor("#F4A0AC"))
+            pen_small.setWidth(1)
+
+            dpi_x = max(72.0, float(self.physicalDpiX() or self.logicalDpiX()))
+            dpi_y = max(72.0, float(self.physicalDpiY() or self.logicalDpiY()))
+            px_per_mm_x = dpi_x / 25.4
+            px_per_mm_y = dpi_y / 25.4
+
+            # Level 3: Clearly visible large box boundary (200px)
+
+            step_tiny  = 8    # 1mm → 8px  (tiny box)
+            step_small = 40   # 5mm → 40px (5 tiny = 1 small)
+            step_large = 200  # 25mm→ 200px (5 small = 1 large)
+
+            # Draw Level 1: tiny grid lines (skip small and large boundaries)
+            painter.setPen(pen_tiny)
+            for mm in range(0, int(w / px_per_mm_x) + 1):
+                gx = round(mm * px_per_mm_x)
+                if mm % 5 != 0:
+                    painter.drawLine(gx, 0, gx, h)
+            for mm in range(0, int(h / px_per_mm_y) + 1):
+                gy = round(mm * px_per_mm_y)
+                if mm % 5 != 0:
+                    painter.drawLine(0, gy, w, gy)
+
+            # Draw Level 2: small box lines (skip large boundaries)
+            painter.setPen(pen_small)
+            for mm in range(0, int(w / px_per_mm_x) + 1, 5):
+                gx = round(mm * px_per_mm_x)
+                painter.drawLine(gx, 0, gx, h)
+            for mm in range(0, int(h / px_per_mm_y) + 1, 5):
+                gy = round(mm * px_per_mm_y)
+                painter.drawLine(0, gy, w, gy)
+
+            # Draw Level 3: large block boundaries (always visible)
+        else:
+            # Default Dark Mode
+            painter.fillRect(self.rect(), QColor(COL_BLACK))
+            minor_pen = QPen(QColor(COL_GRID_MINOR))
+            minor_pen.setWidth(1)
+            major_pen = QPen(QColor(COL_GRID_MAJOR))
+            major_pen.setWidth(1)
+            for gx in range(0, w, 20):
+                painter.setPen(major_pen if gx % 100 == 0 else minor_pen)
+                painter.drawLine(gx, 0, gx, h)
+            for gy in range(0, h, 20):
+                painter.setPen(major_pen if gy % 100 == 0 else minor_pen)
+                painter.drawLine(0, gy, w, gy)
+
+        painter.end()
+
+
+class HorizontalOnlyScrollArea(QScrollArea):
+    """
+    QScrollArea that never scrolls itself vertically from the mouse wheel --
+    only a manual left-click-drag on its scrollbar moves between leads.
+    Wheel input is always redirected to the dialog's horizontal time
+    scrollbar instead, same as ECGStripCanvas.wheelEvent does, so scrolling
+    anywhere over the lead list (canvas, label, or the gap between rows)
+    scrubs time rather than paging through leads.
+    """
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta != 0:
+            parent = self.parentWidget()
+            while parent is not None:
+                if hasattr(parent, '_consume_wheel_notches'):
+                    # Normalize by Qt's standard 120-per-notch convention
+                    # instead of treating every wheelEvent() call as exactly
+                    # one notch -- see ECGStripCanvas.wheelEvent for why.
+                    # Debounced there too, so a trackpad flick that fires
+                    # this twice in quick succession still moves one notch.
+                    parent._consume_wheel_notches(delta / 120.0)
+                    break
+                parent = parent.parentWidget()
+        event.accept()
+
+
 class SegmentOverlay(QWidget):
     """
     Transparent overlay that draws segment selection rectangles across all leads.
@@ -218,11 +335,15 @@ class SegmentOverlay(QWidget):
         self._drag_end_x   = None
         self.update()
 
-    def add_segment(self, start_x, end_x, start_sec, end_sec, label, color, start_time_str='', end_time_str=''):
+    def add_segment(self, start_x, end_x, start_sec, end_sec, label, color, start_time_str='', end_time_str='', auto=False, true_mid_x=None, layer=0):
+        # layer: text row for this segment's label/times. Rhythm segments use
+        # row 0; bundle branch blocks (drawn alongside a rhythm over the same
+        # time) use row 1, above row 0, so the two sets of text never overlap.
         self._segments.append({
             'start_x': start_x, 'end_x': end_x,
-            'start_sec': start_sec, 'end_sec': end_sec,
-            'label': label, 'color': color, 'start_time_str': start_time_str, 'end_time_str': end_time_str
+            'start_sec': start_sec, 'end_sec': end_sec, 'auto': bool(auto),
+            'label': label, 'color': color, 'start_time_str': start_time_str, 'end_time_str': end_time_str,
+            'true_mid_x': true_mid_x, 'layer': int(layer),
         })
         self.update()
 
@@ -251,20 +372,38 @@ class SegmentOverlay(QWidget):
                 painter.drawRect(x1, 0, x2 - x1, h - 1)
 
         # 2. Finalized labeled segments
-        for seg in self._segments:
+        # Drawn in left-to-right pixel order (not insertion order) so the
+        # collision guard below -- which only ever looks at the PREVIOUS
+        # label's right edge -- actually means "the label immediately to
+        # the left", however these segments were added.
+        last_label_right_edges = {}  # per text row (segment 'layer')
+        for seg in sorted(self._segments, key=lambda s: min(s['start_x'], s['end_x'])):
             sx = min(seg['start_x'], seg['end_x'])
             ex = max(seg['start_x'], seg['end_x'])
             if ex <= sx:
                 continue
+            layer = int(seg.get('layer', 0) or 0)
+            # Row 0 (rhythm) at y=20 as always; row 1 (bundle branch block)
+            # sits ABOVE it, at the top edge, so it never runs into the
+            # HR/RR labels the strip draws just below row 0.
+            text_y = 20 if layer == 0 else 15
+            last_label_right_edge = last_label_right_edges.get(layer)
             try:
                 c = QColor(seg['color'])
             except Exception:
                 c = QColor("#FFFF00")
-            painter.fillRect(sx, 0, ex - sx, h, QColor(c.red(), c.green(), c.blue(), 55))
-            painter.setPen(QPen(c, 1))
+            is_auto = bool(seg.get('auto', False))
+            painter.fillRect(sx, 0, ex - sx, h,
+                             QColor(c.red(), c.green(), c.blue(), 38 if is_auto else 55))
+            painter.setPen(QPen(c, 1, Qt.SolidLine))
             painter.drawRect(sx, 0, ex - sx, h - 1)
 
-            mid_x = (sx + ex) // 2
+            # Prefer the segment's true time-midpoint (see
+            # _add_auto_arrhythmia_segments) when it was supplied -- manual
+            # segments don't pass one, and fall back to the visible-portion
+            # midpoint they always used.
+            true_mid_x = seg.get('true_mid_x')
+            mid_x = true_mid_x if true_mid_x is not None else (sx + ex) // 2
             lbl = seg.get('label', '')
             start_sec = seg.get('start_sec', 0)
             end_sec = seg.get('end_sec', 0)
@@ -293,31 +432,67 @@ class SegmentOverlay(QWidget):
 
             spacer_w = 4 if time_str else 0
             total_w = lbl_w + spacer_w + time_w
+
+            # The label always draws -- never hidden. It used to be hidden
+            # whenever it didn't fit the segment's pixel width or would
+            # collide with the previous label, but hiding it made it
+            # flicker in and out while scrolling (the fit/collision check
+            # flips pass/fail frame to frame as pixel positions shift
+            # slightly during a drag).
+            #
+            # When a true time-midpoint is available (true_mid_x above),
+            # the label is centered there and deliberately NOT clamped to
+            # this segment's own visible [sx, ex] -- that clamp is what
+            # used to freeze a long segment's label at screen-center for
+            # as long as you stayed scrolled anywhere inside it. Left
+            # unclamped, the label sits at a real fixed point in time: off
+            # past the right edge before that point has scrolled into
+            # view, sliding left across the screen as the recording
+            # scrolls forward through it, then off past the left edge
+            # once it's gone by -- the same motion as the waveform itself.
+            # A short segment with no clamping applied is unaffected: its
+            # true midpoint already sits inside its own [sx, ex].
+            #
+            # For a manual segment (no true_mid_x), the old behavior is
+            # kept as-is: centered on the visible portion, clamped inside
+            # its own [sx, ex].
             start_text_x = mid_x - (total_w // 2)
+            if true_mid_x is None:
+                start_text_x = max(sx, min(start_text_x, ex - total_w)) if ex - sx >= total_w else sx
 
-            # Draw label (y = 20)
+            # Whichever anchor was used, two labels still must never
+            # visually collide -- nudge this one clear of whatever the
+            # previous (immediately left) label's own right edge reached.
+            # This alone is what actually prevents the garbled
+            # overlapping text seen during scroll/drag, when two adjacent
+            # segments' pixel rectangles can briefly disagree by a few
+            # pixels frame to frame.
+            if last_label_right_edge is not None and start_text_x < last_label_right_edge + 4:
+                start_text_x = last_label_right_edge + 4
+
             painter.setFont(lbl_font)
-            painter.setPen(QPen(c))
-            painter.drawText(start_text_x, 20, lbl)
+            painter.setPen(QPen(c, 1))
+            painter.drawText(start_text_x, text_y, lbl)
 
-            # Draw duration string (y = 20, right of label, in white)
             if time_str:
                 painter.setFont(t_font)
                 painter.setPen(QPen(QColor("#FFFFFF")))
-                painter.drawText(start_text_x + lbl_w + spacer_w, 20, time_str)
+                painter.drawText(start_text_x + lbl_w + spacer_w, text_y, time_str)
 
-            # Draw start time on left edge of segment (y = 20, in white)
+            last_label_right_edges[layer] = start_text_x + total_w
+
+            # Draw start time on left edge of segment (y = text row, in white)
             if start_time_str:
                 painter.setFont(t_font)
                 painter.setPen(QPen(QColor("#FFFFFF")))
-                painter.drawText(sx + 4, 20, start_time_str)
+                painter.drawText(sx + 4, text_y, start_time_str)
 
-            # Draw end time on right edge of segment (y = 20, in white)
+            # Draw end time on right edge of segment (y = text row, in white)
             if end_time_str:
                 end_time_w = painter.fontMetrics().horizontalAdvance(end_time_str)
                 painter.setFont(t_font)
                 painter.setPen(QPen(QColor("#FFFFFF")))
-                painter.drawText(ex - end_time_w - 4, 20, end_time_str)
+                painter.drawText(ex - end_time_w - 4, text_y, end_time_str)
 
         painter.end()
 
@@ -344,7 +519,18 @@ class HolterFullDisclosureDialog(QDialog):
         self._selected_duration = None
         self._active_tool = TOOL_SELECT
         self._active_tool_btn = None
-        
+
+        # Debounce state for mouse-wheel time scrubbing (see
+        # _consume_wheel_notches) -- a single trackpad "flick" gesture can
+        # arrive as two separate wheelEvent() calls in very quick
+        # succession (each individually a normal, correctly-formed one
+        # notch), which a standard mouse wheel's physical detents don't
+        # normally do. Coalescing calls that land within a short window of
+        # each other into a single step keeps one flick = 1 second,
+        # regardless of whether the touchpad driver reported it as one
+        # event or two.
+        self._last_wheel_time = 0.0
+
         # Drag selection state (parallel mode)
         self._drag_start_x = None
         self._drag_current_x = None
@@ -367,6 +553,10 @@ class HolterFullDisclosureDialog(QDialog):
         else:
             self._selection_mode = 'parallel_single'
         
+        # TODO: Testing display mode toggle: 'dark' (default) or 'graph' (medical ECG paper)
+        self._display_theme_mode = 'dark'
+        self._lead_labels = []
+        
         # Pending manual beats to restore after canvases are created
         self._pending_manual_beats = None
         
@@ -387,6 +577,13 @@ class HolterFullDisclosureDialog(QDialog):
         self.setWindowTitle("Full Disclosure ECG")
         self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint)
         self.setWindowState(Qt.WindowMaximized)
+
+        # Do not paint the fallback canvas layout during construction. The
+        # final row height depends on the maximized viewport and is not known
+        # until showEvent(); painting early caused a brief squeezed 12-lead
+        # layout flash before the proper Full Disclosure layout appeared.
+        self._initial_layout_pending = True
+        self.setUpdatesEnabled(False)
 
         screen = QApplication.primaryScreen()
         if screen:
@@ -501,6 +698,60 @@ class HolterFullDisclosureDialog(QDialog):
         except Exception as e:
             print(f"[Full Disclosure] Error loading segment annotations on startup: {e}")
 
+        # Automatic rhythm-region detection, merging with whatever the
+        # recording's own stored replay data already populated into
+        # _structured_events, and rate-vs-morphology suppression all live in
+        # auto_segment_arrthymia_detection.py -- this dialog only calls into
+        # it and otherwise handles rendering (SegmentOverlay, label-to-color
+        # mapping in _add_auto_arrhythmia_segments below). It no longer runs
+        # automatically on open: it's triggered on demand by the "Auto
+        # Arrhythmia Detection" button (see _run_auto_arrhythmia_detection),
+        # so opening a long recording's Full Disclosure doesn't always pay
+        # for detection up front.
+        self._auto_segments_pending = False
+
+        # Gates ALL auto-sourced rhythm marking (the segment-overlay tint/
+        # boxes via _structured_events_for_canvas, and the bottom-right
+        # rhythm label in _update_time_and_arrhythmia_labels) off until the
+        # "Auto Arrhythmia Detection" button is clicked. Without this, the
+        # recording's own stored replay/real-time classification (loaded
+        # into self._engine._structured_events by HolterReplayEngine itself,
+        # tagged source='arrhythmia'/'analysis') would already paint the
+        # strips before the button is ever pressed, making the button look
+        # like it does nothing. Manual beat/segment markings are never
+        # gated by this -- only non-manual ('auto'/'arrhythmia'/'analysis'/
+        # 'classified') sources are affected.
+        self._auto_marking_visible = False
+
+        # Asystole (sustained flatline) detection. Deliberately NOT part of
+        # the "Auto Arrhythmia Detection" pipeline above: it runs its own
+        # independent detector (detect_asystole_segments_async, in
+        # auto_segment_arrthymia_detection.py), is never gated by
+        # _auto_marking_visible, never merged into
+        # self._engine._structured_events, and never touches the segment
+        # overlay / apply_auto_segments_to_engine(). It only feeds the
+        # bottom-right rhythm label in _update_time_and_arrhythmia_labels
+        # (see the Asystole block there), shown with its own system time as
+        # soon as the background scan finishes. See the banner comment
+        # above detect_asystole_segments_async() for why it is kept
+        # separate from the morphological pipeline.
+        self._asystole_segments = []
+        try:
+            reader_path_asys = getattr(getattr(self._engine, '_reader', None), 'path', None)
+            if reader_path_asys:
+                from .auto_segment_arrthymia_detection import detect_asystole_segments_async
+                detect_asystole_segments_async(reader_path_asys, self._on_asystole_segments_ready)
+        except Exception as e:
+            print(f"[Full Disclosure] Asystole detection unavailable: {e}")
+
+        # If the user already clicked "Auto Arrhythmia Detection" earlier in
+        # this session (persisted flag, see _persist_auto_marking_enabled),
+        # reopening Full Disclosure should show that marking again right
+        # away instead of making them click the button every time -- and
+        # Undo should be ready to hide it again, same as right after the
+        # button click itself.
+        self._restore_auto_marking_if_enabled()
+
         self._update_canvases(0.0)
         
         # CRITICAL FIX: Apply the restored selection mode to update button text and UI state
@@ -510,39 +761,276 @@ class HolterFullDisclosureDialog(QDialog):
             # But we need to do this AFTER the button is created, so use a short delay
             QTimer.singleShot(50, lambda: self._switch_selection_mode(self._selection_mode))
 
+    def _run_auto_arrhythmia_detection(self):
+        """"Auto Arrhythmia Detection" button: run (or apply the cached
+        result of) auto rhythm-region detection and redraw the strips with
+        it. Mirrors what used to run automatically on dialog open -- see
+        the comment above self._auto_segments_pending in __init__."""
+        if self._auto_segments_pending:
+            return
+        # Clear deleted auto segments file so report includes all detected segments again
+        try:
+            ecgh_p = getattr(self._engine, 'ecgh_path', None)
+            if ecgh_p:
+                session_dir = os.path.dirname(ecgh_p)
+                del_path = os.path.join(session_dir, 'deleted_auto_segments.json')
+                if os.path.exists(del_path):
+                    os.remove(del_path)
+                    print(f"[Full Disclosure] Cleared {del_path} as auto detection was re-run")
+        except Exception as e:
+            print(f"[Full Disclosure] Error clearing deleted auto segments: {e}")
+        try:
+            from .auto_segment_arrthymia_detection import (
+                apply_auto_segments_to_engine, detect_arrhythmias_async, get_cached_detection,
+            )
+            reader_path = getattr(getattr(self._engine, '_reader', None), 'path', None)
+            cached = get_cached_detection(reader_path) if reader_path else None
+            if cached is not None or not reader_path:
+                self._snapshot_state("Auto Arrhythmia Detection")
+                added = apply_auto_segments_to_engine(self._engine, segments=cached)
+                if added is not None:
+                    print(f"[Full Disclosure] Added {added} automatic rhythm regions.")
+                self._auto_marking_visible = True
+                self._persist_auto_marking_enabled()
+                self._event_index_dirty = True
+                self._update_canvases(self._current_start)
+                self._refresh_segment_overlay()
+            else:
+                self._auto_segments_pending = True
+                if hasattr(self, 'btn_auto_arrhythmia'):
+                    self.btn_auto_arrhythmia.setEnabled(False)
+                    self.btn_auto_arrhythmia.setText("⏳ Detecting...")
+                detect_arrhythmias_async(reader_path, self._on_auto_segments_ready)
+        except Exception as e:
+            print(f"[Full Disclosure] Automatic rhythm detection unavailable: {e}")
+
+    def _on_auto_segments_ready(self, segments):
+        """Background auto-segment detection finished (see
+        _run_auto_arrhythmia_detection)."""
+        self._auto_segments_pending = False
+        if hasattr(self, 'btn_auto_arrhythmia'):
+            self.btn_auto_arrhythmia.setEnabled(True)
+            self.btn_auto_arrhythmia.setText("⚡ Auto Arrhythmia Detection")
+        # Clear deleted auto segments file
+        try:
+            ecgh_p = getattr(self._engine, 'ecgh_path', None)
+            if ecgh_p:
+                session_dir = os.path.dirname(ecgh_p)
+                del_path = os.path.join(session_dir, 'deleted_auto_segments.json')
+                if os.path.exists(del_path):
+                    os.remove(del_path)
+        except Exception:
+            pass
+        try:
+            from .auto_segment_arrthymia_detection import apply_auto_segments_to_engine
+            self._snapshot_state("Auto Arrhythmia Detection")
+            added = apply_auto_segments_to_engine(self._engine, segments=segments)
+            if added is not None:
+                print(f"[Full Disclosure] Added {added} automatic rhythm regions.")
+        except Exception as e:
+            print(f"[Full Disclosure] Automatic rhythm detection unavailable: {e}")
+        self._auto_marking_visible = True
+        self._persist_auto_marking_enabled()
+        self._event_index_dirty = True
+        self._update_canvases(self._current_start)
+        self._refresh_segment_overlay()
+
+    def _on_asystole_segments_ready(self, segments):
+        """Background Asystole scan finished (see the Asystole block in
+        __init__). Entirely separate from auto-marking: only refreshes the
+        bottom-right rhythm label, never the segment overlay or
+        self._engine._structured_events."""
+        self._asystole_segments = segments or []
+        try:
+            self._update_time_and_arrhythmia_labels(self._current_start, self._current_start + self._window_sec)
+        except Exception as e:
+            print(f"[Full Disclosure] Error refreshing Asystole label: {e}")
+        # Auto regions on screen are drawn with Asystole spans cut out
+        # (_without_asystole_spans) -- redraw them now that the spans are known.
+        if getattr(self, '_auto_marking_visible', False):
+            try:
+                self._update_canvases(self._current_start)
+                self._refresh_segment_overlay()
+            except Exception as e:
+                print(f"[Full Disclosure] Error redrawing auto regions after Asystole scan: {e}")
+
+    def _persist_auto_marking_enabled(self):
+        """Record on disk that auto arrhythmia marking was enabled for this
+        session, so generate_holter_report() (which loads fresh from disk,
+        not this live dialog) includes the same rule-based regions instead
+        of defaulting to plain NSR. See is_auto_marking_enabled."""
+        try:
+            from .auto_segment_arrthymia_detection import set_auto_marking_enabled
+            ecgh_path = getattr(self._engine, 'ecgh_path', None)
+            if ecgh_path:
+                set_auto_marking_enabled(os.path.dirname(ecgh_path))
+        except Exception as e:
+            print(f"[Full Disclosure] Could not persist auto-marking flag: {e}")
+
+    def _clear_auto_marking_enabled(self):
+        """Undo counterpart to _persist_auto_marking_enabled() -- called
+        only when the "Auto Arrhythmia Detection" action itself is undone
+        (see _undo_last_action), so report generation goes back to plain
+        NSR too."""
+        try:
+            from .auto_segment_arrthymia_detection import clear_auto_marking_enabled
+            ecgh_path = getattr(self._engine, 'ecgh_path', None)
+            if ecgh_path:
+                clear_auto_marking_enabled(os.path.dirname(ecgh_path))
+        except Exception as e:
+            print(f"[Full Disclosure] Could not clear auto-marking flag: {e}")
+
+    def _restore_auto_marking_if_enabled(self):
+        """Called once from __init__. If the persisted flag says the user
+        already ran "Auto Arrhythmia Detection" for this session (possibly
+        in an earlier open of this same dialog, or even a prior app run --
+        see is_auto_marking_enabled), re-apply the cached detection and
+        flip the marking visible immediately, and push an undo snapshot so
+        the Undo button is ready to hide it again -- mirrors exactly what
+        clicking the button itself does, just without re-running detection.
+        A no-op (and cheap) when the flag isn't set."""
+        try:
+            ecgh_path = getattr(self._engine, 'ecgh_path', None)
+            if not ecgh_path:
+                return
+            from .auto_segment_arrthymia_detection import (
+                apply_auto_segments_to_engine, get_cached_detection, is_auto_marking_enabled,
+            )
+            session_dir = os.path.dirname(ecgh_path)
+            if not is_auto_marking_enabled(session_dir):
+                return
+            self._snapshot_state("Auto Arrhythmia Detection")
+            reader_path = getattr(getattr(self._engine, '_reader', None), 'path', None)
+            cached = get_cached_detection(reader_path) if reader_path else None
+            if cached is not None:
+                # Only re-apply from the on-disk cache (cheap). If it's
+                # missing (e.g. invalidated by a code change), don't fall
+                # back to a fresh detect_arrhythmias() run here -- that's a
+                # slow, synchronous scan and this runs on dialog open/__init__,
+                # which must not block the UI. Whatever's already merged into
+                # self._engine._structured_events from earlier in this same
+                # app run (if any) is still shown; otherwise the user can
+                # just click the button again to redo detection.
+                added = apply_auto_segments_to_engine(self._engine, segments=cached)
+                if added is not None:
+                    print(f"[Full Disclosure] Restored {added} automatic rhythm regions from a prior session.")
+            # If any auto segments were deleted in this session, keep them deleted
+            del_path = os.path.join(session_dir, 'deleted_auto_segments.json')
+            if os.path.exists(del_path):
+                try:
+                    with open(del_path, 'r', encoding='utf-8') as df:
+                        del_list = json.load(df)
+                    if del_list:
+                        def _is_deleted_item(ev):
+                            if 'manual' in str(ev.get('source', '')).lower():
+                                return False
+                            ev_start = float(ev.get('timestamp', 0.0) or 0.0)
+                            ev_end = float(ev.get('end_timestamp', ev.get('end_ts', ev_start)) or ev_start)
+                            ev_lbl = str(ev.get('label', ev.get('type', ''))).strip().lower()
+                            for ds in del_list:
+                                ds_start = float(ds.get('start_sec', 0.0) or 0.0)
+                                ds_end = float(ds.get('end_sec', ds_start) or ds_start)
+                                ds_lbl = str(ds.get('label', '')).strip().lower()
+                                overlap = max(0.0, min(ev_end, ds_end) - max(ev_start, ds_start))
+                                if overlap > 0.5 or (abs(ev_start - ds_start) < 1.0 and abs(ev_end - ds_end) < 1.0):
+                                    if ds_lbl in ev_lbl or ev_lbl in ds_lbl:
+                                        return True
+                            return False
+                        self._engine._structured_events = [
+                            ev for ev in (getattr(self._engine, '_structured_events', []) or [])
+                            if not _is_deleted_item(ev)
+                        ]
+                except Exception as _de:
+                    print(f"[Full Disclosure] Error applying deleted auto segments filter on restore: {_de}")
+            self._auto_marking_visible = True
+            self._event_index_dirty = True
+        except Exception as e:
+            print(f"[Full Disclosure] Could not restore auto-marking state: {e}")
+
     def showEvent(self, event):
         """Override showEvent to refresh segment overlay when dialog is shown."""
         super().showEvent(event)
+        if getattr(self, '_initial_layout_pending', False):
+            # At this point the maximized viewport has its real geometry.
+            # Synchronize before enabling updates so the first visible frame
+            # is already the final Full Disclosure layout.
+            self._sync_row_height_to_viewport()
+            self._update_canvases(self._current_start)
+            self._initial_layout_pending = False
+            self.setUpdatesEnabled(True)
         # Refresh segment overlay to ensure loaded segments are visible
         # Use longer delay to ensure canvas geometry is fully initialized
         QTimer.singleShot(200, self._refresh_segment_overlay)
         # Also raise overlay to ensure it's on top
         QTimer.singleShot(250, lambda: self._segment_overlay.raise_() if hasattr(self, '_segment_overlay') else None)
+        QTimer.singleShot(200, self._sync_leads_scrollbar)
+        # Viewport geometry isn't settled until after the dialog has actually
+        # been laid out/maximized -- same reasoning as the segment-overlay
+        # refresh above.
+        QTimer.singleShot(200, self._sync_row_height_to_viewport)
 
-    # Per-lead row height (px) by gain multiplier. At higher gain the same
-    # mV deflection paints taller, so a fixed 90px row clips QRS peaks against
-    # the next row - give higher gains more headroom (paid for by the tightened
-    # container/row margins above), and let it be honest about the room a low
-    # gain trace actually needs.
-    # Keep the Full Disclosure layout fixed at every gain.  The waveform
-    # renderer fits the amplified trace inside this existing row instead.
-    _GAIN_CANVAS_HEIGHT = {0.5: 84, 1.0: 92, 2.0: 108}
+    # Fallback row height (px) used only for the very first layout pass,
+    # before the dialog has been shown and _sync_row_height_to_viewport()
+    # can measure the real viewport. Overwritten immediately once that runs.
+    _FALLBACK_CANVAS_HEIGHT = 92
 
-    def _canvas_height_for_gain(self, gain):
-        return self._GAIN_CANVAS_HEIGHT.get(gain, 92)
+    # How many lead rows should fill the screen at once. Unlike a fixed pixel
+    # height, this count stays constant across every screen size -- row
+    # height is whatever that screen's available height divided by this
+    # number comes out to (see _sync_row_height_to_viewport), so a bigger
+    # monitor gets taller/easier-to-read rows rather than more rows crammed
+    # in. The remaining leads (12 - this) are always reached by scrolling.
+    _VISIBLE_LEAD_ROWS = 8
 
-    def _apply_canvas_height_for_gain(self):
-        """Resize every lead row to match the current gain's headroom and
-        force a relayout/repaint so peaks stop clipping immediately."""
-        new_height = self._canvas_height_for_gain(self._gain)
+    def _sync_row_height_to_viewport(self):
+        """Derive the per-lead row height from THIS screen/window's actual
+        available height, so _VISIBLE_LEAD_ROWS leads always exactly fill
+        it -- not from gain, and not a hardcoded pixel count. Recomputed on
+        every resize (see eventFilter's canvas_frame Resize handling) so it
+        keeps tracking whatever window size the dialog is currently at."""
+        if not hasattr(self, '_leads_scroll'):
+            return
+        vp_h = self._leads_scroll.viewport().height()
+        if vp_h <= 0:
+            return
+        new_height = max(40, vp_h // self._VISIBLE_LEAD_ROWS)
         if new_height == getattr(self, '_canvas_height', None):
             return
         self._canvas_height = new_height
         for c in getattr(self, '_canvases', []):
             c.setFixedHeight(new_height)
             c.update()
+        self._sync_leads_scrollbar()
         if hasattr(self, 'canvas_layout'):
             self.canvas_layout.activate()
+
+    def _sync_leads_scrollbar(self):
+        """Step the 12-lead list's scrollbar by one row height, so dragging
+        it (or clicking its track) moves through the leads one at a time
+        instead of landing mid-lead."""
+        if not hasattr(self, '_leads_scroll'):
+            return
+        vbar = self._leads_scroll.verticalScrollBar()
+        vbar.setPageStep(self._canvas_height)
+        vbar.setSingleStep(max(1, self._canvas_height // 10))
+
+    _WHEEL_DEBOUNCE_SEC = 0.12
+
+    def _consume_wheel_notches(self, notches: float):
+        """Apply a wheel-scroll step to the time scrollbar, coalescing any
+        second wheelEvent() that arrives within _WHEEL_DEBOUNCE_SEC of the
+        last one into a no-op. Both ECGStripCanvas.wheelEvent and
+        HorizontalOnlyScrollArea.wheelEvent call this instead of touching
+        time_scrollbar directly, so a single physical scroll (mouse notch
+        or trackpad flick) always moves exactly one notch's worth of time,
+        even if the input device reported it as two back-to-back events."""
+        import time
+        now = time.time()
+        if now - self._last_wheel_time < self._WHEEL_DEBOUNCE_SEC:
+            return
+        self._last_wheel_time = now
+        step = -notches
+        self.time_scrollbar.setValue(self.time_scrollbar.value() + int(step * 100))
 
     def _recalc_window(self):
         idx = self.time_tabs.currentIndex() if hasattr(self, 'time_tabs') else 0
@@ -659,6 +1147,82 @@ class HolterFullDisclosureDialog(QDialog):
         self.btn_undo.clicked.connect(self._undo_last_action)
         top_layout.addWidget(self.btn_undo)
 
+        # Pushes the Undo button away from the Frame Time group on the
+        # right, so it sits further left instead of flush against it.
+        top_layout.addStretch()
+
+        # TODO(testing-only): PR interval / QRS duration readout, computed
+        # live from Lead II for whatever is currently on screen. Added so a
+        # tester can scroll Full Disclosure and directly compare
+        # measure_beat()'s PR/QRS numbers (the same ones the VFib/AFib/
+        # Flutter/Supraventricular Tachycardia rules in
+        # auto_segment_arrthymia_detection.py read) against the Lead II
+        # waveform, rhythm by rhythm, without a separate script. Not a
+        # clinical display value, not wired into any detection or report
+        # logic -- updated only by _update_pr_qrs_label() below. Remove this
+        # once the rule-based detectors are fully validated against real
+        # recordings (or promote it to a supported feature if it turns out
+        # useful beyond testing).
+        self.lbl_pr_qrs = QLabel("PR: -- ms   QRS: -- ms")
+        self.lbl_pr_qrs.setStyleSheet("color: #FFD966; font-weight: bold; font-size: 13px;")
+        self.lbl_pr_qrs.setToolTip(
+            "TESTING ONLY -- PR interval / QRS duration measured from Lead II's own\n"
+            "beats in the current visible window, via the same measure_beat() the\n"
+            "auto-segment rules use. Not a clinical readout."
+        )
+        top_layout.addWidget(self.lbl_pr_qrs)
+
+        sep_pr_qrs = QFrame()
+        sep_pr_qrs.setFrameShape(QFrame.VLine)
+        sep_pr_qrs.setStyleSheet(f"color: {COL_GREEN_DRK};")
+        top_layout.addWidget(sep_pr_qrs)
+
+        # Auto Arrhythmia Detection — left of the speed/gain readout. Styled
+        # as a solid, raised accent button (unlike the flat bordered Undo/
+        # label chrome around it) so it visibly reads as a clickable action,
+        # not just another status readout.
+        self.btn_auto_arrhythmia = QPushButton("⚡ Auto Arrhythmia Detection")
+        self.btn_auto_arrhythmia.setCursor(Qt.PointingHandCursor)
+        self.btn_auto_arrhythmia.setToolTip(
+            "Run rule-based arrhythmia detection and draw the rhythm markings for this recording"
+        )
+        self.btn_auto_arrhythmia.setStyleSheet(f"""
+            QPushButton {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #2FA868, stop:0.5 #1B7A4B, stop:1 #0E4A2E);
+                color: #FFFFFF;
+                border: 1px solid #55E39B; border-bottom: 2px solid #06200F;
+                padding: 5px 16px; font-size: 13px; font-weight: bold;
+                border-radius: 5px;
+            }}
+            QPushButton:hover:enabled {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #3FC97F, stop:0.5 #25945C, stop:1 #125B38);
+                border-color: #8CFFC2;
+            }}
+            QPushButton:pressed:enabled {{
+                background: #0E4A2E; border-bottom: 1px solid #06200F;
+                padding-top: 6px;
+            }}
+            QPushButton:disabled {{
+                background: #1A2420; color: #6a7a72; border: 1px solid #2a3a30;
+            }}
+        """)
+        self.btn_auto_arrhythmia.clicked.connect(self._run_auto_arrhythmia_detection)
+        top_layout.addWidget(self.btn_auto_arrhythmia)
+
+        sep_auto = QFrame()
+        sep_auto.setFrameShape(QFrame.VLine)
+        sep_auto.setStyleSheet(f"color: {COL_GREEN_DRK};")
+        top_layout.addWidget(sep_auto)
+
+        # Wave speed / gain readout — mirrors whatever btn_speed/btn_gain
+        # currently show, kept in sync by _update_speed_gain_label() from
+        # every place that changes paper speed or gain.
+        self.lbl_speed_gain = QLabel()
+        self.lbl_speed_gain.setStyleSheet("color: #FFA500; font-weight: bold; font-size: 13px;")
+        top_layout.addWidget(self.lbl_speed_gain)
+
         sep_undo = QFrame()
         sep_undo.setFrameShape(QFrame.VLine)
         sep_undo.setStyleSheet(f"color: {COL_GREEN_DRK};")
@@ -669,19 +1233,38 @@ class HolterFullDisclosureDialog(QDialog):
         self.lbl_real_time.setStyleSheet(f"color: {COL_GREEN}; font-weight: bold; font-size: 13px;")
         top_layout.addWidget(self.lbl_real_time)
         layout.addWidget(top_bar)
+        self._update_speed_gain_label()
 
         canvas_frame = QFrame()
         canvas_frame.setStyleSheet(f"background: {COL_BLACK};")
+        # Assigned immediately, before any child canvas is constructed below.
+        # Each per-lead canvas gets installEventFilter(self) as soon as it's
+        # built, and Qt can deliver it real events (parent/child-added, etc.)
+        # synchronously during that same construction -- eventFilter() reads
+        # self._canvas_frame on every call regardless of which widget the
+        # event is for, so leaving this assignment for later let those early
+        # events hit an AttributeError (caught by Qt/PyQt and logged, not
+        # fatal, but still noise on every dialog open).
+        self._canvas_frame = canvas_frame
         self.canvas_layout = QVBoxLayout(canvas_frame)
         # Tightened from (4,4,4,4) - reclaim the outer gap so it can go toward
-        # per-lead row height instead (see _canvas_height_for_gain below).
+        # per-lead row height instead (see _sync_row_height_to_viewport below).
         self.canvas_layout.setContentsMargins(2, 2, 2, 2)
         self.canvas_layout.setSpacing(0)
 
+        # Shared page-wide grid, created first so it naturally stacks behind
+        # every lead row added below (siblings paint in creation order unless
+        # explicitly raised/lowered). Geometry is kept in sync with
+        # canvas_frame in eventFilter()'s Resize handling.
+        self._grid_background = PageGridBackground(canvas_frame)
+        self._grid_background.setGeometry(canvas_frame.rect())
+
         self._canvases = []
-        leads = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
-        self._canvas_height = self._canvas_height_for_gain(self._gain)
-        for lead in leads:
+        all_leads = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
+        self._canvas_height = self._FALLBACK_CANVAS_HEIGHT
+
+        def _build_lead_row(lead, row_parent):
+            """One label+canvas row. Returns (QHBoxLayout, canvas)."""
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             # Tightened from 4 - small reclaim from the label/canvas gap too.
@@ -695,19 +1278,66 @@ class HolterFullDisclosureDialog(QDialog):
                 f" padding-right: 4px;"
             )
             lbl.setFixedWidth(44)
+            self._lead_labels.append(lbl)
 
-            canvas = ECGStripCanvas(canvas_frame, height=self._canvas_height, color=COL_GREEN, lead_name=lead, show_annotations=(lead == "I"))
+            canvas = ECGStripCanvas(row_parent, height=self._canvas_height, color=COL_GREEN, lead_name=lead, show_annotations=(lead == "I"), draw_background=False)
             canvas.set_paper_speed(25)
             canvas.set_gain(self._gain)
             canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            
+
             # Install event filter on each canvas to catch mouse clicks
             canvas.installEventFilter(self)
 
             row.addWidget(lbl)
             row.addWidget(canvas, 1)
-            self.canvas_layout.addLayout(row)
+            return row, canvas
+
+        # All 12 leads are one continuous vertical list inside a single
+        # scroll area -- not split into a fixed block plus a separate V1-V6
+        # box. The box fills the whole available page height (whatever that
+        # is on this screen/window size), so however many full rows fit show
+        # at once with no blank leftover space, and the vertical scrollbar
+        # reveals whichever leads don't fit by scrolling the whole list, one
+        # lead at a time, exactly like any normal scrollable list (earlier
+        # leads scroll off the top as later ones enter from the bottom).
+        self._leads_scroll = HorizontalOnlyScrollArea(canvas_frame)
+        self._leads_scroll.setFrameShape(QFrame.NoFrame)
+        # True so the content widget's WIDTH always tracks the viewport
+        # (matches whatever Lead I's canvas width would otherwise be, which
+        # the ruler/segment-overlay pixel<->time math is anchored to).
+        self._leads_scroll.setWidgetResizable(True)
+        self._leads_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._leads_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self._leads_scroll.setStyleSheet(f"""
+            QScrollArea {{ background: transparent; border: none; }}
+            QScrollBar:vertical {{
+                background: #16233A; width: 16px; border: 1px solid #2A4268; border-radius: 8px; margin: 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: #3B8EF0; min-height: 40px; border-radius: 6px; margin: 2px;
+            }}
+            QScrollBar::handle:vertical:hover {{ background: #6AAEFF; }}
+            QScrollBar::handle:vertical:pressed {{ background: #9CC7FF; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        """)
+        self._leads_scroll.viewport().setStyleSheet("background: transparent;")
+
+        self._leads_content = QWidget()
+        self._leads_content.setStyleSheet("background: transparent;")
+        leads_content_layout = QVBoxLayout(self._leads_content)
+        leads_content_layout.setContentsMargins(0, 0, 0, 0)
+        leads_content_layout.setSpacing(0)
+
+        for lead in all_leads:
+            row, canvas = _build_lead_row(lead, self._leads_content)
+            leads_content_layout.addLayout(row)
             self._canvases.append(canvas)
+
+        self._leads_scroll.setWidget(self._leads_content)
+        # Stretch factor 1 -- the box fills all of canvas_frame's available
+        # height, so it uses the full page instead of leaving space unused.
+        self.canvas_layout.addWidget(self._leads_scroll, 1)
+        self._sync_leads_scrollbar()
 
         # TODO: Selection box overlay disabled for now
         # self.overlay = FullDisclosureOverlay(canvas_frame)
@@ -731,21 +1361,48 @@ class HolterFullDisclosureDialog(QDialog):
         self._segment_overlay.show()
         
         # Install event filter BEFORE adding canvas_frame to layout
+        # (self._canvas_frame was already assigned up top, before any child
+        # canvas was built)
         canvas_frame.installEventFilter(self)
-        self._canvas_frame = canvas_frame
         layout.addWidget(canvas_frame, 1)
 
 
         self.time_scrollbar = QScrollBar(Qt.Horizontal)
-        self.time_scrollbar.setFixedHeight(12)
+        self.time_scrollbar.setFixedHeight(18)
+        # QScrollBar::left-arrow/right-arrow don't honor the usual CSS
+        # border-triangle trick (confirmed: it renders as a plain filled
+        # square, not a triangle, unlike QComboBox::down-arrow elsewhere in
+        # this app) -- use real arrow image assets instead, same as
+        # analysis_window.py's combo-box dropdown arrow.
+        _assets_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'assets'))
+        _arrow_left = os.path.join(_assets_dir, 'scrollbar_arrow_left.png').replace('\\', '/')
+        _arrow_right = os.path.join(_assets_dir, 'scrollbar_arrow_right.png').replace('\\', '/')
         self.time_scrollbar.setStyleSheet(f"""
             QScrollBar:horizontal {{
-                background: #0d1b2a; height: 12px; border-radius: 5px; margin: 0 4px;
+                background: #16233A; height: 18px; border: 1px solid #2A4268; border-radius: 9px; margin: 0 20px;
             }}
             QScrollBar::handle:horizontal {{
-                background: {COL_GREEN_DRK}; min-width: 24px; border-radius: 5px;
+                background: #3B8EF0; min-width: 40px; border-radius: 6px; margin: 2px;
             }}
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+            QScrollBar::handle:horizontal:hover {{ background: #6AAEFF; }}
+            QScrollBar::handle:horizontal:pressed {{ background: #9CC7FF; }}
+            QScrollBar::add-line:horizontal {{
+                background: #E8EEF4; width: 20px; border-radius: 3px;
+                subcontrol-position: right; subcontrol-origin: margin;
+            }}
+            QScrollBar::sub-line:horizontal {{
+                background: #E8EEF4; width: 20px; border-radius: 3px;
+                subcontrol-position: left; subcontrol-origin: margin;
+            }}
+            QScrollBar::add-line:horizontal:hover, QScrollBar::sub-line:horizontal:hover {{
+                background: #FFFFFF;
+            }}
+            QScrollBar::left-arrow:horizontal {{
+                image: url({_arrow_left}); width: 10px; height: 10px;
+            }}
+            QScrollBar::right-arrow:horizontal {{
+                image: url({_arrow_right}); width: 10px; height: 10px;
+            }}
         """)
         self._update_scrollbar_range()
         self.time_scrollbar.valueChanged.connect(self._on_scrollbar_moved)
@@ -855,6 +1512,38 @@ class HolterFullDisclosureDialog(QDialog):
         self.btn_sel_mode.clicked.connect(_show_sel_mode_menu)
         bot_layout.addWidget(self.btn_sel_mode)
 
+        # --- Display mode dropdown (Dark Mode / Graph Mode) ---
+        # TODO: Testing display mode toggle button & dropdown (Dark Mode / Graph Mode)
+        self.btn_display_mode = QPushButton("▲ Dark Mode")
+        self.btn_display_mode.setStyleSheet(f"""
+            QPushButton {{
+                background: #0d1b2a; color: #a0c4e8;
+                border: 1px solid {COL_GREEN_DRK}; padding: 5px 14px;
+                font-size: 13px; font-weight: bold; border-radius: 4px;
+            }}
+            QPushButton:hover {{ background: #162a3a; color: {COL_GREEN}; }}
+        """)
+        def _show_display_mode_menu():
+            menu = QMenu(self)
+            menu.setStyleSheet(f"""
+                QMenu {{
+                    background-color: {COL_DARK}; color: #a0c4e8;
+                    border: 1px solid {COL_GREEN_DRK};
+                    font-size: 13px; font-weight: bold;
+                }}
+                QMenu::item:selected {{ background-color: {COL_GREEN_DRK}; color: {COL_GREEN}; }}
+                QMenu::item {{ padding: 6px 20px; }}
+            """)
+            act_dark = menu.addAction("✔ Dark Mode" if self._display_theme_mode == 'dark' else "  Dark Mode")
+            act_graph = menu.addAction("✔ Graph Mode" if self._display_theme_mode == 'graph' else "  Graph Mode")
+            act_dark.triggered.connect(lambda: self._switch_display_theme('dark'))
+            act_graph.triggered.connect(lambda: self._switch_display_theme('graph'))
+            btn_pos = self.btn_display_mode.mapToGlobal(QPoint(0, 0))
+            menu_h  = menu.sizeHint().height()
+            menu.exec_(QPoint(btn_pos.x(), btn_pos.y() - menu_h))
+        self.btn_display_mode.clicked.connect(_show_display_mode_menu)
+        bot_layout.addWidget(self.btn_display_mode)
+
         # Arrhythmia indicator left of Recording label
         self.lbl_arrhythmia = QLabel("")
         self.lbl_arrhythmia.setStyleSheet("color: #ff6b6b; font-weight: bold; font-size: 12px;")
@@ -898,6 +1587,10 @@ class HolterFullDisclosureDialog(QDialog):
     def eventFilter(self, obj, event):
         # Handle resize events for canvas_frame — keep both overlays in sync
         if obj == self._canvas_frame and event.type() == QEvent.Resize:
+            if hasattr(self, '_grid_background'):
+                self._grid_background.setGeometry(obj.rect())
+                self._grid_background.lower()
+            self._sync_row_height_to_viewport()
             if hasattr(self, '_vertical_line_overlay'):
                 self._vertical_line_overlay.setGeometry(obj.rect())
             if hasattr(self, '_segment_overlay'):
@@ -940,15 +1633,25 @@ class HolterFullDisclosureDialog(QDialog):
                     click_x_local = max(0, min(w, click_x_local))
                     click_sec = ref._start_sec + (click_x_local / w) * (ref_end_sec - ref._start_sec)
 
-            # Check if clicked inside an existing segment
+            # Check if clicked inside an existing segment (manual or auto)
             clicked_segment = None
-            if self._selection_mode == 'segment' and hasattr(self, '_segment_annotations'):
+            if hasattr(self, '_segment_annotations'):
                 for seg in self._segment_annotations:
                     s_sec = min(seg['start_sec'], seg['end_sec'])
                     e_sec = max(seg['start_sec'], seg['end_sec'])
                     if s_sec <= click_sec <= e_sec:
                         clicked_segment = seg
                         break
+
+            # If no manual segment found, check if clicked inside an auto-detected segment
+            if clicked_segment is None and hasattr(self, '_segment_overlay') and getattr(self, '_auto_marking_visible', False):
+                for seg in getattr(self._segment_overlay, '_segments', []):
+                    if seg.get('auto'):
+                        s_sec = min(seg.get('start_sec', 0.0), seg.get('end_sec', 0.0))
+                        e_sec = max(seg.get('start_sec', 0.0), seg.get('end_sec', 0.0))
+                        if s_sec <= click_sec <= e_sec:
+                            clicked_segment = seg
+                            break
 
             if self._selection_mode == 'segment':
                 if clicked_segment is not None:
@@ -973,8 +1676,8 @@ class HolterFullDisclosureDialog(QDialog):
                     # In segment mode: show labeling menu for pending segment
                     self._show_segment_context_menu(event.globalPos())
             else:
-                # In parallel mode (single or multi): original beat-level context menu
-                self._show_beat_context_menu(click_x, event.globalPos())
+                # In parallel mode (single or multi): original beat-level context menu with segment option if on a segment
+                self._show_beat_context_menu(click_x, event.globalPos(), clicked_segment=clicked_segment)
             return True  # Consume the event
 
 
@@ -982,29 +1685,6 @@ class HolterFullDisclosureDialog(QDialog):
         if self._active_tool != TOOL_SELECT:
             return super().eventFilter(obj, event)
 
-        # Smooth horizontal panning for the time-window views. A left drag
-        # moves the recording underneath the cursor instead of jumping between
-        # coarse scrollbar steps; segment selection remains available in its
-        # dedicated segment mode below.
-        if self._selection_mode == 'parallel_single':
-            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-                self._pan_drag_x = (event.pos().x() if obj == self._canvas_frame
-                                    else obj.mapTo(self._canvas_frame, event.pos()).x())
-                self._pan_drag_start = float(self._current_start)
-                return True
-            if event.type() == QEvent.MouseMove and getattr(self, '_pan_drag_x', None) is not None:
-                current_x = (event.pos().x() if obj == self._canvas_frame
-                             else obj.mapTo(self._canvas_frame, event.pos()).x())
-                frame_width = max(1, self._canvas_frame.width())
-                delta_sec = (self._pan_drag_x - current_x) / frame_width * float(self._window_sec)
-                max_start = max(0.0, float(self._engine.duration_sec) - float(self._window_sec))
-                target = max(0.0, min(max_start, self._pan_drag_start + delta_sec))
-                self.time_scrollbar.setValue(int(round(target * 100.0)))
-                return True
-            if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
-                self._pan_drag_x = None
-                self._pan_drag_start = None
-                return True
 
         # ----------------------------------------------------------------
         # SEGMENT SELECTION MODE — left button press / move / release
@@ -1085,11 +1765,16 @@ class HolterFullDisclosureDialog(QDialog):
                 else:
                     click_x = event.pos().x()
                 
-                # Parallel multi mode: if lines already exist, don't reset them
-                if self._selection_mode == 'parallel_multi' and self._multi_line1_x is not None and self._multi_line2_x is not None:
+                # Parallel multi mode: every fresh click resets line1 to click
+                # position and clears line2 (line2 will follow on drag).
+                if self._selection_mode == 'parallel_multi':
+                    self._multi_line1_x = click_x
+                    self._multi_line2_x = None
                     self._drag_start_x = click_x
                     self._drag_current_x = click_x
                     self._is_dragging = False
+                    if hasattr(self, '_vertical_line_overlay'):
+                        self._vertical_line_overlay.set_line_positions([click_x])
                     return True
                 
                 self._drag_start_x = click_x
@@ -1164,22 +1849,19 @@ class HolterFullDisclosureDialog(QDialog):
         
         elif event.type() == QEvent.MouseMove:
             if hasattr(self, '_drag_start_x') and self._drag_start_x is not None and is_canvas_event:
-                # Parallel multi mode: second line follows mouse
+                # Parallel multi mode: line2 follows mouse during drag
                 if self._selection_mode == 'parallel_multi':
-                    if obj in self._canvases:
-                        drag_pos_global = obj.mapTo(self._canvas_frame, event.pos())
-                        drag_x = drag_pos_global.x()
-                    else:
-                        drag_x = event.pos().x()
-                    
-                    self._multi_line2_x = drag_x
-                    if hasattr(self, '_vertical_line_overlay'):
-                        line_positions = []
-                        if self._multi_line1_x is not None:
-                            line_positions.append(self._multi_line1_x)
-                        if self._multi_line2_x is not None and self._multi_line2_x != self._multi_line1_x:
-                            line_positions.append(self._multi_line2_x)
-                        self._vertical_line_overlay.set_line_positions(line_positions)
+                    if self._drag_start_x is not None:
+                        if obj in self._canvases:
+                            drag_x = obj.mapTo(self._canvas_frame, event.pos()).x()
+                        else:
+                            drag_x = event.pos().x()
+                        self._multi_line2_x = drag_x
+                        if hasattr(self, '_vertical_line_overlay'):
+                            line_positions = [self._multi_line1_x] if self._multi_line1_x is not None else []
+                            if self._multi_line2_x is not None and self._multi_line2_x != self._multi_line1_x:
+                                line_positions.append(self._multi_line2_x)
+                            self._vertical_line_overlay.set_line_positions(line_positions)
                     return True
                 
                 # Parallel single mode: disable drag behavior
@@ -1209,18 +1891,12 @@ class HolterFullDisclosureDialog(QDialog):
         
         elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
             if hasattr(self, '_drag_start_x') and is_canvas_event:
-                # Parallel multi mode: keep both lines fixed
-                if self._selection_mode == 'parallel_multi':
-                    # Second line is already fixed at current position from MouseMove
-                    # Clear drag state but keep line positions
-                    self._drag_start_x   = None
-                    self._drag_current_x = None
-                    self._is_dragging    = False
-                else:
-                    # Single mode: clear everything
-                    self._drag_start_x   = None
-                    self._drag_current_x = None
-                    self._is_dragging    = False
+                # Both parallel_multi and parallel_single: clear drag state.
+                # For multi mode the two line positions (_multi_line1_x / _multi_line2_x)
+                # are intentionally preserved so they stay visible on screen.
+                self._drag_start_x   = None
+                self._drag_current_x = None
+                self._is_dragging    = False
                 return True
                 
         return super().eventFilter(obj, event)
@@ -1229,6 +1905,12 @@ class HolterFullDisclosureDialog(QDialog):
     # def _on_strip_length_changed(self, val):
     #     self._strip_length = float(val)
     #     self.overlay.set_strip_length(self._strip_length)
+
+    def _update_speed_gain_label(self):
+        """Keep the top-bar wave speed/gain readout in sync with btn_speed/btn_gain."""
+        speed = self._paper_speed
+        speed_str = f"{int(speed)}" if float(speed).is_integer() else f"{speed}"
+        self.lbl_speed_gain.setText(f"{speed_str}mm/s {self._gain_label}")
 
     def _cycle_gain(self):
         multipliers = [g[0] for g in self._GAIN_STEPS]
@@ -1239,12 +1921,50 @@ class HolterFullDisclosureDialog(QDialog):
         next_step = self._GAIN_STEPS[(idx + 1) % len(self._GAIN_STEPS)]
         self._gain, self._gain_label = next_step
         self.btn_gain.setText(f"Gain: {self._gain_label}")
-        self._apply_canvas_height_for_gain()
+        self._update_speed_gain_label()
+        # Gain changes only the waveform amplitude; keep the existing row
+        # layout unchanged.
         for c in self._canvases:
             c.set_gain(self._gain)
             c.update()  # Force repaint with new gain
         # Restore selection box when gain is changed
         self._deactivate_tools()
+
+    def apply_record_settings(self, settings: dict):
+        """Apply lead gains and invert from Record Settings to all Full Disclosure canvases.
+        
+        Since Full Disclosure shows all 12 leads at a uniform gain, we derive
+        the gain from the 'All' uniform value if consistent, otherwise use Lead I.
+        """
+        lead_gains = settings.get("lead_gains", {})
+        # Determine gain: prefer a uniform value across all leads, fallback to Lead I
+        gain_val = None
+        if lead_gains:
+            vals = set(lead_gains.values())
+            if len(vals) == 1:
+                gain_val = float(vals.pop())
+            elif "I" in lead_gains:
+                gain_val = float(lead_gains["I"])
+
+        if gain_val is not None:
+            scale = gain_val / 10.0  # 10mm/mV = 1.0 scale
+            self._gain = scale
+            # Map to closest label
+            label_map = {0.5: "5mm/mV", 1.0: "10mm/mV", 2.0: "20mm/mV"}
+            self._gain_label = label_map.get(scale, f"{int(gain_val)}mm/mV")
+            self.btn_gain.setText(f"Gain: {self._gain_label}")
+            self._update_speed_gain_label()
+            for c in self._canvases:
+                c.set_gain(self._gain)
+                c.update()
+            # Sync the cycling index so first click cycles correctly
+            try:
+                multipliers = [g[0] for g in self._GAIN_STEPS]
+                if scale in multipliers:
+                    self._curr_gain_idx = multipliers.index(scale)
+            except Exception:
+                pass
+
 
     def _cycle_speed(self):
         try:
@@ -1253,6 +1973,7 @@ class HolterFullDisclosureDialog(QDialog):
             idx = 1
         self._paper_speed = self._SPEED_STEPS[(idx + 1) % len(self._SPEED_STEPS)]
         self.btn_speed.setText(f"Speed: {self._paper_speed}mm/s")
+        self._update_speed_gain_label()
         self._recalc_window()
         self._update_scrollbar_range()
         for c in self._canvases:
@@ -1299,10 +2020,22 @@ class HolterFullDisclosureDialog(QDialog):
             self._pending_segment = None
             if hasattr(self, '_segment_overlay'):
                 self._segment_overlay.clear_drag()
-            # Restore vertical line overlay visibility
+            # Clear multi-mode lines and reset beat selection state
+            self._multi_line1_x = None
+            self._multi_line2_x = None
+            self._drag_start_x = None
+            self._drag_current_x = None
+            self._is_dragging = False
+            for c in self._canvases:
+                c._selected_beats = []
+                c._clicked_beat_timestamp = None
+                c.update()
+            # Clear vertical line overlay (remove any leftover multi lines)
             if hasattr(self, '_vertical_line_overlay'):
+                self._vertical_line_overlay.clear_line()
                 self._vertical_line_overlay.show()
             # DO NOT clear structured events - they should persist across mode switches
+
         elif mode == 'parallel_multi':
             self.btn_sel_mode.setText("▲ Parallel Multi")
             # Clear any pending segment drag
@@ -1312,14 +2045,23 @@ class HolterFullDisclosureDialog(QDialog):
             self._pending_segment = None
             if hasattr(self, '_segment_overlay'):
                 self._segment_overlay.clear_drag()
-            # Clear multi-line state
+            # Clear multi-line state and drag state
             self._multi_line1_x = None
             self._multi_line2_x = None
-            # Restore vertical line overlay visibility
+            self._drag_start_x = None
+            self._drag_current_x = None
+            self._is_dragging = False
+            # Clear single-mode beat selection highlights
+            for c in self._canvases:
+                c._selected_beats = []
+                c._clicked_beat_timestamp = None
+                c.update()
+            # Clear vertical line overlay (remove any leftover single line)
             if hasattr(self, '_vertical_line_overlay'):
                 self._vertical_line_overlay.clear_line()
                 self._vertical_line_overlay.show()
             # DO NOT clear structured events - they should persist across mode switches
+
         else:  # segment mode
             self.btn_sel_mode.setText("▲ Segment Sel.")
             # Clear parallel-mode state
@@ -1340,6 +2082,104 @@ class HolterFullDisclosureDialog(QDialog):
                 self._refresh_segment_overlay()
 
     # ------------------------------------------------------------------
+    # Display theme mode switching (Testing mode: Dark Mode / Graph Mode)
+    # ------------------------------------------------------------------
+    def _switch_display_theme(self, mode: str):
+        """Switch between 'dark' (default) and 'graph' (medical ECG paper) display mode.
+        TODO: Testing display theme mode toggle."""
+        self._display_theme_mode = mode
+        if hasattr(self, 'btn_display_mode'):
+            self.btn_display_mode.setText("▲ Dark Mode" if mode == 'dark' else "▲ Graph Mode")
+            if mode == 'graph':
+                self.btn_display_mode.setStyleSheet("""
+                    QPushButton {
+                        background: #FFE4E6; color: #990000;
+                        border: 1px solid #E64A5E; padding: 5px 14px;
+                        font-size: 13px; font-weight: bold; border-radius: 4px;
+                    }
+                    QPushButton:hover { background: #FECDD3; color: #880000; }
+                """)
+            else:
+                self.btn_display_mode.setStyleSheet(f"""
+                    QPushButton {{
+                        background: #0d1b2a; color: #a0c4e8;
+                        border: 1px solid {COL_GREEN_DRK}; padding: 5px 14px;
+                        font-size: 13px; font-weight: bold; border-radius: 4px;
+                    }}
+                    QPushButton:hover {{ background: #162a3a; color: {COL_GREEN}; }}
+                """)
+
+        if hasattr(self, '_grid_background') and self._grid_background is not None:
+            self._grid_background.set_mode(mode)
+
+        for canvas in getattr(self, '_canvases', []):
+            if hasattr(canvas, 'set_display_theme_mode'):
+                canvas.set_display_theme_mode(mode)
+
+        if hasattr(self, '_canvas_frame') and self._canvas_frame is not None:
+            if mode == 'graph':
+                self._canvas_frame.setStyleSheet("background: #FFFFFF;")
+            else:
+                self._canvas_frame.setStyleSheet(f"background: {COL_BLACK};")
+
+        # Update lead labels styling
+        if hasattr(self, '_lead_labels'):
+            for lbl in self._lead_labels:
+                if mode == 'graph':
+                    lbl.setStyleSheet(
+                        "color: #990000; font-weight: bold; font-size: 14px;"
+                        " background: #FFFFFF; border-right: 1px solid #D32F2F;"
+                        " padding-right: 4px;"
+                    )
+                else:
+                    lbl.setStyleSheet(
+                        f"color: {COL_GREEN}; font-weight: bold; font-size: 14px;"
+                        f" background: #0a0f18; border-right: 1px solid {COL_GREEN_DRK};"
+                        f" padding-right: 4px;"
+                    )
+
+        # Update scrollbar style
+        if hasattr(self, '_leads_scroll') and self._leads_scroll is not None:
+            if mode == 'graph':
+                self._leads_scroll.setStyleSheet("""
+                    QScrollArea { background: transparent; border: none; }
+                    QScrollBar:vertical {
+                        background: #FFE4E6; width: 16px; border: 1px solid #F3A5AF; border-radius: 8px; margin: 0;
+                    }
+                    QScrollBar::handle:vertical {
+                        background: #E64A5E; min-height: 40px; border-radius: 6px; margin: 2px;
+                    }
+                    QScrollBar::handle:vertical:hover { background: #C8344A; }
+                    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+                """)
+            else:
+                self._leads_scroll.setStyleSheet(f"""
+                    QScrollArea {{ background: transparent; border: none; }}
+                    QScrollBar:vertical {{
+                        background: #16233A; width: 16px; border: 1px solid #2A4268; border-radius: 8px; margin: 0;
+                    }}
+                    QScrollBar::handle:vertical {{
+                        background: #3B8EF0; min-height: 40px; border-radius: 6px; margin: 2px;
+                    }}
+                    QScrollBar::handle:vertical:hover {{ background: #6AAEFF; }}
+                    QScrollBar::handle:vertical:pressed {{ background: #9CC7FF; }}
+                    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+                """)
+
+        # Update waveform strip canvases
+        if hasattr(self, '_canvases'):
+            for c in self._canvases:
+                if hasattr(c, 'set_theme_mode'):
+                    c.set_theme_mode(mode)
+                else:
+                    c.update()
+
+        if hasattr(self, '_vertical_line_overlay') and self._vertical_line_overlay is not None:
+            self._vertical_line_overlay.update()
+        if hasattr(self, '_segment_overlay') and self._segment_overlay is not None:
+            self._segment_overlay.update()
+
+    # ------------------------------------------------------------------
     # Segment context menu + labeling
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -1355,12 +2195,25 @@ class HolterFullDisclosureDialog(QDialog):
             if hasattr(c, '_beat_annotations') and c._beat_annotations is not None:
                 beat_annotations_by_lead[c.lead_name] = copy.deepcopy(c._beat_annotations)
 
+        del_auto_snapshot = []
+        try:
+            ecgh_p = getattr(self._engine, 'ecgh_path', None)
+            if ecgh_p:
+                session_dir = os.path.dirname(ecgh_p)
+                del_path = os.path.join(session_dir, 'deleted_auto_segments.json')
+                if os.path.exists(del_path):
+                    with open(del_path, 'r', encoding='utf-8') as f:
+                        del_auto_snapshot = json.load(f)
+        except Exception:
+            del_auto_snapshot = []
+
         snapshot = {
             'action': action_label,
             'segment_annotations': copy.deepcopy(getattr(self, '_segment_annotations', [])),
             'beat_annotations_by_lead': beat_annotations_by_lead,
             'engine_metrics': copy.deepcopy(getattr(self._engine, '_metrics', None)),
             'structured_events': copy.deepcopy(getattr(self._engine, '_structured_events', None)),
+            'deleted_auto_segments': del_auto_snapshot,
         }
         self._undo_stack.append(snapshot)
         if len(self._undo_stack) > self._UNDO_STACK_LIMIT:
@@ -1397,6 +2250,29 @@ class HolterFullDisclosureDialog(QDialog):
         if snapshot['structured_events'] is not None:
             self._engine._structured_events = snapshot['structured_events']
             self._event_index_dirty = True
+
+        if 'deleted_auto_segments' in snapshot:
+            try:
+                ecgh_p = getattr(self._engine, 'ecgh_path', None)
+                if ecgh_p:
+                    session_dir = os.path.dirname(ecgh_p)
+                    del_path = os.path.join(session_dir, 'deleted_auto_segments.json')
+                    if snapshot['deleted_auto_segments']:
+                        with open(del_path, 'w', encoding='utf-8') as df:
+                            json.dump(snapshot['deleted_auto_segments'], df, indent=2)
+                    elif os.path.exists(del_path):
+                        os.remove(del_path)
+            except Exception as e:
+                print(f"[Full Disclosure] Error restoring deleted_auto_segments on undo: {e}")
+
+        # Undoing the "Auto Arrhythmia Detection" click itself additionally
+        # hides all non-manual rhythm marking again (plain wave, no tint, no
+        # auto rhythm label -- same as before the button was ever clicked)
+        # and un-persists the report-visibility flag. Manual beat/segment
+        # undos never touch this.
+        if snapshot.get('action') == "Auto Arrhythmia Detection":
+            self._auto_marking_visible = False
+            self._clear_auto_marking_enabled()
 
         # Persist the reverted state to disk so it stays consistent with
         # report generation and future reloads.
@@ -1486,6 +2362,7 @@ class HolterFullDisclosureDialog(QDialog):
                 "Poly VTach (Unstable)",
                 "Asystole",
                 "Sinus Bradycardia",
+                "Sinus Tachycardia",
                 "2nd Deg AV Block T",
                 "3rd Deg AV Block",
                 "Rt Bundle Branch B",
@@ -1608,29 +2485,97 @@ class HolterFullDisclosureDialog(QDialog):
             self._segment_overlay.clear_drag()
 
     def _delete_segment(self, segment):
-        """Remove a finalized segment from annotations and the overlay."""
+        """Remove a finalized segment (manual or auto-detected) from annotations and the overlay."""
         self._snapshot_state('delete_segment')
-        if segment in self._segment_annotations:
-            self._segment_annotations.remove(segment)
-        
-        # Remove from JSON file as well
-        try:
-            session_dir = os.path.dirname(self._engine.ecgh_path)
-            segments_path = os.path.join(session_dir, 'manual_segments.json')
-            if os.path.exists(segments_path):
-                with open(segments_path, 'r') as f:
-                    segments_data = json.load(f)
-                # Remove the segment by matching start_sec, end_sec, and label
-                segments_data = [s for s in segments_data if not (
-                    abs(s.get('start_sec', 0) - segment.get('start_sec', 0)) < 0.01 and
-                    abs(s.get('end_sec', 0) - segment.get('end_sec', 0)) < 0.01 and
-                    s.get('label') == segment.get('label')
-                )]
-                with open(segments_path, 'w') as f:
-                    json.dump(segments_data, f, indent=2)
-                print(f"[Full Disclosure] Removed segment from {segments_path}")
-        except Exception as e:
-            print(f"[Full Disclosure] Error removing segment from JSON: {e}")
+
+        if segment.get('auto'):
+            # Auto-detected arrhythmia segment deletion
+            start_sec = float(segment.get('start_sec', 0.0))
+            end_sec = float(segment.get('end_sec', 0.0))
+            target_label = str(segment.get('label', '')).strip().lower()
+
+            targets = {
+                'ventricular fibrillation': 'Ventricular Fibrillation',
+                'vfib': 'Ventricular Fibrillation',
+                'supraventricular tachycardia (svt)': 'Supraventricular Tachycardia (SVT)',
+                'ventricular tachycardia': 'Ventricular Tachycardia',
+                'vtach': 'Ventricular Tachycardia',
+                'atrial fibrillation': 'Atrial Fibrillation',
+                'afib': 'Atrial Fibrillation',
+                'atrial flutter': 'Atrial Flutter',
+                'aflutter': 'Atrial Flutter',
+                'sinus bradycardia': 'Sinus Bradycardia',
+                'bradycardia': 'Sinus Bradycardia',
+                'sinus tachycardia': 'Sinus Tachycardia',
+                'tachycardia': 'Sinus Tachycardia',
+                'sinus arrhythmia': 'Sinus Arrhythmia',
+                'artifact': 'Artifact',
+            }
+
+            def _matches_this_auto_segment(ev):
+                if 'manual' in str(ev.get('source', '')).lower():
+                    return False
+                ev_start = float(ev.get('timestamp', 0.0) or 0.0)
+                ev_end = float(ev.get('end_timestamp', ev.get('end_ts', ev_start)) or ev_start)
+                
+                # Check time bounds: event must fall within or overlap this segment's span
+                if ev_end < start_sec - 0.5 or ev_start > end_sec + 0.5:
+                    return False
+                
+                ev_label = str(ev.get('label', ev.get('type', ''))).strip().lower()
+                canonical = next((v for k, v in targets.items() if k in ev_label), None)
+                if canonical and canonical.lower() == target_label:
+                    return True
+                if target_label in ev_label or ev_label in target_label:
+                    return True
+                return False
+
+            old_events = list(getattr(self._engine, '_structured_events', []) or [])
+            self._engine._structured_events = [ev for ev in old_events if not _matches_this_auto_segment(ev)]
+            self._event_index_dirty = True
+            print(f"[Full Disclosure] Deleted auto segment '{segment.get('label')}' ({start_sec:.1f}s - {end_sec:.1f}s)")
+
+            # Persist deleted auto segment to disk so report generator omits it
+            try:
+                session_dir = os.path.dirname(self._engine.ecgh_path)
+                del_path = os.path.join(session_dir, 'deleted_auto_segments.json')
+                del_list = []
+                if os.path.exists(del_path):
+                    with open(del_path, 'r', encoding='utf-8') as f:
+                        del_list = json.load(f)
+                del_list.append({
+                    'start_sec': start_sec,
+                    'end_sec': end_sec,
+                    'label': segment.get('label', '')
+                })
+                with open(del_path, 'w', encoding='utf-8') as f:
+                    json.dump(del_list, f, indent=2)
+                print(f"[Full Disclosure] Saved deleted auto segment to {del_path}")
+            except Exception as e:
+                print(f"[Full Disclosure] Error saving deleted auto segment: {e}")
+        else:
+            # Manual segment deletion (100% unchanged)
+            if segment in self._segment_annotations:
+                self._segment_annotations.remove(segment)
+            
+            # Remove from JSON file as well
+            try:
+                session_dir = os.path.dirname(self._engine.ecgh_path)
+                segments_path = os.path.join(session_dir, 'manual_segments.json')
+                if os.path.exists(segments_path):
+                    with open(segments_path, 'r') as f:
+                        segments_data = json.load(f)
+                    # Remove the segment by matching start_sec, end_sec, and label
+                    segments_data = [s for s in segments_data if not (
+                        abs(s.get('start_sec', 0) - segment.get('start_sec', 0)) < 0.01 and
+                        abs(s.get('end_sec', 0) - segment.get('end_sec', 0)) < 0.01 and
+                        s.get('label') == segment.get('label')
+                    )]
+                    with open(segments_path, 'w') as f:
+                        json.dump(segments_data, f, indent=2)
+                    print(f"[Full Disclosure] Removed segment from {segments_path}")
+            except Exception as e:
+                print(f"[Full Disclosure] Error removing segment from JSON: {e}")
         
         # Clear and rebuild visible segment list in segment overlay
         if hasattr(self, '_segment_overlay'):
@@ -1661,10 +2606,29 @@ class HolterFullDisclosureDialog(QDialog):
                                     sx_global, ex_global, s_sec, e_sec,
                                     seg['label'], seg['color'], seg.get('start_time_str', ''), seg.get('end_time_str', '')
                                 )
+                    # clear_segments() above wipes BOTH manual and
+                    # auto-detected regions, but the loop just above only
+                    # re-adds manual ones (self._segment_annotations) --
+                    # auto regions (VFib/AFib/etc, drawn from
+                    # _structured_events, never stored in
+                    # _segment_annotations) were silently left out until the
+                    # next scroll/drag happened to call _update_canvases and
+                    # re-add them. Restore them here too, same as
+                    # _refresh_segment_overlay does.
+                    self._add_auto_arrhythmia_segments(
+                        ref,
+                        self._structured_events_for_canvas(ref._start_sec, ref_end),
+                        ref_end,
+                        span,
+                    )
             self._segment_overlay.update()
 
+        # Update canvases to refresh waveform tints and bottom-right arrhythmia label
+        if hasattr(self, '_current_start'):
+            self._update_canvases(self._current_start)
 
-    def _show_beat_context_menu(self, click_x: int, global_pos):
+
+    def _show_beat_context_menu(self, click_x: int, global_pos, clicked_segment=None):
         """Show right-click context menu for beat labeling with hierarchical dropdown menus."""
         from PyQt5.QtWidgets import QMenu, QAction
         
@@ -1739,6 +2703,7 @@ class HolterFullDisclosureDialog(QDialog):
                 "Poly VTach (Unstable)",
                 "Asystole",
                 "Sinus Bradycardia",
+                "Sinus Tachycardia",
                 "2nd Deg AV Block T",
                 "3rd Deg AV Block",
                 "Rt Bundle Branch B",
@@ -1785,6 +2750,11 @@ class HolterFullDisclosureDialog(QDialog):
         delete_action = QAction("Delete", self)
         delete_action.triggered.connect(lambda: self._delete_beat_at_position(click_x))
         menu.addAction(delete_action)
+
+        if clicked_segment is not None:
+            del_seg_action = QAction("Delete segment", self)
+            del_seg_action.triggered.connect(lambda: self._delete_segment(clicked_segment))
+            menu.addAction(del_seg_action)
         
         menu.addSeparator()
         
@@ -2599,6 +3569,18 @@ class HolterFullDisclosureDialog(QDialog):
         self._cached_event_ts = np.array(
             [float(e.get('timestamp', 0.0) or 0.0) for e in events], dtype=np.float64
         )
+        # Regions longer than _EVENT_REGION_PAD_SEC (e.g. a 20+ min Sinus
+        # Tachycardia run on a multi-hour Holter) start before the padded
+        # lower bound once you scroll past their first 10 minutes, so the
+        # bisect slice in _structured_events_for_canvas drops them and the
+        # colored overlay vanishes mid-segment. Keep them in a small side
+        # list so they can be matched by overlap instead.
+        self._cached_long_events = []
+        for e in events:
+            ev_start = float(e.get('timestamp', 0.0) or 0.0)
+            ev_end = float(e.get('end_timestamp', e.get('end_ts', ev_start)) or ev_start)
+            if ev_end - ev_start > self._EVENT_REGION_PAD_SEC:
+                self._cached_long_events.append((ev_start, ev_end, e))
         self._event_index_dirty = False
 
     def _events_in_window(self, start_sec, end_sec):
@@ -2695,9 +3677,200 @@ class HolterFullDisclosureDialog(QDialog):
         if len(self._cached_event_ts) == 0:
             return []
         import bisect
-        lo = bisect.bisect_left(self._cached_event_ts, start_sec - self._EVENT_REGION_PAD_SEC)
+        padded_start = start_sec - self._EVENT_REGION_PAD_SEC
+        lo = bisect.bisect_left(self._cached_event_ts, padded_start)
         hi = bisect.bisect_right(self._cached_event_ts, end_sec)
-        return self._cached_event_list[lo:hi]
+        window_events = self._cached_event_list[lo:hi]
+        # Long regions that began before the padded bound but still overlap
+        # the visible window (see _rebuild_event_index).
+        long_hits = [e for ev_start, ev_end, e in getattr(self, '_cached_long_events', [])
+                     if ev_start < padded_start and ev_end >= start_sec]
+        combined = (long_hits + window_events) if long_hits else window_events
+
+        # Hide every non-manual (auto-detected) region until the "Auto
+        # Arrhythmia Detection" button has been clicked (see
+        # self._auto_marking_visible in __init__). Manual markings always
+        # pass through untouched.
+        if not self._auto_marking_visible:
+            combined = [e for e in combined if 'manual' in str(e.get('source', '')).lower()]
+        else:
+            combined = self._without_asystole_spans(combined)
+        return combined
+
+    # A piece of an auto region left over next to an Asystole span shorter
+    # than this is dropped rather than drawn: no rhythm is established in
+    # under a second, it is only the detector's window edge spilling past
+    # the flatline.
+    _ASYSTOLE_REMNANT_MIN_SEC = 1.0
+
+    def _without_asystole_spans(self, events):
+        """Auto (non-manual) events with every Asystole span cut out of them.
+
+        Display-only: Asystole comes from its own detector
+        (self._asystole_segments) and is never merged into the auto-marking
+        pipeline, so an auto rhythm region can still run straight across a
+        flatline -- seen: Atrial Flutter 340.0-420.9 s over Asystole
+        410.8-420.2 s, tinting the flatline and labelling it "Atrial Flutter
+        | Asystole". With auto marking off the flatline shows only Asystole;
+        this makes auto marking show it the same way. Returns copies --
+        self._engine._structured_events, the detection cache and the report
+        are untouched. Manual markings pass through as they are.
+        """
+        spans = []
+        for seg in getattr(self, '_asystole_segments', []) or []:
+            try:
+                a_s = float(seg.get('start_sec', 0.0) or 0.0)
+                a_e = float(seg.get('end_sec', a_s) or a_s)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if a_e > a_s:
+                spans.append((a_s, a_e))
+        if not spans:
+            return events
+        spans.sort()
+
+        result = []
+        for ev in events:
+            if not isinstance(ev, dict) or 'manual' in str(ev.get('source', '')).lower():
+                result.append(ev)
+                continue
+            try:
+                ev_s = float(ev.get('timestamp', 0.0) or 0.0)
+                ev_e = float(ev.get('end_timestamp', ev.get('end_ts', ev_s)) or ev_s)
+            except (TypeError, ValueError):
+                result.append(ev)
+                continue
+            if not any(a_s < ev_e and a_e > ev_s for a_s, a_e in spans):
+                result.append(ev)
+                continue
+            pieces = []
+            cur = ev_s
+            for a_s, a_e in spans:
+                if a_e <= cur or a_s >= ev_e:
+                    continue
+                pieces.append((cur, a_s))
+                cur = a_e
+            pieces.append((cur, ev_e))
+            for p_s, p_e in pieces:
+                if p_e - p_s < self._ASYSTOLE_REMNANT_MIN_SEC:
+                    continue
+                piece = dict(ev)
+                piece['timestamp'] = p_s
+                piece['end_timestamp'] = p_e
+                if 'end_ts' in piece:
+                    piece['end_ts'] = p_e
+                result.append(piece)
+        return result
+
+    def _add_auto_arrhythmia_segments(self, ref, visible_events, ref_end, span):
+        """Add visual-only auto-arrhythmia regions; manual segments remain separate."""
+        if ref is None or span <= 0:
+            return
+        # Order matters: `next()` below returns the FIRST matching key, and
+        # matching is substring-based ('key in label_lower'). 'ventricular
+        # tachycardia'/'vtach' must be checked before the bare 'tachycardia'
+        # fallback, or a real "Ventricular Tachycardia" event (e.g. from
+        # stored replay analysis) silently matches 'tachycardia' first and
+        # renders as "Sinus Tachycardia" -- a lethal rhythm shown as a benign
+        # rate label. Keep Ventricular Tachycardia visually distinct from
+        # Ventricular Fibrillation; this function only maps an existing event
+        # to its display label/color and does not classify the waveform.
+        targets = {
+            'ventricular fibrillation': ('Ventricular Fibrillation', '#FF3333'),
+            'vfib': ('Ventricular Fibrillation', '#FF3333'),
+            'supraventricular tachycardia (svt)': ('Supraventricular Tachycardia (SVT)', '#FFA500'),
+            'ventricular tachycardia': ('Ventricular Tachycardia', '#E67E22'),
+            'vtach': ('Ventricular Tachycardia', '#E67E22'),
+            'atrial fibrillation': ('Atrial Fibrillation', '#B36BFF'),
+            'afib': ('Atrial Fibrillation', '#B36BFF'),
+            'atrial flutter': ('Atrial Flutter', '#FF69B4'),
+            'aflutter': ('Atrial Flutter', '#FF69B4'),
+            'sinus bradycardia': ('Sinus Bradycardia', '#00BFFF'),
+            'bradycardia': ('Sinus Bradycardia', '#00BFFF'),
+            'sinus tachycardia': ('Sinus Tachycardia', '#00FFFF'),
+            'tachycardia': ('Sinus Tachycardia', '#00FFFF'),
+            'sinus arrhythmia': ('Sinus Arrhythmia', '#F5DEB3'),
+            # AV conduction blocks (auto_segment_arrthymia_detection.py's
+            # _AV_COLORS). Exact full labels only, so a stored replay entry
+            # like a bare "AV Block" isn't drawn as one of these degrees.
+            'third-degree av block': ('Third-degree AV Block', '#C0FF00'),
+            'second-degree av block (mobitz ii)': ('Second-degree AV Block (Mobitz II)', '#FF00FF'),
+            'second-degree av block (mobitz i)': ('Second-degree AV Block (Mobitz I)', '#4169E1'),
+            'first-degree av block': ('First-degree AV Block', '#FFD700'),
+        }
+        # Bundle branch blocks (auto_segment_arrthymia_detection.py's
+        # _BUNDLE_BRANCH_BLOCK_COLORS) are a QRS-shape layer drawn alongside the rhythm, so
+        # they are merged in their own list: one sitting between two pieces
+        # of a rhythm must not stop those pieces merging as before.
+        # "incomplete ..." keys come first: "complete ..." is a substring.
+        bundle_branch_block_targets = {
+            'incomplete right bundle branch block': ('Incomplete Right Bundle Branch Block', '#9E9E9E'),
+            'incomplete left bundle branch block': ('Incomplete Left Bundle Branch Block', '#76D7C4'),
+            'complete right bundle branch block': ('Complete Right Bundle Branch Block', '#E0E0E0'),
+            'complete left bundle branch block': ('Complete Left Bundle Branch Block', '#1ABC9C'),
+            # Artifact (auto_segment_arrthymia_detection.py's Artifact rule)
+            # is a signal-quality layer drawn alongside the rhythm, like the
+            # bundle branch blocks, so it rides in their layer.
+            'artifact': ('Artifact', '#A0A0A0'),
+        }
+        reader_start = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
+        regions = []
+        bundle_branch_block_regions = []
+        for ev in sorted(visible_events or [], key=lambda item: float(item.get('timestamp', 0.0) or 0.0)):
+            label_raw = str(ev.get('label', ev.get('type', '')) or '')
+            label_lower = label_raw.lower()
+            bundle_branch_block_match = next((value for key, value in bundle_branch_block_targets.items() if key in label_lower), None)
+            match = bundle_branch_block_match or next((value for key, value in targets.items() if key in label_lower), None)
+            if match is None:
+                continue
+            start_sec = float(ev.get('timestamp', 0.0) or 0.0)
+            end_sec = float(ev.get('end_timestamp', ev.get('end_ts', start_sec)) or start_sec)
+            if end_sec <= start_sec:
+                continue
+            group = bundle_branch_block_regions if bundle_branch_block_match else regions
+            if group and group[-1][2][0] == match[0] and start_sec <= group[-1][1] + 0.5:
+                group[-1] = (group[-1][0], max(group[-1][1], end_sec), match)
+            else:
+                group.append((start_sec, end_sec, match))
+
+        bundle_branch_block_names = {value[0] for value in bundle_branch_block_targets.values()}
+        for start_sec, end_sec, match in regions + bundle_branch_block_regions:
+            # Clip only for drawing; retain the true event times in the overlay metadata.
+            draw_start = max(start_sec, ref._start_sec)
+            draw_end = min(end_sec, ref_end)
+            if draw_end <= draw_start:
+                continue
+            sx = int(((draw_start - ref._start_sec) / span) * ref.width())
+            ex = int(((draw_end - ref._start_sec) / span) * ref.width())
+            from PyQt5.QtCore import QPoint
+            sx = ref.mapTo(self._canvas_frame, QPoint(sx, 0)).x()
+            ex = ref.mapTo(self._canvas_frame, QPoint(ex, 0)).x()
+
+            # The label is anchored to the segment's own true midpoint in
+            # TIME, not to the midpoint of whatever fraction of it happens
+            # to be visible right now (sx/ex above are clamped to the
+            # current viewport, so a segment longer than one screen would
+            # otherwise freeze its label at screen-center for as long as
+            # you're scrolled anywhere inside it). Mapping the true
+            # midpoint through the same pixel formula WITHOUT that
+            # viewport clamp gives it a real, fixed position in time --
+            # out past either edge while it's not in view yet, sliding in
+            # from the right as the recording scrolls forward through it,
+            # crossing the middle, then sliding out past the left, exactly
+            # like the waveform itself moves.
+            true_mid_sec = (start_sec + end_sec) / 2.0
+            true_mid_x = int(((true_mid_sec - ref._start_sec) / span) * ref.width())
+            true_mid_x = ref.mapTo(self._canvas_frame, QPoint(true_mid_x, 0)).x()
+
+            start_time = end_time = ''
+            if reader_start:
+                start_time = datetime.fromtimestamp(reader_start + start_sec).strftime('%H:%M:%S')
+                end_time = datetime.fromtimestamp(reader_start + end_sec).strftime('%H:%M:%S')
+            self._segment_overlay.add_segment(
+                sx, ex, start_sec, end_sec, match[0], match[1],
+                start_time, end_time, auto=True, true_mid_x=true_mid_x,
+                layer=1 if match[0] in bundle_branch_block_names else 0,
+            )
 
     def _scroll_throttle_interval(self):
         """Minimum seconds between live redraws while dragging, scaled to window size."""
@@ -2826,10 +3999,342 @@ class HolterFullDisclosureDialog(QDialog):
         self._update_scrollbar_range()
         self.time_scrollbar.setValue(int(self._current_start * 100))
         self._update_canvases(self._current_start)
-        
-        self.lbl_dur.setText(f"Recording: {self._engine._sec_to_hms(self._engine.duration_sec)}")
+
+    @staticmethod
+    def _bundle_branch_block_global_qrs_ms(leads_data, lead_names, r_idx, fs):
+        """Global (multi-lead) QRS duration of one beat, in ms, or None.
+
+        Same measurement auto_segment_arrthymia_detection.py's bundle branch
+        block rule uses: the combined slope of leads I, II, aVL, V1, V2, V5,
+        V6 (each scaled by its own QRS size); the QRS runs from where that
+        slope first rises above 10% of its peak to where it stays below 10%
+        for 16 ms (20% when a discordant ST-T keeps it above 10%). A single
+        lead under-reads a bundle branch block's QRS -- part of it is
+        isoelectric in that lead, and its slurred terminal S / R' is cut
+        off -- e.g. Lead II read 132-134 ms where the global QRS is ~154 ms.
+        """
+        from scipy.signal import savgol_filter
+        idx = [lead_names.index(n) for n in ('I', 'II', 'aVL', 'V1', 'V2', 'V5', 'V6') if n in lead_names]
+        if len(idx) < 3:
+            return None
+        w_lo, w_hi = int(r_idx) - int(0.15 * fs), int(r_idx) + int(0.20 * fs)
+        if w_lo < 0 or w_hi > leads_data.shape[1]:
+            return None
+        velocity = np.zeros(w_hi - w_lo)
+        p_lo, p_hi = int(0.07 * fs), int(0.27 * fs)
+        for i in idx:
+            x = np.asarray(leads_data[i][w_lo:w_hi], dtype=float)
+            if x.size >= 11:
+                x = savgol_filter(x, 11, 3)
+            size = float(np.ptp(x[p_lo:p_hi])) or 1.0
+            velocity += np.abs(np.gradient(x)) / size
+        peak = p_lo + int(np.argmax(velocity[p_lo:p_hi]))
+        quiet = max(1, int(0.016 * fs))
+
+        def edge(threshold, step):
+            run = 0
+            rng = range(peak, -1, -1) if step < 0 else range(peak, velocity.size)
+            for k in rng:
+                run = run + 1 if velocity[k] < threshold else 0
+                if run >= quiet:
+                    return k + quiet - 1 if step < 0 else k - quiet + 1
+            return None
+
+        onset = edge(0.10 * float(velocity[peak]), -1)
+        offset = edge(0.10 * float(velocity[peak]), +1)
+        if offset is None:
+            offset = edge(0.20 * float(velocity[peak]), +1)
+        if onset is None or offset is None or offset <= onset:
+            return None
+        return (offset - onset) * 1000.0 / fs
+
+    def _update_pr_qrs_label(self, start_sec: float, end_sec: float):
+        """TODO(testing-only): recompute PR interval / QRS duration from
+        Lead II's own beats in the currently visible window, purely so a
+        tester can verify measure_beat()'s numbers directly against the
+        on-screen waveform while scrolling -- not used by any detection or
+        report logic. See the comment on lbl_pr_qrs's creation (top bar
+        setup) for the removal/promotion plan. Called from
+        _update_time_and_arrhythmia_labels() on every scroll/window change,
+        so it keeps following Lead II's current rhythm pattern as the user
+        scrolls horizontally."""
+        if not hasattr(self, 'lbl_pr_qrs'):
+            return
+        try:
+            from ecg.pan_tompkins import pan_tompkins
+            from ecg.arrhythmia_detector import measure_beat
+
+            # Use the Lead-II canvas that is currently visible as the
+            # primary source.  It is the exact waveform the user is looking
+            # at after a horizontal scroll, so it cannot disagree with the
+            # displayed recording because of a stale dialog reader or a
+            # refresh race.  The reader path below is only an initial-load
+            # fallback, before the canvas has received its data.
+            #
+            # Measure from the canvas's pre-filter _raw_data, not its
+            # display-smoothed _data: the strip's double Gaussian pass
+            # (see ECGStripCanvas.set_data) shifts P-wave/QRS onsets enough
+            # to move this readout.
+            lead_ii_canvas = next(
+                (c for c in getattr(self, '_canvases', [])
+                 if getattr(c, 'lead_name', '') == 'II'),
+                None,
+            )
+            canvas_data = getattr(lead_ii_canvas, '_raw_data', None) if lead_ii_canvas is not None else None
+            if canvas_data is None and lead_ii_canvas is not None:
+                canvas_data = getattr(lead_ii_canvas, '_data', None)
+            canvas_start = getattr(lead_ii_canvas, '_start_sec', None) if lead_ii_canvas is not None else None
+            canvas_fs = getattr(lead_ii_canvas, '_fs', None) if lead_ii_canvas is not None else None
+
+            if canvas_data is not None and len(canvas_data) >= 50 \
+                    and canvas_start is not None and canvas_fs:
+                sig = np.asarray(canvas_data, dtype=float)
+                raw_sig = sig  # before the 25 Hz filter below; see bundle branch block note
+                fs = float(canvas_fs)
+                source_start = float(canvas_start)
+                # PR/QRS logic was tuned on the strip's old Butterworth 25 Hz
+                # filtfilt output; reproduce that exact input here so the
+                # display-only Gaussian filter cannot change these values.
+                if getattr(lead_ii_canvas, '_raw_data', None) is not None:
+                    try:
+                        # 50/60 Hz notches first: the recording holds raw
+                        # serial samples, and the 25 Hz Butterworth alone
+                        # leaves ~6% of the mains hum -- every 20 ms ripple
+                        # peak then passes the P search's prominence gate and
+                        # the strict search (closest wave to the QRS) takes
+                        # one for the P, so PR read "--" on every beat (seen:
+                        # 0/10 beats, 10/10 at 168 ms with the notch). The
+                        # canvas pads the notch with real neighbouring
+                        # samples, so it does not ring at the strip edges.
+                        if hasattr(lead_ii_canvas, 'mains_free_raw'):
+                            mains_free = lead_ii_canvas.mains_free_raw()
+                            if mains_free is not None and len(mains_free) == sig.size:
+                                sig = np.asarray(mains_free, dtype=float)
+                        from scipy.signal import butter, filtfilt
+                        b, a = butter(2, 25.0 / (fs / 2.0), btype='lowpass')
+                        sig = filtfilt(b, a, sig)
+                    except Exception:
+                        pass
+            else:
+                reader = getattr(getattr(self, '_engine', None), '_reader', None)
+                if reader is None:
+                    reader = getattr(self, '_reader', None)
+                if reader is None:
+                    self.lbl_pr_qrs.setText("PR: -- ms   QRS: -- ms")
+                    return
+                lead_names = list(getattr(reader, 'lead_names', []) or [])
+                if 'II' not in lead_names:
+                    self.lbl_pr_qrs.setText("PR: --   QRS: -- ")
+                    return
+                lead_idx = lead_names.index('II')
+                fs = getattr(reader, 'fs', None) or getattr(self._engine, 'fs', 500) or 500
+                total_duration = getattr(self._engine, 'duration_sec', end_sec)
+                pad_start = max(0.0, start_sec - 1.0)
+                pad_end = min(total_duration, end_sec + 1.0)
+                chunk = reader.read_range(pad_start, pad_end)
+                if chunk is None or lead_idx >= chunk.shape[0] or chunk.shape[1] < 50:
+                    self.lbl_pr_qrs.setText("PR: -- ms   QRS: -- ms")
+                    return
+                sig = np.asarray(chunk[lead_idx], dtype=float)
+                raw_sig = sig
+                source_start = pad_start
+
+            peaks = [
+                p for p in pan_tompkins(sig, fs=fs)
+                if start_sec <= source_start + p / fs < end_sec
+            ]
+
+            # AF/Flutter have no consistently identifiable sinus P wave, so
+            # the generic beat measurer's PR candidate is not meaningful in
+            # those auto-marked regions. This is display-only suppression;
+            # auto-segment detection and its thresholds are unchanged.
+            atrial_arrhythmia_active = False
+            ventricular_fibrillation_active = False
+            ventricular_tachycardia_active = False
+            bundle_branch_block_active = False
+            if getattr(self, '_auto_marking_visible', False):
+                # Persisted event stores can contain legacy/non-dict entries
+                # after reopening a recording. One malformed entry must not
+                # abort the independent Lead-II measurement and blank both
+                # PR/QRS values.
+                for event in getattr(self._engine, '_structured_events', []) or []:
+                    if not isinstance(event, dict):
+                        continue
+                    try:
+                        event_label = str(event.get('label', event.get('type', '')) or '').lower()
+                        event_start = float(event.get('timestamp', 0.0) or 0.0)
+                        event_end = float(event.get('end_timestamp', event_start) or event_start)
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+                    if event_start > end_sec or event_end < start_sec:
+                        continue
+                    if event_label in {'atrial fibrillation', 'atrial flutter'}:
+                        atrial_arrhythmia_active = True
+                    elif event_label in {'ventricular fibrillation', 'vfib'} \
+                            or 'ventricular fibrillation' in event_label:
+                        ventricular_fibrillation_active = True
+                    elif event_label in {'ventricular tachycardia', 'vtach'} \
+                            or 'ventricular tachycardia' in event_label:
+                        ventricular_tachycardia_active = True
+                    elif 'bundle branch block' in event_label:
+                        bundle_branch_block_active = True
+
+            pr_values, qrs_values = [], []
+            # Bundle branch block: all leads over the same span as the Lead II
+            # signal above (same start, same sample count), for the global QRS.
+            bbb_leads_data, bbb_lead_names = None, []
+            if bundle_branch_block_active:
+                try:
+                    bbb_reader = getattr(getattr(self, '_engine', None), '_reader', None) or getattr(self, '_reader', None)
+                    if bbb_reader is not None:
+                        bbb_lead_names = list(getattr(bbb_reader, 'lead_names', []) or [])
+                        bbb_leads_data = bbb_reader.read_range(source_start, source_start + raw_sig.size / fs)
+                        # Same filter the auto-segment bundle branch block
+                        # gate applies before this exact global-QRS
+                        # measurement (0.5-40 Hz bandpass + 50 Hz notch):
+                        # mains hum on the chest leads otherwise pushes the
+                        # onset/offset search past the real QRS edges (seen:
+                        # 226 ms shown here for a beat the filtered detector
+                        # measured at 158-174 ms, same recording).
+                        if bbb_leads_data is not None:
+                            from .analysis_pipeline import SignalPreprocessor, HolterConfig
+                            _bbb_preproc = SignalPreprocessor(fs=fs, config=HolterConfig.from_clinical_config())
+                            bbb_leads_data = np.vstack([
+                                np.asarray(_bbb_preproc.process(np.asarray(lead, dtype=float)), dtype=float)
+                                for lead in bbb_leads_data
+                            ])
+                except Exception:
+                    bbb_leads_data = None
+            for i, p in enumerate(peaks):
+                prev_rr_ms = (float(p) - float(peaks[i - 1])) * 1000.0 / fs if i > 0 else None
+                if bundle_branch_block_active:
+                    # Right/Left bundle branch block (auto-marked here): the
+                    # same measurement the bundle branch block detector uses.
+                    # The beat is taken at Lead II's own dominant QRS
+                    # deflection (40 ms before to 100 ms after the detected
+                    # peak) on the unfiltered signal: at the detected peak --
+                    # a small r ahead of a deep S in RBBB, or the dip just
+                    # before the QRS in LBBB -- the P-wave search either
+                    # mistook the P for a too-close QRS or picked that dip
+                    # and found no P, so PR read "--" on every beat. The
+                    # wide BBB QRS often never returns cleanly to baseline,
+                    # so its width is shown whether or not that boundary
+                    # "resolved". Measured: RBBB PR 148-152 / QRS 132-134 ms,
+                    # LBBB PR 152-154 / QRS 130-132 ms.
+                    a_lo = max(0, int(p) - int(0.04 * fs))
+                    a_hi = min(raw_sig.size, int(p) + int(0.10 * fs))
+                    if a_hi <= a_lo:
+                        continue
+                    anchor = a_lo + int(np.argmax(np.abs(raw_sig[a_lo:a_hi] - np.median(raw_sig))))
+                    beat = measure_beat(raw_sig, anchor, fs, strict_pr=True, prev_rr_ms=prev_rr_ms)
+                    if not beat:
+                        continue
+                    # The strict P search takes the wave CLOSEST to the QRS;
+                    # a wide bundle branch block QRS starts with a slurred
+                    # notch 50-80 ms before the dominant deflection, which it
+                    # takes for the P -- that "P" sits after the QRS onset, so
+                    # no PR came out and the header read "PR: --" on every
+                    # beat (seen: LBBB, 0 of 14 beats strict, 144-152 ms on all
+                    # 14 with the search below). Only where the strict search
+                    # found no PR, the non-strict search -- the most PROMINENT
+                    # wave, the real P -- is used, as the bundle branch block
+                    # detector does; only at RR >= 500 ms, as there: faster,
+                    # the previous T wave can be taken for a P.
+                    if beat.get('pr_ms') is None and prev_rr_ms is not None and prev_rr_ms >= 500.0:
+                        relaxed = measure_beat(raw_sig, anchor, fs, strict_pr=False, prev_rr_ms=prev_rr_ms)
+                        if relaxed and relaxed.get('pr_ms') is not None:
+                            beat = dict(beat)
+                            beat['pr_ms'] = relaxed['pr_ms']
+                    # QRS: the global multi-lead duration (see
+                    # _bundle_branch_block_global_qrs_ms); Lead II's own
+                    # width only if all leads couldn't be read.
+                    global_qrs = None
+                    if bbb_leads_data is not None:
+                        global_qrs = self._bundle_branch_block_global_qrs_ms(
+                            bbb_leads_data, bbb_lead_names, int(p), fs)
+                    if global_qrs is not None and 40.0 <= global_qrs <= 250.0:
+                        qrs_values.append(global_qrs)
+                    elif bbb_leads_data is None and 40.0 <= float(beat.get('qrs_ms') or 0.0) <= 220.0:
+                        qrs_values.append(float(beat['qrs_ms']))
+                    if beat.get('pr_ms') is not None:
+                        pr_values.append(beat['pr_ms'])
+                    continue
+                beat = measure_beat(sig, int(p), fs, strict_pr=True, prev_rr_ms=prev_rr_ms)
+                if not beat:
+                    continue
+
+                # Broad-complex runs can have no isoelectric point around an
+                # individual beat. measure_beat() then returns the bounded
+                # wide-QRS estimate (typically 160 ms from the +/-80 ms
+                # search window) with qrs_bounds_resolved=False. Do not let
+                # that make the Full Disclosure header say "--" when the
+                # measured width is clearly in the wide-QRS range. This is a
+                # display/measurement fallback only; auto segment detection
+                # still requires resolved QRS boundaries exactly as before.
+                qrs_ms = float(beat.get('qrs_ms') or 0.0)
+                qrs_resolved = bool(beat.get('qrs_bounds_resolved'))
+                # VFib has no organized, measurable QRS complex. Keep the
+                # display as '--' for an active VFib segment even when the
+                # bounded +/-80 ms fallback happens to return 160 ms. The
+                # fallback remains available for organized wide-complex
+                # rhythms (for example VT/wide-QRS tachycardia).
+                if not ventricular_fibrillation_active and (qrs_resolved or 120.0 <= qrs_ms <= 220.0):
+                    qrs_values.append(qrs_ms)
+                # VFib has no organized atrial-to-ventricular conduction.
+                # Any PR candidate inside its chaotic baseline is only a
+                # coincidental noise-to-wave distance, never a clinical PR
+                # interval. Suppress it for the complete visible VFib
+                # window, just as the QRS readout above is suppressed.
+                if not atrial_arrhythmia_active and not ventricular_fibrillation_active \
+                        and not ventricular_tachycardia_active \
+                        and beat.get('pr_ms') is not None:
+                    pr_values.append(beat['pr_ms'])
+
+            # PR candidates can occasionally contain one incorrectly picked
+            # P onset (for example 80/194 ms beside a true 150-170 ms PR).
+            # A plain standard-deviation gate lets those isolated candidates
+            # hide the valid window-wide PR. Use a robust median/MAD majority
+            # filter instead: the median is the center, MAD estimates normal
+            # beat-to-beat spread, and the clinical display tolerance keeps a
+            # minimum 25 ms band. This affects only the visible readout; the
+            # sinus-conduction gate used by auto classification remains
+            # unchanged.
+            effective_window_fast = False
+            if len(peaks) >= 2:
+                w_rr_ms = np.diff(np.asarray(peaks, dtype=float)) * 1000.0 / fs
+                if w_rr_ms.size and float(np.median(w_rr_ms)) < 333.3:
+                    effective_window_fast = True
+
+            if ventricular_fibrillation_active or ventricular_tachycardia_active or atrial_arrhythmia_active or effective_window_fast:
+                pr_txt = "--"
+            elif len(pr_values) >= 2:
+                # ``pr_values`` is collected as a Python list. Convert it
+                # before vector arithmetic; otherwise every multi-beat
+                # window raises ``TypeError`` and the outer fallback blanks
+                # both PR and QRS as ``--``.
+                pr_array = np.asarray(pr_values, dtype=float)
+                pr_center = float(np.median(pr_array))
+                pr_mad = float(np.median(np.abs(pr_array - pr_center)))
+                pr_tolerance = max(25.0, 3.0 * pr_mad)
+                pr_inliers = pr_array[np.abs(pr_array - pr_center) <= pr_tolerance]
+                if len(pr_inliers) >= max(2, int(np.ceil(len(pr_values) * 0.5))):
+                    pr_txt = f"{float(np.median(pr_inliers)):.0f} ms"
+                else:
+                    pr_txt = "--"
+            elif len(pr_values) == 1:
+                pr_txt = f"{float(pr_values[0]):.0f} ms"
+            else:
+                pr_txt = "--"
+            qrs_txt = f"{float(np.median(qrs_values)):.0f} ms" if qrs_values else "--"
+            self.lbl_pr_qrs.setText(f"PR: {pr_txt}   QRS: {qrs_txt} ")
+        except Exception as e:
+            print(f"[Full Disclosure] PR/QRS testing label error: {e}")
+            self.lbl_pr_qrs.setText("PR: -- ms   QRS: -- ms")
 
     def _update_time_and_arrhythmia_labels(self, start_sec: float, end_sec: float):
+        # TODO(testing-only): see _update_pr_qrs_label()'s own docstring.
+        self._update_pr_qrs_label(start_sec, end_sec)
+
         # Update real-time display
         if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
             start_real = datetime.fromtimestamp(self._engine._reader.start_time + start_sec)
@@ -2846,8 +4351,97 @@ class HolterFullDisclosureDialog(QDialog):
                     break
         
         arrhythmia_label = ""
+        # End (s) of the auto rhythm segment shown in the label, if any --
+        # read by the Asystole block below.
+        active_rhythm_end = None
+
+        # Full-disclosure auto regions are the source of truth for the
+        # bottom-right rhythm indicator.  Beat badges alone cannot represent
+        # a Brady/Tachy segment because those rhythms are window-level events.
+        try:
+            # Whether a segment is still "current" is judged on the wall-clock
+            # SECOND shown on screen, the same truncated HH:MM:SS the segment
+            # overlay prints for its end. Recordings start at a fractional
+            # second (e.g. 12:21:19.87) and scrolling moves in whole seconds
+            # from that start, so comparing raw seconds dropped an AFib ending
+            # at 12:40:41.35 one step early: the label went "AFib at 12:40:40"
+            # -> "NSR at 12:40:41" while the overlay said AFib ended 12:40:41.
+            reader_start = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
+            if reader_start:
+                def _shown_second(sec):
+                    return math.floor(reader_start + sec)
+                view_second = _shown_second(start_sec)
+            active_auto = []
+            # Same gate as _structured_events_for_canvas: no auto-detected
+            # rhythm label until "Auto Arrhythmia Detection" has been
+            # clicked (self._auto_marking_visible, see __init__).
+            # Asystole spans are cut out the same way as for the canvases
+            # (_without_asystole_spans).
+            events_for_label = self._without_asystole_spans(
+                getattr(self._engine, '_structured_events', []) or []
+            ) if self._auto_marking_visible else []
+            for event in events_for_label:
+                source = str(event.get('source', '')).lower()
+                if 'manual' in source:
+                    continue
+                event_start = float(event.get('timestamp', 0.0) or 0.0)
+                event_end = float(event.get('end_timestamp', event_start) or event_start)
+                if reader_start:
+                    still_on = _shown_second(event_end) >= view_second
+                else:
+                    still_on = event_end >= start_sec
+                # Do not activate an event merely because its start falls
+                # somewhere in the *future* part of the visible 10-second
+                # frame.  NSR is the display fallback (it is not stored as
+                # an auto event), so using ``event_start <= end_sec`` made a
+                # Brady/Tachy event appear to end the preceding NSR early:
+                # the current frame could still be before the event while
+                # its right edge touched the event start.  Activate the
+                # event only once the scroll position reaches its actual
+                # timestamp.  This is display-boundary reconciliation only;
+                # no arrhythmia detector or segment boundary is changed.
+                if still_on and event_start <= start_sec:
+                    label = str(event.get('label', event.get('type', '')) or '')
+                    if label.lower() in {
+                        'sinus bradycardia', 'bradycardia',
+                        'sinus tachycardia', 'tachycardia',
+                        'sinus arrhythmia',
+                        'ventricular fibrillation', 'ventricular tachycardia',
+                        'atrial fibrillation', 'atrial flutter',
+                        'supraventricular tachycardia (svt)',
+                        'first-degree av block',
+                        'second-degree av block (mobitz i)',
+                        'second-degree av block (mobitz ii)',
+                        'third-degree av block',
+                    }:
+                        active_auto.append((event_start, event_end, label))
+            if active_auto:
+                event_start, event_end, event_label = min(active_auto, key=lambda item: item[0])
+                active_rhythm_end = event_end
+                if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
+                    # Same as the Normal Sinus Rhythm label below: the time
+                    # follows the scroll position, but stays inside this
+                    # segment -- it starts at the segment's own start time and
+                    # stops advancing at its end time.
+                    shown_sec = min(max(start_sec, event_start), event_end)
+                    event_time = datetime.fromtimestamp(
+                        self._engine._reader.start_time + shown_sec
+                    ).strftime('%H:%M:%S')
+                    display_event_label = event_label
+                    arrhythmia_label = f"Arrhythmia: {display_event_label} at {event_time}"
+                else:
+                    display_event_label = event_label
+                    arrhythmia_label = f"Arrhythmia: {display_event_label}"
+        except Exception as e:
+            print(f"[Full Disclosure] Error updating auto rhythm label: {e}")
         
-        if lead_i_canvas and hasattr(lead_i_canvas, '_beat_annotations'):
+        # Beat badges (Single PVC, PVC/PAC Couplet, Bigeminy..., VT Run, SVT
+        # Run, AFib, Paced) describe the raw beat stream, so they are only
+        # shown before "Auto Arrhythmia Detection" is clicked. Once auto
+        # marking is on, this label comes only from the auto-detected
+        # segments above (and the Normal Sinus Rhythm fallback below).
+        if not arrhythmia_label and not getattr(self, '_auto_marking_visible', False) \
+                and lead_i_canvas and hasattr(lead_i_canvas, '_beat_annotations'):
             # Get beats in current window
             window_beats = [b for b in lead_i_canvas._beat_annotations 
                            if start_sec <= b.get('timestamp', 0.0) <= end_sec]
@@ -2875,17 +4469,135 @@ class HolterFullDisclosureDialog(QDialog):
                     else:
                         arrhythmia_label = f"Arrhythmia: {badge_name}"
                 elif window_beats:
-                    # No arrhythmias detected, show Normal Sinus Rhythm if there are beats in the window
-                    if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
-                        first_beat_ts = window_beats[0].get('timestamp', 0.0)
-                        ts_real = datetime.fromtimestamp(self._engine._reader.start_time + first_beat_ts)
-                        arrhythmia_label = f"Arrhythmia: Normal Sinus Rhythm at {ts_real.strftime('%H:%M:%S')}"
-                    else:
-                        arrhythmia_label = "Arrhythmia: Normal Sinus Rhythm"
+                    # For the remaining organized rhythm, use the visible
+                    # window's RR values and the current scroll position.
+                    window_rr = np.asarray(
+                        [float(b.get('rr_ms')) for b in window_beats
+                         if b.get('rr_ms') is not None],
+                        dtype=float,
+                    )
+                    normal_rr = bool(
+                        window_rr.size == 0
+                        or np.all((window_rr >= 600.0) & (window_rr <= 1000.0))
+                    )
+                    if normal_rr:
+                        if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
+                            # Use start_sec, not the first beat timestamp, so
+                            # the label follows every scroll/drag update.
+                            ts_real = datetime.fromtimestamp(
+                                self._engine._reader.start_time + start_sec
+                            )
+                            arrhythmia_label = f"Arrhythmia: Normal Sinus Rhythm at {ts_real.strftime('%H:%M:%S')}"
+                        else:
+                            arrhythmia_label = "Arrhythmia: Normal Sinus Rhythm"
                         
             except Exception as e:
                 print(f"[Full Disclosure] Error updating arrhythmia label from badges: {e}")
-                
+
+        # At the first canvas refresh beat annotations may not yet be loaded.
+        # If no auto-arrhythmia is active, keep the status label populated with
+        # the current visible time instead of leaving it blank.
+        if not arrhythmia_label:
+            if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
+                current_time = datetime.fromtimestamp(
+                    self._engine._reader.start_time + start_sec
+                ).strftime('%H:%M:%S')
+                arrhythmia_label = f"Arrhythmia: Normal Sinus Rhythm at {current_time}"
+            else:
+                arrhythmia_label = "Arrhythmia: Normal Sinus Rhythm"
+
+        # A bundle branch block is a QRS-shape finding alongside the rhythm.
+        # Where the rhythm text above is only the Normal Sinus Rhythm
+        # fallback, the label shows the bundle branch block alone, with its
+        # own time ("Complete Right Bundle Branch Block at 15:10:49"); where
+        # an auto rhythm segment is active (e.g. Sinus Bradycardia) it is
+        # appended to that rhythm's text. It is active by the same rules as
+        # the rhythm segments above: from its own start, through the
+        # wall-clock second it ends in.
+        try:
+            if self._auto_marking_visible and arrhythmia_label:
+                bundle_branch_block_labels = {
+                    'complete right bundle branch block', 'incomplete right bundle branch block',
+                    'complete left bundle branch block', 'incomplete left bundle branch block',
+                }
+                reader_start_bbb = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
+                for event in self._without_asystole_spans(getattr(self._engine, '_structured_events', []) or []):
+                    if not isinstance(event, dict) or 'manual' in str(event.get('source', '')).lower():
+                        continue
+                    label = str(event.get('label', event.get('type', '')) or '')
+                    if label.lower() not in bundle_branch_block_labels:
+                        continue
+                    ev_start = float(event.get('timestamp', 0.0) or 0.0)
+                    ev_end = float(event.get('end_timestamp', ev_start) or ev_start)
+                    if reader_start_bbb:
+                        still_on = math.floor(reader_start_bbb + ev_end) >= math.floor(reader_start_bbb + start_sec)
+                    else:
+                        still_on = ev_end >= start_sec
+                    if not (ev_start <= start_sec and still_on):
+                        continue
+                    if arrhythmia_label.startswith("Arrhythmia: Normal Sinus Rhythm"):
+                        if reader_start_bbb:
+                            shown_sec = min(max(start_sec, ev_start), ev_end)
+                            bbb_time = datetime.fromtimestamp(reader_start_bbb + shown_sec).strftime('%H:%M:%S')
+                            arrhythmia_label = f"Arrhythmia: {label} at {bbb_time}"
+                        else:
+                            arrhythmia_label = f"Arrhythmia: {label}"
+                    else:
+                        arrhythmia_label = f"{arrhythmia_label} | {label}"
+                    break
+        except Exception as e:
+            print(f"[Full Disclosure] Error updating Bundle Branch Block label: {e}")
+
+        # Auto-segment detection is still running in the background: don't
+        # claim a rhythm (the fallbacks above would say Normal Sinus Rhythm).
+        if getattr(self, '_auto_segments_pending', False):
+            arrhythmia_label = "Arrhythmia: Analyzing recording..."
+
+        # Asystole: a fully independent flatline detector (see
+        # detect_asystole_segments in auto_segment_arrthymia_detection.py).
+        # It never participates in the auto-marking pipeline above
+        # (self._engine._structured_events, _auto_marking_visible,
+        # apply_auto_segments_to_engine) -- layered onto the rhythm label
+        # here, with its own system time, the same way Bundle Branch Block
+        # is layered on above. Shown regardless of whether "Auto Arrhythmia
+        # Detection" has been clicked, and even while that pipeline is
+        # still analyzing in the background.
+        try:
+            reader_start_asys = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
+            for seg in getattr(self, '_asystole_segments', []) or []:
+                seg_start = float(seg.get('start_sec', 0.0) or 0.0)
+                seg_end = float(seg.get('end_sec', seg_start) or seg_start)
+                if reader_start_asys:
+                    still_on = math.floor(reader_start_asys + seg_end) >= math.floor(reader_start_asys + start_sec)
+                else:
+                    still_on = seg_end >= start_sec
+                if not (seg_start <= start_sec and still_on):
+                    continue
+                if reader_start_asys:
+                    shown_sec = min(max(start_sec, seg_start), seg_end)
+                    asys_time = datetime.fromtimestamp(reader_start_asys + shown_sec).strftime('%H:%M:%S')
+                    asys_text = f"Asystole at {asys_time}"
+                else:
+                    asys_text = "Asystole"
+                # A rhythm segment that ended where this Asystole starts is
+                # only still in the label because its end falls in the same
+                # on-screen second (see _shown_second above) -- it is over,
+                # Asystole replaces it. Seen: VT ending 128.600 s, Asystole
+                # starting 128.600 s, label "VT at 14:39:25 | Asystole at
+                # 14:39:25".
+                rhythm_already_ended = (active_rhythm_end is not None
+                                        and active_rhythm_end <= seg_start + 1e-3)
+                if (not arrhythmia_label
+                        or rhythm_already_ended
+                        or arrhythmia_label.startswith("Arrhythmia: Normal Sinus Rhythm")
+                        or arrhythmia_label == "Arrhythmia: Analyzing recording..."):
+                    arrhythmia_label = f"Arrhythmia: {asys_text}"
+                else:
+                    arrhythmia_label = f"{arrhythmia_label} | {asys_text}"
+                break
+        except Exception as e:
+            print(f"[Full Disclosure] Error updating Asystole label: {e}")
+
         self.lbl_arrhythmia.setText(arrhythmia_label)
 
     def _update_canvases(self, start_sec: float, update_extras: bool = True):
@@ -2894,16 +4606,36 @@ class HolterFullDisclosureDialog(QDialog):
         self._current_start = start_sec
         end_sec = start_sec + self._window_sec
 
-        # The time label is cheap (string format only) so keep it live every
-        # frame; the arrhythmia/event label rebuild involves gathering and
-        # sorting events and is gated by update_extras (see _process_scroll_update).
-        self.lbl_time.setText(f"Time:  {self._engine._sec_to_hms(start_sec)}")
+        # Top-left "Time" shows the TOTAL recording length (not the scroll
+        # position -- that is what "Capture Frame Time" already shows), so
+        # it no longer changes while scrolling. The arrhythmia/event label
+        # rebuild involves gathering and sorting events and is gated by
+        # update_extras (see _process_scroll_update).
+        self.lbl_time.setText(f"Time:  {self._engine._sec_to_hms(eff_dur)}")
         self._update_time_and_arrhythmia_labels(start_sec, end_sec)
 
         read_end_sec = min(end_sec, eff_dur)
         
-        # Read data efficiently
-        data = self._reader.read_range(start_sec, read_end_sec)
+        # Read data efficiently -- plus up to 2 s of real samples on each
+        # side, which the strips use to pad their mains notch / high-pass
+        # (see ECGStripCanvas.set_data). The window slice is sample-for-sample
+        # what read_range(start_sec, read_end_sec) returns: both index frames
+        # as int(sec * fs).
+        ctx_before = ctx_after = None
+        try:
+            fs_ctx = float(self._engine.fs)
+            ctx_start = max(0.0, start_sec - 2.0)
+            ctx = self._reader.read_range(ctx_start, min(eff_dur, read_end_sec + 2.0))
+            lead_in = int(start_sec * fs_ctx) - int(ctx_start * fs_ctx)
+            n_win = int((min(read_end_sec, self._reader.duration_sec) - start_sec) * fs_ctx)
+            if n_win > 0 and ctx.shape[1] >= lead_in + n_win:
+                data = ctx[:, lead_in:lead_in + n_win]
+                ctx_before = ctx[:, :lead_in]
+                ctx_after = ctx[:, lead_in + n_win:]
+            else:
+                data = self._reader.read_range(start_sec, read_end_sec)
+        except Exception:
+            data = self._reader.read_range(start_sec, read_end_sec)
         expected_len = int(self._window_sec * self._engine.fs)
         
         # Get beat annotations for this window
@@ -3159,9 +4891,13 @@ class HolterFullDisclosureDialog(QDialog):
         for i, c in enumerate(self._canvases):
             if i < data.shape[0] and data.shape[1] > 0:
                 d_i = data[i]
+                before_i = ctx_before[i] if ctx_before is not None else None
+                after_i = ctx_after[i] if ctx_after is not None else None
                 # Use numpy slicing instead of padding for better performance
                 if len(d_i) != expected_len:
                     if len(d_i) > expected_len:
+                        if after_i is not None:
+                            after_i = np.concatenate((d_i[expected_len:], after_i))
                         d_i = d_i[:expected_len]
                     else:
                         # Create padded array more efficiently
@@ -3170,9 +4906,19 @@ class HolterFullDisclosureDialog(QDialog):
                         padded[len(d_i):] = d_i[-1] if len(d_i) > 0 else 0
                         d_i = padded
                 # Convert to float32 for faster rendering and pass beat annotations
-                c.set_data(x, np.asarray(d_i, dtype=np.float32), beat_annotations=beat_annotations, start_sec=start_sec, structured_events=visible_structured_events, fast_preview=not update_extras)
+                c.set_data(x, np.asarray(d_i, dtype=np.float32), beat_annotations=beat_annotations, start_sec=start_sec, structured_events=visible_structured_events, fast_preview=not update_extras,
+                           context_before=before_i, context_after=after_i)
             else:
                 c.set_data(x, np.zeros(expected_len, dtype=np.float32), beat_annotations=beat_annotations, start_sec=start_sec, structured_events=visible_structured_events, fast_preview=not update_extras)
+
+        # Refresh the measurement header after the current waveform has been
+        # installed on every canvas.  The status/header update runs earlier
+        # in this method so it can briefly see the previous reader/window
+        # state during a horizontal scroll; that left valid PR/QRS values at
+        # the initial '--' text even though the waveform and RR labels had
+        # already moved.  This is display synchronization only; the same
+        # Lead-II measurement path and all arrhythmia rules remain unchanged.
+        self._update_pr_qrs_label(start_sec, end_sec)
 
         # Clear and repopulate segment overlay with only visible segments.
         # CRITICAL FIX: ALWAYS update segment positions on scroll, not just when update_extras=True
@@ -3205,6 +4951,10 @@ class HolterFullDisclosureDialog(QDialog):
                                     sx_global, ex_global, s_sec, e_sec,
                                     seg['label'], seg['color'], seg.get('start_time_str', ''), seg.get('end_time_str', '')
                                 )
+            # Auto-detected fibrillation/flutter regions are visual-only
+            # overlays and never enter the manual segment store.
+            self._add_auto_arrhythmia_segments(ref, visible_structured_events, ref_end, span)
+
             # Ensure overlay is updated after segments are added
             self._segment_overlay.update()
             # Raise overlay to ensure it's visible on top of canvases
@@ -3254,6 +5004,18 @@ class HolterFullDisclosureDialog(QDialog):
                     print(f"[Full Disclosure] Canvas not ready: ref_w={ref_w}, data_l={data_l}")
             else:
                 print(f"[Full Disclosure] Canvas ref not available or missing attributes")
+            # The first canvas refresh happens before the segment overlay is
+            # constructed. Re-add visible automatic regions here so they are
+            # visible immediately, without requiring a scroll/drag refresh.
+            if ref and hasattr(ref, '_start_sec') and hasattr(ref, '_data') and hasattr(ref, '_fs'):
+                ref_end = ref._start_sec + len(ref._data) / ref._fs
+                span = ref_end - ref._start_sec
+                self._add_auto_arrhythmia_segments(
+                    ref,
+                    self._structured_events_for_canvas(ref._start_sec, ref_end),
+                    ref_end,
+                    span,
+                )
             self._segment_overlay.update()
         else:
             print(f"[Full Disclosure] _refresh_segment_overlay: overlay or annotations not available")
@@ -3477,6 +5239,10 @@ class HolterToolHandlers:
         if hasattr(parent, "_replay_engine") and parent._replay_engine:
             from .holter_full_disclosure import HolterFullDisclosureDialog
             dialog = HolterFullDisclosureDialog(parent._replay_engine, parent)
+            # Apply record settings (gain/invert) from the replay panel if available
+            record_settings = getattr(parent, "_last_record_settings", None)
+            if record_settings:
+                dialog.apply_record_settings(record_settings)
             dialog.exec_()
         else:
             from PyQt5.QtWidgets import QMessageBox
@@ -3526,6 +5292,16 @@ class HolterToolHandlers:
         
         gains = [g / 10.0 for g in GAINS]
         curr_g = getattr(parent, '_curr_gain_idx', 1)
+        # Check current gain of channel strips if out of sync
+        ch_strips = getattr(parent, "_ch_strips", [])
+        if ch_strips and hasattr(ch_strips[0], '_gain'):
+            try:
+                int_g = int(round(ch_strips[0]._gain * 10))
+                if int_g in GAINS:
+                    curr_g = GAINS.index(int_g)
+            except Exception:
+                pass
+
         next_g = (curr_g + 1) % len(gains)
         parent._curr_gain_idx = next_g
         val = gains[next_g]
@@ -3660,6 +5436,15 @@ class HolterToolHandlers:
         # Handle different actions
         action = event_data.get('action', 'add_event')
         
+        if action == 'instant_print':
+            # TODO: Implement instant print
+            print("[Add Event] Instant print triggered")
+        elif action == 'export_pdf':
+            # TODO: Implement PDF export
+            print("[Add Event] PDF export triggered")
+        elif action == 'add_event':
+            # Just add to event list
+            print(f"[Add Event] Event added at timestamp {event_data['timestamp']}")
         if action == 'instant_print':
             # TODO: Implement instant print
             print("[Add Event] Instant print triggered")

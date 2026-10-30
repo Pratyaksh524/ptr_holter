@@ -111,9 +111,9 @@ class HolterConfig:
     signal_baseline_wander_ratio: float = 0.30
     signal_hf_noise_ratio: float = 0.40
     signal_regularity_cv: float = 0.8
-    qrs_validator_min_width_ms: float = 40.0
+    qrs_validator_min_width_ms: float = 25.0
     qrs_validator_max_width_ms: float = 200.0
-    qrs_validator_min_amplitude: float = 0.08
+    qrs_validator_min_amplitude: float = 0.04
     template_similarity_threshold: float = 0.90
     qrs_detection_window_ms: float = 150.0
     qrs_detection_refractory_ms: float = 120.0
@@ -256,7 +256,7 @@ class MultiLeadSelector:
 
 
 class QRSValidator:
-    def __init__(self, min_width_ms: float = 40.0, max_width_ms: float = 200.0, min_amplitude: float = 0.08):
+    def __init__(self, min_width_ms: float = 25.0, max_width_ms: float = 200.0, min_amplitude: float = 0.04):
         self.min_width_ms = float(min_width_ms)
         self.max_width_ms = float(max_width_ms)
         self.min_amplitude = float(min_amplitude)

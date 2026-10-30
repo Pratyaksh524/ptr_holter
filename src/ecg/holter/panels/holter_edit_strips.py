@@ -41,7 +41,18 @@ from ..holter_helpers import (
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
     _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _card_style, _card_title_style,
 )
+
+
+def _es_tool_btn_style() -> str:
+    # Same look as _style_btn but without the horizontal padding so the
+    # fixed-size (28x28) tool buttons don't clip their text.
+    return _style_btn() + "QPushButton{padding:0px 8px;border-radius:6px;}"
+
+
+def _es_danger_btn_style() -> str:
+    return _style_btn()
 
 from ..summary_utils import derive_hr_focus_summary
 from .holter_widgets import ClickableSummaryTile, ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas
@@ -52,7 +63,7 @@ class HolterEditStripsPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(f"background:{COL_BG};")
+        self.setStyleSheet(f"background:{UI_BG};")
         self._events = []
         self._summary = {}
         self._metrics_list = []
@@ -84,28 +95,36 @@ class HolterEditStripsPanel(QWidget):
         layout.setSpacing(8)
 
         # --- LEFT: Event List (20% width) ---
-        left = QWidget()
+        left = QFrame()
+        left.setObjectName("esLeftCard")
+        left.setStyleSheet(_card_style("QFrame#esLeftCard"))
         left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(4)
+        left_layout.setContentsMargins(8, 8, 8, 8)
+        left_layout.setSpacing(8)
+        ev_title = QLabel("Event List")
+        ev_title.setStyleSheet(_card_title_style())
+        left_layout.addWidget(ev_title)
 
         cols = ["Event name", "Start Time", "Chan.", "Print Len."]
         self._ev_table = QTableWidget(0, len(cols))
         self._ev_table.setHorizontalHeaderLabels(cols)
         self._ev_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._ev_table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._ev_table.setStyleSheet(
             _table_style() +
-            """
-            QTableWidget::item:selected {
-                background-color: rgba(66, 153, 225, 70);
-                color: #F3F7FB;
-                border: 1px solid rgba(255, 255, 255, 90);
-            }
-            QTableWidget::item:selected:active {
-                background-color: rgba(66, 153, 225, 110);
-            }
+            f"""
+            QTableWidget::item:selected {{
+                background-color: #1E3A5F;
+                color: {UI_TEXT};
+                border: none;
+            }}
+            QTableWidget::item:selected:active {{
+                background-color: #22457A;
+            }}
             """
         )
+        self._ev_table.setAlternatingRowColors(True)
+        self._ev_table.setShowGrid(False)
         self._ev_table.verticalHeader().setVisible(False)
         self._ev_table.setSelectionBehavior(QTableWidget.SelectRows)
         self._ev_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -116,16 +135,21 @@ class HolterEditStripsPanel(QWidget):
         nav_row = QHBoxLayout()
         for lbl in ["Prev", "Next", "Remove All", "Remove"]:
             btn = QPushButton(lbl)
-            btn.setStyleSheet(_style_btn())
+            btn.setStyleSheet(_es_danger_btn_style() if lbl.startswith("Remove") else _style_btn())
+            btn.setCursor(Qt.PointingHandCursor)
             nav_row.addWidget(btn)
         left_layout.addLayout(nav_row)
 
+        stats_title = QLabel("Summary")
+        stats_title.setStyleSheet(_card_title_style())
+        left_layout.addWidget(stats_title)
         stats_frame = QFrame()
+        stats_frame.setObjectName("esStatsCard")
         stats_frame.setStyleSheet(
-            f"QFrame{{background:{COL_DARK};border:1px solid {COL_GREEN_DRK};border-radius:6px;}}"
+            f"QFrame#esStatsCard{{background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};border-radius:6px;}}"
         )
         sf_layout = QGridLayout(stats_frame)
-        sf_layout.setContentsMargins(8, 6, 8, 6)
+        sf_layout.setContentsMargins(10, 8, 10, 8)
         sf_layout.setSpacing(6)
         for i, (key, label) in enumerate([
             ("hr", "Avg HR"),
@@ -139,9 +163,9 @@ class HolterEditStripsPanel(QWidget):
         ]):
             row, col = divmod(i, 2)
             l = QLabel(f"{label}:")
-            l.setStyleSheet(f"color:{UI_MUTED};font-size:10px;font-weight:bold;letter-spacing:0.5px;border:none;")
+            l.setStyleSheet(f"color:{UI_MUTED};font-size:10px;font-weight:bold;letter-spacing:0.5px;border:none;background:transparent;")
             v = QLabel("-")
-            v.setStyleSheet(f"color:{COL_GREEN};font-size:12px;font-weight:bold;border:none;")
+            v.setStyleSheet(f"color:{UI_TEXT};font-size:12px;font-weight:bold;border:none;background:transparent;")
             sf_layout.addWidget(l, row * 2, col)
             sf_layout.addWidget(v, row * 2 + 1, col)
             self._stat_labels[key] = v
@@ -149,17 +173,21 @@ class HolterEditStripsPanel(QWidget):
         layout.addWidget(left, 2)
 
         # --- CENTER: 2x2 Thumbnail Boxes (30% width) ---
-        center = QWidget()
+        center = QFrame()
+        center.setObjectName("esCenterCard")
+        center.setStyleSheet(_card_style("QFrame#esCenterCard"))
         center_layout = QVBoxLayout(center)
-        center_layout.setContentsMargins(0, 0, 0, 0)
-        center_layout.setSpacing(4)
+        center_layout.setContentsMargins(8, 8, 8, 8)
+        center_layout.setSpacing(8)
 
         # Tool buttons
         tool_row = QHBoxLayout()
         for icon in ["Refresh", "Menu", "Prev", "Next", "<<", ">>", "Up", "Down", "End"]:
             btn = QPushButton(icon)
-            btn.setStyleSheet(_style_btn())
-            btn.setFixedSize(28, 28)
+            btn.setStyleSheet(_es_tool_btn_style())
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(28)
+            btn.setMinimumWidth(36)
             tool_row.addWidget(btn)
         tool_row.addStretch()
         center_layout.addLayout(tool_row)
@@ -169,8 +197,11 @@ class HolterEditStripsPanel(QWidget):
         thumb_grid.setHorizontalSpacing(12)
         thumb_grid.setVerticalSpacing(12)
         self._thumb_frames = []
-        self._tile_style_normal = f"QFrame{{background:{COL_DARK};border:1px solid #888888;border-radius:8px;}}"
-        self._tile_style_active = f"QFrame{{background:{COL_BLACK};border:2px solid {COL_YELLOW};border-radius:8px;}}"
+        self._tile_style_normal = (
+            f"QFrame#esTile{{background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};border-radius:8px;}}"
+            f"QFrame#esTile:hover{{border:1px solid {UI_ACCENT};}}"
+        )
+        self._tile_style_active = f"QFrame#esTile{{background:#16294A;border:2px solid {UI_ACCENT};border-radius:8px;}}"
         self._tile_widgets = {}
         tile_specs = [
             (0, 0, "max_hr", "Maximum Heart Rate"),
@@ -180,6 +211,7 @@ class HolterEditStripsPanel(QWidget):
         ]
         for row, col, key, title in tile_specs:
             frame = ClickableSummaryTile(key)
+            frame.setObjectName("esTile")
             frame.setMinimumHeight(210)
             frame.setMinimumWidth(280)
             frame.setStyleSheet(self._tile_style_normal)
@@ -188,20 +220,20 @@ class HolterEditStripsPanel(QWidget):
             fl.setSpacing(4)
 
             header_w = QWidget()
-            header_w.setStyleSheet("border:none;")
+            header_w.setStyleSheet("border:none;background:transparent;")
             hl = QHBoxLayout(header_w)
             hl.setContentsMargins(0, 0, 0, 0)
             t_lbl = QLabel(title)
-            t_lbl.setStyleSheet("color:#FFFFFF;font-size:12px;font-weight:bold;")
+            t_lbl.setStyleSheet(f"color:{UI_TEXT};font-size:12px;font-weight:bold;border:none;background:transparent;")
             hl.addWidget(t_lbl)
             hl.addStretch()
             hr_lbl = QLabel("HR: --")
-            hr_lbl.setStyleSheet("color:#FFFF00;font-size:11px;font-weight:bold;")
+            hr_lbl.setStyleSheet(f"color:{UI_WARNING};font-size:11px;font-weight:bold;border:none;background:transparent;")
             hl.addWidget(hr_lbl)
             fl.addWidget(header_w)
 
             time_lbl = QLabel("--:--:--")
-            time_lbl.setStyleSheet("color:#AAAAAA;font-size:10px;")
+            time_lbl.setStyleSheet(f"color:{UI_MUTED};font-size:10px;border:none;background:transparent;")
             fl.addWidget(time_lbl)
 
             strips = []
@@ -235,28 +267,28 @@ class HolterEditStripsPanel(QWidget):
         right_layout.setSpacing(6)
 
         detail_frame = QFrame()
-        detail_frame.setStyleSheet(
-            f"QFrame{{background:{COL_BLACK};border:1px solid {COL_GREEN_DRK};border-radius:8px;}}"
-        )
+        detail_frame.setObjectName("esDetailCard")
+        detail_frame.setStyleSheet(_card_style("QFrame#esDetailCard"))
         df_layout = QGridLayout(detail_frame)
         df_layout.setContentsMargins(10, 8, 10, 8)
         df_layout.setHorizontalSpacing(10)
         df_layout.setVerticalSpacing(4)
         self._detail_title = QLabel("Select a heart-rate tile")
         self._detail_title.setStyleSheet(
-            f"color:{COL_YELLOW};font-size:14px;font-weight:bold;border:none;"
+            f"color:{UI_TEXT};font-size:14px;font-weight:bold;border:none;background:transparent;"
+            f"border-left:3px solid {UI_ACCENT};padding-left:8px;"
         )
         self._detail_value = QLabel("-- bpm")
         self._detail_value.setStyleSheet(
-            f"color:{COL_GREEN};font-size:26px;font-weight:bold;border:none;"
+            f"color:{UI_SUCCESS};font-size:26px;font-weight:bold;border:none;background:transparent;"
         )
         self._detail_time = QLabel("-")
         self._detail_time.setStyleSheet(
-            f"color:{COL_TIMESTAMP};font-size:11px;font-weight:bold;border:none;"
+            f"color:{UI_WARNING};font-size:11px;font-weight:bold;border:none;background:transparent;"
         )
         self._detail_note = QLabel("Click any tile to expand the matching strip view here.")
         self._detail_note.setStyleSheet(
-            f"color:{COL_WHITE};font-size:11px;border:none;"
+            f"color:{UI_MUTED};font-size:11px;border:none;background:transparent;"
         )
         self._detail_note.setWordWrap(True)
         df_layout.addWidget(self._detail_title, 0, 0, 1, 2)
@@ -266,12 +298,13 @@ class HolterEditStripsPanel(QWidget):
         right_layout.addWidget(detail_frame, 0)
 
         main_frame = QFrame()
-        main_frame.setStyleSheet(f"QFrame{{background:{COL_BLACK};border:1px solid #888888;border-radius:4px;}}")
+        main_frame.setObjectName("esMainCard")
+        main_frame.setStyleSheet(f"QFrame#esMainCard{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:8px;}}")
         ml = QVBoxLayout(main_frame)
         ml.setContentsMargins(8, 8, 8, 8)
 
         self._detail_header_lbl = QLabel("Detailed View")
-        self._detail_header_lbl.setStyleSheet("color:#FFFF00;font-size:12px;font-weight:bold;border:none;")
+        self._detail_header_lbl.setStyleSheet(_card_title_style())
         ml.addWidget(self._detail_header_lbl)
 
         self._main_strips = []
@@ -290,7 +323,7 @@ class HolterEditStripsPanel(QWidget):
         
         for name in lead_names:
             lbl = QLabel(name)
-            lbl.setStyleSheet(f"color:{COL_GREEN};border:none;font-weight:bold;")
+            lbl.setStyleSheet(f"color:{COL_GREEN};border:none;font-weight:bold;background:transparent;")
             strip = ECGStripCanvas(height=95)
             scroll_layout.addWidget(lbl)
             scroll_layout.addWidget(strip)
@@ -303,7 +336,7 @@ class HolterEditStripsPanel(QWidget):
         right_layout.addWidget(main_frame, 1)
 
         self._mini_lbl = QLabel("Lead II")
-        self._mini_lbl.setStyleSheet(f"color:{COL_GREEN};border:none;font-weight:bold;")
+        self._mini_lbl.setStyleSheet(f"color:{COL_GREEN};border:none;font-weight:bold;background:transparent;")
         right_layout.addWidget(self._mini_lbl)
 
         self._mini = ECGStripCanvas(height=40, color="#00AA00")
@@ -438,7 +471,7 @@ class HolterEditStripsPanel(QWidget):
             t_str = _format_system_time(self._session_dir, ev['timestamp'])
             for j, val in enumerate([ev['label'], t_str, "12", "7s"]):
                 item = QTableWidgetItem(val)
-                item.setForeground(QColor(COL_WHITE))
+                item.setForeground(QColor(UI_TEXT))
                 self._ev_table.setItem(i, j, item)
         if self._selected_focus_key not in self._focus_cards:
             self._selected_focus_key = "max_hr"

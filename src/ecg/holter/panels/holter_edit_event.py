@@ -41,7 +41,25 @@ from ..holter_helpers import (
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
     _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _card_style, _card_title_style,
 )
+
+# Visual-only helpers for this panel (palette colours from holter_helpers).
+_EE_INPUT_CSS = (
+    f"background:{UI_BG};color:{UI_TEXT};border:1px solid {UI_BORDER};"
+    f"padding:5px;border-radius:6px;selection-background-color:#1E3A5F;"
+)
+_EE_FIELD_LABEL_CSS = f"color:{UI_MUTED};font-weight:bold;border:none;background:transparent;"
+
+
+def _ee_tool_btn_style() -> str:
+    # Same look as _style_btn but without the horizontal padding so the
+    # fixed-size (30x30) tool buttons don't clip their text.
+    return _style_btn() + "QPushButton{padding:0px 8px;border-radius:6px;}"
+
+
+def _ee_danger_btn_style() -> str:
+    return _style_btn()
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas
 
@@ -51,7 +69,7 @@ class HolterEditEventPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(f"background:{COL_BG};")
+        self.setStyleSheet(f"background:{UI_BG};")
         self._events = []
         self._session_dir = ""
         self._selected_payload = {}
@@ -73,28 +91,36 @@ class HolterEditEventPanel(QWidget):
         layout.setSpacing(8)
 
         # Left: event list + stats
-        left = QWidget()
+        left = QFrame()
+        left.setObjectName("eeLeftCard")
+        left.setStyleSheet(_card_style("QFrame#eeLeftCard"))
         left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(4)
+        left_layout.setContentsMargins(8, 8, 8, 8)
+        left_layout.setSpacing(8)
+        ev_title = QLabel("Event List")
+        ev_title.setStyleSheet(_card_title_style())
+        left_layout.addWidget(ev_title)
 
         cols = ["Event name", "Start Time", "Chan.", "Print Len.", "Source", "Conf."]
         self._ev_table = QTableWidget(0, len(cols))
         self._ev_table.setHorizontalHeaderLabels(cols)
         self._ev_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._ev_table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._ev_table.setStyleSheet(
             _table_style() +
-            """
-            QTableWidget::item:selected {
-                background-color: rgba(66, 153, 225, 70);
-                color: #F3F7FB;
-                border: 1px solid rgba(255, 255, 255, 90);
-            }
-            QTableWidget::item:selected:active {
-                background-color: rgba(66, 153, 225, 110);
-            }
+            f"""
+            QTableWidget::item:selected {{
+                background-color: #1E3A5F;
+                color: {UI_TEXT};
+                border: none;
+            }}
+            QTableWidget::item:selected:active {{
+                background-color: #22457A;
+            }}
             """
         )
+        self._ev_table.setAlternatingRowColors(True)
+        self._ev_table.setShowGrid(False)
         self._ev_table.verticalHeader().setVisible(False)
         self._ev_table.setSelectionBehavior(QTableWidget.SelectRows)
         self._ev_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -103,10 +129,14 @@ class HolterEditEventPanel(QWidget):
         left_layout.addWidget(self._ev_table, 1)
 
         # Stats
+        stats_title = QLabel("Summary")
+        stats_title.setStyleSheet(_card_title_style())
+        left_layout.addWidget(stats_title)
         stats_frame = QFrame()
-        stats_frame.setStyleSheet(f"QFrame{{background:{COL_DARK};border:1px solid {COL_GREEN_DRK};border-radius:4px;}}")
+        stats_frame.setObjectName("eeStatsCard")
+        stats_frame.setStyleSheet(f"QFrame#eeStatsCard{{background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};border-radius:6px;}}")
         sf_layout = QGridLayout(stats_frame)
-        sf_layout.setContentsMargins(8, 6, 8, 6)
+        sf_layout.setContentsMargins(10, 8, 10, 8)
         sf_layout.setSpacing(4)
         self._stat_labels = {}
         for i, (key, lbl) in enumerate([
@@ -117,9 +147,9 @@ class HolterEditEventPanel(QWidget):
         ]):
             r, c = divmod(i, 2)
             l = QLabel(f"{lbl}:")
-            l.setStyleSheet(f"color:{UI_MUTED};font-size:10px;font-weight:bold;letter-spacing:0.5px;border:none;")
+            l.setStyleSheet(f"color:{UI_MUTED};font-size:10px;font-weight:bold;letter-spacing:0.5px;border:none;background:transparent;")
             v = QLabel("-")
-            v.setStyleSheet(f"color:{COL_GREEN};font-size:12px;font-weight:bold;border:none;")
+            v.setStyleSheet(f"color:{UI_TEXT};font-size:12px;font-weight:bold;border:none;background:transparent;")
             sf_layout.addWidget(l, r*2, c)
             sf_layout.addWidget(v, r*2+1, c)
             self._stat_labels[key] = v
@@ -136,8 +166,10 @@ class HolterEditEventPanel(QWidget):
         tool_row = QHBoxLayout()
         for icon in ["Refresh", "Menu", "Prev", "Next", "<<", ">>", "Up", "Down"]:
             btn = QPushButton(icon)
-            btn.setStyleSheet(_style_btn())
-            btn.setFixedSize(30, 30)
+            btn.setStyleSheet(_ee_tool_btn_style())
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(30)
+            btn.setMinimumWidth(36)
             tool_row.addWidget(btn)
         tool_row.addStretch()
         right_layout.addLayout(tool_row)
@@ -147,7 +179,7 @@ class HolterEditEventPanel(QWidget):
         leads_scroll.setWidgetResizable(True)
         leads_scroll.setFrameShape(QFrame.NoFrame)
         leads_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        leads_scroll.setStyleSheet(f"QScrollArea{{background:{COL_BLACK};border:1px solid {COL_GREEN_DRK};border-radius:6px;}}")
+        leads_scroll.setStyleSheet(f"QScrollArea{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:8px;}}")
         leads_host = QWidget()
         leads_host.setStyleSheet(f"background:{COL_BLACK};")
         leads_layout = QVBoxLayout(leads_host)
@@ -158,7 +190,7 @@ class HolterEditEventPanel(QWidget):
                            "V1", "V2", "V3", "V4", "V5", "V6"]
         for name in _all_lead_names:
             lbl = QLabel(name)
-            lbl.setStyleSheet(f"color:{COL_GREEN};font-size:11px;font-weight:bold;border:none;padding:2px 0;")
+            lbl.setStyleSheet(f"color:{COL_GREEN};font-size:11px;font-weight:bold;border:none;padding:2px 0;background:transparent;")
             leads_layout.addWidget(lbl)
             strip = ECGStripCanvas(height=80)
             strip.setFixedHeight(80)
@@ -168,16 +200,17 @@ class HolterEditEventPanel(QWidget):
         right_layout.addWidget(leads_scroll, 1)
 
         annot_box = QFrame()
-        annot_box.setStyleSheet(f"QFrame{{background:{COL_BLACK};border:1px solid {COL_GREEN_DRK};border-radius:6px;}}")
+        annot_box.setObjectName("eeAnnotCard")
+        annot_box.setStyleSheet(_card_style("QFrame#eeAnnotCard"))
         annot_layout = QGridLayout(annot_box)
-        annot_layout.setContentsMargins(8, 6, 8, 6)
+        annot_layout.setContentsMargins(10, 8, 10, 8)
         annot_layout.setSpacing(6)
         annot_title = QLabel("Beat Annotation Editor")
-        annot_title.setStyleSheet(f"color:{COL_GREEN};font-size:12px;font-weight:bold;border:none;")
+        annot_title.setStyleSheet(_card_title_style())
         annot_layout.addWidget(annot_title, 0, 0, 1, 2)
         self._annot_event_id = QLineEdit()
         self._annot_event_id.setPlaceholderText("beat_id / event id")
-        self._annot_event_id.setStyleSheet(f"QLineEdit{{background:{COL_DARK};color:{COL_GREEN};border:1px solid {COL_GREEN_DRK};padding:5px;border-radius:4px;}}")
+        self._annot_event_id.setStyleSheet(f"QLineEdit{{{_EE_INPUT_CSS}}} QLineEdit:focus{{border:1px solid {UI_ACCENT};}}")
         self._annot_auto = QLineEdit()
         self._annot_auto.setPlaceholderText("auto label")
         self._annot_auto.setStyleSheet(self._annot_event_id.styleSheet())
@@ -185,11 +218,13 @@ class HolterEditEventPanel(QWidget):
         self._annot_clin.addItems(["", "N", "S", "V", "AF", "Pause", "Tachy", "Brady", "Other"])
         self._annot_clin.setStyleSheet(f"""
             QComboBox {{
-                background:{COL_DARK}; color:{COL_GREEN}; border:1px solid {COL_GREEN_DRK};
-                padding:5px; border-radius:4px;
+                background:{UI_BG}; color:{UI_TEXT}; border:1px solid {UI_BORDER};
+                padding:5px; border-radius:6px;
             }}
+            QComboBox:hover, QComboBox:focus {{ border:1px solid {UI_ACCENT}; }}
             QComboBox QAbstractItemView {{
-                background:{COL_DARK}; color:white; selection-background-color:{COL_GREEN_DRK};
+                background:{UI_PANEL}; color:{UI_TEXT}; border:1px solid {UI_BORDER};
+                selection-background-color:#1E3A5F; selection-color:{UI_TEXT}; outline:none;
             }}
         """)
         self._annot_conf = QDoubleSpinBox()
@@ -197,28 +232,29 @@ class HolterEditEventPanel(QWidget):
         self._annot_conf.setSingleStep(0.05)
         self._annot_conf.setDecimals(2)
         self._annot_conf.setValue(0.0)
-        self._annot_conf.setStyleSheet(f"QDoubleSpinBox{{background:{COL_DARK};color:{COL_GREEN};border:1px solid {COL_GREEN_DRK};padding:5px;border-radius:4px;}}")
+        self._annot_conf.setStyleSheet(f"QDoubleSpinBox{{{_EE_INPUT_CSS}}} QDoubleSpinBox:focus{{border:1px solid {UI_ACCENT};}}")
         self._annot_editor = QTextEdit()
         self._annot_editor.setPlaceholderText("Optional note or reviewer context")
         self._annot_editor.setFixedHeight(56)
-        self._annot_editor.setStyleSheet(f"QTextEdit{{background:{COL_DARK};color:{COL_WHITE};border:1px solid {COL_GREEN_DRK};padding:5px;border-radius:4px;}}")
+        self._annot_editor.setStyleSheet(f"QTextEdit{{{_EE_INPUT_CSS}}} QTextEdit:focus{{border:1px solid {UI_ACCENT};}}")
         self._annot_save_btn = QPushButton("Save Annotation")
         self._annot_save_btn.setStyleSheet(_style_active_btn())
+        self._annot_save_btn.setCursor(Qt.PointingHandCursor)
         self._annot_save_btn.clicked.connect(self._save_annotation)
         annot_lbl = QLabel("Beat ID:")
-        annot_lbl.setStyleSheet(f"color:{COL_WHITE};border:none;")
+        annot_lbl.setStyleSheet(_EE_FIELD_LABEL_CSS)
         annot_layout.addWidget(annot_lbl, 1, 0)
         annot_layout.addWidget(self._annot_event_id, 1, 1)
         annot_lbl = QLabel("Auto label:")
-        annot_lbl.setStyleSheet(f"color:{COL_WHITE};border:none;")
+        annot_lbl.setStyleSheet(_EE_FIELD_LABEL_CSS)
         annot_layout.addWidget(annot_lbl, 2, 0)
         annot_layout.addWidget(self._annot_auto, 2, 1)
         annot_lbl = QLabel("Clinician label:")
-        annot_lbl.setStyleSheet(f"color:{COL_WHITE};border:none;")
+        annot_lbl.setStyleSheet(_EE_FIELD_LABEL_CSS)
         annot_layout.addWidget(annot_lbl, 3, 0)
         annot_layout.addWidget(self._annot_clin, 3, 1)
         annot_lbl = QLabel("Confidence:")
-        annot_lbl.setStyleSheet(f"color:{COL_WHITE};border:none;")
+        annot_lbl.setStyleSheet(_EE_FIELD_LABEL_CSS)
         annot_layout.addWidget(annot_lbl, 4, 0)
         annot_layout.addWidget(self._annot_conf, 4, 1)
         annot_layout.addWidget(self._annot_editor, 5, 0, 1, 2)
@@ -228,7 +264,8 @@ class HolterEditEventPanel(QWidget):
         nav_row = QHBoxLayout()
         for lbl in ["Prev Event", "Next Event", "Remove All", "Remove"]:
             btn = QPushButton(lbl)
-            btn.setStyleSheet(_style_btn())
+            btn.setStyleSheet(_ee_danger_btn_style() if lbl.startswith("Remove") else _style_btn())
+            btn.setCursor(Qt.PointingHandCursor)
             nav_row.addWidget(btn)
         right_layout.addLayout(nav_row)
         layout.addWidget(right, 2)
@@ -250,7 +287,7 @@ class HolterEditEventPanel(QWidget):
             t_str = _format_system_time(self._session_dir, ev['timestamp'])
             for j, val in enumerate([ev['label'], t_str, "12", "7s", source, f"{conf:.2f}"]):
                 item = QTableWidgetItem(val)
-                item.setForeground(QColor(COL_WHITE))
+                item.setForeground(QColor(UI_TEXT))
                 if j == 0:
                     item.setData(Qt.UserRole, {
                         "beat_id": str(ev.get("beat_id", ev.get("template_label", ev.get("label", "")))),

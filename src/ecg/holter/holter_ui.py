@@ -43,8 +43,8 @@ from PyQt5.QtWidgets import (
     QSizePolicy, QScrollArea, QGridLayout, QSpinBox, QMessageBox,
     QFileDialog, QApplication, QProgressBar, QSplitter, QTextEdit, QInputDialog, QDoubleSpinBox,
     QAbstractItemView, QToolButton, QButtonGroup, QMenu, QScrollBar, QStackedWidget)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QPoint, QPointF, QRect, QObject, QEvent
-from PyQt5.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QPixmap, QPainterPath
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QPoint, QPointF, QRect, QObject, QEvent, QSize
+from PyQt5.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QPixmap, QPainterPath, QIcon
 
 try:
     import pyqtgraph as pg
@@ -311,6 +311,32 @@ def _style_btn(bg=UI_PANEL_ALT, fg=UI_TEXT, hover="#1A2C49"):
         }}
         QPushButton:pressed {{ background: {bg}; border: 1px solid {UI_ACCENT_HOVER}; }}
         QPushButton:disabled {{ background: #1A2233; color: #5F708A; border: 1px solid #2A3953; }}
+    """
+
+
+def _chip_html(caption: str, value, value_color: str = UI_TEXT) -> str:
+    """Header chip text: small muted caption, then the value in bold."""
+    from html import escape
+    return (f"<span style='color:{UI_MUTED};font-size:9px;font-weight:700;letter-spacing:1px;'>{escape(caption.upper())}</span>"
+            f"&nbsp;&nbsp;<span style='color:{value_color};font-size:11px;font-weight:700;'>{escape(str(value))}</span>")
+
+
+def _chip_style(accent: str = UI_BORDER) -> str:
+    return (f"QLabel{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-left:3px solid {accent};"
+            f"border-radius:6px;padding:5px 12px;}}")
+
+
+def _style_bar_btn() -> str:
+    return f"""
+        QPushButton {{
+            background: {UI_PANEL_ALT}; color: {UI_TEXT};
+            border: 1px solid {UI_BORDER}; border-radius: 6px;
+            padding: 4px 14px; font-size: 11px; font-weight: 700;
+        }}
+        QPushButton:hover {{ background: #1A2C49; border-color: {UI_ACCENT}; }}
+        QPushButton:pressed {{ background: {UI_PANEL}; border-color: {UI_ACCENT_HOVER}; }}
+        QPushButton:checked {{ background: {UI_ACCENT}; border-color: #5EA4FF; color: {UI_TEXT}; }}
+        QPushButton:disabled {{ background: #1A2233; color: #5F708A; border-color: #2A3953; }}
     """
 
 
@@ -898,6 +924,7 @@ from .panels.holter_report_table import HolterReportTablePanel
 from .panels.holter_recordings import HolterRecordManagementPanel
 from .panels.holter_preview import HolterInsightPanel
 from .panels.holter_hrv import HolterHRVPanel
+from .panels.holter_record_settings import HolterRecordSettingsPanel
 
 # -----------------------------------------------------------------------------
 # 17. HOLTER MAIN WINDOW  - Orchestrates everything
@@ -921,7 +948,8 @@ class HolterMainWindow(QDialog):
             self.resize(1400, 900)
 
         self.setWindowFlags(Qt.Window | Qt.CustomizeWindowHint | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
-        self.setStyleSheet(f"QDialog{{background:{UI_BG};}}")
+        from .holter_helpers import _global_style
+        self.setStyleSheet(f"QDialog{{background:{UI_BG};}}" + _global_style())
         self.showMaximized()
 
         self.session_dir = session_dir
@@ -1098,6 +1126,15 @@ class HolterMainWindow(QDialog):
     def _recordings_panel(self):
         return getattr(self, '_record_mgmt_panel', None)
 
+    def _sync_filter_buttons(self, label=None):
+        """Highlight the top-bar date filter that the record browser is using."""
+        panel = self._recordings_panel()
+        combo = getattr(panel, '_filter', None) if panel is not None else None
+        if combo is not None:
+            label = combo.currentText()
+        for name, btn in getattr(self, '_filter_buttons', {}).items():
+            btn.setChecked(name == (label or "All"))
+
     def _open_recordings_folder(self):
         if self._is_replay_active():
             return
@@ -1142,6 +1179,25 @@ class HolterMainWindow(QDialog):
         panel = self._recordings_panel()
         if panel and hasattr(panel, '_delete_session'):
             panel._delete_session()
+
+    def _view_selected_recording(self):
+        """Open the currently highlighted row in the RECORDINGS table and jump to its overview."""
+        if self._is_replay_active():
+            return
+        panel = self._recordings_panel()
+        session_path = ""
+        if panel and hasattr(panel, '_selected_path'):
+            session_path = panel._selected_path()
+        if session_path and os.path.isdir(session_path):
+            if os.path.normpath(session_path) != os.path.normpath(self.session_dir or ""):
+                try:
+                    self.load_completed_session(session_path)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+        # Always land on the OVERVIEW tab for the highlighted recording, even if a
+        # panel refresh above raised (so the user is never stuck on RECORDINGS).
+        self._focus_tab('OVERVIEW')
 
     def _is_replay_active(self) -> bool:
         panel = getattr(self, "_replay_panel", None)
@@ -1401,41 +1457,44 @@ class HolterMainWindow(QDialog):
         tb_layout = QHBoxLayout(title_bar)
         tb_layout.setContentsMargins(16, 0, 16, 0)
         tb_layout.setSpacing(14)
-        self._mode_badge = QLabel("LIVE" if self._writer else "REVIEW")
+        self._mode_badge = QLabel("●  LIVE" if self._writer else "●  REVIEW")
         self._mode_badge.setStyleSheet(
-            f"background:{'#7A2633' if self._writer else '#124936'};color:{UI_TEXT};"
-            f"border:1px solid {UI_BORDER};border-radius:12px;padding:5px 12px;font-size:11px;font-weight:700;"
+            f"background:{'#3A1520' if self._writer else '#0E3326'};"
+            f"color:{'#FF6B6B' if self._writer else UI_SUCCESS};"
+            f"border:1px solid {'#7A2633' if self._writer else '#206B51'};border-radius:12px;"
+            f"padding:0px 12px;font-size:11px;font-weight:700;letter-spacing:1px;"
         )
-        tb_layout.addWidget(self._mode_badge)
+        self._mode_badge.setFixedHeight(26)
+        tb_layout.addWidget(self._mode_badge, 0, Qt.AlignVCenter)
         app_title = QLabel("Comprehensive ECG Analysis")
-        app_title.setStyleSheet(f"color:{UI_TEXT};font-size:18px;font-weight:700;border:none;")
+        app_title.setStyleSheet(f"color:{UI_TEXT};font-size:18px;font-weight:700;border:none;background:transparent;")
         tb_layout.addWidget(app_title)
         dur_text = self._summary.get('duration_sec', 0)
         dur_h = int(dur_text // 3600)
         dur_m = int((dur_text % 3600) // 60)
-        self._dur_label = QLabel(f"{dur_h:02d}h {dur_m:02d}m")
-        self._dur_label.setStyleSheet(
-            f"color:{UI_TEXT};font-size:13px;font-weight:700;background:{UI_PANEL_ALT};"
-            f"padding:7px 12px;border-radius:8px;border:1px solid {UI_BORDER};"
-        )
-        tb_layout.addWidget(self._dur_label)
+        dur_s = int(dur_text % 60)
+        self._dur_label = QLabel(_chip_html("Duration", f"{dur_h:02d}h {dur_m:02d}m {dur_s:02d}s"))
+        self._dur_label.setTextFormat(Qt.RichText)
+        self._dur_label.setStyleSheet(_chip_style(UI_ACCENT))
+        self._dur_label.setFixedHeight(30)
+        tb_layout.addWidget(self._dur_label, 0, Qt.AlignVCenter)
         tb_layout.addStretch()
-        gen_report_btn = QPushButton("Generate Report")
-        gen_report_btn.setStyleSheet(
+        self.gen_report_btn = QPushButton("Generate Report")
+        self.gen_report_btn.setStyleSheet(
             f"QPushButton{{background:{UI_ACCENT};color:{UI_TEXT};border:1px solid #61a8ff;border-radius:8px;padding:8px 14px;font-size:12px;font-weight:700;}}"
             f"QPushButton:hover{{background:{UI_ACCENT_HOVER};}}"
         )
-        gen_report_btn.setFixedHeight(34)
-        gen_report_btn.clicked.connect(self._generate_report)
-        tb_layout.addWidget(gen_report_btn)
-        close_btn = QPushButton("Close")
-        close_btn.setStyleSheet(
+        self.gen_report_btn.setFixedHeight(34)
+        self.gen_report_btn.clicked.connect(self._generate_report)
+        tb_layout.addWidget(self.gen_report_btn)
+        self.close_btn = QPushButton("Close")
+        self.close_btn.setStyleSheet(
             f"QPushButton{{background:{UI_PANEL_ALT};color:{UI_TEXT};border:1px solid {UI_BORDER};border-radius:8px;padding:8px 14px;font-size:12px;font-weight:600;}}"
             "QPushButton:hover{background:#2A3D61;}"
         )
-        close_btn.setFixedHeight(34)
-        close_btn.clicked.connect(self.close)
-        tb_layout.addWidget(close_btn)
+        self.close_btn.setFixedHeight(34)
+        self.close_btn.clicked.connect(self.close)
+        tb_layout.addWidget(self.close_btn)
         main_layout.addWidget(title_bar)
 
         session_bar = QFrame()
@@ -1452,65 +1511,59 @@ class HolterMainWindow(QDialog):
         patient_name = self.patient_info.get("patient_name") or self.patient_info.get("name") or "Unknown Patient"
         doctor_name = self.patient_info.get("doctor") or "No referring doctor"
         session_name = os.path.basename(self.session_dir) if self.session_dir else "Active Session"
-        self._patient_chip = QLabel(f"Patient: {patient_name}")
-        self._patient_chip.setStyleSheet(f"background:#123B2D;color:{UI_TEXT};border:1px solid #206B51;border-radius:14px;padding:6px 12px;font-size:11px;font-weight:700;")
+        self._patient_chip = QLabel(_chip_html("Patient", patient_name, UI_SUCCESS))
+        self._patient_chip.setStyleSheet(_chip_style(UI_SUCCESS))
         sb_layout.addWidget(self._patient_chip)
-        self._doctor_chip = QLabel(f"Doctor: {doctor_name}")
-        self._doctor_chip.setStyleSheet(f"background:{UI_PANEL};color:{UI_MUTED};border:1px solid {UI_BORDER};border-radius:14px;padding:6px 12px;font-size:11px;font-weight:600;")
+        self._doctor_chip = QLabel(_chip_html("Doctor", doctor_name))
+        self._doctor_chip.setStyleSheet(_chip_style())
         sb_layout.addWidget(self._doctor_chip)
-        self._session_chip = QLabel(f"Session: {session_name}")
-        self._session_chip.setStyleSheet(f"background:{UI_PANEL};color:{UI_MUTED};border:1px solid {UI_BORDER};border-radius:14px;padding:6px 12px;font-size:11px;font-weight:600;")
+        self._session_chip = QLabel(_chip_html("Session", session_name))
+        self._session_chip.setStyleSheet(_chip_style())
         sb_layout.addWidget(self._session_chip)
-        self._rec_time_chip = QLabel("Recording: --")
-        self._rec_time_chip.setStyleSheet(f"background:{UI_PANEL};color:{UI_MUTED};border:1px solid {UI_BORDER};border-radius:14px;padding:6px 12px;font-size:11px;font-weight:600;")
+        self._rec_time_chip = QLabel(_chip_html("Recording", "--"))
+        self._rec_time_chip.setStyleSheet(_chip_style())
         sb_layout.addWidget(self._rec_time_chip)
+        for chip in (self._patient_chip, self._doctor_chip, self._session_chip, self._rec_time_chip):
+            chip.setTextFormat(Qt.RichText)
+            chip.setFixedHeight(30)
         sb_layout.addStretch()
         self._analysis_state = QLabel("Clinical review mode")
-        self._analysis_state.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:600;border:none;")
+        self._analysis_state.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:600;border:none;background:transparent;")
         sb_layout.addWidget(self._analysis_state)
         main_layout.addWidget(session_bar)
 
         action_bar = QFrame()
-        action_bar.setStyleSheet("""
-            QFrame {
+        action_bar.setObjectName("holterActionBar")
+        action_bar.setStyleSheet(f"""
+            QFrame#holterActionBar {{
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #3D444B, stop:0.5 #20252A, stop:1 #0B0D0F);
-                border-bottom: 1px solid #56616B;
-            }
+                    stop:0 {UI_PANEL}, stop:1 {UI_BG});
+                border-bottom: 1px solid {UI_BORDER};
+            }}
         """)
         ab_layout = QHBoxLayout(action_bar)
-        ab_layout.setContentsMargins(8, 6, 8, 6)
+        ab_layout.setContentsMargins(12, 6, 12, 6)
         ab_layout.setSpacing(6)
         self._action_buttons = {}
         for label in ["Browse", "Search", "Analyse", "View", "Import", "Backup"]:
             btn = QPushButton(label)
-            btn.setFixedHeight(30)
-            btn.setStyleSheet("""
-                QPushButton {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 #59636D, stop:0.5 #30363C, stop:1 #171A1D);
-                    color: #FFFFFF; border: 1px solid #78838D;
-                    border-radius: 5px; padding: 5px 13px; font-weight: 700;
-                }
-                QPushButton:hover { background: #657481; border-color: #AEB8C0; }
-                QPushButton:pressed { background: #171B1F; }
-            """)
+            btn.setFixedHeight(28)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(_style_bar_btn())
             self._action_buttons[label] = btn
             ab_layout.addWidget(btn)
         ab_layout.addStretch()
+        show_lbl = QLabel("SHOW")
+        show_lbl.setStyleSheet(f"color:{UI_MUTED};font-size:9px;font-weight:700;letter-spacing:1px;border:none;background:transparent;padding-right:4px;")
+        ab_layout.addWidget(show_lbl)
         self._filter_buttons = {}
         for label in ["All", "Today", "Yesterday", "This Week", "This Month", "This Year"]:
             btn = QPushButton(label)
-            btn.setFixedHeight(30)
-            btn.setStyleSheet("""
-                QPushButton {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 #4B545D, stop:1 #20252A);
-                    color: #FFFFFF; border: 1px solid #68747E;
-                    border-radius: 5px; padding: 5px 11px; font-weight: 600;
-                }
-                QPushButton:hover { background: #5E6A75; color: #FFFFFF; }
-            """)
+            btn.setFixedHeight(28)
+            btn.setCheckable(True)
+            btn.setChecked(label == "All")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet(_style_bar_btn())
             self._filter_buttons[label] = btn
             ab_layout.addWidget(btn)
         main_layout.addWidget(action_bar)
@@ -1564,6 +1617,7 @@ class HolterMainWindow(QDialog):
 
         self._tab_scroller = TabBarScroller(self)
         self._tabs.tabBar().installEventFilter(self._tab_scroller)
+        self._tabs.setIconSize(QSize(18, 18))
 
         self._tabs.setStyleSheet(f"""
             QTabWidget::pane {{
@@ -1571,17 +1625,19 @@ class HolterMainWindow(QDialog):
                 border:1px solid {UI_BORDER};
                 border-top:none;
             }}
+            QTabBar {{
+                background:{UI_PANEL};
+            }}
             QTabBar::tab {{
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #4B545D, stop:0.5 #282E34, stop:1 #111417);
-                color:#FFFFFF;
-                border:1px solid #68747E;
+                background:{UI_PANEL_ALT};
+                color:#C9D6EA;
+                border:1px solid {UI_BORDER};
                 border-radius:8px;
-                padding:9px 12px;
+                padding:8px 10px;
                 font-size:11px;
                 font-weight:700;
                 margin:6px 6px 8px 0;
-                min-width:112px;
+                min-width:115px;
                 text-align:center;
             }}
             QTabBar::tab:selected {{
@@ -1590,8 +1646,14 @@ class HolterMainWindow(QDialog):
                 border-color:#6EB4FF;
             }}
             QTabBar::tab:hover:!selected {{
-                background:#566572;
+                background:#1A2C49;
+                border-color:{UI_ACCENT};
                 color:#FFFFFF;
+            }}
+            QTabBar QToolButton {{
+                background:{UI_PANEL_ALT};
+                border:1px solid {UI_BORDER};
+                border-radius:6px;
             }}
             QGroupBox {{
                 border: none;
@@ -1608,11 +1670,198 @@ class HolterMainWindow(QDialog):
             }}
         """)
 
+        def _make_icon(tab_type: str) -> QIcon:
+            pix = QPixmap(24, 24)
+            pix.fill(Qt.transparent)
+            painter = QPainter(pix)
+            painter.setRenderHint(QPainter.Antialiasing)
+            pen = QPen(QColor('#4DB6AC'), 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            painter.setPen(pen)
+
+            if tab_type == "OVERVIEW":
+                # Monitor screen / grid icon
+                painter.drawRect(3, 4, 18, 13)
+                painter.drawLine(8, 20, 16, 20)
+                painter.drawLine(12, 17, 12, 20)
+                path = QPainterPath()
+                path.moveTo(5, 11)
+                path.lineTo(8, 11)
+                path.lineTo(10, 7)
+                path.lineTo(13, 15)
+                path.lineTo(15, 11)
+                path.lineTo(19, 11)
+                painter.setPen(QPen(QColor('#00E676'), 1.8))
+                painter.drawPath(path)
+
+            elif tab_type == "REPLAY":
+                # Play / replay curve icon
+                path = QPainterPath()
+                path.moveTo(6, 12)
+                path.lineTo(9, 12)
+                path.lineTo(11, 7)
+                path.lineTo(13, 17)
+                path.lineTo(15, 12)
+                path.lineTo(19, 12)
+                painter.setPen(QPen(QColor('#FFCA28'), 1.8))
+                painter.drawPath(path)
+                painter.drawEllipse(16, 15, 5, 5)
+
+            elif tab_type == "TEMPLATE":
+                # Beat template pulse
+                path = QPainterPath()
+                path.moveTo(3, 14)
+                path.lineTo(7, 14)
+                path.lineTo(9, 18)
+                path.lineTo(12, 4)
+                path.lineTo(15, 19)
+                path.lineTo(17, 14)
+                path.lineTo(21, 14)
+                painter.setPen(QPen(QColor('#29B6F6'), 2))
+                painter.drawPath(path)
+
+            elif tab_type == "HISTOGRAM":
+                # Bar chart histogram
+                painter.setPen(QPen(QColor('#AB47BC'), 1.8))
+                painter.drawRect(4, 13, 3, 7)
+                painter.drawRect(9, 7, 3, 13)
+                painter.drawRect(14, 10, 3, 10)
+                painter.drawRect(19, 15, 3, 5)
+
+            elif tab_type == "LORENZ":
+                # Scatter plot
+                painter.setPen(QPen(QColor('#26A69A'), 1.8))
+                painter.drawLine(4, 20, 20, 20)
+                painter.drawLine(4, 4, 4, 20)
+                painter.setPen(QPen(QColor('#26C6DA'), 3))
+                painter.drawPoint(8, 16)
+                painter.drawPoint(11, 12)
+                painter.drawPoint(13, 10)
+                painter.drawPoint(16, 7)
+                painter.drawPoint(17, 14)
+
+            elif tab_type == "AF ANALYSIS":
+                # Irregular AF rhythm wave
+                path = QPainterPath()
+                path.moveTo(3, 12)
+                path.lineTo(6, 9)
+                path.lineTo(8, 15)
+                path.lineTo(11, 5)
+                path.lineTo(14, 18)
+                path.lineTo(17, 10)
+                path.lineTo(21, 12)
+                painter.setPen(QPen(QColor('#EF5350'), 1.8))
+                painter.drawPath(path)
+
+            elif tab_type == "EVENTS":
+                # List / warning event icon
+                painter.setPen(QPen(QColor('#FFA726'), 1.8))
+                painter.drawLine(4, 7, 7, 7)
+                painter.drawLine(10, 7, 20, 7)
+                painter.drawLine(4, 12, 7, 12)
+                painter.drawLine(10, 12, 20, 12)
+                painter.drawLine(4, 17, 7, 17)
+                painter.drawLine(10, 17, 20, 17)
+
+            elif tab_type == "ST TENDENCY":
+                # ST elevation trend line
+                painter.setPen(QPen(QColor('#66BB6A'), 1.8))
+                painter.drawLine(3, 17, 8, 17)
+                painter.drawLine(8, 17, 13, 8)
+                painter.drawLine(13, 8, 21, 8)
+
+            elif tab_type == "EDIT EVENT":
+                # Pencil / edit icon
+                painter.setPen(QPen(QColor('#FF7043'), 1.8))
+                painter.drawLine(5, 19, 19, 5)
+                painter.drawLine(15, 5, 19, 9)
+                painter.drawLine(3, 21, 7, 20)
+
+            elif tab_type == "EDIT STRIPS":
+                # Strip scissors / edit
+                painter.setPen(QPen(QColor('#8D6E63'), 1.8))
+                painter.drawRect(4, 6, 16, 12)
+                painter.drawLine(8, 6, 8, 18)
+                painter.drawLine(16, 6, 16, 18)
+
+            elif tab_type == "REPORT TABLE":
+                # Grid table icon
+                painter.setPen(QPen(QColor('#7E57C2'), 1.8))
+                painter.drawRect(4, 4, 16, 16)
+                painter.drawLine(4, 10, 20, 10)
+                painter.drawLine(4, 15, 20, 15)
+                painter.drawLine(12, 4, 12, 20)
+
+            elif tab_type == "HRV":
+                # Heart + pulse icon
+                painter.setPen(QPen(QColor('#EC407A'), 1.8))
+                path = QPainterPath()
+                path.moveTo(12, 19)
+                path.cubicTo(6, 14, 3, 10, 6, 6)
+                path.cubicTo(8, 4, 11, 5, 12, 8)
+                path.cubicTo(13, 5, 16, 4, 18, 6)
+                path.cubicTo(21, 10, 18, 14, 12, 19)
+                painter.drawPath(path)
+
+            elif tab_type == "RECORD SETTINGS":
+                # Gear icon
+                painter.setPen(QPen(QColor('#78909C'), 1.8))
+                painter.drawEllipse(7, 7, 10, 10)
+                painter.drawLine(12, 3, 12, 7)
+                painter.drawLine(12, 17, 12, 21)
+                painter.drawLine(3, 12, 7, 12)
+                painter.drawLine(17, 12, 21, 12)
+
+            elif tab_type == "RECORDINGS":
+                # Folder / archive icon
+                painter.setPen(QPen(QColor('#FFA726'), 1.8))
+                painter.drawRect(4, 8, 16, 12)
+                path = QPainterPath()
+                path.moveTo(4, 8)
+                path.lineTo(8, 4)
+                path.lineTo(13, 4)
+                path.lineTo(15, 8)
+                painter.drawPath(path)
+
+            elif tab_type == "PREVIEW":
+                # Eye / document preview
+                painter.setPen(QPen(QColor('#42A5F5'), 1.8))
+                painter.drawRect(6, 4, 12, 16)
+                painter.drawLine(9, 8, 15, 8)
+                painter.drawLine(9, 12, 15, 12)
+                painter.drawLine(9, 16, 13, 16)
+
+            elif tab_type == "PRINT":
+                # Printer icon
+                painter.setPen(QPen(QColor('#9E9E9E'), 1.8))
+                painter.drawRect(6, 9, 12, 8)
+                painter.drawRect(8, 4, 8, 5)
+                painter.drawRect(8, 14, 8, 6)
+
+            elif tab_type == "REANALYSIS":
+                # Refresh / sync icon
+                painter.setPen(QPen(QColor('#26A69A'), 1.8))
+                painter.drawArc(4, 4, 16, 16, 30 * 16, 280 * 16)
+                painter.drawLine(18, 6, 20, 10)
+                painter.drawLine(18, 6, 14, 9)
+
+            elif tab_type == "QUIT":
+                # Power / exit icon
+                painter.setPen(QPen(QColor('#E53935'), 1.8))
+                painter.drawArc(5, 5, 14, 14, -40 * 16, 260 * 16)
+                painter.drawLine(12, 3, 12, 11)
+
+            else:
+                painter.setPen(QPen(QColor('#00E676'), 1.8))
+                painter.drawEllipse(6, 6, 12, 12)
+
+            painter.end()
+            return QIcon(pix)
+
         #  "  "  OVERVIEW tab (12-lead scrollable expert view)  "  " 
         self._expert_panel = HolterExpertReviewPanel()
         self._expert_panel.update_from_metrics(self._metrics_list, self._summary)
         self._expert_panel.seek_requested.connect(self._on_seek_requested)
-        self._tabs.addTab(self._expert_panel, "OVERVIEW")
+        self._tabs.addTab(self._expert_panel, _make_icon("OVERVIEW"), "OVERVIEW")
 
         # Replay
         duration = self._summary.get('duration_sec', self._duration_hours * 3600)
@@ -1624,7 +1873,7 @@ class HolterMainWindow(QDialog):
         self._replay_panel.playback_state_changed.connect(self._set_record_browser_enabled)
         self._replay_panel.update_lorenz(self._metrics_list)
         self._replay_panel.update_summary(self._summary)
-        self._tabs.addTab(self._replay_panel, "REPLAY")
+        self._tabs.addTab(self._replay_panel, _make_icon("REPLAY"), "REPLAY")
         self._lorenz_panel = self._replay_panel
 
         # Beat Templates
@@ -1636,27 +1885,30 @@ class HolterMainWindow(QDialog):
                 pass
         self._template_panel.update_from_metrics(self._metrics_list, self._summary)
         self._template_panel.seek_requested.connect(self._on_seek_requested)
-        self._tabs.addTab(self._template_panel, "TEMPLATE")
+        self._tabs.addTab(self._template_panel, _make_icon("TEMPLATE"), "TEMPLATE")
 
         # Histogram
         self._hist_panel = HolterHistogramPanel()
         self._hist_panel.update_from_metrics(self._metrics_list)
         self._hist_panel.seek_requested.connect(self._on_seek_requested)
-        self._tabs.addTab(self._hist_panel, "HISTOGRAM")
+        self._tabs.addTab(self._hist_panel, _make_icon("HISTOGRAM"), "HISTOGRAM")
 
         # Lorenz
         self._lorenz_tab_panel = HolterLorenzPanel(replay_engine=self._replay_engine)
         self._lorenz_tab_panel.update_from_metrics(self._metrics_list)
         self._lorenz_tab_panel.seek_requested.connect(self._on_seek_requested)
-        if self._replay_engine:
-            self._lorenz_tab_panel.set_replay_engine(self._replay_engine)
-        self._tabs.addTab(self._lorenz_tab_panel, "LORENZ")
+        self._tabs.addTab(self._lorenz_tab_panel, _make_icon("LORENZ"), "LORENZ")
 
 
         # AF Analysis
         self._af_panel = HolterAFPanel(session_dir=self.session_dir)
+        if self._replay_engine:
+            try:
+                self._af_panel.set_replay_engine(self._replay_engine)
+            except Exception:
+                pass
         self._af_panel.update_from_metrics(self._metrics_list, duration)
-        self._tabs.addTab(self._af_panel, "AF ANALYSIS")
+        self._tabs.addTab(self._af_panel, _make_icon("AF ANALYSIS"), "AF ANALYSIS")
 
         events = self._build_linked_events()
 
@@ -1665,35 +1917,31 @@ class HolterMainWindow(QDialog):
         self._events_panel.set_session_dir(self.session_dir)
         self._events_panel.load_events(events, self._summary)
         self._events_panel.seek_requested.connect(self._on_seek_requested)
-        self._tabs.addTab(self._events_panel, "EVENTS")
+        self._tabs.addTab(self._events_panel, _make_icon("EVENTS"), "EVENTS")
 
         # ST Tendency
         self._st_panel = HolterSTPanel(replay_engine=self._replay_engine)
         self._st_panel.update_from_metrics(self._metrics_list)
-        self._tabs.addTab(self._st_panel, "ST TENDENCY")
+        self._tabs.addTab(self._st_panel, _make_icon("ST TENDENCY"), "ST TENDENCY")
 
         # Edit Event
         self._edit_event_panel = HolterEditEventPanel()
         self._edit_event_panel.set_session_dir(self.session_dir)
         self._edit_event_panel.load_events(events, self._summary)
         self._edit_event_panel.seek_requested.connect(self._on_seek_requested)
-        self._tabs.addTab(self._edit_event_panel, "EDIT EVENT")
+        self._tabs.addTab(self._edit_event_panel, _make_icon("EDIT EVENT"), "EDIT EVENT")
 
         # Edit Strips
         self._edit_strips_panel = HolterEditStripsPanel()
         self._edit_strips_panel.set_session_dir(self.session_dir)
         self._edit_strips_panel.seek_requested.connect(self._on_seek_requested)
         self._edit_strips_panel.load_events(events, self._summary, self._metrics_list)
-        self._tabs.addTab(self._edit_strips_panel, "EDIT STRIPS")
-
-        # Report Tendency
-        self._report_tendency_panel = HolterSTPanel(replay_engine=self._replay_engine)
-        self._tabs.addTab(self._report_tendency_panel, "REPORT TENDENCY")
+        self._tabs.addTab(self._edit_strips_panel, _make_icon("EDIT STRIPS"), "EDIT STRIPS")
 
         # Report Table
         self._report_table_panel = HolterReportTablePanel()
         self._report_table_panel.update_from_metrics(self._metrics_list)
-        self._tabs.addTab(self._report_table_panel, "REPORT TABLE")
+        self._tabs.addTab(self._report_table_panel, _make_icon("REPORT TABLE"), "REPORT TABLE")
 
         # Expert Review (OVERVIEW tab) already added as first tab above
         # kept here as comment for clarity   " see OVERVIEW tab creation at top of tabs section
@@ -1701,26 +1949,16 @@ class HolterMainWindow(QDialog):
         # HRV Analysis
         self._hrv_panel = HolterHRVPanel()
         self._hrv_panel.update_hrv(self._metrics_list, self._summary)
-        self._tabs.addTab(self._hrv_panel, "HRV")
+        self._tabs.addTab(self._hrv_panel, _make_icon("HRV"), "HRV")
 
         # Record settings
-        settings_panel = QWidget()
-        settings_layout = QVBoxLayout(settings_panel)
-        settings_layout.setContentsMargins(18, 18, 18, 18)
-        settings_layout.setSpacing(10)
-        settings_title = QLabel("Record Settings")
-        settings_title.setStyleSheet(f"font-size:16px;font-weight:700;color:{UI_TEXT};")
-        settings_layout.addWidget(settings_title)
-        settings_info = QLabel(
-            f"Recording duration: {self._duration_hours:g} hours\n"
-            f"Session: {os.path.basename(os.path.normpath(self.session_dir)) if self.session_dir else 'Current session'}"
+        session_name = os.path.basename(os.path.normpath(self.session_dir)) if self.session_dir else 'Current session'
+        self._record_settings_panel = HolterRecordSettingsPanel(
+            duration_hours=self._duration_hours,
+            session_name=session_name
         )
-        settings_info.setStyleSheet(f"font-size:13px;color:{UI_MUTED};")
-        settings_info.setWordWrap(True)
-        settings_layout.addWidget(settings_info)
-        settings_layout.addStretch(1)
-        self._record_settings_panel = settings_panel
-        self._tabs.addTab(settings_panel, "RECORD SETTINGS")
+        self._record_settings_panel.settings_changed.connect(self._on_record_settings_changed)
+        self._tabs.addTab(self._record_settings_panel, _make_icon("RECORD SETTINGS"), "RECORD SETTINGS")
 
         # Record browser
         self._record_mgmt_panel = HolterRecordManagementPanel(
@@ -1729,7 +1967,13 @@ class HolterMainWindow(QDialog):
         self._record_mgmt_panel.session_selected.connect(self.load_completed_session)
         if self.session_dir:
             self._record_mgmt_panel.set_active_session(self.session_dir)
-        self._tabs.addTab(self._record_mgmt_panel, "RECORDINGS")
+        _recordings_tab_idx = self._tabs.addTab(self._record_mgmt_panel, _make_icon("RECORDINGS"), "RECORDINGS")
+        # No visible "RECORDINGS" button in the tab bar -- the tab itself
+        # still exists and stays reachable programmatically (View Previous
+        # Recording lands on it via _show_holter_ui(show_record_mgmt=True)
+        # in twelve_lead_test.py, which scans tabText()/setCurrentIndex()),
+        # it's just not offered as something the user clicks into from here.
+        self._tabs.tabBar().setTabVisible(_recordings_tab_idx, False)
 
         # Report Preview
         scroll_insight = QScrollArea()
@@ -1739,10 +1983,11 @@ class HolterMainWindow(QDialog):
         self._insight_panel = HolterInsightPanel()
         self._insight_panel.update_text(self.patient_info, self._summary)
         scroll_insight.setWidget(self._insight_panel)
-        self._tabs.addTab(scroll_insight, "PREVIEW")
-        self._tabs.addTab(QWidget(), "PRINT")
-        self._tabs.addTab(QWidget(), "REANALYSIS")
-        self._tabs.addTab(QWidget(), "QUIT")
+        self._tabs.addTab(scroll_insight, _make_icon("PREVIEW"), "PREVIEW")
+
+        self._tabs.addTab(QWidget(), _make_icon("PRINT"), "PRINT")
+        self._tabs.addTab(QWidget(), _make_icon("REANALYSIS"), "REANALYSIS")
+        self._tabs.addTab(QWidget(), _make_icon("QUIT"), "QUIT")
 
         # Track the last active content tab
         self._last_active_tab_name = "OVERVIEW"
@@ -1759,10 +2004,21 @@ class HolterMainWindow(QDialog):
                     QTimer.singleShot(0, self.close)
             else:
                 self._last_active_tab_name = tab_name
-                if tab_name == "RECORDINGS":
-                    self._tabs.tabBar().setVisible(False)
-                else:
-                    self._tabs.tabBar().setVisible(True)
+                if tab_name in ("OVERVIEW", "REPLAY"):
+                    QTimer.singleShot(0, self._refresh_st_episodes)
+                is_recordings = (tab_name == "RECORDINGS")
+                self._tabs.tabBar().setVisible(not is_recordings)
+                # The record browser (reached via "View Previous Recording",
+                # not by clicking a tab -- that button is hidden, see
+                # setTabVisible above) isn't itself a recording under
+                # review, so it gets neither the "Focused view: ..." label
+                # nor the Generate Report/Close actions that apply to one.
+                if hasattr(self, "_analysis_state"):
+                    self._analysis_state.setVisible(not is_recordings)
+                if hasattr(self, "gen_report_btn"):
+                    self.gen_report_btn.setVisible(not is_recordings)
+                if hasattr(self, "close_btn"):
+                    self.close_btn.setVisible(not is_recordings)
         self._tabs.currentChanged.connect(_on_tab_changed)
         # Ensure initial state is correct
         _on_tab_changed(self._tabs.currentIndex())
@@ -1773,11 +2029,12 @@ class HolterMainWindow(QDialog):
                 f"Focused view: {self._tabs.tabText(idx)}"
             )
         )
+
         action_handlers = {
             "Browse": self._open_recordings_folder,
             "Search": self._search_recordings,
             "Analyse": lambda: self._focus_tab("REPLAY"),
-            "View": lambda: self._focus_tab("PREVIEW"),
+            "View": self._view_selected_recording,
             "Import": self._import_recording,
             "Backup": self._backup_recordings,
             "Delete": self._delete_recording,
@@ -1788,10 +2045,20 @@ class HolterMainWindow(QDialog):
                 btn.clicked.connect(handler)
         for label, btn in self._filter_buttons.items():
             btn.clicked.connect(lambda _, t=label: self._apply_recordings_filter(t))
+            btn.clicked.connect(lambda _: self._sync_filter_buttons())
+        _rec_panel = self._recordings_panel()
+        if _rec_panel is not None and hasattr(_rec_panel, '_filter'):
+            _rec_panel._filter.currentTextChanged.connect(self._sync_filter_buttons)
 
         main_layout.addWidget(right_frame, 1)
         if hasattr(self, '_analysis_state'):
             self._analysis_state.setText(f"Focused view: {self._tabs.tabText(self._tabs.currentIndex())}")
+
+    def _on_record_settings_changed(self, settings: dict):
+        """Handler called when user applies/ok settings in Record Settings panel."""
+        if hasattr(self, "_replay_panel") and self._replay_panel is not None:
+            if hasattr(self._replay_panel, "apply_record_settings"):
+                self._replay_panel.apply_record_settings(settings)
 
 
     # ----- Callbacks ----------------------------------------------------------------------------
@@ -1833,7 +2100,7 @@ class HolterMainWindow(QDialog):
         for panel in [getattr(self, p, None) for p in [
             '_replay_panel', '_lorenz_panel', '_hist_panel', '_af_panel',
             '_st_panel', '_edit_event_panel', '_edit_strips_panel', '_events_panel',
-            '_expert_panel', '_template_panel', '_report_tendency_panel', '_hrv_panel',
+            '_expert_panel', '_template_panel', '_hrv_panel',
             '_lorenz_tab_panel'
         ]]:
             if panel and hasattr(panel, 'set_replay_frame'):
@@ -1949,7 +2216,65 @@ class HolterMainWindow(QDialog):
             self._load_session()
             self._refresh_ui()
 
+    def _refresh_st_episodes(self):
+        """Put the ST Elevation / ST Depression and T Inversion episodes of
+        this recording into the summary ('st_episodes', 't_episodes') and
+        redraw the OVERVIEW and REPLAY tables. They are values, not auto
+        arrhythmia marks: ischemia_detection reads the recording itself and
+        has nothing to do with the auto arrhythmia detection or its button.
+        Uses the cached result; if there is none yet, the calculation runs in
+        the background and the rows ("-" meanwhile) fill in when it is done."""
+        session_dir = getattr(self, 'session_dir', '') or ''
+        ecgh_path = os.path.join(session_dir, 'recording.ecgh') if session_dir else ''
+        st_eps, t_eps = None, None
+        try:
+            from .ischemia_detection import get_cached_ischemia, ischemia_async
+            if ecgh_path and os.path.exists(ecgh_path):
+                cached = get_cached_ischemia(ecgh_path)
+                if cached is not None:
+                    st_eps, t_eps = cached.get('st', []), cached.get('t', [])
+                    self._st_info = cached.get('st_info')
+                    self._qrs_axis = cached.get('axis')
+                elif not getattr(self, '_ischemia_pending', False):
+                    self._ischemia_pending = True
+
+                    def _done(result, path=ecgh_path):
+                        self._ischemia_pending = False
+                        if getattr(self, 'session_dir', '') and                                 os.path.join(self.session_dir, 'recording.ecgh') == path:
+                            self._st_episodes = result.get('st', [])
+                            self._t_episodes = result.get('t', [])
+                            self._st_info = result.get('st_info')
+                            self._qrs_axis = result.get('axis')
+                            self._push_ischemia_to_panels()
+                    ischemia_async(ecgh_path, _done)
+        except Exception as e:
+            print(f"[Holter UI] ST / T Inversion unavailable: {e}")
+        self._st_episodes = st_eps
+        self._t_episodes = t_eps
+        if st_eps is None:
+            self._st_info = None
+            self._qrs_axis = None
+        self._push_ischemia_to_panels()
+
+    def _push_ischemia_to_panels(self):
+        """Put the ST and T Inversion episodes into the summary and redraw the
+        OVERVIEW and REPLAY tables."""
+        if isinstance(getattr(self, '_summary', None), dict):
+            self._summary['st_episodes'] = getattr(self, '_st_episodes', None)
+            self._summary['t_episodes'] = getattr(self, '_t_episodes', None)
+            self._summary['st_info'] = getattr(self, '_st_info', None)
+            self._summary['qrs_axis'] = getattr(self, '_qrs_axis', None)
+            if hasattr(self, '_expert_panel'):
+                self._expert_panel.update_from_metrics(self._metrics_list, self._summary)
+            if hasattr(self, '_replay_panel'):
+                self._replay_panel.update_summary(self._summary)
+
     def _refresh_ui(self):
+        if isinstance(getattr(self, '_summary', None), dict) and hasattr(self, '_st_episodes'):
+            self._summary['st_episodes'] = self._st_episodes
+            self._summary['t_episodes'] = getattr(self, '_t_episodes', None)
+            self._summary['st_info'] = getattr(self, '_st_info', None)
+            self._summary['qrs_axis'] = getattr(self, '_qrs_axis', None)
         if hasattr(self, '_summary_cards'):
             self._summary_cards.update_summary(self._summary)
         if hasattr(self, '_insight_panel'):
@@ -1983,6 +2308,11 @@ class HolterMainWindow(QDialog):
         if hasattr(self, '_lorenz_tab_panel'):
             self._lorenz_tab_panel.update_from_metrics(self._metrics_list)
         if hasattr(self, '_af_panel'):
+            if self._replay_engine:
+                try:
+                    self._af_panel.set_replay_engine(self._replay_engine)
+                except Exception:
+                    pass
             self._af_panel.update_from_metrics(self._metrics_list, self._summary.get('duration_sec', 0))
         if hasattr(self, '_st_panel'):
             self._st_panel.update_from_metrics(self._metrics_list)
@@ -2031,21 +2361,22 @@ class HolterMainWindow(QDialog):
         dur = self._summary.get('duration_sec', 0)
         dur_h = int(dur // 3600)
         dur_m = int((dur % 3600) // 60)
+        dur_s = int(dur % 60)
         if hasattr(self, '_dur_label'):
-            self._dur_label.setText(f"{dur_h:02d}h {dur_m:02d}m")
+            self._dur_label.setText(_chip_html("Duration", f"{dur_h:02d}h {dur_m:02d}m {dur_s:02d}s"))
         if hasattr(self, '_patient_chip'):
             patient_name = self.patient_info.get("patient_name") or self.patient_info.get("name") or "Unknown Patient"
-            self._patient_chip.setText(f"Patient: {patient_name}")
+            self._patient_chip.setText(_chip_html("Patient", patient_name, UI_SUCCESS))
         if hasattr(self, '_doctor_chip'):
             doctor_name = self.patient_info.get("doctor") or "No referring doctor"
-            self._doctor_chip.setText(f"Doctor: {doctor_name}")
+            self._doctor_chip.setText(_chip_html("Doctor", doctor_name))
         if hasattr(self, '_session_chip'):
             session_name = os.path.basename(self.session_dir) if self.session_dir else "Active Session"
-            self._session_chip.setText(f"Session: {session_name}")
+            self._session_chip.setText(_chip_html("Session", session_name))
         if hasattr(self, '_rec_time_chip'):
             st_str, end_str = _get_recording_start_end_times(self.session_dir, dur)
             if st_str != "Unknown":
-                self._rec_time_chip.setText(f"Recording: {st_str} to {end_str}")
+                self._rec_time_chip.setText(_chip_html("Recording", f"{st_str}  →  {end_str}"))
                 self._rec_time_chip.show()
             else:
                 self._rec_time_chip.hide()
@@ -2093,9 +2424,6 @@ class HolterMainWindow(QDialog):
             QMessageBox.information(self, "Recording Complete",
                                     f"Comprehensive ECG Analysis recording saved to:\n{summary.get('session_dir', '')}")
             self.load_completed_session(summary.get('session_dir', ''), summary.get('patient_info', {}))
-            
-            # Auto-generate report when recording is stopped
-            self._generate_report()
 
     def _generate_report(self):
         from PyQt5.QtWidgets import QProgressDialog

@@ -41,13 +41,16 @@ from ..holter_helpers import (
     UI_SUCCESS, UI_TEXT, UI_WARNING, _class_matches_filter, _find_latest_completed_session,
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
-    _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _style_active_btn, _style_btn, _style_filter_btn, _table_style, _template_filter_key,
+    _card_style, _card_title_style, _overview_table_style,
 )
 
 from ..tool_engine import ECGToolEngine
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas, HolterRRTrendCanvas, HRTrendCanvas
 
 # 6. HOLTER REPLAY PANEL
+from ..ischemia_detection import ST_DEPRESSION, ST_ELEVATION, T_INVERSION, format_st_summary
+
 class HolterReplayPanel(QWidget):
     playback_state_changed = pyqtSignal(bool)
     seek_requested = pyqtSignal(float)
@@ -59,7 +62,9 @@ class HolterReplayPanel(QWidget):
         super().__init__(parent)
         self.duration_sec = max(1, duration_sec)
         self._strip_length_sec = 10.0
-        self.setStyleSheet(f"background:{COL_DARK};")
+        self.setObjectName("replayPanel")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(f"QWidget#replayPanel{{background:{UI_BG};}}")
         self._replay_engine = None
         self._tool_engine = ECGToolEngine()
         self._current_replay_frame = None
@@ -96,14 +101,8 @@ class HolterReplayPanel(QWidget):
 
         #  "  "  48-hour session summary bar (replaces the two RR trend canvases)  "  " 
         summary_frame = QFrame()
-        summary_frame.setStyleSheet("""
-            QFrame {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #172D4D, stop:0.48 #10213A, stop:1 #080D16);
-                border: 1px solid #315783;
-                border-radius: 8px;
-            }
-        """)
+        summary_frame.setObjectName("rpSummaryCard")
+        summary_frame.setStyleSheet(_card_style("QFrame#rpSummaryCard"))
         summary_frame.setMinimumHeight(76)
         summary_layout = QHBoxLayout(summary_frame)
         summary_layout.setContentsMargins(12, 6, 12, 6)
@@ -114,9 +113,9 @@ class HolterReplayPanel(QWidget):
             col.setContentsMargins(12, 0, 12, 0)
             col.setSpacing(2)
             t = QLabel(title)
-            t.setStyleSheet("color:#D5E5F7;font-size:9px;font-weight:700;border:none;")
+            t.setStyleSheet(f"color:{UI_MUTED};font-size:9px;font-weight:700;border:none;background:transparent;")
             v = QLabel("-")
-            v.setStyleSheet("color:#FFFFFF;font-size:13px;font-weight:700;border:none;")
+            v.setStyleSheet(f"color:{UI_TEXT};font-size:13px;font-weight:700;border:none;background:transparent;")
             col.addWidget(t)
             col.addWidget(v)
             self._summary_labels[key] = v
@@ -164,22 +163,26 @@ class HolterReplayPanel(QWidget):
         top_splitter.setStyleSheet(f"QSplitter{{background:{UI_BG};}} QSplitter::handle{{background:{UI_BORDER};}}")
 
         left_wrap = QFrame()
-        left_wrap.setStyleSheet(f"QFrame{{background:#292D32;border:1px solid {UI_BORDER};border-radius:8px;}}")
+        left_wrap.setObjectName("rpLeftCard")
+        left_wrap.setStyleSheet(_card_style("QFrame#rpLeftCard"))
         lw_l = QVBoxLayout(left_wrap)
-        lw_l.setContentsMargins(4, 4, 4, 4)
+        lw_l.setContentsMargins(8, 8, 8, 8)
         lw_l.setSpacing(6)
+        lorenz_ttl = QLabel("RR Scatter (Lorenz)")
+        lorenz_ttl.setStyleSheet(_card_title_style())
+        lw_l.addWidget(lorenz_ttl)
         self._lorenz_canvas = LorenzCanvas(parent=left_wrap)
         lw_l.addWidget(self._lorenz_canvas, 3)
         lorenz_filter_row = QHBoxLayout()
         lorenz_filter_row.setSpacing(4)
+        lorenz_filter_row.setContentsMargins(0, 4, 0, 4)
         self._lorenz_class_btns = {}
         for key, lbl in [("all", "All"), ("N", "N"), ("S", "S"), ("V", "V"), ("P", "P"), ("AF", "AF"), ("X", "X"), ("Other", "Other")]:
             b = QPushButton(lbl)
             b.setCheckable(True)
             b.setToolTip(f"Show {lbl} beats" if key != "all" else "Show all beats")
-            b.setFixedHeight(24)
-            style = _style_btn(COL_DARK, COL_GREEN, COL_GREEN_DRK).replace("padding: 7px 14px;", "padding: 1px 4px;")
-            b.setStyleSheet(style)
+            b.setFixedHeight(28)
+            b.setStyleSheet(_style_filter_btn(active=(key == "all"), fg=COL_GREEN if key != "all" else UI_TEXT))
             b.clicked.connect(lambda checked=False, k=key: self._set_lorenz_class_filter(k))
             self._lorenz_class_btns[key] = b
             lorenz_filter_row.addWidget(b)
@@ -191,10 +194,14 @@ class HolterReplayPanel(QWidget):
         top_splitter.addWidget(left_wrap)
 
         ecg_right = QFrame()
-        ecg_right.setStyleSheet(f"QFrame{{background:#292D32;border:1px solid {UI_BORDER};border-radius:8px;}}")
+        ecg_right.setObjectName("rpEcgCard")
+        ecg_right.setStyleSheet(_card_style("QFrame#rpEcgCard"))
         ecg_right_layout = QVBoxLayout(ecg_right)
-        ecg_right_layout.setContentsMargins(4, 4, 4, 4)
-        ecg_right_layout.setSpacing(2)
+        ecg_right_layout.setContentsMargins(8, 8, 8, 8)
+        ecg_right_layout.setSpacing(4)
+        ecg_ttl = QLabel("12-Lead ECG")
+        ecg_ttl.setStyleSheet(_card_title_style())
+        ecg_right_layout.addWidget(ecg_ttl)
 
         #  "  "  12-lead scrollable grid (1 column, 12 rows)  "  " 
         leads_scroll = QScrollArea()
@@ -202,9 +209,9 @@ class HolterReplayPanel(QWidget):
         leads_scroll.setFrameShape(QFrame.NoFrame)
         leads_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         leads_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        leads_scroll.setStyleSheet("QScrollArea{background:#25292E;border:none;}")
+        leads_scroll.setStyleSheet(f"QScrollArea{{background:{UI_PANEL};border:none;}}")
         leads_container = QWidget()
-        leads_container.setStyleSheet("background:#25292E;")
+        leads_container.setStyleSheet(f"background:{UI_PANEL};")
         leads_vbox = QVBoxLayout(leads_container)
         leads_vbox.setContentsMargins(2, 2, 2, 2)
         leads_vbox.setSpacing(2)
@@ -243,7 +250,7 @@ class HolterReplayPanel(QWidget):
         self._mini_lead_lbl = rhythm_lbl
         rhythm_lbl.setFixedWidth(34)
         rhythm_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        rhythm_lbl.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;")
+        rhythm_lbl.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;background:transparent;")
         # Replay mode: disable ALL coloring
         self._mini_strip = ECGStripCanvas(height=60, color="#00AA00", pen_width=0.9, show_annotations=False, disable_all_coloring=True)
         rhythm_row.addWidget(rhythm_lbl)
@@ -254,38 +261,34 @@ class HolterReplayPanel(QWidget):
 
 
         ov_frame = QFrame()
-        ov_frame.setStyleSheet(f"QFrame{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-radius:8px;}}")
+        ov_frame.setObjectName("rpOverviewCard")
+        ov_frame.setStyleSheet(_card_style("QFrame#rpOverviewCard"))
         ov_layout = QVBoxLayout(ov_frame)
-        ov_layout.setContentsMargins(6, 6, 6, 6)
-        ov_layout.setSpacing(6)
+        ov_layout.setContentsMargins(8, 8, 8, 8)
+        ov_layout.setSpacing(8)
         ov_title = QLabel("Overview")
-        ov_title.setStyleSheet("color:#F4F8FC;font-size:14px;font-weight:700;border:none;")
+        ov_title.setStyleSheet(_card_title_style())
         ov_layout.addWidget(ov_title)
+
         self._overview_table = QTableWidget(0, 2)
         self._overview_table.setHorizontalHeaderLabels(["Name", "Value"])
-        self._overview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self._overview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        # No horizontal scrolling: the Name column takes what it needs, Value
+        # takes the rest and its text (ST episodes) goes down, line by line.
+        self._overview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self._overview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._overview_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._overview_table.setWordWrap(True)
+        # refit one event later: the new column width is only in place after the resize is done
+        self._overview_table.horizontalHeader().sectionResized.connect(lambda *_: QTimer.singleShot(0, self._fit_st_rows))
         self._overview_table.verticalHeader().setVisible(False)
         self._overview_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._overview_table.setSelectionMode(QAbstractItemView.NoSelection)
         self._overview_table.setFocusPolicy(Qt.NoFocus)
-        self._overview_table.setStyleSheet(_table_style() + f"""
-            QTableWidget {{
-                background: {UI_PANEL};
-                alternate-background-color: {UI_PANEL_ALT};
-                gridline-color: {UI_BORDER};
-                border: none;
-            }}
-            QHeaderView::section {{
-                background: {UI_PANEL_ALT};
-                color: {UI_TEXT};
-                border: none;
-                border-bottom: 1px solid {UI_BORDER};
-                padding: 7px 6px;
-                font-weight: 700;
-            }}
-            QTableWidget::item {{ padding: 5px 6px; border-bottom: 1px solid {UI_BORDER}; }}
-        """)
+        self._overview_table.setShowGrid(False)
+        self._overview_table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._overview_table.horizontalHeader().setFixedHeight(28)
+
+        self._overview_table.setStyleSheet(_overview_table_style())
         ov_layout.addWidget(self._overview_table, 1)
         top_splitter.addWidget(ov_frame)
         top_splitter.setSizes([430, 980, 280])
@@ -296,15 +299,17 @@ class HolterReplayPanel(QWidget):
         slider_row.setContentsMargins(2, 0, 2, 0)
         slider_row.setSpacing(8)
         self._time_start_label = QLabel("00:00:00")
-        self._time_start_label.setStyleSheet(f"color:{COL_TIMESTAMP};font-family:monospace;font-size:12px;border:none;")
+        self._time_start_label.setStyleSheet(f"color:{COL_TIMESTAMP};font-family:monospace;font-size:12px;border:none;background:transparent;")
         slider_row.addWidget(self._time_start_label)
         self._slider = QSlider(Qt.Horizontal)
         self._slider.setRange(0, self._slider_sec_to_value(self.duration_sec))
         self._slider.setStyleSheet(f"""
-            QSlider::groove:horizontal{{height:8px;background:{COL_DARK};border:1px solid {COL_GREEN_DRK};border-radius:4px;}}
-            QSlider::handle:horizontal{{background:{COL_GREEN};border:1px solid {COL_WHITE};border-radius:9px;
-                width:18px;height:18px;margin:-6px 0;}}
-            QSlider::sub-page:horizontal{{background:{COL_GREEN_DRK};border-radius:4px;}}
+            QSlider{{background:transparent;}}
+            QSlider::groove:horizontal{{height:8px;background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};border-radius:4px;}}
+            QSlider::handle:horizontal{{background:{UI_ACCENT};border:2px solid {UI_TEXT};border-radius:9px;
+                width:14px;height:14px;margin:-6px 0;}}
+            QSlider::handle:horizontal:hover{{background:{UI_ACCENT_HOVER};}}
+            QSlider::sub-page:horizontal{{background:{UI_ACCENT};border:1px solid {UI_ACCENT};border-radius:4px;}}
         """)
         self._slider.setTracking(True)
         self._slider.valueChanged.connect(self._on_slider)
@@ -312,7 +317,7 @@ class HolterReplayPanel(QWidget):
         slider_row.addWidget(self._slider, 1)
         self._pos_label = QLabel("00:00:00")
         self._pos_label.setStyleSheet(f"color:{COL_TIMESTAMP};font-family:monospace;font-size:14px;font-weight:bold;"
-                                      f"background:{COL_BLACK};padding:4px;border:1px solid {COL_GREEN_DRK};border-radius:4px;border:none;")
+                                      f"background:{UI_PANEL};padding:4px 8px;border:1px solid {UI_BORDER};border-radius:6px;")
         slider_row.addWidget(self._pos_label)
         layout.addLayout(slider_row)
 
@@ -329,24 +334,29 @@ class HolterReplayPanel(QWidget):
 
         for speed_lbl in ["0.5x", "1x", "2x", "4x"]:
             btn = QPushButton(speed_lbl)
-            btn.setStyleSheet(_style_btn(COL_DARK, COL_GREEN, COL_GREEN_DRK))
+            btn.setStyleSheet(_style_btn())
             btn.setFixedHeight(30)
             btn.setMinimumWidth(56)
             btn.clicked.connect(lambda _, s=speed_lbl: self._set_speed(s))
             ctrl_row.addWidget(btn)
         sep = QLabel("|")
-        sep.setStyleSheet(f"color:{COL_GREEN_DRK};")
+        sep.setStyleSheet(f"color:{UI_BORDER};background:transparent;border:none;")
         ctrl_row.addWidget(sep)
 
         lbl_lead = QLabel("Lead:")
-        lbl_lead.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;border:none;font-size:13px;")
+        lbl_lead.setStyleSheet(f"color:{UI_MUTED};font-weight:bold;border:none;font-size:13px;background:transparent;")
         ctrl_row.addWidget(lbl_lead)
         self._lead_combo = QComboBox()
         self._lead_combo.addItems(["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"])
         self._lead_combo.setCurrentIndex(1)
         self._lead_combo.setFixedWidth(70)
-        self._lead_combo.setStyleSheet(f"background:{COL_DARK};color:{COL_GREEN};border:1px solid {COL_GREEN_DRK};"
-                                       f"padding:4px;border-radius:4px;font-weight:bold;")
+        self._lead_combo.setStyleSheet(f"""
+            QComboBox {{ background:{UI_PANEL_ALT}; color:{UI_TEXT}; border:1px solid {UI_BORDER};
+                padding:4px 6px; border-radius:6px; font-weight:bold; }}
+            QComboBox:hover {{ border:1px solid {UI_ACCENT}; }}
+            QComboBox QAbstractItemView {{ background:{UI_PANEL}; color:{UI_TEXT}; border:1px solid {UI_BORDER};
+                selection-background-color:{UI_ACCENT}; selection-color:#FFFFFF; outline:none; }}
+        """)
         self._lead_combo.currentIndexChanged.connect(self._on_lead_changed)
         ctrl_row.addWidget(self._lead_combo)
 
@@ -357,13 +367,8 @@ class HolterReplayPanel(QWidget):
 
         # Bottom toolbar (like reference image)
         toolbar = QFrame()
-        toolbar.setStyleSheet(f"""
-            QFrame {{
-                background: #090B0D;
-                border: 1px solid #3A4148;
-                border-radius: 8px;
-            }}
-        """)
+        toolbar.setObjectName("rpToolbar")
+        toolbar.setStyleSheet(_card_style("QFrame#rpToolbar"))
         toolbar_layout = QHBoxLayout(toolbar)
         toolbar_layout.setContentsMargins(5, 4, 5, 4)
         toolbar_layout.setSpacing(5)
@@ -381,32 +386,26 @@ class HolterReplayPanel(QWidget):
             "Adjust strip position": 146,
             "Strip Length:10s": 120,
         }
-        tool_button_style = """
-            QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #4A5158, stop:0.5 #292E33, stop:1 #15181B);
-                color: #FFFFFF;
-                border: 1px solid #68727C;
-                border-bottom: 2px solid #101214;
-                border-radius: 5px;
+        tool_button_style = f"""
+            QPushButton {{
+                background: {UI_PANEL_ALT};
+                color: {UI_TEXT};
+                border: 1px solid {UI_BORDER};
+                border-radius: 6px;
                 padding: 5px 10px;
                 font-size: 10px;
                 font-weight: 600;
-            }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #69747E, stop:1 #353C43);
+            }}
+            QPushButton:hover {{
+                background: #1A2C49;
+                color: {UI_TEXT};
+                border: 1px solid {UI_ACCENT};
+            }}
+            QPushButton:pressed, QPushButton:checked {{
+                background: {UI_ACCENT};
                 color: #FFFFFF;
-                border: 1px solid #AAB4BD;
-            }
-            QPushButton:pressed, QPushButton:checked {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #171A1D, stop:1 #59636C);
-                color: #FFFFFF;
-                border: 1px solid #D0D7DD;
-                padding-top: 6px;
-                padding-bottom: 4px;
-            }
+                border: 1px solid #5EA4FF;
+            }}
         """
         for tool in ["Patient information", "Full Disc.", "Goto Template"]:
             tbtn = QPushButton(tool)
@@ -422,6 +421,8 @@ class HolterReplayPanel(QWidget):
             tbtn.setStyleSheet(tool_button_style)
             tbtn.setMinimumHeight(32)
             tbtn.setMinimumWidth(tool_min_widths.get(tool, 110))
+            if tool == "Gain Settings":
+                tbtn.setText("Gain: 10mm/mV")
             tbtn.clicked.connect(lambda _, t=tool, b=tbtn: self._set_tool_mode(t, b))
             toolbar_layout.addWidget(tbtn)
             self._tool_btns[tool] = tbtn
@@ -604,9 +605,9 @@ class HolterReplayPanel(QWidget):
         table.setAlternatingRowColors(True)
         for row, (label, value) in enumerate(rows):
             label_item = QTableWidgetItem(str(label))
-            label_item.setForeground(QColor(UI_TEXT))
+            label_item.setForeground(QColor(UI_MUTED))
             value_item = QTableWidgetItem(str(value))
-            value_item.setForeground(QColor(COL_WHITE))
+            value_item.setForeground(QColor(UI_TEXT))
             table.setItem(row, 0, label_item)
             table.setItem(row, 1, value_item)
         table.resizeRowsToContents()
@@ -658,7 +659,7 @@ class HolterReplayPanel(QWidget):
             m = (sec % 3600) // 60
             s = sec % 60
             if h > 0:
-                return f"{h}h {m:02d}m"
+                return f"{h}h {m:02d}m {s:02d}s"
             if m > 0:
                 return f"{m}m {s:02d}s"
             return f"{s}s"
@@ -693,7 +694,7 @@ class HolterReplayPanel(QWidget):
                 border-radius: 8px;
                 margin-top: 12px;
                 padding-top: 16px;
-                background: {COL_BLACK};
+                background: {UI_PANEL};
             }}
             QHeaderView::section {{
                 background: {UI_PANEL_ALT};
@@ -852,7 +853,8 @@ class HolterReplayPanel(QWidget):
             dur = summary.get('duration_sec', 0)
             h = int(dur // 3600)
             m = int((dur % 3600) // 60)
-            set_lbl("duration", f"{h:02d}h {m:02d}m")
+            s = int(dur % 60)
+            set_lbl("duration", f"{h:02d}h {m:02d}m {s:02d}s")
             set_lbl("total_beats", summary.get('total_beats', 0))
             set_lbl("avg_hr", f"{summary.get('avg_hr', 0)} bpm")
             set_lbl("max_hr", f"{summary.get('max_hr', 0)} bpm")
@@ -862,6 +864,10 @@ class HolterReplayPanel(QWidget):
             set_lbl("sve", summary.get('sve_beats', 0))
             set_lbl("sdnn", f"{summary.get('sdnn', 0)} ms")
             set_lbl("rmssd", f"{summary.get('rmssd', 0)} ms")
+        # ST episodes arrive through the summary; redraw the overview table
+        # with the metrics it was last drawn from.
+        if getattr(self, '_overview_args', None) is not None:
+            self._update_overview_table(*self._overview_args)
 
     def _slider_sec_to_value(self, seconds: float) -> int:
         units = max(1, int(getattr(self, "_slider_units_per_sec", 100)))
@@ -936,8 +942,9 @@ class HolterReplayPanel(QWidget):
             key = "all"
         self._class_filter = key
         for btn_key, btn in self._lorenz_class_btns.items():
-            btn.setChecked(btn_key == key)
-            btn.setStyleSheet(_style_active_btn() if btn_key == key else _style_btn(COL_DARK, COL_GREEN, COL_GREEN_DRK))
+            is_active = (btn_key == key)
+            btn.setChecked(is_active)
+            btn.setStyleSheet(_style_filter_btn(active=is_active, fg=COL_GREEN if not is_active else UI_TEXT))
         if self._last_metrics_list:
             self.update_lorenz(self._last_metrics_list)
 
@@ -1137,18 +1144,77 @@ class HolterReplayPanel(QWidget):
         except Exception:
             pass
 
+    def apply_record_settings(self, settings: dict):
+        """Apply lead gains and invert states from Record Settings to all lead strips."""
+        # Persist so Full Disclosure dialog can read these settings when it opens
+        self._last_record_settings = settings
+        lead_gains = settings.get("lead_gains", {})
+        lead_inverts = settings.get("lead_inverts", {})
+        for lead, strip in self._lead_strips.items():
+            if lead in lead_gains:
+                # Map gain mm/mV (e.g. 5, 10, 20) to scaling factor (10 mm/mV is 1.0)
+                g_val = lead_gains[lead]
+                scale = float(g_val) / 10.0
+                strip.set_gain(scale)
+            if lead in lead_inverts:
+                strip.set_invert(lead_inverts[lead])
+        if hasattr(self, "_mini_strip"):
+            selected_lead = self._lead_combo.currentText() if hasattr(self, "_lead_combo") else "II"
+            if selected_lead in lead_gains:
+                self._mini_strip.set_gain(float(lead_gains[selected_lead]) / 10.0)
+            if selected_lead in lead_inverts:
+                self._mini_strip.set_invert(lead_inverts[selected_lead])
+        # Update toolbar Gain button text if uniform gain across leads
+        if hasattr(self, "_tool_btns") and "Gain Settings" in self._tool_btns:
+            g_vals = set(lead_gains.values()) if lead_gains else set()
+            if len(g_vals) == 1:
+                val = int(list(g_vals)[0])
+                self._tool_btns["Gain Settings"].setText(f"Gain: {val}mm/mV")
+                try:
+                    from ecg.holter.theme import GAINS
+                    if val in GAINS:
+                        self._curr_gain_idx = GAINS.index(val)
+                except Exception:
+                    pass
+            else:
+                self._tool_btns["Gain Settings"].setText("Gain: 10mm/mV")
+                self._curr_gain_idx = 1
+
     def _update_overview_table(self, metrics_list: list, rr_n: list):
         if not hasattr(self, "_overview_table"):
             return
+        self._overview_args = (metrics_list, rr_n)
         summary_rows = self._compute_replay_overview(metrics_list, rr_n)
         self._overview_table.setRowCount(len(summary_rows))
         for r, (name, value) in enumerate(summary_rows):
+            self._overview_table.setRowHeight(r, max(24, 18 * (str(value).count("\n") + 1) + 8))
             n_item = QTableWidgetItem(name)
             v_item = QTableWidgetItem(value)
+            v_item.setToolTip(value)
+            bg_col = QColor(UI_PANEL) if r % 2 == 0 else QColor(UI_PANEL_ALT)
+            n_item.setBackground(bg_col)
+            v_item.setBackground(bg_col)
             n_item.setForeground(QColor(UI_MUTED))
             v_item.setForeground(QColor(UI_TEXT))
             self._overview_table.setItem(r, 0, n_item)
             self._overview_table.setItem(r, 1, v_item)
+            if name in ('T Inversion', 'ST Elevation', 'ST Depression') and "\n" in str(value):
+                # limb leads on one line, chest leads below; wrapped to the column
+                self._overview_table.resizeRowToContents(r)
+                self._overview_table.setRowHeight(r, max(self._overview_table.rowHeight(r), 24))
+
+    def _fit_st_rows(self, *_args):
+        """Size the ST Elevation / ST Depression rows to their wrapped text.
+        Called after the rows are filled and whenever a column is resized
+        (the Value column's width is only final once the table is laid out)."""
+        table = self._overview_table
+        for r in range(table.rowCount()):
+            name_item, value_item = table.item(r, 0), table.item(r, 1)
+            if name_item is None or value_item is None:
+                continue
+            if name_item.text() in ('T Inversion', 'ST Elevation', 'ST Depression') and "\n" in value_item.text():
+                table.resizeRowToContents(r)
+                table.setRowHeight(r, max(table.rowHeight(r), 24))
 
     def _compute_replay_overview(self, metrics_list: list, rr_n: list) -> list:
         total_beats = len(rr_n)
@@ -1171,7 +1237,20 @@ class HolterReplayPanel(QWidget):
         tachy_pct = (tachy_chunks / total_chunks) * 100.0
         brady_pct = (brady_chunks / total_chunks) * 100.0
         af_dur_str = f"{(af_chunks * chunk_dur) / 60.0:.1f} m"
-        
+
+        # ST Elevation/Depression: the episodes ischemia_detection found on
+        # the recording's own 12 leads (limb leads >= 1 mm, chest leads
+        # >= 2 mm, any 2 leads of one group, >= 1 min). The old per-chunk
+        # 'st_mv' stored in metrics.jsonl (one Lead II reading taken while
+        # recording, never recomputed, seen reading up to 9 mV) is no longer
+        # shown. "-" until the episodes have been calculated.
+        t_inversion_str = format_st_summary((getattr(self, '_summary', None) or {}).get('t_episodes'), T_INVERSION, multiline=True)
+        # ST: event list, Full Disclosure screen mm (average/max per lead)
+        st_episodes = (getattr(self, '_summary', None) or {}).get('st_episodes')
+        st_info = (getattr(self, '_summary', None) or {}).get('st_info')
+        st_elevation_str = format_st_summary(st_episodes, ST_ELEVATION, multiline=True, info=st_info)
+        st_depression_str = format_st_summary(st_episodes, ST_DEPRESSION, multiline=True, info=st_info)
+
         return [
             ("Total NNs", str(total_beats)),
             ("AVG HR", f"{avg_hr:.0f} bpm"),
@@ -1184,6 +1263,9 @@ class HolterReplayPanel(QWidget):
             ("AF Duration", af_dur_str),
             ("V Total", str(ve)),
             ("S Total", str(sve)),
+            ("T Inversion", t_inversion_str),
+            ("ST Elevation", st_elevation_str),
+            ("ST Depression", st_depression_str),
         ]
 
 

@@ -82,46 +82,49 @@ class HolterReplayEngine:
                             label_code = 'N'
                             color = '#00FF00'  # Default green for NSR
                             
-                            # Color mapping for arrhythmia types
-                            if 'ventricular fibrillation' in arr_label or 'vfib' in arr_label or 'vf' in arr_label:
+                            # ── Unified Auto-Segment Color System ──────────────
+                            # Colors must match holter_full_disclosure.py targets
+                            # dict exactly so all views stay in sync.
+                            # SVT must be checked BEFORE VT: 'supraventricular
+                            # tachycardia' contains 'ventricular tachycardia'
+                            # as a substring (false VT match otherwise).
+                            # ────────────────────────────────────────────────────
+                            if 'ventricular fibrillation' in arr_label or 'vfib' in arr_label:
                                 label_code = 'V'
                                 color = '#FF3333'  # Red
-                            elif 'ventricular tachycardia' in arr_label or 'vtach' in arr_label:
-                                label_code = 'V'
+                            elif 'supraventricular tachycardia' in arr_label or 'svt' in arr_label:
+                                label_code = 'S'  # Supraventricular
                                 color = '#FFA500'  # Orange
+                            elif 'ventricular tachycardia' in arr_label or 'vtach' in arr_label:
+                                label_code = 'V'  # Ventricular
+                                color = '#E67E22'  # Burnt Orange
                             elif 'atrial fibrillation' in arr_label or 'afib' in arr_label:
                                 label_code = 'AF'
-                                color = '#9932CC'  # Purple
+                                color = '#B36BFF'  # Purple
                             elif 'atrial flutter' in arr_label or 'aflutter' in arr_label:
                                 label_code = 'AF'
                                 color = '#FF69B4'  # Pink
+                            elif 'av block' in arr_label:
+                                label_code = 'P'
+                                color = '#FF00FF'  # Magenta
                             elif 'sinus bradycardia' in arr_label or 'bradycardia' in arr_label:
                                 label_code = 'S'
-                                color = '#0000FF'  # Blue
+                                color = '#00BFFF'  # Deep Sky Blue
                             elif 'sinus tachycardia' in arr_label or 'tachycardia' in arr_label:
                                 label_code = 'S'
-                                color = '#00BFFF'  # Deep Sky Blue
-                            elif '1st-degree av block' in arr_label:
-                                label_code = 'P'
-                                color = '#FFFF00'  # Yellow
-                            elif '2nd-degree av block' in arr_label:
-                                label_code = 'P'
-                                color = '#FFD700'  # Gold
-                            elif '3rd-degree av block' in arr_label:
-                                label_code = 'P'
-                                color = '#FF8C00'  # Dark Orange
-                            elif 'right bundle branch block' in arr_label:
-                                label_code = 'P'
-                                color = '#32CD32'  # Lime Green
-                            elif 'left bundle branch block' in arr_label:
-                                label_code = 'P'
-                                color = '#9370DB'  # Medium Purple
+                                color = '#00FFFF'  # Cyan
                             elif 'premature ventricular contraction' in arr_label or 'pvc' in arr_label:
                                 label_code = 'V'
-                                color = '#8B4513'  # Brown
+                                color = '#E67E22'  # Burnt Orange (ventricular)
                             elif 'premature atrial contraction' in arr_label or 'pac' in arr_label:
                                 label_code = 'S'
-                                color = '#00FFFF'  # Cyan
+                                color = '#FFA500'  # Orange (supraventricular)
+                            elif 'right bundle branch block' in arr_label or 'left bundle branch block' in arr_label:
+                                label_code = 'P'
+                                color = '#FF00FF'  # Magenta (conduction)
+                            elif 'bundle branch block' in arr_label:
+                                label_code = 'P'
+                                color = '#FF00FF'  # Magenta (conduction)
                             
                             # Calculate end timestamp (use chunk duration)
                             chunk_start = float(m.get('t', 0.0) or 0.0)
@@ -164,7 +167,11 @@ class HolterReplayEngine:
             if layered_events:
                 self._structured_events = []
                 self._arrhythmia_events = []
-                for item in layered_events:
+                sorted_items = sorted(
+                    layered_events,
+                    key=lambda it: float(it.get("timestamp", it.get("t", 0.0)) or 0.0),
+                )
+                for idx, item in enumerate(sorted_items):
                     ts = float(item.get("timestamp", item.get("t", 0.0)) or 0.0)
                     label = str(item.get("label", item.get("event_type", "Event")))
                     label_lower = label.lower()
@@ -173,52 +180,93 @@ class HolterReplayEngine:
                     label_code = 'N'
                     color = '#00FF00'  # Default green for NSR
                     
-                    # Color mapping for arrhythmia types
-                    if 'ventricular fibrillation' in label_lower or 'vfib' in label_lower or 'vf' in label_lower:
+                    # ── Unified Auto-Segment Color System ──────────────
+                    # Colors must match holter_full_disclosure.py targets
+                    # dict exactly so all views stay in sync.
+                    # SVT must be checked BEFORE VT: 'supraventricular
+                    # tachycardia' contains 'ventricular tachycardia'
+                    # as a substring (false VT match otherwise).
+                    # ────────────────────────────────────────────────────
+                    if 'ventricular fibrillation' in label_lower or 'vfib' in label_lower:
                         label_code = 'V'
                         color = '#FF3333'  # Red
-                    elif 'ventricular tachycardia' in label_lower or 'vtach' in label_lower:
-                        label_code = 'V'
+                    elif 'supraventricular tachycardia' in label_lower or 'svt' in label_lower:
+                        label_code = 'S'  # Supraventricular
                         color = '#FFA500'  # Orange
+                    elif 'ventricular tachycardia' in label_lower or 'vtach' in label_lower:
+                        label_code = 'V'  # Ventricular
+                        color = '#E67E22'  # Burnt Orange
                     elif 'atrial fibrillation' in label_lower or 'afib' in label_lower:
                         label_code = 'AF'
-                        color = '#9932CC'  # Purple
+                        color = '#B36BFF'  # Purple
                     elif 'atrial flutter' in label_lower or 'aflutter' in label_lower:
                         label_code = 'AF'
                         color = '#FF69B4'  # Pink
+                    elif 'av block' in label_lower:
+                        label_code = 'P'
+                        color = '#FF00FF'  # Magenta
                     elif 'sinus bradycardia' in label_lower or 'bradycardia' in label_lower:
                         label_code = 'S'
-                        color = '#0000FF'  # Blue
+                        color = '#00BFFF'  # Deep Sky Blue
                     elif 'sinus tachycardia' in label_lower or 'tachycardia' in label_lower:
                         label_code = 'S'
-                        color = '#00BFFF'  # Deep Sky Blue
-                    elif '1st-degree av block' in label_lower:
-                        label_code = 'P'
-                        color = '#FFFF00'  # Yellow
-                    elif '2nd-degree av block' in label_lower:
-                        label_code = 'P'
-                        color = '#FFD700'  # Gold
-                    elif '3rd-degree av block' in label_lower:
-                        label_code = 'P'
-                        color = '#FF8C00'  # Dark Orange
-                    elif 'right bundle branch block' in label_lower:
-                        label_code = 'P'
-                        color = '#32CD32'  # Lime Green
-                    elif 'left bundle branch block' in label_lower:
-                        label_code = 'P'
-                        color = '#9370DB'  # Medium Purple
+                        color = '#00FFFF'  # Cyan
                     elif 'premature ventricular contraction' in label_lower or 'pvc' in label_lower:
                         label_code = 'V'
-                        color = '#8B4513'  # Brown
+                        color = '#E67E22'  # Burnt Orange (ventricular)
                     elif 'premature atrial contraction' in label_lower or 'pac' in label_lower:
                         label_code = 'S'
-                        color = '#00FFFF'  # Cyan
+                        color = '#FFA500'  # Orange (supraventricular)
+                    elif 'right bundle branch block' in label_lower or 'left bundle branch block' in label_lower:
+                        label_code = 'P'
+                        color = '#FF00FF'  # Magenta (conduction)
+                    elif 'bundle branch block' in label_lower:
+                        label_code = 'P'
+                        color = '#FF00FF'  # Magenta (conduction)
                     
-                    # Check if item has end_timestamp, otherwise calculate from duration
+                    # Check if item has end_timestamp, otherwise calculate from
+                    # duration -- or, if neither is stored, cap the fallback
+                    # span at the next *chunk-level* snapshot's own start
+                    # time. These rows can be discrete, closely-spaced
+                    # real-time classifier snapshots (e.g. one label every
+                    # ~5s) with no duration field persisted; a flat 60s guess
+                    # made an old snapshot's rendered region balloon far past
+                    # where a newer, later classification already superseded
+                    # it, which then visually collided with a genuinely
+                    # separate, later arrhythmia episode on the Full
+                    # Disclosure timeline.
+                    #
+                    # The same real-time pipeline also logs finer-grained,
+                    # beat-level annotations (e.g. "PVC Candidate") at the
+                    # precise instant that beat occurred, which can be
+                    # anywhere within a chunk-level label's own ~5s window --
+                    # not necessarily close in time to the chunk label itself
+                    # (seen up to ~3s away in practice, so a short minimum-gap
+                    # heuristic isn't reliable). Sorted by timestamp, that
+                    # beat-level row would otherwise get treated as "the next
+                    # chunk", capping the rhythm label's span early and
+                    # leaving the rest of that chunk unrendered. Chunk-level
+                    # rhythm labels are logged on whole-second boundaries
+                    # (105.00, 110.00, ...); beat-level annotations are logged
+                    # at the beat's precise, generally fractional timestamp.
+                    # So the "next" row used for capping is the next one that
+                    # itself looks like a whole-second chunk boundary, not
+                    # simply the next row in sorted order.
                     end_ts = item.get("end_timestamp")
                     if end_ts is None:
-                        duration = float(item.get("duration", 60.0) or 60.0)
-                        end_ts = ts + duration
+                        duration = item.get("duration")
+                        if duration is None:
+                            next_ts = None
+                            for later in sorted_items[idx + 1:]:
+                                later_ts = float(later.get("timestamp", later.get("t", 0.0)) or 0.0)
+                                if later_ts <= ts:
+                                    continue
+                                if abs(later_ts - round(later_ts)) < 0.01:
+                                    next_ts = later_ts
+                                    break
+                            end_ts = next_ts if next_ts is not None and next_ts > ts else ts + 5.0
+                        else:
+                            end_ts = ts + float(duration or 60.0)
                     
                     event_dict = {
                         "timestamp": ts,

@@ -40,7 +40,7 @@ from ..holter_helpers import (
     UI_SUCCESS, UI_TEXT, UI_WARNING, _class_matches_filter, _find_latest_completed_session,
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
-    _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _style_active_btn, _style_btn, _style_filter_btn, _table_style, _template_filter_key,
 )
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas, HolterRRTrendCanvas, HRTrendCanvas
@@ -53,7 +53,7 @@ class HolterLorenzPanel(QWidget):
         super().__init__(parent)
         self.duration_sec = duration_sec
         self.replay_engine = replay_engine
-        self.setStyleSheet(f"background:{COL_BG};")
+        self.setStyleSheet(f"background:{UI_BG};")
         self._metrics_list = []
         self._all_beat_data = []  # Store (time, rr, beat_class, metric_ref) for beat selection
         self._current_replay_data = None  # Store current 12-lead frame for beat selection display
@@ -90,6 +90,7 @@ class HolterLorenzPanel(QWidget):
         # Filter buttons matching the Template tab
         btn_row = QHBoxLayout()
         btn_row.setSpacing(4)
+        btn_row.setContentsMargins(0, 4, 0, 4)
         self._filter_btns = {}
         self._current_filter = "all"
         for key, lbl in [
@@ -106,7 +107,8 @@ class HolterLorenzPanel(QWidget):
             btn.setCheckable(True)
             btn.setChecked(key == "all")
             btn.setToolTip(f"Filter by {lbl}")
-            btn.setStyleSheet(_style_active_btn() if key == "all" else _style_btn())
+            btn.setFixedHeight(28)
+            btn.setStyleSheet(_style_filter_btn(active=(key == "all")))
             btn.clicked.connect(lambda checked=False, k=key: self._set_lorenz_filter(k))
             self._filter_btns[key] = btn
             btn_row.addWidget(btn)
@@ -139,14 +141,15 @@ class HolterLorenzPanel(QWidget):
             
             # Create a frame for each lead
             lead_frame = QFrame()
-            lead_frame.setStyleSheet(f"background:{COL_BLACK};border:1px solid {COL_GREEN_DRK};border-radius:4px;")
+            lead_frame.setObjectName("lzLeadFrame")
+            lead_frame.setStyleSheet(f"QFrame#lzLeadFrame{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:6px;}}")
             lead_frame_layout = QVBoxLayout(lead_frame)
             lead_frame_layout.setContentsMargins(2, 2, 2, 2)
             lead_frame_layout.setSpacing(1)
             
             # Lead label
             lead_label = QLabel(lead_name)
-            lead_label.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;")
+            lead_label.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;background:transparent;")
             lead_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             lead_frame_layout.addWidget(lead_label)
             
@@ -233,7 +236,7 @@ class HolterLorenzPanel(QWidget):
         for k, btn in self._filter_btns.items():
             is_active = (k == key)
             btn.setChecked(is_active)
-            btn.setStyleSheet(_style_active_btn() if is_active else _style_btn())
+            btn.setStyleSheet(_style_filter_btn(active=is_active))
         self._apply_lorenz_filter()
 
     def _apply_lorenz_filter(self):

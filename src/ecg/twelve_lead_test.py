@@ -10498,25 +10498,6 @@ class ECGTestPage(QWidget):
                 except Exception as e:
                     print(f"Failed to save patient.json: {e}")
 
-            # Generate the Holter report
-            from .holter.report_generator import generate_holter_report
-            report_path = generate_holter_report(
-                session_dir=summary['session_dir'],
-                patient_info=summary['patient_info'],
-                summary=summary
-            )
-            
-            # Open the report
-            if os.path.exists(report_path):
-                try:
-                    from utils.platform_compat import open_file
-                    open_file(report_path)
-                except Exception as open_err:
-                    print(f" Failed to open Holter report automatically: {open_err}")
-            
-            QMessageBox.information(self, "Holter Session Complete", 
-                                    f"Holter recording saved and report generated:\n{report_path}")
-            
             self._holter_writer = None
             self._holter_worker = None
             self.holter_mode_enabled = False

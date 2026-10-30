@@ -130,6 +130,7 @@ def _atrial_flutter_features(
     total_energy = float(np.sum(spectrum[reference_band] ** 2)) + 1e-9
     score = flutter_energy / total_energy
     atrial_rate_bpm = peak_hz * 60.0
+
     is_flutter = bool(0.18 <= score and 240.0 <= atrial_rate_bpm <= 360.0)
     return {
         "is_flutter": is_flutter,
@@ -250,41 +251,95 @@ def _first_baseline_crossing(signal: np.ndarray, baseline: float, start: int, st
     return min(max(idx, 0), signal.size - 1)
 
 
-def _qrs_bounds(signal: np.ndarray, r_idx: int, fs: float) -> Tuple[int, int, float]:
+def _qrs_bounds(signal: np.ndarray, r_idx: int, fs: float) -> Tuple[int, int, float, bool]:
     if signal.size == 0:
-        return 0, 0, 0.0
+        return 0, 0, 0.0, False
     qrs_left = max(0, r_idx - _ms_to_samples(80, fs))
     qrs_right = min(signal.size - 1, r_idx + _ms_to_samples(80, fs))
     smooth_window = _ensure_odd(min(11, signal.size - (1 - signal.size % 2)))
     smoothed = savgol_filter(signal, smooth_window, 3, mode="interp") if signal.size >= smooth_window else signal
     slopes = np.gradient(smoothed)
-    baseline = _median_baseline(signal, r_idx - _ms_to_samples(400, fs), _ms_to_samples(100, fs))
+    # Pre-QRS local baseline: at high heart rates (e.g. tachycardia >100 BPM),
+    # r_idx - 400ms falls directly onto the preceding beat's R/T wave,
+    # causing baseline to be hundreds of counts too high and preventing
+    # q_onset/j_point detection. Use the local pre-QRS window instead,
+    # falling back to the 400ms window only if insufficient samples exist.
+    pre_qrs_start = max(0, r_idx - _ms_to_samples(160, fs))
+    pre_qrs_end = max(pre_qrs_start + 1, r_idx - _ms_to_samples(35, fs))
+    if pre_qrs_end - pre_qrs_start >= 5:
+        baseline = float(np.median(signal[pre_qrs_start:pre_qrs_end]))
+    else:
+        baseline = _median_baseline(signal, r_idx - _ms_to_samples(400, fs), _ms_to_samples(100, fs))
     local_slopes = np.abs(slopes[qrs_left:qrs_right + 1])
     slope_threshold = max(float(np.percentile(local_slopes, 35)) if local_slopes.size else 0.0, 1e-4)
     baseline_threshold = max(0.15 * max(float(np.ptp(signal[qrs_left:qrs_right + 1])), 0.05), 0.015)
     amplitude_threshold = max(0.05 * max(float(np.ptp(signal[qrs_left:qrs_right + 1])), 0.1), 0.02)
 
+    # q_resolved/j_resolved track whether a genuine quiet (isoelectric) boundary
+    # was actually found, as opposed to the search falling through to the raw
+    # +/-80ms window edge. On a chaotic/fibrillatory signal there is no quiet
+    # point anywhere nearby, so both loops fall through and q_onset/j_point
+    # silently default to qrs_left/qrs_right -- producing a fake, perfectly
+    # uniform ~160ms "QRS" on every beat instead of signalling "undetermined".
     q_onset = qrs_left
+    q_resolved = False
     for idx in range(r_idx, qrs_left - 1, -1):
         if abs(slopes[idx]) <= slope_threshold and abs(smoothed[idx] - baseline) <= baseline_threshold:
             q_onset = idx
+            q_resolved = True
             break
 
     j_point = qrs_right
+    j_resolved = False
     for idx in range(r_idx, qrs_right + 1):
         if abs(slopes[idx]) <= slope_threshold and abs(smoothed[idx] - baseline) <= baseline_threshold:
             j_point = idx
+            j_resolved = True
             break
 
-    active = np.where(np.abs(smoothed[qrs_left:qrs_right + 1] - baseline) > amplitude_threshold)[0]
-    if active.size:
-        q_onset = min(q_onset, qrs_left + int(active[0]))
-        j_point = max(j_point, qrs_left + int(active[-1]))
+    # Widen q_onset/j_point to cover any genuinely active (non-baseline)
+    # samples the slope+baseline loops above undershot -- meant for a
+    # pathological/notched QRS where that search finds a "quiet" point too
+    # early, while real QRS activity continues past it.
+    #
+    # This must only widen through a CONTIGUOUS active run starting at
+    # r_idx, not jump to the first/last active sample anywhere in the whole
+    # +/-80ms window: at a fast heart rate (RR short enough that the
+    # previous beat's T wave or the next beat's P wave falls inside this
+    # beat's own +/-80ms search window), the far edges of that window are
+    # "active" too, for a different wave entirely -- confirmed directly on
+    # a real recording where this walked q_onset/j_point all the way out to
+    # the full +/-80ms span (qrs_left/qrs_right) on every fast-rate beat,
+    # reading a uniform, fake 160ms "QRS" where the true QRS, measured at a
+    # slower rate on the exact same lead moments earlier, was ~90ms. QRS
+    # duration is a property of ventricular conduction, not heart rate --
+    # it does not legitimately change between a slow and fast stretch of
+    # the same rhythm. Walking outward from r_idx and stopping at the first
+    # non-active sample keeps this widening local to the beat's own QRS,
+    # the same way it would if there were no neighboring wave in range.
+    active_mask = np.abs(smoothed[qrs_left:qrs_right + 1] - baseline) > amplitude_threshold
+    if active_mask.size:
+        r_rel = r_idx - qrs_left
+        left_rel = r_rel
+        while left_rel > 0 and active_mask[left_rel - 1]:
+            left_rel -= 1
+        right_rel = r_rel
+        while right_rel < active_mask.size - 1 and active_mask[right_rel + 1]:
+            right_rel += 1
+        q_onset = min(q_onset, qrs_left + left_rel)
+        j_point = max(j_point, qrs_left + right_rel)
 
-    return int(q_onset), int(j_point), baseline
+    return int(q_onset), int(j_point), baseline, bool(q_resolved and j_resolved)
 
 
-def _detect_p_wave(signal: np.ndarray, r_idx: int, baseline: float, fs: float) -> Dict[str, object]:
+def _detect_p_wave(
+    signal: np.ndarray,
+    r_idx: int,
+    baseline: float,
+    fs: float,
+    strict_selection: bool = False,
+    prev_rr_ms: Optional[float] = None,
+) -> Dict[str, object]:
     result = {
         "p_present": False,
         "p_peak": None,
@@ -293,42 +348,102 @@ def _detect_p_wave(signal: np.ndarray, r_idx: int, baseline: float, fs: float) -
         "p_duration_ms": None,
         "p_amplitude": 0.0,
     }
+    # At extreme tachycardia rates (HR >= 180 BPM / RR < 333.3 ms), physiological
+    # P-waves merge with preceding T-waves (P-on-T fusion) and cannot be
+    # independently resolved. Any wave in this pre-QRS zone is a T-wave or
+    # fused component, so P-wave presence and PR interval are suppressed.
+    if prev_rr_ms is not None and prev_rr_ms < 333.3:
+        return result
+
+    # When prev_rr_ms is not explicitly passed, check if a preceding QRS
+    # complex sits within 333.3 ms of r_idx (HR >= 180 BPM collision):
+    r_amp = abs(float(signal[r_idx]) - baseline)
+    collision_zone = signal[max(0, r_idx - _ms_to_samples(333.3, fs)): max(0, r_idx - _ms_to_samples(70, fs))]
+    if collision_zone.size and r_amp > 1e-4 and float(np.max(np.abs(collision_zone - baseline))) > 0.55 * r_amp:
+        return result
+
     p_start = max(0, r_idx - _ms_to_samples(400, fs))
     p_end = max(p_start + 1, r_idx - _ms_to_samples(50, fs))
     if p_end - p_start < 5:
         return result
 
     window = signal[p_start:p_end]
-    prominence = max(0.04, 0.18 * max(float(np.ptp(window)), 0.05))
-    peaks, props = find_peaks(window, prominence=prominence)
-    if peaks.size == 0:
-        peak_rel = int(np.argmax(window))
-        if window[peak_rel] - baseline < max(0.05, 0.2 * np.ptp(window)):
+    # FIX: Scale-adaptive prominence threshold.
+    # 0.04 was in mV; for ADC-count signals (Holter recorded data) the ptp
+    # of the P-wave search window is in hundreds of counts, so 18% of that
+    # is already large enough. The max(0.04, ...) floor only applies for
+    # signals already in mV scale. This one-liner handles both correctly.
+    window_ptp = float(np.ptp(window))
+    prominence = max(0.04, 0.12 * window_ptp) if window_ptp > 0.05 else 0.04
+
+    if strict_selection:
+        # For the on-screen PR measurement, search both polarities and choose
+        # the valid candidate closest to QRS. The older detector-wide rule
+        # selected the preceding T wave in sinus tachycardia.
+        positive, positive_props = find_peaks(window, prominence=prominence)
+        negative, negative_props = find_peaks(-window, prominence=prominence)
+        candidates = []
+        for peak, prom in zip(positive, positive_props.get("prominences", [])):
+            candidates.append((int(peak), float(prom)))
+        for peak, prom in zip(negative, negative_props.get("prominences", [])):
+            candidates.append((int(peak), float(prom)))
+        latest_p_rel = max(0, (r_idx - _ms_to_samples(50, fs)) - p_start)
+        earliest_p_rel = max(0, (r_idx - _ms_to_samples(300, fs)) - p_start)
+        candidates = [
+            (peak, prom) for peak, prom in candidates
+            if earliest_p_rel <= peak <= latest_p_rel
+        ]
+        if not candidates:
             return result
+        peak_rel = max(peak for peak, _ in candidates)
     else:
-        prominences = props.get("prominences", np.zeros(peaks.size))
-        peak_rel = int(peaks[int(np.argmax(prominences))])
+        # Preserve the detector's established P-wave behavior for rhythm
+        # classification. The strict candidate selection above is a display
+        # measurement heuristic and must not change brady/tachy segmentation.
+        peaks, props = find_peaks(window, prominence=prominence)
+        if peaks.size == 0:
+            peak_rel = int(np.argmax(window))
+            if window[peak_rel] - baseline < max(0.05, 0.2 * np.ptp(window)):
+                return result
+        else:
+            prominences = props.get("prominences", np.zeros(peaks.size))
+            peak_rel = int(peaks[int(np.argmax(prominences))])
 
     p_peak = p_start + peak_rel
-    amplitude = float(signal[p_peak] - baseline)
-    # Threshold lowered from 0.08 → 0.04 mV: small but real P waves (common in
-    # standard single-lead recordings) were being rejected, causing NSR to be
-    # misclassified as "Rhythm Undetermined".
-    if amplitude < 0.04:
+    # In fast rhythms the older QRS-centered baseline window can contain the
+    # preceding T wave, shifting the baseline toward the T peak. The P wave
+    # is then visibly present but its measured amplitude becomes near-zero
+    # and the PR result disappears. For strict PR/P gating, use the local
+    # pre-QRS search window's robust median instead; keep the established
+    # detector-wide baseline path unchanged.
+    p_baseline = float(np.median(window)) if strict_selection else baseline
+    amplitude = float(signal[p_peak] - p_baseline)
+
+    # FIX: Scale-adaptive amplitude threshold.
+    # The old threshold (0.04) was in mV — it blocked real P waves when the
+    # signal is in raw ADC counts (Holter recorded data), where a normal
+    # P wave can be 50-300 counts while R is 500-2000 counts.
+    # New: use 3% of R-peak amplitude as minimum (works in both mV and ADC).
+    r_amplitude = abs(float(signal[r_idx]) - p_baseline)
+    # Fallback: if r_amplitude is near-zero (e.g. at signal edge), use 0.04
+    if r_amplitude < 1e-6:
+        r_amplitude = 1.0
+    min_p_amp = max(0.04, 0.03 * r_amplitude)  # min 0.04 OR 3% of R
+    if abs(amplitude) < min_p_amp:
         return result
-    boundary_threshold = max(0.02, 0.2 * abs(amplitude))
+    boundary_threshold = max(0.02 * r_amplitude, 0.2 * abs(amplitude))
 
     p_onset = p_peak
     left_limit = max(p_start, p_peak - _ms_to_samples(120, fs))
     for idx in range(p_peak, left_limit - 1, -1):
-        if abs(signal[idx] - baseline) <= boundary_threshold:
+        if abs(signal[idx] - p_baseline) <= boundary_threshold:
             p_onset = idx
             break
 
     p_finish = p_peak
     right_limit = min(p_end - 1, p_peak + _ms_to_samples(120, fs))
     for idx in range(p_peak, right_limit + 1):
-        if abs(signal[idx] - baseline) <= boundary_threshold:
+        if abs(signal[idx] - p_baseline) <= boundary_threshold:
             p_finish = idx
             break
 
@@ -396,12 +511,18 @@ def _beat_noise_flags(signal: np.ndarray, q_onset: int, j_point: int, baseline: 
     return bool(reasons), reasons, qrs_amplitude
 
 
-def measure_beat(signal: Sequence[float], r_idx: int, fs: float = DEFAULT_FS) -> Optional[Dict[str, object]]:
+def measure_beat(
+    signal: Sequence[float],
+    r_idx: int,
+    fs: float = DEFAULT_FS,
+    strict_pr: bool = False,
+    prev_rr_ms: Optional[float] = None,
+) -> Optional[Dict[str, object]]:
     signal_arr = _safe_array(signal)
     if signal_arr.size == 0 or r_idx <= 0 or r_idx >= signal_arr.size:
         return None
 
-    q_onset, j_point, baseline = _qrs_bounds(signal_arr, int(r_idx), fs)
+    q_onset, j_point, baseline, qrs_bounds_resolved = _qrs_bounds(signal_arr, int(r_idx), fs)
     qrs_ms = float((j_point - q_onset) * 1000.0 / fs)
 
     beat = {
@@ -410,6 +531,7 @@ def measure_beat(signal: Sequence[float], r_idx: int, fs: float = DEFAULT_FS) ->
         "j_point": int(j_point),
         "baseline": baseline,
         "qrs_ms": qrs_ms,
+        "qrs_bounds_resolved": qrs_bounds_resolved,
         "p_present": False,
         "p_peak": None,
         "p_onset": None,
@@ -432,11 +554,18 @@ def measure_beat(signal: Sequence[float], r_idx: int, fs: float = DEFAULT_FS) ->
         beat["noise_reasons"] = ["qrs_out_of_range"]
         return beat
 
-    beat.update(_detect_p_wave(signal_arr, int(r_idx), baseline, fs))
+    beat.update(_detect_p_wave(signal_arr, int(r_idx), baseline, fs, strict_selection=strict_pr, prev_rr_ms=prev_rr_ms))
     if beat["p_present"] and beat["p_onset"] is not None:
-        pr_ms = float((int(q_onset) - int(beat["p_onset"])) * 1000.0 / fs)
-        if 80.0 <= pr_ms <= 400.0:
-            beat["pr_ms"] = pr_ms
+        p_onset = int(beat["p_onset"])
+        p_peak = int(beat.get("p_peak") or p_onset)
+        # Clinical PR standard: P-onset to Q-onset.
+        # P-onset and P-peak must strictly precede Q-onset, and Q-onset <= R.
+        if p_onset < int(q_onset) and p_peak <= int(q_onset):
+            pr_ms = float((int(q_onset) - p_onset) * 1000.0 / fs)
+            if 60.0 <= pr_ms <= 400.0:
+                beat["pr_ms"] = pr_ms
+                if beat.get("p_end") is not None and int(beat["p_end"]) > int(q_onset):
+                    beat["p_end"] = int(q_onset)
 
     t_end, t_amp = _tangent_t_end(signal_arr, int(r_idx), baseline, fs)
     if t_end is not None:
@@ -820,11 +949,17 @@ def is_ventricular_fibrillation(signal: np.ndarray, r_peaks: List[int], fs: floa
         pass
 
     if score > 0.4:
-        print(f" ⚠️ VFib Evaluation -> Score: {score:.2f} | Flags: {debug_flags}")
+        print(f" [VFib] Evaluation -> Score: {score:.2f} | Flags: {debug_flags}")
 
-    # If flutter spectral features are present, reduce amplitude CoV weight
+    # If flutter spectral features are present, reduce amplitude CoV weight.
+    # Only let this veto a BORDERLINE candidate: VF's own chaotic baseline can
+    # concentrate spectral energy in the same 3.5-8Hz band real flutter uses
+    # (confirmed on real chaotic recordings misread as organised flutter), so
+    # a score that has already cleared the VF threshold on rate/irregularity/
+    # amplitude/chaos criteria should not be thrown out on spectral overlap
+    # alone -- genuine flutter does not also present with VF-level RR chaos.
     flutter_check = _atrial_flutter_features(sig, fs, r_peaks=r_peaks)
-    if float(flutter_check.get("score", 0)) > 0.18:
+    if float(flutter_check.get("score", 0)) > 0.18 and score < 0.60:
         # Organised atrial activity = not VFib
         return False
 
@@ -841,14 +976,15 @@ def is_ventricular_fibrillation(signal: np.ndarray, r_peaks: List[int], fs: floa
     # short and chaotic, so short_rr_ratio is high and this gate does not apply.
     if len(valid_rr) > 3:
         median_rr_ms = float(np.median(valid_rr))
-        if median_rr_ms > 0:
-            implied_hr = 60000.0 / median_rr_ms
-            if short_rr_ratio <= 0.35 and 20.0 <= implied_hr <= 150.0:
+        p75_rr_ms = float(np.percentile(valid_rr, 75))
+        effective_rr_ms = max(median_rr_ms, p75_rr_ms)
+        if effective_rr_ms > 0:
+            implied_hr = 60000.0 / effective_rr_ms
+            if 20.0 <= implied_hr <= 150.0:
                 if score >= 0.60:
                     print(
                         f" VFib rejected: organised rhythm at {implied_hr:.0f} bpm "
-                        f"(median RR {median_rr_ms:.0f} ms, only "
-                        f"{short_rr_ratio*100:.0f}% of beats < 450 ms). "
+                        f"(effective RR {effective_rr_ms:.0f} ms). "
                         f"Noise score was {score:.2f}."
                     )
                 return False
@@ -1183,6 +1319,7 @@ def analyze_ecg(
     patient_gender: str = "M",
     external_metrics: Optional[Dict[str, float]] = None,
     clinical_config: Optional[ClinicalConfig] = None,
+    hysteresis_key: Optional[str] = None,
 ) -> Dict[str, object]:
     clinical_config = clinical_config or _CLINICAL_CONFIG
     fs = float(fs or clinical_config.sampling_rate_hz or DEFAULT_FS)
@@ -1285,8 +1422,41 @@ def analyze_ecg(
         }
     # --- VFib Short Circuit ---
     # Even if Pan-Tompkins found "R-peaks", they might be chaotic VFib waves.
-    # We must check this before doing PR/QRS beat measurements which are meaningless in VFib.
-    if is_ventricular_fibrillation(detection_signal, r_peaks, fs):
+    # Validate that the candidate has neither reliable P waves nor an
+    # organized QRS response before accepting the VF label.  Flutter F-waves
+    # are independent of QRS, but Flutter still has organized ventricular
+    # QRS peaks; that distinction prevents spectral Flutter activity from
+    # being confused with VF.
+    vf_candidate = is_ventricular_fibrillation(detection_signal, r_peaks, fs)
+    provisional_beats = [
+        beat for peak in r_peaks
+        for beat in [measure_beat(detection_signal, int(peak), fs)]
+        if beat is not None
+    ]
+    # A P wave only counts as "reliable" here when its own beat's QRS boundary
+    # was actually resolved (see qrs_bounds_resolved above). An absolute
+    # amplitude cutoff can't do this job: recordings may be stored as raw ADC
+    # counts rather than calibrated mV, so a fixed-unit threshold is either a
+    # no-op (ADC scale) or rejects real P waves (mV scale). A beat whose QRS
+    # window never found a genuine isoelectric boundary is chaotic/noise at
+    # that location, so any "P wave" measured relative to it is noise too --
+    # on a fibrillatory baseline this flags nearly every beat as a false P wave.
+    reliable_p_count = sum(
+        bool(beat.get("p_present")) and bool(beat.get("qrs_bounds_resolved"))
+        for beat in provisional_beats
+    )
+    # Only count a beat's QRS as "organized" when _qrs_bounds() actually found
+    # a genuine isoelectric onset/offset -- not when both searches fell through
+    # to the raw +/-80ms window edge, which yields a uniform fake ~160ms width
+    # on every beat of a chaotic trace with no real QRS anywhere.
+    organized_qrs_count = sum(
+        bool(beat.get("qrs_bounds_resolved")) and 40.0 <= float(beat.get("qrs_ms") or 0.0) <= 220.0
+        for beat in provisional_beats
+    )
+    no_reliable_p = reliable_p_count <= max(2, len(r_peaks) // 4)
+    no_organized_qrs = organized_qrs_count < max(3, len(r_peaks) // 2)
+
+    if vf_candidate and no_reliable_p and no_organized_qrs:
         return {
             "heart_rate_bpm": 0.0,
             "rr_ms": 0.0,
@@ -1438,9 +1608,14 @@ def analyze_ecg(
     atrial_fib = (not p_present) and rr_irregular
     flutter_score = float(flutter_features.get("score", 0))
     atrial_flutter = spectral_flutter and (
-        not rr_irregular or flutter_score > 0.35   # strong spectral evidence overrides
+        not rr_irregular or flutter_score > 0.35
     )
     effective_pr_ms = None if (atrial_fib or atrial_flutter) else pr_ms
+    # AF/Flutter do not have a consistently identifiable sinus P wave, so a
+    # P-to-QRS interval found by the generic beat measurer is not a valid PR
+    # measurement. Keep the internal raw value available for rhythm logic, but
+    # expose the rhythm-aware value to UI/API consumers.
+    display_pr_ms = effective_pr_ms or 0.0
 
     # Fix 2: PR Series for Mobitz I
     pr_series = [float(b.get("pr_ms")) for b in beats if b.get("pr_ms")]
@@ -1550,7 +1725,7 @@ def analyze_ecg(
     except Exception:
         engine_diagnoses = []
 
-    if signal_snr < 0.2: 
+    if signal_snr < 0.2:
         primary = "Poor Signal"
     else:
         primary = engine_diagnoses[0] if engine_diagnoses else ("Normal Sinus Rhythm" if p_present else "Unknown Rhythm")
@@ -1627,7 +1802,7 @@ def analyze_ecg(
             "P waves present" if p_present else "No P waves"
         ],
         "Intervals": {
-            "PR": round(float(pr_ms or 0.0)),
+            "PR": round(float(display_pr_ms)),
             "QRS": round(float(qrs_ms or 0.0)),
             "QT/QTc": f"{int(qt_ms)}/{int(qtc_bazett)}"
         },
@@ -1635,7 +1810,7 @@ def analyze_ecg(
         "Confidence": round(float(confidence), 2),
         # Legacy/Extra bindings
         "rr_ms": float(rate_info["rr_mean_ms"]),
-        "pr_ms": float(pr_ms or 0.0),
+        "pr_ms": float(display_pr_ms),
         "qrs_ms": float(qrs_ms or 0.0),
         "qt_ms": float(qt_ms),
         "qtc_bazett": float(qtc_bazett),
@@ -1683,14 +1858,22 @@ def analyze_ecg(
         }
         dl_metrics = {
             "heart_rate_bpm": heart_rate,
-            "pr_ms": pr_ms or 0.0,
+            "pr_ms": display_pr_ms,
             "qrs_ms": qrs_ms or 0.0,
             "qt_ms": qt_ms,
             "qtc_bazett": qtc_bazett,
             "Confidence": confidence,
         }
         available_leads = list(cleaned_leads.keys())
-        instance_key = str(id(detection_signal)) if detection_signal.size else "default"
+        # The id()-based default key is a memory address that Python reuses
+        # for unrelated arrays, so hysteresis state leaks between windows at
+        # random -- the same window could return a different diagnosis
+        # depending on call history. Callers can pass their own stable
+        # hysteresis_key, or "" to turn hysteresis off.
+        if hysteresis_key is not None:
+            instance_key = hysteresis_key
+        else:
+            instance_key = str(id(detection_signal)) if detection_signal.size else "default"
         dl_result = process_decision_layer(
             instance_id=instance_key,
             raw_signal=detection_signal,

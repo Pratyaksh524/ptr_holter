@@ -84,9 +84,9 @@ class ClinicalConfig:
     bandpass_high_hz: float = 40.0
     notch_hz: float = 50.0
 
-    qrs_validator_min_width_ms: float = 40.0
+    qrs_validator_min_width_ms: float = 25.0
     qrs_validator_max_width_ms: float = 200.0
-    qrs_validator_min_amplitude: float = 0.08
+    qrs_validator_min_amplitude: float = 0.04
 
     template_similarity_threshold: float = 0.90
     qrs_detection_window_ms: float = 150.0
@@ -128,9 +128,9 @@ class ClinicalConfig:
         bandpass_high_hz = _as_float(signal.get("bandpass_high_hz", data.get("bandpass_high_hz")), 40.0)
         notch_hz = _as_float(signal.get("notch_hz", data.get("notch_hz")), 50.0)
 
-        qrs_validator_min_width_ms = _as_float(qrs_validator.get("min_width_ms", data.get("qrs_validator_min_width_ms")), 40.0)
+        qrs_validator_min_width_ms = _as_float(qrs_validator.get("min_width_ms", data.get("qrs_validator_min_width_ms")), 25.0)
         qrs_validator_max_width_ms = _as_float(qrs_validator.get("max_width_ms", data.get("qrs_validator_max_width_ms")), 200.0)
-        qrs_validator_min_amplitude = _as_float(qrs_validator.get("min_amplitude", data.get("qrs_validator_min_amplitude")), 0.08)
+        qrs_validator_min_amplitude = _as_float(qrs_validator.get("min_amplitude", data.get("qrs_validator_min_amplitude")), 0.04)
 
         template_similarity_threshold = _as_float(
             data.get("template_similarity_threshold"),

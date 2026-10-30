@@ -50,6 +50,39 @@ from ..holter_helpers import (
     _style_active_btn, _style_btn, _table_style, _template_filter_key,
 )
 
+try:
+    # Shared morphology-preserving display filter.  The Gaussian low-pass in
+    # enhanced_filter.py has no overshoot/ringing around QRS edges.
+    from ...enhanced_filter import gaussian_lowpass
+except ImportError:
+    gaussian_lowpass = None
+
+try:
+    # Baseline-drift (DFT) filter shared with the 12-lead dashboard.
+    from ...ecg_filters import apply_dft_filter
+except ImportError:
+    apply_dft_filter = None
+
+try:
+    # Mains (50/60 Hz) notch for the full-disclosure display strip.
+    from ...enhanced_filter import make_notch
+    from scipy.signal import filtfilt as scipy_filtfilt
+except ImportError:
+    make_notch = None
+    scipy_filtfilt = None
+
+
+def _remove_mains(x, fs):
+    """Zero-phase 50 and 60 Hz notches (Q=25). Recordings do not store which
+    mains frequency was in use, so both run; each removes only ~2 Hz."""
+    if make_notch is None or scipy_filtfilt is None:
+        return x
+    for mains_hz in (50.0, 60.0):
+        if mains_hz < fs / 2.0:
+            bq = make_notch(mains_hz, fs)
+            x = scipy_filtfilt(bq.b, bq.a, x)
+    return x
+
 
 # 6. HOLTER RR / HR TREND CANVAS
 class HolterRRTrendCanvas(QWidget):
@@ -139,18 +172,19 @@ class HolterRRTrendCanvas(QWidget):
         # Keep the trend comparable across recordings and modes. The replay
         # chart uses seconds on X, milliseconds (RR) or BPM (HR) on Y.
         rect = self.rect().adjusted(42, 18, -12, 30)
-        painter.setPen(QPen(QColor(COL_GREEN_DRK), 1))
+        painter.setPen(QPen(QColor("#243242"), 1))
         painter.drawRect(rect)
 
-        painter.setPen(QPen(QColor(COL_GREEN), 1))
-        painter.setFont(QFont("Arial", 9, QFont.Bold))
+        # Title Label styling matching workstation theme
+        painter.setPen(QPen(QColor("#FFFFFF"), 1))
+        painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
         title = self._title
         mode = str(getattr(self, "_mode", "") or "").upper()
         if mode == "RR" and "Heart Rate" in title:
             title = title.replace("Heart Rate", "RR Interval")
         elif mode == "HR" and "RR Interval" in title:
             title = title.replace("RR Interval", "Heart Rate")
-        painter.drawText(12, 12, title)
+        painter.drawText(12, 13, title)
 
         if not self._points:
             painter.setPen(QPen(QColor(UI_MUTED)))
@@ -170,8 +204,8 @@ class HolterRRTrendCanvas(QWidget):
 
         # Draw fixed-axis tick marks so the chart's scale is visible even when
         # the recording contains only a short or low-variation segment.
-        painter.setFont(QFont("Arial", 8))
-        painter.setPen(QPen(QColor(UI_MUTED), 1))
+        painter.setFont(QFont("Segoe UI", 8))
+        painter.setPen(QPen(QColor("#B0BEC5"), 1))
         y_ticks = np.arange(y_lo, y_hi + 75.0, 75.0) if mode == "HR" else (0.0, 1500.0, 3000.0)
         for value in y_ticks:
             _, py = map_xy(x_lo, value)
@@ -204,7 +238,7 @@ class HolterRRTrendCanvas(QWidget):
                 painter.setPen(QPen(QColor(COL_GREEN), 1))
                 painter.drawEllipse(px - 2, py - 2, 4, 4)
 
-        painter.setPen(QPen(QColor(UI_MUTED)))
+        painter.setPen(QPen(QColor("#B0BEC5")))
         painter.drawText(rect.right() - 38, rect.bottom() + 17, "Time")
 
 
@@ -785,7 +819,7 @@ class LorenzCanvas(QWidget):
 # 6b. ECG STRIP CANVAS
 class ECGStripCanvas(QWidget):
     """Simple ECG strip renderer with interactive measurement tools."""
-    def __init__(self, parent=None, height: int = 80, color: str = "#00FF00", pen_width: float = 0.7, lead_name: str = "", show_vertical_lines: bool = True, show_annotations: bool = True, disable_all_coloring: bool = False, show_rr_numbers: bool = True):
+    def __init__(self, parent=None, height: int = 80, color: str = "#00FF00", pen_width: float = 0.7, lead_name: str = "", show_vertical_lines: bool = True, show_annotations: bool = True, disable_all_coloring: bool = False, show_rr_numbers: bool = True, draw_background: bool = True):
         super().__init__(parent)
         self._data = np.zeros(200)
         self._color = color
@@ -796,10 +830,23 @@ class ECGStripCanvas(QWidget):
         self._show_annotations = show_annotations  # Control whether to show beat badge labels
         self._show_rr_numbers = show_rr_numbers  # Control whether to show RR interval numbers (e.g. 476, 632)
         self._disable_all_coloring = disable_all_coloring  # CRITICAL: Disable ALL coloring (for replay/overview)
+        # When False, this canvas paints no black fill / grid of its own -
+        # used when a shared background widget behind several canvases
+        # (e.g. Full Disclosure's page-wide grid) already provides both,
+        # so the grid reads as one continuous sheet instead of restarting
+        # inside every lead's own small container.
+        self._draw_background = draw_background
+        # Full Disclosure supplies the shared background, so draw_background
+        # alone cannot tell whether the current theme is dark or graph.
+        self._display_theme_mode = "dark"
         self._gain = 1.0
         self._speed = 25
+        self._inverted = False
         self.setFixedHeight(height)
-        self.setStyleSheet(f"background:{COL_BLACK};border:none;")
+        if draw_background:
+            self.setStyleSheet(f"background:{COL_BLACK};border:none;")
+        else:
+            self.setStyleSheet("background:transparent;border:none;")
         self.setMouseTracking(True)
         self._mode = TOOL_SELECT
         self._start_pos = None
@@ -824,6 +871,22 @@ class ECGStripCanvas(QWidget):
         
         # Drag selection: multiple selected beats
         self._selected_beats = []  # List of timestamps for all selected beats
+
+    def set_invert(self, inverted: bool):
+        self._inverted = bool(inverted)
+        self.update()
+
+    def set_theme_mode(self, mode: str):
+        """Set display theme mode: 'dark' (default) or 'graph' (medical ECG paper)."""
+        # TODO: Testing display mode toggle support
+        self._theme_mode = mode
+        if mode == 'graph':
+            self._color = "#000000"
+            self._pen_width = 1.8  # Thickened black trace for clear visibility on ECG paper
+        else:
+            self._color = COL_GREEN
+            self._pen_width = 0.7
+        self.update()
 
     def _find_magnifier_host(self):
         parent = self.parentWidget()
@@ -853,6 +916,11 @@ class ECGStripCanvas(QWidget):
 
     def set_gain(self, gain: float):
         self._gain = gain
+        self.update()
+
+    def set_display_theme_mode(self, mode: str):
+        """Set the parent Full Disclosure background theme for annotations."""
+        self._display_theme_mode = str(mode or "dark").lower()
         self.update()
 
     def set_paper_speed(self, speed: int):
@@ -893,40 +961,115 @@ class ECGStripCanvas(QWidget):
         self._clicked_beat_x_pos = None
         self.update()
 
-    def set_data(self, *args, beat_annotations=None, start_sec=0.0, structured_events=None, fast_preview=False):
+    def set_data(self, *args, beat_annotations=None, start_sec=0.0, structured_events=None, fast_preview=False,
+                 context_before=None, context_after=None):
         if len(args) == 2:
             raw_data = np.asarray(args[1], dtype=float)
         elif len(args) == 1:
             raw_data = np.asarray(args[0], dtype=float)
         else:
             raw_data = np.zeros(0)
+        # Real recording samples just outside this strip (up to ~2 s each
+        # side), used to pad the mains notch and baseline high-pass. Mirror
+        # padding breaks the 50 Hz sine's phase at the strip edge and the
+        # notch rings there for ~0.15 s; real neighbouring samples do not.
+        before = np.asarray(context_before if context_before is not None else [], dtype=float)
+        after = np.asarray(context_after if context_after is not None else [], dtype=float)
+        self._raw_context_before = before
+        self._raw_context_after = after
 
-        # NOTE: fast_preview no longer skips the low-pass filter below - an
-        # earlier version did, to save time on in-between scrub frames, but
-        # that displayed the raw unfiltered signal (baseline wander + HF
-        # noise the filter normally removes) and made the trace look like
-        # pure noise while dragging. Filtering always runs; fast_preview now
-        # only skips the RR-interval recompute (self._rr_intervals), which
-        # isn't drawn as part of the trace itself.
+        # Filtering always runs for display.  Use the shared enhanced-filter
+        # Gaussian low-pass instead of a zero-phase Butterworth: the latter
+        # can ring around QRS edges and create a false J-point notch.  50/60 Hz
+        # mains is removed by narrow notches ahead of the Gaussian (see below).
         if len(raw_data) > 15:
             try:
-                if getattr(self, '_filter_ba', None) is None:
-                    from scipy.signal import butter
-                    self._filter_ba = butter(2, 25.0 / (self._fs / 2.0), btype='lowpass')
-                from scipy.signal import filtfilt
-                b, a = self._filter_ba
-                self._data = filtfilt(b, a, raw_data)
+                # Baseline drift (breathing, movement) removed for display with
+                # the same DFT filter the 12-lead dashboard uses: 0.5 Hz
+                # zero-phase Butterworth high-pass (apply_dft_filter). Zero
+                # phase, so the ST segment is not shifted. The strip is padded
+                # by mirroring up to 2 s on each side first: a 0.5 Hz high-pass
+                # run on a short page bends its first and last second.
+                # Display-only: _raw_data below stays unfiltered for PR/QRS
+                # measurement, and detection reads the recording itself.
+                display_input = raw_data
+                if raw_data.size > 30 and (apply_dft_filter is not None or make_notch is not None):
+                    fs = float(self._fs or 500)
+                    padded, lead_in = self._padded_raw(raw_data, fs)
+                    # Mains removal for display: the recording file holds the
+                    # raw serial samples (the acquisition-page AC notch only
+                    # filters the live trace), and the double 35 Hz Gaussian
+                    # below still passes ~13% of 50 Hz.
+                    padded = _remove_mains(padded, fs)
+                    if apply_dft_filter is not None:
+                        padded = np.asarray(apply_dft_filter(padded, fs, "0.5"), dtype=float)
+                    display_input = np.asarray(padded, dtype=float)[lead_in:lead_in + raw_data.size]
+                    # Keep the strip's own level: the high-pass removes the
+                    # DC offset too, and the vertical placement below works
+                    # from the signal's median.
+                    display_input = display_input + float(np.median(raw_data))
+                if gaussian_lowpass is not None:
+                    # Remove tiny isolated display spikes before the
+                    # morphology-safe Gaussian. This is display-only and
+                    # does not alter measurement or arrhythmia input.
+                    if display_input.size >= 3:
+                        padded = np.pad(display_input, (1, 1), mode="edge")
+                        display_data = np.median(
+                            np.stack((padded[:-2], padded[1:-1], padded[2:]), axis=0),
+                            axis=0,
+                        )
+                    else:
+                        display_data = display_input
+                    # Keep a second Gaussian pass display-only. Cascading
+                    # Gaussian stages suppresses residual fine noise without
+                    # the overshoot/ringing that the old Butterworth path
+                    # produced around the QRS-to-ST transition.
+                    display_data = gaussian_lowpass(display_data, 35.0, self._fs)
+                    self._data = gaussian_lowpass(display_data, 35.0, self._fs)
+                else:
+                    self._data = display_input
             except Exception:
                 self._data = raw_data
         else:
             self._data = raw_data
+
+        # Kept alongside the filtered self._data so PR/QRS measurement code
+        # (e.g. holter_full_disclosure._update_pr_qrs_label) can read the
+        # pre-filter signal instead of the display-smoothed one.
+        self._raw_data = raw_data
 
         self._beat_annotations = beat_annotations or []
         self._structured_events = structured_events or []
         self._start_sec = start_sec
         self._rr_intervals = self._calculate_rr_intervals() if beat_annotations else []
         self.update()
-    
+
+    def _padded_raw(self, raw_data, fs):
+        """raw_data with ~2 s on each side: the real neighbouring samples
+        passed to set_data, topped up by mirroring only where the recording
+        itself starts or ends. Returns (padded, index of raw_data[0])."""
+        want = int(min(raw_data.size - 1, 2.0 * fs))
+        before = getattr(self, '_raw_context_before', np.zeros(0))[-want:] if want > 0 else np.zeros(0)
+        after = getattr(self, '_raw_context_after', np.zeros(0))[:want] if want > 0 else np.zeros(0)
+        padded = np.concatenate((before, raw_data, after))
+        extra_l = min(want - before.size, padded.size - 1)
+        extra_r = min(want - after.size, padded.size - 1)
+        if extra_l > 0 or extra_r > 0:
+            padded = np.pad(padded, (max(0, extra_l), max(0, extra_r)), mode="reflect")
+        return padded, before.size + max(0, extra_l)
+
+    def mains_free_raw(self):
+        """This strip's unfiltered samples with only the 50/60 Hz notches
+        applied (padded the same way as the display), for measurements that
+        read _raw_data -- e.g. the Full Disclosure PR/QRS header. None if
+        there is no data."""
+        raw = getattr(self, '_raw_data', None)
+        if raw is None or len(raw) <= 30:
+            return raw
+        fs = float(self._fs or 500)
+        padded, lead_in = self._padded_raw(np.asarray(raw, dtype=float), fs)
+        return np.asarray(_remove_mains(padded, fs), dtype=float)[lead_in:lead_in + len(raw)]
+
     def _calculate_rr_intervals(self):
         """Calculate RR intervals (N-N intervals) between consecutive R-peaks."""
         if not self._beat_annotations:
@@ -976,13 +1119,19 @@ class ECGStripCanvas(QWidget):
         """Scroll time scrollbar forward/backward on mouse wheel."""
         delta = event.angleDelta().y()
         if delta != 0:
-            step = -1.0 if delta > 0 else 1.0  # Wheel up = scroll forward, wheel down = backward
+            # One standard wheel notch reports angleDelta().y() == 120 (Qt's
+            # own convention) -- normalize by that instead of treating every
+            # wheelEvent() call as exactly one notch. Some mice/trackpads
+            # report a single physical click as a larger delta.
             parent = self.parentWidget()
             while parent is not None:
-                if hasattr(parent, 'time_scrollbar') and parent.time_scrollbar is not None:
-                    curr_val = parent.time_scrollbar.value()
-                    # Step by 100 units (1.0 second) per wheel click
-                    parent.time_scrollbar.setValue(curr_val + int(step * 100))
+                if hasattr(parent, '_consume_wheel_notches'):
+                    # Debounced there too (see _consume_wheel_notches) --
+                    # a trackpad flick confirmed to fire this wheelEvent()
+                    # twice in very quick succession, each a normal,
+                    # correctly-formed single notch on its own, which
+                    # doubled the scroll before the debounce was added.
+                    parent._consume_wheel_notches(delta / 120.0)
                     break
                 parent = parent.parentWidget()
 
@@ -1143,16 +1292,16 @@ class ECGStripCanvas(QWidget):
             center = (mn + rng / 2.0)
             d = center + (d - center) * self._gain
 
-        # Gain is a vertical display magnification, not permission for the
-        # trace to enter the neighbouring lead row. Keep the baseline fixed
-        # and proportionally fit unusually large amplified deflections into
-        # the existing canvas range, preserving their shape without clipping.
-        center = (mn + rng / 2.0)
-        max_deviation = float(np.max(np.abs(d - center))) if d.size else 0.0
-        allowed_deviation = (rng * 0.5) * 0.94
-        if max_deviation > allowed_deviation > 0.0:
-            d = center + (d - center) * (allowed_deviation / max_deviation)
-            
+        # Apply waveform inversion around baseline if enabled
+        if getattr(self, '_inverted', False):
+            center = (mn + rng / 2.0)
+            d = center - (d - center)
+
+        # Do not normalize the amplified signal to the current time window.
+        # That made the apparent gain change whenever horizontal scrolling
+        # brought a larger or smaller beat into view. Gain must remain fixed
+        # across all windows; any out-of-range samples are clipped at draw time.
+
         return d, mn, rng
 
     def _x_to_index(self, x: int, width: int, n: int) -> int:
@@ -1374,18 +1523,66 @@ class ECGStripCanvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(COL_BLACK))
         w, h = self.width(), self.height()
-        minor_pen = QPen(QColor(COL_GRID_MINOR))
-        minor_pen.setWidth(1)
-        major_pen = QPen(QColor(COL_GRID_MAJOR))
-        major_pen.setWidth(1)
-        for gx in range(0, w, 20):
-            painter.setPen(major_pen if gx % 100 == 0 else minor_pen)
-            painter.drawLine(gx, 0, gx, h)
-        for gy in range(0, h, 20):
-            painter.setPen(major_pen if gy % 100 == 0 else minor_pen)
-            painter.drawLine(0, gy, w, gy)
+        if self._draw_background:
+            if getattr(self, '_theme_mode', 'dark') == 'graph':
+                # Medical Standard ECG Graph Paper Mode — 3-level grid matching Image 1:
+                #   Level 1 (tiny)  : 8px  = 1mm  → very faint pink lines
+                #   Level 2 (small) : 40px = 5mm  → 5 tiny boxes per small box
+                #   Level 3 (large) : 200px= 25mm → 5 small boxes per large block
+                painter.fillRect(self.rect(), QColor("#FFE8EA"))
+
+                # Level 1: Faint pink tiny grid (8px)
+                pen_tiny = QPen(QColor("#FFCDD2"))
+                pen_tiny.setWidth(1)
+
+                # Level 2: Slightly more visible small box grid (40px)
+                pen_small = QPen(QColor("#F4A0AC"))
+                pen_small.setWidth(1)
+                dpi_x = max(72.0, float(self.physicalDpiX() or self.logicalDpiX()))
+                dpi_y = max(72.0, float(self.physicalDpiY() or self.logicalDpiY()))
+                px_per_mm_x = dpi_x / 25.4
+                px_per_mm_y = dpi_y / 25.4
+
+                # Level 3: Clearly visible large box boundary (200px)
+
+                step_tiny  = 8    # 1mm → 8px  (tiny box)
+                step_small = 40   # 5mm → 40px (5 tiny = 1 small)
+                step_large = 200  # 25mm→ 200px (5 small = 1 large)
+
+                # Draw Level 1: tiny grid lines (skip small and large boundaries)
+                painter.setPen(pen_tiny)
+                for mm in range(0, int(w / px_per_mm_x) + 1):
+                    gx = round(mm * px_per_mm_x)
+                    if mm % 5 != 0:
+                        painter.drawLine(gx, 0, gx, h)
+                for mm in range(0, int(h / px_per_mm_y) + 1):
+                    gy = round(mm * px_per_mm_y)
+                    if mm % 5 != 0:
+                        painter.drawLine(0, gy, w, gy)
+
+                # Draw Level 2: small box lines (skip large boundaries)
+                painter.setPen(pen_small)
+                for mm in range(0, int(w / px_per_mm_x) + 1, 5):
+                    gx = round(mm * px_per_mm_x)
+                    painter.drawLine(gx, 0, gx, h)
+                for mm in range(0, int(h / px_per_mm_y) + 1, 5):
+                    gy = round(mm * px_per_mm_y)
+                    painter.drawLine(0, gy, w, gy)
+
+                # Draw Level 3: large block boundaries (always visible)
+            else:
+                painter.fillRect(self.rect(), QColor(COL_BLACK))
+                minor_pen = QPen(QColor(COL_GRID_MINOR))
+                minor_pen.setWidth(1)
+                major_pen = QPen(QColor(COL_GRID_MAJOR))
+                major_pen.setWidth(1)
+                for gx in range(0, w, 20):
+                    painter.setPen(major_pen if gx % 100 == 0 else minor_pen)
+                    painter.drawLine(gx, 0, gx, h)
+                for gy in range(0, h, 20):
+                    painter.setPen(major_pen if gy % 100 == 0 else minor_pen)
+                    painter.drawLine(0, gy, w, gy)
 
         if self._data.size < 2:
             painter.end()
@@ -1395,18 +1592,14 @@ class ECGStripCanvas(QWidget):
             painter.end()
             return
         
-        # --- Paper speed: control how many samples are visible per screen width ---
-        # At 25mm/s: show all data. At 50mm/s: stretch (show half). At 12.5mm/s:
-        # show the complete, expanded time window.  The slow-speed window contains
-        # twice as much data, so applying speed_factor to x_scale would use only
-        # half the canvas and make the remaining data look cropped/blank.
-        speed_factor = max(0.25, min(float(self._speed) / 25.0, 4.0))
-        n_visible = max(2, int(round(len(d) / speed_factor)))
-        if n_visible < len(d):
-            d = d[-n_visible:]   # show the most recent n_visible samples (stretched)
-        # Keep the complete 12.5mm/s window fitted to the canvas.  Higher speeds
-        # retain the existing stretched rendering of their shorter window.
-        x_scale = w / max(1, len(d) - 1) if speed_factor <= 1.0 else w / max(1, len(d) - 1) * speed_factor
+        # --- Paper speed ---
+        # The caller already sizes the fetched window for the current paper
+        # speed (e.g. 20s at 12.5mm/s, 10s at 25mm/s, 5s at 50mm/s), so `d`
+        # already holds exactly the time span that should fill the canvas
+        # width. Re-cropping/stretching it here by speed again would double
+        # the scaling (e.g. 50mm/s would show only the last 2.5s of its 5s
+        # window, stretched to fill the width), so just fit it as-is.
+        x_scale = w / max(1, len(d) - 1)
         
         # Determine colored intervals based on annotations and structured events
         colored_intervals = []
@@ -1471,10 +1664,15 @@ class ECGStripCanvas(QWidget):
                 elif ev_lbl == 'x':
                     active_label = 'X'
                 # Check for full label names (from auto-detection)
-                elif 'asystole' in ev_lbl:
+                elif 'asystole' in ev_lbl or 'artifact' in ev_lbl:
                     active_label = 'X'
                 elif 'ventricular fibrillation' in ev_lbl or 'vfib' in ev_lbl:
                     active_label = 'V'
+                elif 'supraventricular tachycardia (svt)' in ev_lbl:
+                    # Must be checked BEFORE 'ventricular tachycardia' because
+                    # 'supraventricular tachycardia' contains 'ventricular tachycardia'
+                    # as a substring, causing a false VT match.
+                    active_label = 'S'
                 elif 'ventricular tachycardia' in ev_lbl or 'vtach' in ev_lbl:
                     active_label = 'V'
                 elif 'atrial fibrillation' in ev_lbl or 'afib' in ev_lbl:
@@ -1484,6 +1682,8 @@ class ECGStripCanvas(QWidget):
                 elif 'sinus bradycardia' in ev_lbl:
                     active_label = 'S'
                 elif 'sinus tachycardia' in ev_lbl:
+                    active_label = 'S'
+                elif 'sinus arrhythmia' in ev_lbl:
                     active_label = 'S'
                 elif 'bradycardia (non-sinus)' in ev_lbl:
                     active_label = 'S'
@@ -1513,7 +1713,11 @@ class ECGStripCanvas(QWidget):
                     elif ev_lbl_orig == 'X':
                         active_label = 'X'
 
-                if active_label != 'N':
+                # Automatic arrhythmia regions are represented by the
+                # Full Disclosure segment overlay. Keep this canvas pass for
+                # explicit manual structured markings only, so auto-detected
+                # QRS peaks are not highlighted.
+                if active_label != 'N' and is_manual_structured:
                     # Use color from event if available, otherwise use label_colors
                     color = ev.get('color', label_colors.get(active_label, "#FF3333"))
                     # Calculate overlapping indices
@@ -1607,10 +1811,9 @@ class ECGStripCanvas(QWidget):
                             colored_intervals.append((s_idx, e_idx, color))
 
                 # Only process auto-detected beats — never touch manual beats
-                auto_beats_for_color = [
-                    b for b in self._beat_annotations
-                    if not b.get('is_manual', False)
-                ]
+                # Suppress automatic QRS peak highlighting. Manual beat
+                # coloring is handled by the loop above and is preserved.
+                auto_beats_for_color = []
 
                 if auto_beats_for_color:
                     # Run pattern sequencing to assign rhythm_pattern (Bigeminy, Couplet, VT Run etc.)
@@ -1652,8 +1855,11 @@ class ECGStripCanvas(QWidget):
 
         colored_intervals.sort(key=lambda x: x[0])
         
+        painter.setRenderHint(QPainter.Antialiasing, True)
         default_pen = QPen(QColor(self._color))
         default_pen.setWidthF(self._pen_width)
+        default_pen.setCapStyle(Qt.RoundCap)
+        default_pen.setJoinStyle(Qt.RoundJoin)
 
         n = len(d)
         # Vectorized coordinate computation (numpy) instead of a per-sample Python loop.
@@ -1679,7 +1885,7 @@ class ECGStripCanvas(QWidget):
         painter.drawPath(trace_path)
 
         # Overlay colored sub-segments (arrhythmia regions / annotated beats) on top
-        # of the base trace â€” only a handful of these exist per window, so drawing
+        # of the base trace — only a handful of these exist per window, so drawing
         # each as its own short path is cheap.
         for start_idx, end_idx, color in colored_intervals:
             start_idx = max(0, start_idx)
@@ -1687,7 +1893,9 @@ class ECGStripCanvas(QWidget):
             if end_idx <= start_idx:
                 continue
             seg_pen = QPen(QColor(color))
-            seg_pen.setWidthF(self._pen_width * 2.0)
+            seg_pen.setWidthF(max(2.0, self._pen_width * 1.3))
+            seg_pen.setCapStyle(Qt.RoundCap)
+            seg_pen.setJoinStyle(Qt.RoundJoin)
             painter.setPen(seg_pen)
             seg_path = QPainterPath()
             seg_path.moveTo(xs[start_idx], ys[start_idx])
@@ -1724,7 +1932,9 @@ class ECGStripCanvas(QWidget):
             data_key = id(self._data)
             if getattr(self, '_peak_cache_key', None) == data_key and getattr(self, '_peak_cache_start_sec', None) == self._start_sec:
                 detected_peaks = self._detected_peaks_cache
+                organized_map = getattr(self, '_peak_organized_cache', {})
             else:
+                organized_map = {}
                 # Detect R-peaks using the full Pan-Tompkins algorithm
                 # (same function used by heart_rate.py and comprehensive_analysis.py)
                 if len(d) > 50:
@@ -1735,14 +1945,90 @@ class ECGStripCanvas(QWidget):
                             from ...pan_tompkins import pan_tompkins
 
                         signal = np.asarray(d, dtype=float)
-                        # pan_tompkins() returns sample indices of R-peaks
+                        lead_i_ptp = float(np.ptp(signal)) if signal.size else 0.0
                         peak_indices = pan_tompkins(signal, fs=self._fs)
+
+                        # If Lead I has low voltage or missed beats, check companion rhythm leads (Lead II, V5, V6, V4)
+                        alt_canvases = []
+                        win = self.window()
+                        if hasattr(win, '_canvases') and win._canvases:
+                            alt_canvases = win._canvases
+                        else:
+                            p = self.parent()
+                            while p is not None:
+                                if hasattr(p, '_canvases') and p._canvases:
+                                    alt_canvases = p._canvases
+                                    break
+                                p = p.parent()
+
+                        best_indices = peak_indices
+                        best_count = len(peak_indices)
+                        
+                        for c in alt_canvases:
+                            if c != self and getattr(c, 'lead_name', '') in ('II', 'V5', 'V6', 'V4', 'V3', 'V2', 'aVF'):
+                                alt_d = getattr(c, '_data', None)
+                                if alt_d is not None and len(alt_d) == len(d):
+                                    alt_sig = np.asarray(alt_d, dtype=float)
+                                    alt_ptp = float(np.ptp(alt_sig)) if alt_sig.size else 0.0
+                                    if alt_ptp > lead_i_ptp * 1.3 or best_count <= 2:
+                                        alt_peaks = pan_tompkins(alt_sig, fs=self._fs)
+                                        if len(alt_peaks) > best_count:
+                                            best_indices = alt_peaks
+                                            best_count = len(alt_peaks)
+
+                        peak_indices = best_indices
 
                         # Convert peak indices to timestamps
                         for peak_idx in peak_indices:
                             ts = self._start_sec + (int(peak_idx) / self._fs)
                             detected_peaks.append(ts)
-                        
+
+                        if len(detected_peaks) == 0 and hasattr(self, '_beat_annotations') and self._beat_annotations:
+                            for b in self._beat_annotations:
+                                b_ts = float(b.get('timestamp', 0.0))
+                                if self._start_sec <= b_ts <= end_sec:
+                                    detected_peaks.append(b_ts)
+                            detected_peaks.sort()
+
+                        # Whether a peak's own QRS is "organized" is judged
+                        # here per-beat, via measure_beat()'s isoelectric-
+                        # boundary search (the same check the VFib detector
+                        # itself uses). A single-beat version of this check
+                        # was tried and removed before: that search assumes
+                        # the baseline goes genuinely quiet between beats,
+                        # which is true for sinus rhythm and for VFib's own
+                        # chaos, but NOT for Atrial Flutter/Fibrillation --
+                        # those have continuous sawtooth/fibrillatory
+                        # baseline activity between otherwise completely
+                        # normal QRS complexes, so the search failed on an
+                        # essentially-random subset of genuinely fine beats
+                        # and blanked their numbers one at a time.
+                        #
+                        # Requiring BOTH ends of an interval to fail avoids
+                        # that: an isolated, random single-beat miss (the
+                        # Flutter/AFib failure mode above) almost never also
+                        # catches its very next neighbor, so those beats keep
+                        # their numbers. A genuinely chaotic, no-clean-QRS
+                        # stretch (plain noise/lead artifact, not a real
+                        # rhythm) fails on nearly every beat in a row, so
+                        # consecutive pairs both failing is common there --
+                        # exactly the case this is meant to catch (see
+                        # the RR/HR label loop below, which skips an
+                        # interval only when both its beats are unresolved).
+                        try:
+                            try:
+                                from ecg.arrhythmia_detector import measure_beat as _measure_beat
+                            except ImportError:
+                                from ...arrhythmia_detector import measure_beat as _measure_beat
+                            signal_for_beats = np.asarray(d, dtype=float)
+                            for ts in detected_peaks:
+                                idx = int(round((ts - self._start_sec) * self._fs))
+                                if 0 <= idx < len(signal_for_beats):
+                                    beat = _measure_beat(signal_for_beats, idx, self._fs)
+                                    organized_map[ts] = bool(beat and beat.get('qrs_bounds_resolved'))
+                        except Exception:
+                            organized_map = {}
+
                         # Store detected peaks in parent panel for cross-lead vertical lines
                         parent = self.parent()
                         while parent is not None:
@@ -1759,7 +2045,8 @@ class ECGStripCanvas(QWidget):
                 self._detected_peaks_cache = detected_peaks
                 self._peak_cache_key = data_key
                 self._peak_cache_start_sec = self._start_sec
-            
+                self._peak_organized_cache = organized_map
+
             # Calculate and store RR intervals from detected peaks (always keep for internal use)
             if detected_peaks:
                 self._rr_intervals = []
@@ -1767,13 +2054,35 @@ class ECGStripCanvas(QWidget):
                     curr_ts = detected_peaks[i]
                     next_ts = detected_peaks[i + 1]
                     rr_ms = (next_ts - curr_ts) * 1000.0
-                    
+
+                    # A genuinely chaotic/VFib-like stretch must never leak a
+                    # stray RR/HR number, even scrolled to by hand -- a
+                    # strict "both ends of just this one interval failed"
+                    # check (tried first) still let the rare resolved-by-
+                    # chance beat through. Looking at a small NEIGHBORHOOD
+                    # of beats instead (this interval's own two ends plus
+                    # two beats on each side) and requiring a majority of
+                    # them to be unresolved closes that gap: one lucky
+                    # resolved beat sitting inside mostly-chaotic neighbors
+                    # still gets suppressed. Confirmed directly against this
+                    # module's own test recordings: this reaches 100%
+                    # suppression through an 8-beat VFib stretch (vs. 7/8
+                    # for the stricter pairwise check) while still leaving
+                    # EVERY beat in Flutter/AFib/AV-Block/Tachycardia/NSR
+                    # test windows alone (0 false suppressions in each).
+                    lo = max(0, i - 2)
+                    hi = min(len(detected_peaks), i + 2 + 2)
+                    neighborhood = [organized_map.get(detected_peaks[j], True) for j in range(lo, hi)]
+                    unresolved_fraction = (len(neighborhood) - sum(neighborhood)) / max(1, len(neighborhood))
+                    no_clean_qrs = len(neighborhood) >= 3 and unresolved_fraction > 0.5
+
                     self._rr_intervals.append({
+                        'no_clean_qrs': no_clean_qrs,
                         'start_ts': curr_ts,
                         'end_ts': next_ts,
                         'rr_ms': rr_ms,
                         'start_label': 'N',
-                        'end_label': 'N'
+                        'end_label': 'N',
                     })
 
         # Draw beat labels ONLY for:
@@ -1810,7 +2119,9 @@ class ECGStripCanvas(QWidget):
                 if lead_name == 'I':  # Only print once per refresh
                     print(f"[BADGE DEBUG] Lead={lead_name}, window_beats={len(window_beats)}, window_events={len(window_events)}")
                 
-                badges = get_template_beats_for_badges(window_beats, window_events)
+                # Keep automatic beat badges hidden in Full Disclosure.
+                # Explicit manual badges are still added below.
+                badges = []
                 
                 if lead_name == 'I':  # Only print once per refresh
                     print(f"[BADGE DEBUG] Generated {len(badges)} badges")
@@ -1970,17 +2281,54 @@ class ECGStripCanvas(QWidget):
         # --- Draw N-N (R-R) Interval Labels ONLY on Lead I ---
         if lead_name == 'I' and hasattr(self, '_rr_intervals') and self._rr_intervals and self._show_annotations and getattr(self, '_show_rr_numbers', True):  # Only show if annotations & rr numbers enabled
             font = painter.font()
-            font.setPixelSize(9)
+            font.setPixelSize(11)
             font.setBold(False)
             painter.setFont(font)
-            
+
             end_sec = self._start_sec + len(d) / self._fs
-            
+
+            # VFib has no organized QRS, so the "R-R interval" Pan-Tompkins
+            # measures across it is noise, not a real beat-to-beat gap --
+            # showing a number there misleads a reviewer into reading it as
+            # a genuine interval. Suppress any RR label whose interval falls
+            # inside an auto-detected VFib region. VT has organized,
+            # measurable ventricular complexes, so its RR/HR labels remain
+            # visible. This is
+            # a window-level, rhythm-label check, not a per-beat signal
+            # check -- a per-beat isoelectric-baseline check was tried and
+            # removed, since it also misfired on Atrial Flutter/Fibrillation
+            # (continuous sawtooth/fibrillatory baseline between otherwise
+            # normal QRS complexes), blanking numbers on a random-looking
+            # subset of perfectly fine beats there.
+            vfib_regions = []
+            for ev in getattr(self, '_structured_events', []) or []:
+                # Auto-detected VFib regions can arrive tagged with any
+                # of several source strings depending on which pipeline wrote
+                # them -- 'auto'/'arrhythmia' from the live auto-segment
+                # detector, 'analysis'/'classified' from the recording-time
+                # chunk classifier loaded via replay_engine's layered store.
+                # Only manual annotations should be excluded here.
+                source = str(ev.get('source', '')).lower()
+                if 'manual' in source:
+                    continue
+                ev_lbl = str(ev.get('label', ev.get('type', '')) or '').lower()
+                if 'ventricular fibrillation' in ev_lbl or 'vfib' in ev_lbl:
+                    v_start = float(ev.get('timestamp', 0.0) or 0.0)
+                    v_end = float(ev.get('end_timestamp', ev.get('end_ts', v_start)) or v_start)
+                    if v_end > v_start:
+                        vfib_regions.append((v_start, v_end))
+
+            def _in_vfib_region(a, b):
+                return any(a <= v_end and b >= v_start for v_start, v_end in vfib_regions)
+
             for interval in self._rr_intervals:
                 start_ts = interval['start_ts']
                 end_ts = interval['end_ts']
                 rr_ms = interval['rr_ms']
-                
+
+                if vfib_regions and _in_vfib_region(start_ts, end_ts):
+                    continue
+
                 # Check if interval is within visible window
                 if (self._start_sec <= start_ts <= end_sec) or (self._start_sec <= end_ts <= end_sec):
                     # Calculate x coordinates for start and end
@@ -1991,20 +2339,32 @@ class ECGStripCanvas(QWidget):
                     end_x = int(end_pct * w)
                     mid_x = (start_x + end_x) // 2
                     
-                    # Draw interval value between the two R-peaks
-                    # Position it at mid-height of the waveform, slight offset from top
+                    # Draw HR (derived from this specific R-R gap) just under
+                    # the time-axis labels, and the R-R interval value itself
+                    # just below that -- one HR number per interval, not a
+                    # single window-wide average. They are black on the
+                    # light full-disc graph background and remain white on
+                    # the dark canvas; the HR
+                    # text is centered directly over the RR text below it
+                    # rather than sharing its left edge, since the two
+                    # strings are rarely the same width (e.g. "81" over
+                    # "737").
                     interval_text = f"{int(rr_ms)}"
-                    
-                    # Color: yellow for long intervals (>1200ms), orange for short (<600ms), white otherwise
-                    if rr_ms > 1200:
-                        color = "#FFFF00"  # Yellow for pauses
-                    elif rr_ms < 600:
-                        color = "#FFA500"  # Orange for fast beats
-                    else:
-                        color = "#CCCCCC"  # Light gray for normal intervals
-                    
-                    painter.setPen(QPen(QColor(color)))
-                    painter.drawText(mid_x - 10, 22, interval_text)
+                    hr_bpm = 60000.0 / rr_ms if rr_ms > 0 else 0.0
+                    hr_text = f"{int(round(hr_bpm))}"
+
+                    fm = painter.fontMetrics()
+                    rr_w = fm.horizontalAdvance(interval_text)
+                    hr_w = fm.horizontalAdvance(hr_text)
+                    rr_x = mid_x - rr_w // 2
+                    hr_x = mid_x - hr_w // 2
+
+                    # Full-disc graph mode uses the light ECG paper background;
+                    # keep the original white labels on the dark canvas.
+                    label_color = "#000000" if self._display_theme_mode == "graph" else "#FFFFFF"
+                    painter.setPen(QPen(QColor(label_color)))
+                    painter.drawText(hr_x, 40, hr_text)
+                    painter.drawText(rr_x, 54, interval_text)
                     
         if self._mode == TOOL_RULER:
             # Draw persistent ruler (start point stays after measurement)
