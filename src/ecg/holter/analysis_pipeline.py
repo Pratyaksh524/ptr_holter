@@ -108,8 +108,8 @@ class HolterConfig:
     signal_flatline_std: float = 0.05
     signal_saturation_mv: float = 4.5
     signal_saturation_ratio: float = 0.01
-    signal_baseline_wander_ratio: float = 0.30
-    signal_hf_noise_ratio: float = 0.40
+    signal_baseline_wander_ratio: float = 2.0
+    signal_hf_noise_ratio: float = 0.05
     signal_regularity_cv: float = 0.8
     qrs_validator_min_width_ms: float = 25.0
     qrs_validator_max_width_ms: float = 200.0
@@ -190,46 +190,157 @@ class SignalPreprocessor:
         return np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+# Recorded samples are 12-bit ADC counts (0-4095, 200 counts per mV).
+# I, II and V1-V6 are measured; III, aVR, aVL and aVF are computed from I and
+# II, so they clip wherever I or II clips (their own values can go negative).
+ADC_COUNTS_PER_MV = 200.0
+ADC_CLIP_LOW, ADC_CLIP_HIGH = 1, 4094
+DERIVED_LEAD_SOURCES = {"III": ("I", "II"), "aVR": ("I", "II"), "aVL": ("I", "II"), "aVF": ("I", "II")}
+
+
 class SignalQuality:
+    """Per-lead signal quality, 0-1, on the RAW recorded samples of one lead.
+
+    It has to see the raw signal: the noise it looks for (baseline swings,
+    clipping, EMG) is exactly what the 0.5-40 Hz band-pass removes, so a
+    filtered input always scored ~0.875 and never failed.
+
+    Each check scores 1.0 for a perfect signal and exactly sqi_min (0.6) at
+    its limit; the SQI is the lowest one, so a lead fails when any single
+    check is past its limit:
+      flat       -- std of the 0.5-40 Hz ECG < flatline_std mV (lead off);
+      clipping   -- fraction of samples at the ADC rails, outside the QRS
+                    complexes, > saturation_ratio (electrode / motion swing
+                    driving the input out of range);
+      HF noise   -- std above 40 Hz (after 50/60 Hz notches) / ECG
+                    peak-to-peak > hf_noise_ratio (muscle / EMG);
+      wander     -- baseline (< 0.5 Hz) peak-to-peak / ECG peak-to-peak
+                    > baseline_wander_ratio;
+      regularity -- only when r_peaks are passed: RR CV > regularity_cv.
+    Clipping inside a QRS (+-80 ms of its energy peak) is not counted: a
+    large QRS whose S wave tips hit the rail is still a clean lead -- seen
+    on a human V3, where 98% of the clipped samples sat within 120 ms of an
+    R-peak, one short run per beat, while motion clips all through the beat.
+    Limits measured on the test recordings: simulator recordings (incl.
+    VFib / AFib / Flutter) clip at most 0.92%, HF noise <= 0.020, wander
+    <= 0.51; a 30 min human recording's motion stretches clip > 1% in 74%
+    of lead-windows.
+    """
+
+    QRS_HALF_WIDTH_SEC = 0.08
+
     def __init__(self, fs: float = 500.0, config: Optional[HolterConfig] = None):
         self.fs = float(fs or 500.0)
         self.config = config or HolterConfig()
+        from ..enhanced_filter import make_notch
+        nyq = self.fs / 2.0
+        cfg = self.config
+        self._notches = [(np.asarray(bq.b), np.asarray(bq.a))
+                         for bq in (make_notch(hz, self.fs) for hz in (50.0, 60.0) if hz < nyq)]
+        self._bp = butter(2, [cfg.bandpass_low_hz / nyq, min(cfg.bandpass_high_hz / nyq, 0.99)], btype="band")
+        self._hp = butter(2, min(cfg.bandpass_high_hz / nyq, 0.99), btype="high")
+        self._lp = butter(2, cfg.bandpass_low_hz / nyq, btype="low")
 
-    def compute_sqi(self, signal: Sequence[float], r_peaks: Optional[Sequence[int]] = None) -> float:
+    def _score(self, value, limit):
+        return np.clip(1.0 - (1.0 - self.config.sqi_min) * np.asarray(value, dtype=float) / max(limit, 1e-9),
+                       0.0, 1.0)
+
+    def _qrs_mask(self, ecg: np.ndarray) -> np.ndarray:
+        """Samples within QRS_HALF_WIDTH_SEC of each QRS energy peak, per row."""
+        from scipy.signal import find_peaks
+        win = max(3, int(0.15 * self.fs))
+        half = int(self.QRS_HALF_WIDTH_SEC * self.fs)
+        mask = np.zeros(ecg.shape, dtype=bool)
+        for i, row in enumerate(ecg):
+            env = np.convolve(np.diff(row, prepend=row[0]) ** 2, np.ones(win) / win, mode="same")
+            top = float(np.percentile(env, 99))
+            if top <= 0:
+                continue
+            peaks, _ = find_peaks(env, height=0.3 * top, distance=int(0.25 * self.fs))
+            for p in peaks:
+                mask[i, max(0, p - half):p + half + 1] = True
+        return mask
+
+    def lead_scores(self, block: np.ndarray, clipped: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """SQI of every row of ``block`` (leads x samples, raw ADC).
+        ``clipped``: optional same-shape mask of clipped samples, by default
+        taken from ``block`` itself. Returns (scores, flat) arrays."""
+        x = np.nan_to_num(np.atleast_2d(np.asarray(block, dtype=float)), nan=0.0, posinf=0.0, neginf=0.0)
+        n_leads, n = x.shape
+        if n < max(int(self.fs * max(self.config.min_signal_seconds, 0.5)), 30):
+            return np.zeros(n_leads), np.ones(n_leads, dtype=bool)
+        if clipped is None:
+            clipped = (x <= ADC_CLIP_LOW) | (x >= ADC_CLIP_HIGH)
+
+        y = (x - np.median(x, axis=1, keepdims=True)) / ADC_COUNTS_PER_MV
+        for b, a in self._notches:
+            y = filtfilt(b, a, y, axis=-1)
+        ecg = filtfilt(*self._bp, y, axis=-1)
+        flat = np.std(ecg, axis=1) < self.config.signal_flatline_std
+        ecg_pp = np.maximum(np.ptp(ecg, axis=1), 1e-9)
+
+        clip_frac = np.mean(clipped & ~self._qrs_mask(ecg), axis=1)
+        hf = np.std(filtfilt(*self._hp, y, axis=-1), axis=1) / ecg_pp
+        wander = np.ptp(filtfilt(*self._lp, y, axis=-1), axis=1) / ecg_pp
+        scores = np.minimum.reduce([
+            self._score(clip_frac, self.config.signal_saturation_ratio),
+            self._score(hf, self.config.signal_hf_noise_ratio),
+            self._score(wander, self.config.signal_baseline_wander_ratio),
+        ])
+        scores[flat] = 0.0
+        return scores, flat
+
+    def compute_sqi(self, signal: Sequence[float], r_peaks: Optional[Sequence[int]] = None,
+                    clipped: Optional[np.ndarray] = None) -> float:
+        """``signal``: raw ADC samples of one lead. ``clipped``: optional
+        boolean mask of clipped samples (for a derived lead, from its source
+        leads); by default taken from ``signal`` itself."""
         arr = _safe_array(signal)
-        if arr.size < int(self.fs * max(self.config.min_signal_seconds, 0.5)):
-            return 0.0
-        if not np.any(arr):
-            return 0.0
-
-        signal_std = float(np.std(arr))
-        if signal_std < self.config.signal_flatline_std:
-            return 0.0
-
-        baseline = _lowpass(arr, self.fs, self.config.bandpass_low_hz, order=2)
-        drift_energy = float(np.var(baseline) / max(np.var(arr), 1e-9))
-        drift_score = max(0.0, 1.0 - min(1.0, drift_energy / max(self.config.signal_baseline_wander_ratio, 1e-6)))
-
-        high_freq = _highpass(arr, self.fs, self.config.bandpass_high_hz, order=2)
-        noise_energy = float(np.var(high_freq) / max(np.var(arr), 1e-9))
-        noise_score = max(0.0, 1.0 - min(1.0, noise_energy / max(self.config.signal_hf_noise_ratio, 1e-6)))
-
-        stability_score = 0.5
+        scores, _ = self.lead_scores(arr[None, :], None if clipped is None else np.asarray(clipped)[None, :])
+        score = float(scores[0])
         if r_peaks is not None:
             peaks = np.asarray(r_peaks, dtype=float).reshape(-1)
             if peaks.size >= 3:
                 rr = np.diff(peaks)
                 mean_rr = float(np.mean(rr))
                 if mean_rr > 0:
-                    cv = float(np.std(rr) / mean_rr)
-                    stability_score = max(0.0, 1.0 - min(1.0, cv / max(self.config.signal_regularity_cv, 1e-6)))
+                    score = min(score, float(self._score(float(np.std(rr) / mean_rr), self.config.signal_regularity_cv)))
+        return score
 
-        amplitude_score = max(
-            0.0,
-            min(1.0, float(np.ptp(arr)) / max(self.config.signal_saturation_mv, 1e-6)),
-        )
-        sqi = float(np.clip(np.mean([drift_score, noise_score, stability_score, amplitude_score]), 0.0, 1.0))
-        return sqi
+    def _lead_block(self, leads: Dict[str, Sequence[float]]):
+        """(names, raw block, clipped mask) for equal-length leads; a derived
+        lead's clipped mask comes from its source leads."""
+        names = [str(name) for name in (leads or {})]
+        if not names:
+            return names, np.zeros((0, 0)), np.zeros((0, 0), dtype=bool)
+        rows = [_safe_array(sig) for sig in leads.values()]
+        n = min(r.size for r in rows)
+        block = np.vstack([r[:n] for r in rows])
+        clipped = (block <= ADC_CLIP_LOW) | (block >= ADC_CLIP_HIGH)
+        for i, name in enumerate(names):
+            sources = DERIVED_LEAD_SOURCES.get(name)
+            if sources and all(s in names for s in sources):
+                clipped[i] = np.logical_or.reduce([clipped[names.index(s)] for s in sources])
+        return names, block, clipped
+
+    def compute_lead_sqis(self, leads: Dict[str, Sequence[float]]) -> Dict[str, float]:
+        """compute_sqi for every lead of {lead name: raw ADC samples}."""
+        names, block, clipped = self._lead_block(leads)
+        if not names:
+            return {}
+        scores, _ = self.lead_scores(block, clipped)
+        return {name: float(s) for name, s in zip(names, scores)}
+
+    def noisy_leads(self, leads: Dict[str, Sequence[float]]) -> List[str]:
+        """Leads whose SQI is below sqi_min. When every lead is flat at once
+        there is no signal at all (e.g. asystole), not noise: none returned."""
+        names, block, clipped = self._lead_block(leads)
+        if not names:
+            return []
+        scores, flat = self.lead_scores(block, clipped)
+        if bool(np.all(flat)):
+            return []
+        return [name for name, s in zip(names, scores) if s < self.config.sqi_min]
 
 
 class MultiLeadSelector:
@@ -240,19 +351,17 @@ class MultiLeadSelector:
         self._quality = SignalQuality(self.fs, self.config)
 
     def select_best_lead(self, leads: Dict[str, Sequence[float]]) -> Tuple[Optional[str], np.ndarray, Dict[str, float]]:
-        scores: Dict[str, float] = {}
-        best_name: Optional[str] = None
-        best_signal = np.array([], dtype=float)
-        best_score = -1.0
-        for lead_name, lead_signal in (leads or {}).items():
-            processed = self._preprocessor.process(lead_signal)
-            score = self._quality.compute_sqi(processed)
-            scores[str(lead_name)] = float(score)
-            if score > best_score:
-                best_name = str(lead_name)
-                best_signal = processed
-                best_score = float(score)
-        return best_name, best_signal, scores
+        """Per-lead SQI on the raw leads. The first primary detection lead
+        (II, V5) that passes sqi_min is used, else the best-scoring lead.
+        Returns (name, its preprocessed signal, {lead: SQI})."""
+        leads = {str(name): sig for name, sig in (leads or {}).items()}
+        scores = self._quality.compute_lead_sqis(leads)
+        if not scores:
+            return None, np.array([], dtype=float), scores
+        passing = [n for n in self.config.primary_detection_leads
+                   if n in scores and scores[n] >= self.config.sqi_min]
+        best_name = passing[0] if passing else max(scores, key=lambda n: scores[n])
+        return best_name, self._preprocessor.process(leads[best_name]), scores
 
 
 class QRSValidator:

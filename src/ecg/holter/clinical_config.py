@@ -72,8 +72,8 @@ class ClinicalConfig:
     signal_flatline_std: float = 0.05
     signal_saturation_mv: float = 4.5
     signal_saturation_ratio: float = 0.01
-    signal_baseline_wander_ratio: float = 0.30
-    signal_hf_noise_ratio: float = 0.40
+    signal_baseline_wander_ratio: float = 2.0
+    signal_hf_noise_ratio: float = 0.05
     signal_regularity_cv: float = 0.8
 
     tachy_threshold_bpm: float = 100.0
@@ -116,8 +116,8 @@ class ClinicalConfig:
         signal_flatline_std = _as_float(quality.get("flatline_std", signal.get("flatline_std")), 0.05)
         signal_saturation_mv = _as_float(quality.get("saturation_mv", signal.get("saturation_mv")), 4.5)
         signal_saturation_ratio = _as_float(quality.get("saturation_ratio", signal.get("saturation_ratio")), 0.01)
-        signal_baseline_wander_ratio = _as_float(quality.get("baseline_wander_ratio", signal.get("baseline_wander_ratio")), 0.30)
-        signal_hf_noise_ratio = _as_float(quality.get("hf_noise_ratio", signal.get("hf_noise_ratio")), 0.40)
+        signal_baseline_wander_ratio = _as_float(quality.get("baseline_wander_ratio", signal.get("baseline_wander_ratio")), 2.0)
+        signal_hf_noise_ratio = _as_float(quality.get("hf_noise_ratio", signal.get("hf_noise_ratio")), 0.05)
         signal_regularity_cv = _as_float(quality.get("regularity_cv", signal.get("regularity_cv")), 0.8)
 
         tachy_threshold_bpm = _as_float(arrhythmia.get("tachy_threshold_bpm", data.get("tachy_threshold_bpm")), 100.0)

@@ -5393,6 +5393,72 @@ def _detect_arrhythmias_uncached(
     except Exception as e:
         print(f"[Auto Arrhythmia Detect] Sinus Arrhythmia check error: {e}")
 
+    # ------------------------------------------------------------------
+    # Noise gate, applied to every label above: no auto marking where the
+    # signal is not clean. Per 10 s block, every lead's SQI is computed on
+    # the raw samples (analysis_pipeline.SignalQuality: flat / clipping
+    # outside the QRS / EMG / baseline wander); a block where ANY lead is
+    # below sqi_min is noisy and is cut out of every segment. All leads flat
+    # at once is no signal rather than noise, so it is not cut. A piece left
+    # shorter than 2 s (or than the whole original segment) is dropped.
+    # Simulator recordings (incl. VFib / AFib / Flutter) had no noisy block.
+    # ------------------------------------------------------------------
+    _NOISE_BLOCK_SEC = 10.0
+    _NOISE_READ_SEC = 60.0
+    _NOISE_MIN_PIECE_SEC = 2.0
+    try:
+        from .analysis_pipeline import SignalQuality, HolterConfig
+        _nq = SignalQuality(fs=fs, config=HolterConfig.from_clinical_config())
+        noisy_blocks = []
+        r0 = 0.0
+        while r0 < total_duration and final_segments:
+            r1 = min(total_duration, r0 + _NOISE_READ_SEC)
+            data = reader.read_range(r0, r1)
+            if data is not None and data.shape[1] > 0:
+                b0 = r0
+                while b0 < r1:
+                    b1 = min(r1, b0 + _NOISE_BLOCK_SEC)
+                    i0, i1 = int(round((b0 - r0) * fs)), int(round((b1 - r0) * fs))
+                    block = data[:, i0:i1]
+                    if block.shape[1] >= int(2.0 * fs):
+                        leads = {lead_names[i]: block[i] for i in range(min(len(lead_names), block.shape[0]))}
+                        if _nq.noisy_leads(leads):
+                            if noisy_blocks and abs(noisy_blocks[-1][1] - b0) < 1e-6:
+                                noisy_blocks[-1][1] = b1
+                            else:
+                                noisy_blocks.append([b0, b1])
+                    b0 = b1
+            r0 = r1
+        if noisy_blocks:
+            gated = []
+            for seg in final_segments:
+                pieces = [(float(seg['start_sec']), float(seg['end_sec']))]
+                for n0, n1 in noisy_blocks:
+                    nxt = []
+                    for p0, p1 in pieces:
+                        if n1 <= p0 or n0 >= p1:
+                            nxt.append((p0, p1))
+                            continue
+                        if n0 > p0:
+                            nxt.append((p0, n0))
+                        if n1 < p1:
+                            nxt.append((n1, p1))
+                    pieces = nxt
+                min_len = min(_NOISE_MIN_PIECE_SEC, float(seg['end_sec']) - float(seg['start_sec']))
+                for p0, p1 in pieces:
+                    if p1 - p0 < min_len - 1e-6:
+                        continue
+                    piece = dict(seg)
+                    if (p0, p1) != (float(seg['start_sec']), float(seg['end_sec'])):
+                        s_str, e_str = make_time_strs(p0, p1)
+                        piece.update({'start_sec': p0, 'end_sec': p1, 'start_time_str': s_str, 'end_time_str': e_str})
+                    gated.append(piece)
+            print(f"[Auto Arrhythmia Detect] Noise gate: {len(noisy_blocks)} noisy stretch(es), "
+                  f"{sum(b - a for a, b in noisy_blocks):.0f}s; segments {len(final_segments)} -> {len(gated)}")
+            final_segments = sorted(gated, key=lambda x: x['start_sec'])
+    except Exception as e:
+        print(f"[Auto Arrhythmia Detect] Noise gate error: {e}")
+
     print(f"[Auto Arrhythmia Detect] Found {len(final_segments)} exact rhythm segments:")
     for s in final_segments:
         print(f"  - {s['label']}: {s['start_sec']:.2f}s to {s['end_sec']:.2f}s ({s['start_time_str']} - {s['end_time_str']})")

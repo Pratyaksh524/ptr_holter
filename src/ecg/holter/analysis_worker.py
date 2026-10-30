@@ -196,8 +196,12 @@ class HolterAnalysisWorker(threading.Thread):
 
         sqi_score = 1.0
         try:
-            if self._signal_quality is not None:
-                sqi_score = float(self._signal_quality.compute_sqi(best_signal))
+            # SQI of the raw lead: best_signal is already band-passed, and
+            # band-passing removes the very noise the SQI looks for.
+            if best_lead_name in lead_scores:
+                sqi_score = float(lead_scores[best_lead_name])
+            elif self._signal_quality is not None:
+                sqi_score = float(self._signal_quality.compute_sqi(lead_map.get(best_lead_name, lead_ii)))
             elif self._calc_sqi is not None:
                 sqi_score = float(self._calc_sqi(best_signal, np.array([], dtype=int), sampling_rate=float(fs)))
         except Exception:

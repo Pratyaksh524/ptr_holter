@@ -15,12 +15,14 @@ signal:
   bandpass_high_hz: 40.0
   notch_hz: 50.0
 
+# Per-lead signal quality (analysis_pipeline.SignalQuality), on the raw
+# samples. A lead fails (SQI < quality_threshold) when any one is exceeded.
 quality:
-  flatline_std: 0.05
+  flatline_std: 0.05          # mV, std of the 0.5-40 Hz ECG; below = flat / lead off
   saturation_mv: 4.5
-  saturation_ratio: 0.01
-  baseline_wander_ratio: 0.30
-  hf_noise_ratio: 0.40
+  saturation_ratio: 0.01      # fraction of samples clipped at the ADC rails
+  baseline_wander_ratio: 2.0  # baseline (<0.5 Hz) peak-to-peak / ECG peak-to-peak
+  hf_noise_ratio: 0.05        # std above 40 Hz / ECG peak-to-peak
   regularity_cv: 0.8
 
 arrhythmia:
