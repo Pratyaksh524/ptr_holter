@@ -45,6 +45,22 @@ UNIDENTIFIED_COLOR = '#808080'
 # a frame with a rhythm label of its own (VFib ...) keeps that label.
 IDENTICAL_LEADS = ('I', 'V1', 'V5')
 IDENTICAL_LEADS_CORR = 0.95
+# Among those, a test signal is mostly flat: the share of Lead II samples
+# whose step is <= 0.2% of the range -- square wave 0.84, triangle / pulse
+# trains 0.64-0.74; the simulator's VFib 0.03-0.21.
+TEST_SIGNAL_FLAT_STEP = 0.002
+TEST_SIGNAL_FLAT_FRACTION = 0.5
+STATUS_CONTEXT_SEC = 2.0
+
+
+def span_status(reader, start_sec: float, end_sec: float) -> str:
+    """frame_status of a short stretch (one RR interval), judged on at least
+    STATUS_CONTEXT_SEC of signal centred on it."""
+    mid = 0.5 * (start_sec + end_sec)
+    total = float(getattr(reader, 'duration_sec', end_sec) or end_sec)
+    lo = max(0.0, min(start_sec, mid - STATUS_CONTEXT_SEC / 2.0))
+    hi = min(total, max(end_sec, mid + STATUS_CONTEXT_SEC / 2.0))
+    return frame_status(reader, lo, hi)
 
 # Rhythms with no P wave to measure a PR from (or P waves not conducted).
 NO_PR_RHYTHMS = (
@@ -280,8 +296,11 @@ def measure_beats(reader, start_sec: float, end_sec: float) -> List[Dict[str, An
 
 
 def frame_status(reader, start_sec: float, end_sec: float) -> str:
-    """'non_ecg' (the same waveform on every lead: a test signal, not a
-    heart), 'noise' (Lead II signal quality under sqi_min) or 'ok'."""
+    """'test_signal' (the same waveform on every lead and Lead II flat over
+    >= TEST_SIGNAL_FLAT_FRACTION of the samples: a square / triangle /
+    pulse test train), 'non_ecg' (the same waveform on every lead otherwise
+    -- e.g. the simulator's VFib), 'noise' (Lead II signal quality under
+    sqi_min) or 'ok'. At least 2 s of signal; shorter reads 'ok'."""
     from .analysis_pipeline import SignalPreprocessor, SignalQuality, HolterConfig
     lead_names = list(getattr(reader, 'lead_names', []) or [])
     fs = float(getattr(reader, 'fs', 500) or 500)
@@ -296,6 +315,12 @@ def frame_status(reader, start_sec: float, end_sec: float) -> str:
         if np.all(np.std(x, axis=1) > 0):
             corr = np.corrcoef(x)
             if np.all(corr[np.triu_indices(len(idx), 1)] >= IDENTICAL_LEADS_CORR):
+                if 'II' in lead_names:
+                    lead_ii = np.asarray(data[lead_names.index('II')], dtype=float)
+                    step = np.abs(np.diff(lead_ii))
+                    flat = float(np.mean(step <= TEST_SIGNAL_FLAT_STEP * float(np.ptp(lead_ii))))
+                    if flat >= TEST_SIGNAL_FLAT_FRACTION:
+                        return 'test_signal'
                 return 'non_ecg'
     if 'II' in lead_names:
         scores, _ = SignalQuality(fs=fs, config=cfg).lead_scores(

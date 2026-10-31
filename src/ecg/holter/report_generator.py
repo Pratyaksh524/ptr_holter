@@ -988,6 +988,11 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
             1 for e in _auto_segment_events_all
             if str(e.get('label', '')).lower() == 'second-degree av block (mobitz ii)'
         )
+        # 2:1 block can't be graded type I or II (no PR trend): its own row.
+        _av_block_2to1_count = sum(
+            1 for e in _auto_segment_events_all
+            if str(e.get('label', '')).lower() == 'second-degree av block (2:1)'
+        )
         _av_block_3_count = sum(
             1 for e in _auto_segment_events_all
             if ('third' in str(e.get('label', '')).lower() or '3rd' in str(e.get('label', '')).lower())
@@ -1104,6 +1109,7 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         others_panel = _grid_panel("Others", [
             ("2nd deg. AV block type I", str(_av_block_2_1_count) if _auto_segment_events_all else "-"),
             ("2nd deg. AV block type II", str(_av_block_2_2_count) if _auto_segment_events_all else "-"),
+            ("2nd deg. AV block 2:1", str(_av_block_2to1_count) if _auto_segment_events_all else "-"),
             ("3rd deg. AV block", str(_av_block_3_count) if _auto_segment_events_all else "-"),
         ])
 

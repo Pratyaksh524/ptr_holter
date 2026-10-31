@@ -1328,16 +1328,17 @@ def _detect_arrhythmias_uncached(
                                        1.0, 'Sinus Tachycardia', '#00FFFF')
 
         # B. Sinus Bradycardia: first pass through the same P/PR/QRS sinus
-        # gate, then consecutive beats with RR >= 1050ms (HR < 57.1 bpm)
+        # gate, then consecutive beats with RR >= _BRADY_MIN_RR_MS (HR < 60,
+        # the textbook bound -- was RR >= 1050 ms, HR < 57.1).
         # Note: 60 bpm (1000ms RR) is Normal Sinus Rhythm (NSR: 60-100 bpm), NOT Bradycardia.
-        # This detector's configured brady range is 10-57 bpm:
-        # RR 1050-6000ms. Anything slower is treated as a pause/possible
-        # signal-loss interval rather than sustained sinus bradycardia.
+        # Brady range: RR _BRADY_MIN_RR_MS-6000ms. Anything slower is treated
+        # as a pause/possible signal-loss interval rather than sustained sinus
+        # bradycardia.
         #
         # An RR this "slow" must also stay under a ceiling, or a stretch
         # where Pan-Tompkins simply finds no peaks at all -- because the
         # rhythm has degenerated into chaos, e.g. a VFib onset -- reads as
-        # one single multi-second "RR interval" and clears the >=1050ms bar
+        # one single multi-second "RR interval" and clears the brady RR bar
         # easily, mislabelling the start of VFib as Sinus Bradycardia.
         # Confirmed directly: a real recording had a 6.7s gap with zero
         # detected peaks right where VFib began, reported as a ~7s Sinus
@@ -1373,7 +1374,7 @@ def _detect_arrhythmias_uncached(
         # before.
         _recovered_beats = []
         for i, rr in enumerate(all_rr_ms):
-            if not (1050.0 <= rr <= _brady_max_rr_ms):
+            if not (_BRADY_MIN_RR_MS <= rr <= _brady_max_rr_ms):
                 continue
             gap_start, gap_end = all_r_peaks[i], all_r_peaks[i + 1]
             read_start = max(0.0, gap_start - 3.0)
@@ -1428,10 +1429,10 @@ def _detect_arrhythmias_uncached(
         for i, rr in enumerate(brady_rr_ms):
             next_rr = brady_rr_ms[i + 1] if i + 1 < len(brady_rr_ms) else None
             is_slow = (
-                (1050.0 <= rr <= _brady_max_rr_ms)
+                (_BRADY_MIN_RR_MS <= rr <= _brady_max_rr_ms)
                 or (
-                    1020.0 <= rr <= _brady_max_rr_ms and in_brady
-                    and next_rr is not None and 1050.0 <= next_rr <= _brady_max_rr_ms
+                    _BRADY_MIN_RR_MS - 30.0 <= rr <= _brady_max_rr_ms and in_brady
+                    and next_rr is not None and _BRADY_MIN_RR_MS <= next_rr <= _brady_max_rr_ms
                 )
             )
             if is_slow:
@@ -2243,16 +2244,18 @@ def _detect_arrhythmias_uncached(
     _AV_FIRST = 'First-degree AV Block'
     _AV_MOBITZ_I = 'Second-degree AV Block (Mobitz I)'
     _AV_MOBITZ_II = 'Second-degree AV Block (Mobitz II)'
+    _AV_TWO_TO_ONE = 'Second-degree AV Block (2:1)'
     _AV_THIRD = 'Third-degree AV Block'
     _AV_COLORS = {
         _AV_FIRST: '#FFD700',      # gold
         _AV_MOBITZ_I: "#3D3AD4",   # royal blue
         _AV_MOBITZ_II: '#FF00FF',  # magenta
+        _AV_TWO_TO_ONE: '#DA70D6',  # orchid
         _AV_THIRD: '#C0FF00',      # chartreuse
     }
     # Most severe first. A region of a less severe block is cut wherever it
     # overlaps a more severe one (or any non-AV rhythm), see below.
-    _AV_LABELS = (_AV_THIRD, _AV_MOBITZ_II, _AV_MOBITZ_I, _AV_FIRST)
+    _AV_LABELS = (_AV_THIRD, _AV_MOBITZ_II, _AV_TWO_TO_ONE, _AV_MOBITZ_I, _AV_FIRST)
     # Beat-exact AV spans from overlapping windows touch or overlap; anything
     # further apart than this is a real stretch of normal conduction between
     # two episodes and must not be bridged over.
@@ -2715,11 +2718,15 @@ def _detect_arrhythmias_uncached(
     #      within 20 ms of each other (no lengthening, no reset);
     #   3. the pause around the blocked P is 2x the P-P interval (+/-15%).
     # 2:1 block (one conducted beat between blocked P waves) can't show a PR
-    # trend; it is reported here when PR is fixed and the 2:1 pattern repeats
-    # (>= 2 such cycles in the window).
+    # trend, so it can't be told Mobitz I from Mobitz II: it is its own label,
+    # _AV_TWO_TO_ONE (as Hampton), see _is_two_to_one_av_block_window. Was:
+    # reported as Mobitz II.
     # Returns (R before the conducted run's last two beats, first R after the
     # last blocked P), or None.
-    def _is_mobitz_ii_window(ctx):
+    def _fixed_pr_block_spans(ctx):
+        """(Mobitz II spans, 2:1 spans) of the window's blocked-P cycles with
+        a fixed PR and a doubled pause, or None when a complete cycle breaks
+        that pattern."""
         if not ctx['atrial_regular']:
             return None
         cycles = _blocked_p_cycles(ctx)
@@ -2741,10 +2748,23 @@ def _detect_arrhythmias_uncached(
                 continue
             span = (run[max(0, len(run) - 2)]['qrs'], after['qrs'])
             (spans if len(run) >= 2 else two_to_one).append(span)
-        if len(two_to_one) >= 2:
-            spans.extend(two_to_one)
-        if not spans:
+        return spans, two_to_one
+
+    def _is_mobitz_ii_window(ctx):
+        found = _fixed_pr_block_spans(ctx)
+        if not found or not found[0]:
             return None
+        spans = found[0]
+        return min(s for s, _ in spans), max(e for _, e in spans)
+
+    # Second-degree AV Block 2:1: every other P wave blocked, PR of the
+    # conducted beats fixed, pause 2x the P-P interval; the pattern repeats
+    # (>= 2 such cycles in the window). Checked after Mobitz II.
+    def _is_two_to_one_av_block_window(ctx):
+        found = _fixed_pr_block_spans(ctx)
+        if not found or len(found[1]) < 2:
+            return None
+        spans = found[1]
         return min(s for s, _ in spans), max(e for _, e in spans)
 
     # Third-degree (complete) AV Block: atria and ventricles beat
@@ -2786,6 +2806,7 @@ def _detect_arrhythmias_uncached(
         for label, rule in (
             (_AV_THIRD, _is_third_degree_av_block_window),
             (_AV_MOBITZ_II, _is_mobitz_ii_window),
+            (_AV_TWO_TO_ONE, _is_two_to_one_av_block_window),
             (_AV_MOBITZ_I, _is_mobitz_i_window),
             (_AV_FIRST, _is_first_degree_av_block_window),
         ):
@@ -5733,38 +5754,94 @@ def _detect_arrhythmias_uncached(
     except Exception as e:
         print(f"[Auto Arrhythmia Detect] First-degree AV Block beat check error: {e}")
 
-    # Unidentified: 10 s frames with no heart signal that P / QRS / T can be
-    # read from (pqrst_measure.frame_status): the same waveform on every lead
-    # (a simulator test signal -- seen: triangle / pulse trains read as
-    # Tachycardia 1276-1287 s) or Lead II too noisy. A frame that holds a
-    # rhythm label of its own (VFib, AFib, an AV block ...) keeps it -- the
-    # ProSim VFib is the same on every lead too. Rate labels (Sinus
-    # Bradycardia / Tachycardia / Arrhythmia) are cut out of these frames,
-    # and plain Bradycardia / Tachycardia below never start in them.
+    # Unidentified: stretches with no heart signal that P / QRS / T can be
+    # read from (pqrst_measure.frame_status): a simulator test signal (the
+    # same waveform on every lead -- seen: triangle / pulse trains read as
+    # Tachycardia 1276-1287 s, a square wave read as VFib 2005-2020 s) or
+    # Lead II too noisy. Judged RR interval by RR interval
+    # (pqrst_measure.span_status, 2 s of signal around each; 1 s steps where
+    # no beat is found), so the stretch starts and ends on a beat -- was 10 s
+    # frames, which took in the normal beats before a test signal. Only
+    # frames that are unreadable, and the frames next to them, are walked
+    # beat by beat. A VFib region that is mostly test signal is dropped (the
+    # VFib rule fires on a square wave's steps); a stretch inside any other
+    # rhythm label (VFib, AFib, an AV block ... -- the simulator's VFib is
+    # the same on every lead too) keeps that label. Rate labels (Sinus
+    # Bradycardia / Tachycardia / Arrhythmia) are cut out of it, and plain
+    # Bradycardia / Tachycardia below never start in it.
+    def _cut_spans(spans, blockers):
+        """`spans` minus `blockers`, pieces of >= 2 s."""
+        out = []
+        for s0, s1 in spans:
+            pieces = [(s0, s1)]
+            for b0, b1 in blockers:
+                nxt = []
+                for p0, p1 in pieces:
+                    if b1 <= p0 or b0 >= p1:
+                        nxt.append((p0, p1))
+                        continue
+                    if b0 > p0:
+                        nxt.append((p0, b0))
+                    if b1 < p1:
+                        nxt.append((b1, p1))
+                pieces = nxt
+            out.extend(p for p in pieces if p[1] - p[0] >= 2.0)
+        return out
+
+    unreadable_spans = []
     try:
-        from .pqrst_measure import frame_status, FRAME_SEC, UNIDENTIFIED, UNIDENTIFIED_COLOR
+        from .pqrst_measure import frame_status, span_status, FRAME_SEC, UNIDENTIFIED, UNIDENTIFIED_COLOR
         _rate_labels = ('Sinus Bradycardia', 'Sinus Tachycardia', 'Sinus Arrhythmia')
-        own_rhythm = [
-            (float(s['start_sec']), float(s['end_sec'])) for s in final_segments
-            if s['label'] not in _rate_labels and 'bundle branch block' not in s['label'].lower()
-        ]
-        # Every frame with nothing to read, kept for the pass after the
-        # noise gate below.
-        unreadable_frames = []
+        zones = []
         f0 = 0.0
         while f0 < total_duration:
             f1 = min(f0 + FRAME_SEC, total_duration)
             if f1 - f0 >= 2.0 and frame_status(reader, f0, f1) != 'ok':
-                unreadable_frames.append((f0, f1))
+                z0, z1 = max(0.0, f0 - FRAME_SEC), min(total_duration, f1 + FRAME_SEC)
+                if zones and z0 <= zones[-1][1]:
+                    zones[-1][1] = z1
+                else:
+                    zones.append([z0, z1])
             f0 = f1
-        unidentified = []
-        for f0, f1 in unreadable_frames:
-            if any(s < f1 and e > f0 for s, e in own_rhythm):
-                continue
-            if unidentified and abs(unidentified[-1][1] - f0) < 1e-6:
-                unidentified[-1][1] = f1
-            else:
-                unidentified.append([f0, f1])
+        test_spans = []
+        for z0, z1 in zones:
+            points = [z0] + [float(p) for p in all_r_peaks if z0 < p < z1] + [z1]
+            filled = [points[0]]
+            for p in points[1:]:
+                while p - filled[-1] > 1.5:
+                    filled.append(filled[-1] + 1.0)
+                filled.append(p)
+            for a, b in zip(filled, filled[1:]):
+                if b - a <= 0:
+                    continue
+                status = span_status(reader, a, b)
+                if status == 'ok':
+                    continue
+                if unreadable_spans and abs(unreadable_spans[-1][1] - a) < 1e-6:
+                    unreadable_spans[-1][1] = b
+                else:
+                    unreadable_spans.append([a, b])
+                if status == 'test_signal':
+                    if test_spans and abs(test_spans[-1][1] - a) < 1e-6:
+                        test_spans[-1][1] = b
+                    else:
+                        test_spans.append([a, b])
+        unreadable_spans = [(a, b) for a, b in unreadable_spans if b - a >= 2.0]
+
+        def _test_overlap(seg):
+            s0, s1 = float(seg['start_sec']), float(seg['end_sec'])
+            return sum(max(0.0, min(s1, b) - max(s0, a)) for a, b in test_spans)
+
+        final_segments = [
+            seg for seg in final_segments
+            if not (seg['label'] == 'Ventricular Fibrillation'
+                    and _test_overlap(seg) >= 0.5 * (float(seg['end_sec']) - float(seg['start_sec'])))
+        ]
+        own_rhythm = [
+            (float(s['start_sec']), float(s['end_sec'])) for s in final_segments
+            if s['label'] not in _rate_labels and 'bundle branch block' not in s['label'].lower()
+        ]
+        unidentified = _cut_spans(unreadable_spans, own_rhythm)
         if unidentified:
             kept = []
             for seg in final_segments:
@@ -5899,17 +5976,16 @@ def _detect_arrhythmias_uncached(
     except Exception as e:
         print(f"[Auto Arrhythmia Detect] Noise gate error: {e}")
 
-    # Unidentified, second pass: an unreadable frame left with no rhythm
+    # Unidentified, second pass: an unreadable stretch left with no rhythm
     # label once the noise gate cut it -- it was skipped above because a
     # label covered it then (seen: VFib to 650 s cut back to 630 s, 630-650 s
     # noisy and blank).
     try:
         from .pqrst_measure import UNIDENTIFIED, UNIDENTIFIED_COLOR
         added = False
-        for f0, f1 in unreadable_frames:
-            if any(float(s['start_sec']) < f1 and float(s['end_sec']) > f0 for s in final_segments
-                   if 'bundle branch block' not in s['label'].lower()):
-                continue
+        labelled = [(float(s['start_sec']), float(s['end_sec'])) for s in final_segments
+                    if 'bundle branch block' not in s['label'].lower()]
+        for f0, f1 in _cut_spans(unreadable_spans, labelled):
             s_str, e_str = make_time_strs(f0, f1)
             final_segments.append({
                 'start_sec': f0, 'end_sec': f1, 'label': UNIDENTIFIED, 'color': UNIDENTIFIED_COLOR,
@@ -5928,8 +6004,6 @@ def _detect_arrhythmias_uncached(
                     continue
                 merged.append(seg)
             final_segments = merged
-    except NameError:
-        pass   # the first Unidentified pass failed and said so
     except Exception as e:
         print(f"[Auto Arrhythmia Detect] Unidentified second pass error: {e}")
 
@@ -5940,7 +6014,12 @@ def _detect_arrhythmias_uncached(
     return final_segments
 
 
-_PLAIN_BRADY_HR = (10.0, 57.0)    # Bradycardia: 10 < HR < 57 bpm
+# Bradycardia, sinus or not: HR < 60 (textbook), as RR >= 1010 ms. A 60 bpm
+# simulator rhythm reads RR 998-1002 ms beat to beat; a bound at exactly
+# 1000 ms would mark plain 60 bpm sinus rhythm as bradycardia on every beat
+# that came out at 1001-1002 ms. Was RR >= 1050 ms (HR < 57.1).
+_BRADY_MIN_RR_MS = 1010.0
+_PLAIN_BRADY_HR = (10.0, 60000.0 / _BRADY_MIN_RR_MS)    # Bradycardia: 10 < HR < 59.4 bpm
 # Tachycardia: HR > 100 bpm, no upper limit. Above 180 bpm the SVT rules
 # get there first (their segments block this label); a capped band left
 # beats alternating 179.6 / 180.7 bpm (RR 334 / 332 ms) with no label at all.

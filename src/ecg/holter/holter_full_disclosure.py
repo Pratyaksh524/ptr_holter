@@ -3802,6 +3802,7 @@ class HolterFullDisclosureDialog(QDialog):
             # like a bare "AV Block" isn't drawn as one of these degrees.
             'third-degree av block': ('Third-degree AV Block', '#C0FF00'),
             'second-degree av block (mobitz ii)': ('Second-degree AV Block (Mobitz II)', '#FF00FF'),
+            'second-degree av block (2:1)': ('Second-degree AV Block (2:1)', '#DA70D6'),
             'second-degree av block (mobitz i)': ('Second-degree AV Block (Mobitz I)', '#4169E1'),
             'first-degree av block': ('First-degree AV Block', '#FFD700'),
         }
@@ -4157,6 +4158,7 @@ class HolterFullDisclosureDialog(QDialog):
                         'first-degree av block',
                         'second-degree av block (mobitz i)',
                         'second-degree av block (mobitz ii)',
+                        'second-degree av block (2:1)',
                         'third-degree av block',
                         'unidentified',
                     }:
