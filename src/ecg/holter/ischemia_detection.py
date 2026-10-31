@@ -36,11 +36,10 @@ ST Elevation / ST Depression (detect_st_episodes), frame by frame:
   5. Criteria per frame, limb leads and chest leads judged separately:
        limb group  (I, II, III, aVL, aVF), chest group (V1-V6)
        ST Elevation : limb >= 1 mm, chest >= 2 mm, in 2 CONTIGUOUS leads of
-                      one group (II / III / aVF, I / aVL, V1-V2 ... V5-V6);
-                      any 2 leads of one group for the other labels.
+                      one group (II / III / aVF, I / aVL, V1-V2 ... V5-V6).
        ST Depression: limb and chest <= -1 mm, horizontal or downsloping
                       (not rising more than 0.5 mm from J+20 to the ST
-                      point).
+                      point), in 2 CONTIGUOUS leads of one group.
      aVR is not judged. A frame with both is ST Elevation; its depression
      is shown with the event, not as an ST Depression event:
        Reciprocal: leads facing the wall opposite an elevated wall
@@ -374,7 +373,8 @@ def _chunk_st(data: np.ndarray, lead_names: List[str], fs: float, pan_tompkins,
     return {'limb': _lead_group(*limb), 'chest': _lead_group(*chest)}, hr
 
 
-# ST Elevation needs two CONTIGUOUS leads (textbook: Hampton / Luthra) --
+# ST Elevation and ST Depression need two CONTIGUOUS leads (textbook:
+# Hampton / Luthra) --
 # leads that look at the same part of the heart: limb leads of one wall
 # (inferior II / III / aVF, high lateral I / aVL), chest leads next to each
 # other (V1-V2 ... V5-V6). Was: any two leads of the limb or chest group.
@@ -402,8 +402,8 @@ def _chunk_label(st: Dict[str, Dict[str, Any]]):
 
     The limb-lead array and the chest-lead array are judged separately; ST
     Elevation needs at least _MIN_LEADS_IN_GROUP CONTIGUOUS leads of one
-    group past its threshold (_contiguous_leads), ST Depression any
-    _MIN_LEADS_IN_GROUP leads of one group. Noisy leads and aVR are not
+    group past its threshold (_contiguous_leads), ST Depression the same
+    with its own criteria. Noisy leads and aVR are not
     judged. The first dict holds
     the leads of the groups that qualified. The second, only for an ST
     Elevation frame, holds every lead past the depression criteria (each lead
@@ -425,8 +425,9 @@ def _chunk_label(st: Dict[str, Dict[str, Any]]):
         contiguous = _contiguous_leads(elev)
         if len(contiguous) >= _MIN_LEADS_IN_GROUP:
             elevated.update({name: elev[name] for name in contiguous})
-        if len(dep) >= _MIN_LEADS_IN_GROUP:
-            depressed.update(dep)
+        contiguous_dep = _contiguous_leads(dep)
+        if len(contiguous_dep) >= _MIN_LEADS_IN_GROUP:
+            depressed.update({name: dep[name] for name in contiguous_dep})
     if elevated:
         return ST_ELEVATION, elevated, dep_any
     if depressed:
