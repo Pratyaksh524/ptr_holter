@@ -5580,6 +5580,100 @@ def _detect_arrhythmias_uncached(
     except Exception as e:
         print(f"[Auto Arrhythmia Detect] Artifact check error: {e}")
 
+    # Mains interference (50 / 60 Hz) Artifact, RR interval by RR interval
+    # (1 s steps where no beat is found): the share of the raw signal's
+    # 1-150 Hz power that sits at 48-52 Hz or 58-62 Hz, over at least 1 s
+    # around the interval, on leads I, II, V1, V5; the interval is Artifact
+    # when that share is >= _MAINS_SHARE on >= 2 of them. Measured on a test
+    # recording with 50 / 60 Hz switched on: clean stretches <= 0.05,
+    # interference 0.3-0.94, on every lead at once. The rule above can't see
+    # it (it filters to 0.5-40 Hz first and needs a clean lead). Only 10 s
+    # blocks whose Lead II share reaches _MAINS_SCREEN (and the blocks next
+    # to them) are walked interval by interval. Consecutive intervals of one
+    # frequency merge; a stretch is kept when >= 1 s. Like the rule above, a
+    # layer next to the rhythm labels: the measurements notch 50 / 60 Hz out
+    # and the rhythm under it is still read. 'artifact_kind' = '50 Hz' /
+    # '60 Hz'.
+    def _is_layer_label(label):
+        """Labels drawn next to the rhythm, not as one: bundle branch
+        blocks and Artifact. The rhythm steps after this treat their time
+        as free."""
+        return 'bundle branch block' in label.lower() or label == _art_label
+
+    _MAINS_SHARE = 0.2
+    _MAINS_SCREEN = 0.05
+    _MAINS_MIN_LEADS = 2
+    _MAINS_MIN_SEC = 1.0
+    try:
+        from scipy.signal import welch as _welch
+        _mains_leads = [lead_names.index(n) for n in ('I', 'II', 'V1', 'V5') if n in lead_names]
+        _mains_ii = lead_names.index('II') if 'II' in lead_names else (_mains_leads[0] if _mains_leads else None)
+
+        def _mains_share(x):
+            x = np.asarray(x, dtype=float)
+            if x.size < int(0.5 * fs):
+                return 0.0, 0.0
+            f, p = _welch(x - float(np.mean(x)), fs=fs, nperseg=min(x.size, int(fs)))
+            total = float(p[(f >= 1.0) & (f <= 150.0)].sum())
+            if total <= 0:
+                return 0.0, 0.0
+            return (float(p[(f >= 48.0) & (f <= 52.0)].sum()) / total,
+                    float(p[(f >= 58.0) & (f <= 62.0)].sum()) / total)
+
+        zones = []
+        if _mains_ii is not None:
+            b0 = 0.0
+            while b0 < total_duration:
+                b1 = min(total_duration, b0 + 10.0)
+                blk = reader.read_range(b0, b1)
+                if blk is not None and blk.shape[1] >= int(fs) and max(_mains_share(blk[_mains_ii])) >= _MAINS_SCREEN:
+                    z0, z1 = max(0.0, b0 - 10.0), min(total_duration, b1 + 10.0)
+                    if zones and z0 <= zones[-1][1]:
+                        zones[-1][1] = z1
+                    else:
+                        zones.append([z0, z1])
+                b0 = b1
+        mains_runs = []   # [start, end, kind]
+        for z0, z1 in zones:
+            points = [z0] + [float(p) for p in all_r_peaks if z0 < p < z1] + [z1]
+            filled = [points[0]]
+            for p in points[1:]:
+                while p - filled[-1] > 1.5:
+                    filled.append(filled[-1] + 1.0)
+                filled.append(p)
+            for a, b in zip(filled, filled[1:]):
+                if b <= a:
+                    continue
+                mid = 0.5 * (a + b)
+                lo, hi = max(0.0, min(a, mid - 0.5)), min(total_duration, max(b, mid + 0.5))
+                data = reader.read_range(lo, hi)
+                if data is None:
+                    continue
+                shares = [_mains_share(data[i]) for i in _mains_leads if i < data.shape[0]]
+                kind = None
+                if sum(1 for s50, _ in shares if s50 >= _MAINS_SHARE) >= _MAINS_MIN_LEADS:
+                    kind = '50 Hz'
+                elif sum(1 for _, s60 in shares if s60 >= _MAINS_SHARE) >= _MAINS_MIN_LEADS:
+                    kind = '60 Hz'
+                if kind is None:
+                    continue
+                if mains_runs and mains_runs[-1][2] == kind and abs(mains_runs[-1][1] - a) < 1e-6:
+                    mains_runs[-1][1] = b
+                else:
+                    mains_runs.append([a, b, kind])
+        for a, b, kind in mains_runs:
+            if b - a < _MAINS_MIN_SEC:
+                continue
+            s_str, e_str = make_time_strs(a, b)
+            final_segments.append({
+                'start_sec': float(a), 'end_sec': float(b), 'label': _art_label, 'color': '#A0A0A0',
+                'start_time_str': s_str, 'end_time_str': e_str, 'detected_rhythm': _art_label,
+                'artifact_kind': kind,
+            })
+        final_segments.sort(key=lambda x: x['start_sec'])
+    except Exception as e:
+        print(f"[Auto Arrhythmia Detect] Mains Artifact check error: {e}")
+
     # ------------------------------------------------------------------
     # Sinus Arrhythmia: its own rule, run last, only in time no other label
     # covers -- so it never changes any other label's segments.
@@ -5638,7 +5732,8 @@ def _detect_arrhythmias_uncached(
         return runs
 
     try:
-        _sa_covered = sorted((s['start_sec'], s['end_sec']) for s in final_segments)
+        _sa_covered = sorted((s['start_sec'], s['end_sec']) for s in final_segments
+                             if s['label'] != _art_label)
         for sa_start, sa_end in _sinus_arrhythmia_runs():
             pieces = [(sa_start, sa_end)]
             for c_start, c_end in _sa_covered:
@@ -5685,7 +5780,7 @@ def _detect_arrhythmias_uncached(
         _rate_only = ('Sinus Bradycardia', 'Sinus Tachycardia', 'Sinus Arrhythmia')
         other_rhythm = [
             (float(s['start_sec']), float(s['end_sec'])) for s in final_segments
-            if s['label'] not in _rate_only and 'bundle branch block' not in s['label'].lower()
+            if s['label'] not in _rate_only and not _is_layer_label(s['label'])
         ]
 
         def _first_degree_beat(i):
@@ -5839,7 +5934,7 @@ def _detect_arrhythmias_uncached(
         ]
         own_rhythm = [
             (float(s['start_sec']), float(s['end_sec'])) for s in final_segments
-            if s['label'] not in _rate_labels and 'bundle branch block' not in s['label'].lower()
+            if s['label'] not in _rate_labels and not _is_layer_label(s['label'])
         ]
         unidentified = _cut_spans(unreadable_spans, own_rhythm)
         if unidentified:
@@ -5892,7 +5987,7 @@ def _detect_arrhythmias_uncached(
     try:
         rhythm_spans = [
             (float(s['start_sec']), float(s['end_sec'])) for s in final_segments
-            if 'bundle branch block' not in s['label'].lower()
+            if not _is_layer_label(s['label'])
         ]
         plain_brady_peaks = brady_r_peaks if len(all_rr_ms) >= 3 else all_r_peaks
         final_segments.extend(_plain_rate_segments(
@@ -5984,7 +6079,7 @@ def _detect_arrhythmias_uncached(
         from .pqrst_measure import UNIDENTIFIED, UNIDENTIFIED_COLOR
         added = False
         labelled = [(float(s['start_sec']), float(s['end_sec'])) for s in final_segments
-                    if 'bundle branch block' not in s['label'].lower()]
+                    if not _is_layer_label(s['label'])]
         for f0, f1 in _cut_spans(unreadable_spans, labelled):
             s_str, e_str = make_time_strs(f0, f1)
             final_segments.append({

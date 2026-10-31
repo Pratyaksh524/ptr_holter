@@ -71,9 +71,6 @@ except ImportError:
     make_notch = None
     scipy_filtfilt = None
 
-# Waveform colour and "A" mark for an auto-detected Artifact stretch.
-AUTO_ARTIFACT_COLOR = "#FF3333"
-
 
 def _remove_mains(x, fs):
     """Zero-phase 50 and 60 Hz notches (Q=25). Recordings do not store which
@@ -85,6 +82,88 @@ def _remove_mains(x, fs):
             bq = make_notch(mains_hz, fs)
             x = scipy_filtfilt(bq.b, bq.a, x)
     return x
+
+
+# Waveform colour (and lead I "A" mark) for the visible mains wiggle of an
+# auto-detected Artifact.
+AUTO_ARTIFACT_COLOR = "#F4A460"
+
+
+def _visible_mains_wiggle(d, fs, start_sec, events):
+    """Sample spans (start_idx, end_idx) of the displayed strip `d` where an
+    auto-detected mains Artifact's interference is still visible on screen.
+
+    The display notch removes steady 50/60 Hz, so the stretch inside an
+    Artifact looks clean; what stays visible is the notch's short wiggle
+    where the interference starts and stops (~0.2-0.5 s). Only those spots
+    are returned: the strip's 40-70 Hz envelope, within 1 s of an Artifact
+    start or end, above twice this lead's own baseline level elsewhere
+    (QRS left out, so a tall-QRS lead such as V2 still shows its wiggle).
+    A QRS falling inside a wiggle is left uncoloured."""
+    if scipy_filtfilt is None or d.size < int(fs) or fs <= 140:
+        return []
+    n = d.size
+    zone = np.zeros(n, dtype=bool)
+    for ev in events or []:
+        if str(ev.get('source', '')).lower() != 'auto':
+            continue
+        if str(ev.get('label', ev.get('type', '')) or '').strip().lower() != 'artifact':
+            continue
+        if ev.get('end_timestamp') is None:
+            continue
+        for edge in (float(ev.get('timestamp', 0.0) or 0.0), float(ev['end_timestamp'])):
+            a = int((edge - 1.0 - start_sec) * fs)
+            b = int((edge + 1.0 - start_sec) * fs)
+            if b > 0 and a < n:
+                zone[max(0, a):min(n, b)] = True
+    if not zone.any() or zone.sum() > 0.8 * n:
+        return []
+    from scipy.signal import butter
+    from scipy.ndimage import binary_closing, binary_dilation, maximum_filter1d, median_filter
+    d = np.asarray(d, dtype=float)
+    bb, ab = butter(2, [40.0 / (fs / 2.0), 70.0 / (fs / 2.0)], 'band')
+    env = maximum_filter1d(np.abs(scipy_filtfilt(bb, ab, d)), max(1, int(0.025 * fs)))
+    # QRS: far from the strip's slow 0.2 s median, compared with its tallest beat.
+    swing = np.abs(d - median_filter(d, size=int(0.2 * fs) | 1, mode='nearest'))
+    qrs = binary_dilation(swing > 0.25 * float(np.percentile(swing, 99.5)),
+                          structure=np.ones(int(0.04 * fs) + 1, dtype=bool))
+    quiet = ~zone & ~qrs
+    if not quiet.any():
+        return []
+    ref = float(np.percentile(env[quiet], 99))
+    wiggle = binary_closing(zone & (env > 2.0 * ref), structure=np.ones(int(0.1 * fs) + 1, dtype=bool))
+    idx = np.flatnonzero(wiggle & ~qrs)
+    spans = []
+    for i in idx:
+        if spans and i == spans[-1][1] + 1:
+            spans[-1][1] = i
+        else:
+            spans.append([i, i])
+    return [(a, b) for a, b in spans if b - a >= int(0.03 * fs)]
+
+
+def keep_artifact_wiggle_in_all_leads(canvases):
+    """An Artifact wiggle is marked only where it shows in every lead: each
+    canvas keeps a wiggle span of its own only if every other lead with a
+    signal also has one within 0.25 s of it. Call after set_data() on all
+    the canvases of one window (they must cover the same samples)."""
+    leads = [c for c in canvases
+             if getattr(c, '_data', None) is not None and np.asarray(c._data).size > 1
+             and float(np.ptp(np.asarray(c._data, dtype=float))) > 0.0]
+    if not leads:
+        return
+    n = min(np.asarray(c._data).size for c in leads)
+    pad = int(0.25 * float(leads[0]._fs or 500))
+    common = np.ones(n, dtype=bool)
+    for c in leads:
+        has = np.zeros(n, dtype=bool)
+        for a, b in getattr(c, '_artifact_wiggle', []):
+            has[max(0, a - pad):min(n, b + pad + 1)] = True
+        common &= has
+    for c in canvases:
+        c._artifact_wiggle = [(a, b) for a, b in getattr(c, '_artifact_wiggle', [])
+                              if common[min(a, n - 1):min(b, n - 1) + 1].any()]
+        c.update()
 
 
 # 6. HOLTER RR / HR TREND CANVAS
@@ -1043,6 +1122,11 @@ class ECGStripCanvas(QWidget):
         self._beat_annotations = beat_annotations or []
         self._structured_events = structured_events or []
         self._start_sec = start_sec
+        try:
+            self._artifact_wiggle = _visible_mains_wiggle(
+                np.asarray(self._data, dtype=float), float(self._fs or 500), start_sec, self._structured_events)
+        except Exception:
+            self._artifact_wiggle = []
         self._rr_intervals = self._calculate_rr_intervals() if beat_annotations else []
         self.update()
 
@@ -1605,7 +1689,6 @@ class ECGStripCanvas(QWidget):
         
         # Determine colored intervals based on annotations and structured events
         colored_intervals = []
-        artifact_marks = []   # sample index where each auto Artifact stretch starts in view
         end_sec = self._start_sec + len(d) / self._fs
         
         # 1. Color full regions for arrhythmias from _structured_events
@@ -1716,15 +1799,9 @@ class ECGStripCanvas(QWidget):
                     elif ev_lbl_orig == 'X':
                         active_label = 'X'
 
-                # Auto-detected Artifact has no Full Disclosure segment band;
-                # its waveform is coloured over the whole stretch instead,
-                # and lead I gets an "A" above it (drawn after the trace).
+                # Auto-detected Artifact: only its visible wiggle is coloured
+                # (_artifact_wiggle, added below), not the whole stretch.
                 if not is_manual_structured and ev_lbl == 'artifact' and ev.get('end_timestamp') is not None:
-                    start_idx = max(0, int((region_start_ts - self._start_sec) * self._fs))
-                    end_idx = min(len(d) - 1, int((region_end_ts - self._start_sec) * self._fs))
-                    if start_idx < end_idx:
-                        colored_intervals.append((start_idx, end_idx, AUTO_ARTIFACT_COLOR))
-                        artifact_marks.append(start_idx)
                     continue
 
                 # Automatic arrhythmia regions are represented by the
@@ -1867,6 +1944,10 @@ class ECGStripCanvas(QWidget):
             except Exception as _exc:
                 pass   # Never crash paint — coloring is decorative
 
+        if not self._disable_all_coloring:
+            for start_idx, end_idx in getattr(self, '_artifact_wiggle', []):
+                colored_intervals.append((start_idx, end_idx, AUTO_ARTIFACT_COLOR))
+
         colored_intervals.sort(key=lambda x: x[0])
         
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -1917,7 +1998,8 @@ class ECGStripCanvas(QWidget):
                 seg_path.lineTo(xv, yv)
             painter.drawPath(seg_path)
 
-        if artifact_marks and getattr(self, 'lead_name', '') == 'I':
+        artifact_wiggle = getattr(self, '_artifact_wiggle', [])
+        if artifact_wiggle and not self._disable_all_coloring and getattr(self, 'lead_name', '') == 'I':
             painter.save()
             mark_font = painter.font()
             mark_font.setBold(True)
@@ -1925,8 +2007,16 @@ class ECGStripCanvas(QWidget):
             painter.setFont(mark_font)
             painter.setPen(QColor(AUTO_ARTIFACT_COLOR))
             fm = painter.fontMetrics()
-            for idx in artifact_marks:
-                painter.drawText(int(xs[min(idx, n - 1)]) + 2, fm.ascent(), "A")
+            # One "A" per wiggle: pieces split by a QRS (< 0.5 s apart) share it.
+            groups = []
+            for start_idx, end_idx in artifact_wiggle:
+                if groups and start_idx - groups[-1][1] < int(0.5 * self._fs):
+                    groups[-1][1] = end_idx
+                else:
+                    groups.append([start_idx, end_idx])
+            for start_idx, end_idx in groups:
+                mid = min((start_idx + end_idx) // 2, n - 1)
+                painter.drawText(int(xs[mid] - fm.horizontalAdvance("A") / 2), fm.ascent(), "A")
             painter.restore()
 
         # --- Draw Auto-Detected Arrhythmia Labels ---

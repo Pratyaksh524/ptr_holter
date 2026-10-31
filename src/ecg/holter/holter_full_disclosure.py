@@ -41,10 +41,12 @@ try:
     from .theme import (COL_BLACK, COL_DARK, COL_GREEN, COL_GREEN_DRK, COL_WHITE, COL_GRID_MAJOR, COL_GRID_MINOR,
                         TOOL_RULER, TOOL_CALIPER, TOOL_MAGNIFY, TOOL_SELECT)
     from .holter_ui import ECGStripCanvas, MagnifierOverlay
+    from .panels.holter_widgets import keep_artifact_wiggle_in_all_leads
 except ImportError:
     from ecg.holter.theme import (COL_BLACK, COL_DARK, COL_GREEN, COL_GREEN_DRK, COL_WHITE, COL_GRID_MAJOR, COL_GRID_MINOR,
                                    TOOL_RULER, TOOL_CALIPER, TOOL_MAGNIFY, TOOL_SELECT)
     from ecg.holter.holter_ui import ECGStripCanvas, MagnifierOverlay
+    from ecg.holter.panels.holter_widgets import keep_artifact_wiggle_in_all_leads
 
 try:
     from utils.settings_manager import SettingsManager
@@ -3817,8 +3819,8 @@ class HolterFullDisclosureDialog(QDialog):
             'complete right bundle branch block': ('Complete Right Bundle Branch Block', '#E0E0E0'),
             'complete left bundle branch block': ('Complete Left Bundle Branch Block', '#1ABC9C'),
             # Artifact (auto_segment_arrthymia_detection.py's Artifact rule)
-            # gets no segment band: ECGStripCanvas colours its waveform and
-            # puts an "A" above lead I instead.
+            # gets no segment band: ECGStripCanvas colours only its visible
+            # wiggle on the waveform instead.
         }
         # The auto detector's plain rate labels (no sinus P/PR/QRS) and its
         # Unidentified frames (no heart signal to read): exact label, 'Auto'
@@ -4660,6 +4662,8 @@ class HolterFullDisclosureDialog(QDialog):
                            context_before=before_i, context_after=after_i)
             else:
                 c.set_data(x, np.zeros(expected_len, dtype=np.float32), beat_annotations=beat_annotations, start_sec=start_sec, structured_events=visible_structured_events, fast_preview=not update_extras)
+        # Artifact wiggle is coloured only where every lead shows it.
+        keep_artifact_wiggle_in_all_leads(self._canvases)
 
         # Refresh the measurement header after the current waveform has been
         # installed on every canvas.  The status/header update runs earlier
