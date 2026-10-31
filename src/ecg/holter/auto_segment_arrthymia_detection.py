@@ -1044,411 +1044,20 @@ def _detect_arrhythmias_uncached(
             pass
         return s_str, e_str
 
-    def sinus_conduction_gate(start_idx, end_idx, metrics=None):
-        """Require organized P-to-QRS conduction before a rate label.
-
-        Bradycardia/Tachycardia are sinus labels, therefore an RR pattern by
-        itself must not create them. Most beats in the candidate must have a
-        real P before QRS, a valid and consistent PR, and a resolved,
-        consistent QRS. P polarity/duration consistency is an additional
-        guard against counting random baseline bumps as P waves.
-
-        metrics: per-beat measurements the indices refer to; defaults to
-        rate_beat_metrics (all_r_peaks). The Sinus Bradycardia rule passes
-        its own list, see brady_r_peaks below.
-        """
-        if metrics is None:
-            metrics = sinus_gate_metrics
-        if start_idx is None or end_idx is None:
-            return False
-        left = max(0, int(start_idx))
-        right = min(len(metrics) - 1, int(end_idx))
-        if right < left:
-            return False
-        beats = [b for b in metrics[left:right + 1] if b]
-        if len(beats) < 3:
-            return False
-
-        valid = [
-            b for b in beats
-            if bool(b.get('p_present'))
-            and b.get('p_onset') is not None
-            and b.get('p_end') is not None
-            and b.get('qrs_bounds_resolved')
-            and b.get('q_onset') is not None
-            and 40.0 <= float(b.get('qrs_ms') or 0.0) <= 200.0
-        ]
-        # A sinus label needs P/QRS evidence on at least 75% of the beats;
-        # for the shortest permitted segment this means all three beats.
-        required = max(3, int(np.ceil(len(beats) * 0.75)))
-        if len(valid) < required:
-            return False
-
-        # PR is a beat-to-beat conduction measurement. Reject only when a
-        # majority of the candidate's beats disagree; an occasional missed
-        # P boundary or noise bump must not erase a genuine long brady run.
-        # For short runs (<= 30 beats), use the candidate median; for long
-        # sustained episodes (> 30 beats), use a rolling local median (+-15 beats)
-        # so natural multi-minute autonomic PR drift does not erase true sinus rhythm.
-        pr_valid = [b for b in valid if b.get('pr_ms') is not None]
-        if len(pr_valid) < required:
-            return False
-        pr_values = np.asarray([float(b['pr_ms']) for b in pr_valid], dtype=float)
-        if len(pr_values) <= 30:
-            pr_median = float(np.median(pr_values))
-            pr_consistent_count = int(np.count_nonzero(np.abs(pr_values - pr_median) <= 25.0))
-        else:
-            w = 15
-            pr_consistent_count = 0
-            for i in range(len(pr_values)):
-                lo = max(0, i - w)
-                hi = min(len(pr_values), i + w + 1)
-                loc_med = float(np.median(pr_values[lo:hi]))
-                if abs(pr_values[i] - loc_med) <= 25.0:
-                    pr_consistent_count += 1
-        if pr_consistent_count < required:
-            return False
-
-        qrs_values = np.asarray([float(b['qrs_ms']) for b in valid], dtype=float)
-        if float(np.std(qrs_values)) > 20.0:
-            return False
-
-        # P-to-P timing should follow the ventricular cycle. This rejects
-        # isolated noise bumps that happen to pass the individual P-wave
-        # shape test, while allowing normal beat-to-beat rate variability.
-        p_times = np.asarray(
-            [float(b['_p_time_sec']) for b in valid if b.get('_p_time_sec') is not None],
-            dtype=float,
-        )
-        if len(p_times) < required:
-            return False
-        r_times = np.asarray(
-            [float(b['_r_time_sec']) for b in valid if b.get('_r_time_sec') is not None],
-            dtype=float,
-        )
-        if len(r_times) < required:
-            return False
-        pp_values = np.diff(p_times) * 1000.0
-        rr_for_p_values = np.diff(r_times) * 1000.0
-        if pp_values.size and rr_for_p_values.size:
-            pair_count = min(pp_values.size, rr_for_p_values.size)
-            # In sinus rhythm the atrial cycle follows the ventricular cycle;
-            # compare P-P to the matching R-R interval. This permits a real
-            # rate transition inside a long brady run while rejecting a
-            # random baseline bump whose timing does not track QRS.
-            pp_rr_error = np.abs(pp_values[:pair_count] - rr_for_p_values[:pair_count])
-            pp_rr_ok = pp_rr_error <= np.maximum(120.0, 0.15 * rr_for_p_values[:pair_count])
-            if int(np.count_nonzero(pp_rr_ok)) < max(2, int(np.ceil(pair_count * 0.75))):
-                return False
-
-        # P morphology should not randomly flip polarity or change duration
-        # from beat to beat. Amplitude magnitude is deliberately not used as
-        # a hard equality because physiological P amplitude can vary.
-        p_amplitudes = np.asarray([float(b.get('p_amplitude') or 0.0) for b in valid])
-        p_durations = np.asarray([float(b.get('p_duration_ms') or 0.0) for b in valid])
-        if len(p_amplitudes) <= 30:
-            if max(np.count_nonzero(p_amplitudes >= 0.0), np.count_nonzero(p_amplitudes < 0.0)) < required:
-                return False
-        else:
-            w = 15
-            p_pol_consistent_count = 0
-            for i in range(len(p_amplitudes)):
-                lo = max(0, i - w)
-                hi = min(len(p_amplitudes), i + w + 1)
-                win = p_amplitudes[lo:hi]
-                dom_pos = np.count_nonzero(win >= 0.0) >= np.count_nonzero(win < 0.0)
-                if (p_amplitudes[i] >= 0.0) == dom_pos:
-                    p_pol_consistent_count += 1
-            if p_pol_consistent_count < required:
-                return False
-        if len(p_durations) <= 30:
-            p_duration_median = float(np.median(p_durations))
-            p_dur_consistent_count = int(np.count_nonzero(np.abs(p_durations - p_duration_median) <= 40.0))
-        else:
-            w = 15
-            p_dur_consistent_count = 0
-            for i in range(len(p_durations)):
-                lo = max(0, i - w)
-                hi = min(len(p_durations), i + w + 1)
-                loc_med = float(np.median(p_durations[lo:hi]))
-                if abs(p_durations[i] - loc_med) <= 40.0:
-                    p_dur_consistent_count += 1
-        if p_dur_consistent_count < required:
-            return False
-        return True
-
-    def _sinus_beat(b):
-        """One beat's own sinus evidence: a P with onset/end, a resolved QRS
-        of 40-200 ms and a measured PR -- sinus_conduction_gate()'s per-beat
-        "valid" test plus the PR it needs."""
-        return bool(
-            b
-            and b.get('p_present')
-            and b.get('p_onset') is not None
-            and b.get('p_end') is not None
-            and b.get('qrs_bounds_resolved')
-            and b.get('q_onset') is not None
-            and 40.0 <= float(b.get('qrs_ms') or 0.0) <= 200.0
-            and b.get('pr_ms') is not None
-        )
-
-    def append_sinus_rate_segments(start_idx, end_idx, peaks, metrics, min_dur_sec, label, color):
-        """Sinus Tachycardia / Bradycardia judged beat by beat inside one
-        rate run (beats start_idx..end_idx of `peaks`): a beat that fails
-        _sinus_beat() ends the current segment and the next passing beat
-        starts a new one. Each segment needs >= 3 beats, >= min_dur_sec and
-        sinus_conduction_gate() on its own beats (PR / QRS / P-P / P shape
-        consistency). Was: the gate on the whole run at once, so one bad
-        stretch dropped the good one with it -- seen: Sinus Tachycardia 150
-        bpm 100.1-148.6 s, 37 of 122 beats valid (92 needed) because P was
-        rejected on every beat after 120 s, while 101-111 s alone had 21
-        of 25 and got no label."""
-        k = start_idx
-        while k <= end_idx:
-            if not _sinus_beat(metrics[k]):
-                k += 1
-                continue
-            seg_start = k
-            while k + 1 <= end_idx and _sinus_beat(metrics[k + 1]):
-                k += 1
-            seg_end = k
-            k += 1
-            if seg_end - seg_start + 1 >= 3 \
-                    and peaks[seg_end] - peaks[seg_start] >= min_dur_sec \
-                    and sinus_conduction_gate(seg_start, seg_end, metrics):
-                s_sec = peaks[seg_start]
-                e_sec = peaks[seg_end]
-                s_str, e_str = make_time_strs(s_sec, e_sec)
-                detected_segments.append({
-                    'start_sec': s_sec,
-                    'end_sec': e_sec,
-                    'label': label,
-                    'color': color,
-                    'start_time_str': s_str,
-                    'end_time_str': e_str,
-                    'detected_rhythm': label
-                })
-
-    def suppress_rate_overlap(rate_segments, morph_segments):
-        """
-        Morphological rhythms (VFib, VTach, AFib, Flutter, AV Block) are detected
-        from actual QRS/P-wave morphology and take clinical priority over the
-        P/PR/QRS-gated, RR-rate-based Sinus Tachycardia/Bradycardia segments above.
-        Pan-Tompkins can mis-fire "R-peaks" on a chaotic VFib/VTach baseline at
-        spacing that happens to look fast or slow, which previously caused
-        Sinus Tachycardia/Bradycardia labels to be drawn on top of a confirmed
-        morphological arrhythmia. Trim (or drop) any rate-based segment so it
-        never overlaps a morphological segment's time range.
-
-        A fixed buffer is added around each morphological interval before
-        checking overlap (not to the interval's own displayed boundaries,
-        only to this comparison). Right at the transition into/out of a
-        chaotic episode, Pan-Tompkins can briefly catch one or two
-        wide-spaced peaks before/after the window that actually crossed the
-        VFib threshold, producing a short "Sinus Bradycardia"/"Sinus
-        Tachycardia" blip that sits immediately next to -- but doesn't
-        strictly overlap -- the morphological region. That blip is a
-        transition artifact, not a real rhythm, so a piece that sits entirely
-        within buffer_sec of a morphological edge is dropped.
-
-        The buffer is NOT used for trimming itself: trimming against the
-        buffered interval cut every real rate segment 5s short of the
-        morphological one (a 120 bpm Sinus Tachycardia that ran right up to
-        a VFib onset at 600.2s was cut at 595.2s, leaving an unlabeled gap
-        of steady tachycardia beats). Rate segments are trimmed at the exact
-        morphological edge.
-        """
-        if not morph_segments:
-            return rate_segments
-        buffer_sec = 5.0
-        morph_intervals = sorted((m['start_sec'], m['end_sec']) for m in morph_segments)
-
-        def _is_transition_blip(p_start, p_end):
-            return any(
-                (p_end <= m_start and p_start >= m_start - buffer_sec)
-                or (p_start >= m_end and p_end <= m_end + buffer_sec)
-                for m_start, m_end in morph_intervals
-            )
-
-        result = []
-        for seg in rate_segments:
-            pieces = [(seg['start_sec'], seg['end_sec'])]
-            for m_start, m_end in morph_intervals:
-                next_pieces = []
-                for p_start, p_end in pieces:
-                    if m_end <= p_start or m_start >= p_end:
-                        next_pieces.append((p_start, p_end))
-                        continue
-                    if m_start > p_start:
-                        next_pieces.append((p_start, m_start))
-                    if m_end < p_end:
-                        next_pieces.append((m_end, p_end))
-                pieces = next_pieces
-            for p_start, p_end in pieces:
-                if p_end - p_start < 1.0 or _is_transition_blip(p_start, p_end):
-                    continue
-                s_str, e_str = make_time_strs(p_start, p_end)
-                trimmed = dict(seg)
-                trimmed['start_sec'] = p_start
-                trimmed['end_sec'] = p_end
-                trimmed['start_time_str'] = s_str
-                trimmed['end_time_str'] = e_str
-                result.append(trimmed)
-        return result
-
-    # ------------------------------------------------------------------
-    # 2. Extract Beat-Exact Rate Segments (Sinus Tachycardia & Sinus Bradycardia)
-    # ------------------------------------------------------------------
-    if len(all_rr_ms) >= 3:
-        # A. Sinus Tachycardia: first pass through the P/PR/QRS sinus gate,
-        # then consecutive beats with RR <= 600ms (HR >= 100 bpm).
-        in_tachy = False
-        tachy_start_idx = None
-
-        # Lower bound 340 ms, not 333.3: _detect_p_wave suppresses P whenever
-        # the previous QRS sits within 333.3 ms, and RR at ~180 bpm jitters
-        # around that edge. Those P-less beats sat inside the run and failed
-        # the 75% P gate for the whole run, dropping valid 100-175 bpm sinus
-        # tachycardia along with them.
-        for i, rr in enumerate(all_rr_ms):
-            is_fast = (340.0 <= rr <= 600.5) or (rr <= 630.0 and in_tachy and i + 1 < len(all_rr_ms) and 340.0 <= all_rr_ms[i + 1] <= 600.5)
-            if is_fast:
-                if not in_tachy:
-                    in_tachy = True
-                    tachy_start_idx = i
-            else:
-                if in_tachy:
-                    append_sinus_rate_segments(tachy_start_idx, i, all_r_peaks, sinus_gate_metrics,
-                                               1.0, 'Sinus Tachycardia', '#00FFFF')
-                    in_tachy = False
-                    tachy_start_idx = None
-
-        if in_tachy and tachy_start_idx is not None:
-            append_sinus_rate_segments(tachy_start_idx, len(all_rr_ms), all_r_peaks, sinus_gate_metrics,
-                                       1.0, 'Sinus Tachycardia', '#00FFFF')
-
-        # B. Sinus Bradycardia: first pass through the same P/PR/QRS sinus
-        # gate, then consecutive beats with RR >= _BRADY_MIN_RR_MS (HR < 60,
-        # the textbook bound -- was RR >= 1050 ms, HR < 57.1).
-        # Note: 60 bpm (1000ms RR) is Normal Sinus Rhythm (NSR: 60-100 bpm), NOT Bradycardia.
-        # Brady range: RR _BRADY_MIN_RR_MS-6000ms. Anything slower is treated
-        # as a pause/possible signal-loss interval rather than sustained sinus
-        # bradycardia.
-        #
-        # An RR this "slow" must also stay under a ceiling, or a stretch
-        # where Pan-Tompkins simply finds no peaks at all -- because the
-        # rhythm has degenerated into chaos, e.g. a VFib onset -- reads as
-        # one single multi-second "RR interval" and clears the brady RR bar
-        # easily, mislabelling the start of VFib as Sinus Bradycardia.
-        # Confirmed directly: a real recording had a 6.7s gap with zero
-        # detected peaks right where VFib began, reported as a ~7s Sinus
-        # Bradycardia episode because nothing capped how slow "slow" was
-        # allowed to be.
-        #
-        # The app's own pause_threshold_ms (2000ms, used for "RRI
-        # (>=2.0s)"/pause counting elsewhere) is NOT the right ceiling here
-        # -- tried first and confirmed wrong directly: a different real
-        # recording has genuine, sustained 30 bpm Sinus Bradycardia (RR
-        # steady at ~2000ms for 2 straight minutes), which that cutoff
-        # fragmented into disconnected ~4s pieces since roughly half its
-        # real beats landed right at/above 2000ms. 6000ms (10 bpm) instead:
-        # comfortably below the 6.7s chaos gap above while allowing the
-        # requested lower boundary.
-        _brady_max_rr_ms = 6000.0
-
-        # Missed-beat recovery, for this Sinus Bradycardia rule ONLY. The
-        # whole-recording R-peak pass above runs Pan-Tompkins on 60 s chunks,
-        # and pan_tompkins() widens its refractory period to a third of the
-        # chunk's MEDIAN RR. A chunk that is mostly a very slow rhythm (RR
-        # ~4000 ms) then gets a ~1320 ms refractory period, which drops
-        # beats of a 60 bpm rhythm in the same chunk -- two 1000 ms RR
-        # intervals read as one 2000 ms "slow" RR, and Sinus Bradycardia was
-        # drawn over plain 60 bpm beats (seen: 179.15/180.15/181.15/182.16 s,
-        # only 179.15 and 181.15 detected, Bradycardia from 179.15 s instead
-        # of 182.16 s). Each gap this rule could count as slow is re-checked
-        # by running the same pan_tompkins() on just that gap +/-3 s, where
-        # the median RR reflects the local rhythm; beats found inside the gap
-        # are added to this rule's own beat list and measured exactly like
-        # rate_beat_metrics. all_r_peaks itself is left untouched, so Sinus
-        # Tachycardia and every morphological rule see the same beats as
-        # before.
-        _recovered_beats = []
-        for i, rr in enumerate(all_rr_ms):
-            if not (_BRADY_MIN_RR_MS <= rr <= _brady_max_rr_ms):
-                continue
-            gap_start, gap_end = all_r_peaks[i], all_r_peaks[i + 1]
-            read_start = max(0.0, gap_start - 3.0)
-            read_end = min(total_duration, gap_end + 3.0)
-            gap_data = reader.read_range(read_start, read_end)
-            if gap_data is None or best_lead_idx >= gap_data.shape[0]:
-                continue
-            gap_sig = np.asarray(gap_data[best_lead_idx], dtype=float)
-            if len(gap_sig) <= 50:
-                continue
-            for p_idx in pan_tompkins(gap_sig, fs=fs):
-                peak_sec = read_start + float(p_idx) / float(fs)
-                if gap_start + 0.25 < peak_sec < gap_end - 0.25:
-                    _recovered_beats.append(peak_sec)
-
-        if _recovered_beats:
-            brady_r_peaks = sorted(set(all_r_peaks) | set(_recovered_beats))
-            _metric_at = dict(zip(all_r_peaks, sinus_gate_metrics))
-            brady_beat_metrics = []
-            for k, peak_sec in enumerate(brady_r_peaks):
-                if peak_sec in _metric_at:
-                    brady_beat_metrics.append(_metric_at[peak_sec])
-                    continue
-                # Same measurement as sinus_gate_metrics above: conduction
-                # lead, strict P/PR, 0.5 Hz high-pass + 25 Hz low-pass; 3 s
-                # of signal on each side so the high-pass has room to settle.
-                metric = None
-                m_start = max(0.0, peak_sec - 3.0)
-                m_end = min(total_duration, peak_sec + 3.0)
-                m_data = reader.read_range(m_start, m_end)
-                if m_data is not None and conduction_lead_idx < m_data.shape[0]:
-                    m_sig = _sinus_gate_filter(np.asarray(m_data[conduction_lead_idx], dtype=float))
-                    local_peak = int(round((peak_sec - m_start) * fs))
-                    prev_rr_ms = (peak_sec - brady_r_peaks[k - 1]) * 1000.0 if k > 0 else None
-                    if 0 < local_peak < len(m_sig):
-                        metric = measure_beat(m_sig, local_peak, fs, strict_pr=True, prev_rr_ms=prev_rr_ms)
-                        if metric and metric.get('p_peak') is not None:
-                            metric['_p_time_sec'] = m_start + float(metric['p_peak']) / float(fs)
-                        if metric:
-                            metric['_r_time_sec'] = peak_sec
-                brady_beat_metrics.append(metric)
-            brady_rr_ms = [
-                (brady_r_peaks[k + 1] - brady_r_peaks[k]) * 1000.0
-                for k in range(len(brady_r_peaks) - 1)
-            ]
-        else:
-            brady_r_peaks, brady_beat_metrics, brady_rr_ms = all_r_peaks, sinus_gate_metrics, all_rr_ms
-
-        in_brady = False
-        brady_start_idx = None
-
-        for i, rr in enumerate(brady_rr_ms):
-            next_rr = brady_rr_ms[i + 1] if i + 1 < len(brady_rr_ms) else None
-            is_slow = (
-                (_BRADY_MIN_RR_MS <= rr <= _brady_max_rr_ms)
-                or (
-                    _BRADY_MIN_RR_MS - 30.0 <= rr <= _brady_max_rr_ms and in_brady
-                    and next_rr is not None and _BRADY_MIN_RR_MS <= next_rr <= _brady_max_rr_ms
-                )
-            )
-            if is_slow:
-                if not in_brady:
-                    in_brady = True
-                    brady_start_idx = i
-            else:
-                if in_brady:
-                    append_sinus_rate_segments(brady_start_idx, i, brady_r_peaks, brady_beat_metrics,
-                                               2.5, 'Sinus Bradycardia', '#00BFFF')
-                    in_brady = False
-                    brady_start_idx = None
-
-        if in_brady and brady_start_idx is not None:
-            append_sinus_rate_segments(brady_start_idx, len(brady_rr_ms), brady_r_peaks, brady_beat_metrics,
-                                       2.5, 'Sinus Bradycardia', '#00BFFF')
+    # Beat-exact Sinus Tachycardia / Sinus Bradycardia segments. Moved out
+    # to _sinus_rate_segments() (with its own helpers _sinus_beat() /
+    # _sinus_conduction_gate() / _append_sinus_rate_segments(), defined at
+    # module level next to _plain_rate_segments) -- pure extraction, same
+    # computation, same order, same inputs; only how it's organized on disk
+    # changed. _sinus_conduction_gate() is shared: the Sinus Arrhythmia rule
+    # further below calls it too. brady_r_peaks is returned alongside the
+    # segments: the plain Bradycardia/Tachycardia pass further below reuses
+    # it as its own Bradycardia candidate beat list.
+    _sinus_rate_result, brady_r_peaks = _sinus_rate_segments(
+        reader, fs, best_lead_idx, conduction_lead_idx, total_duration,
+        all_r_peaks, all_rr_ms, sinus_gate_metrics, _sinus_gate_filter, make_time_strs,
+    )
+    detected_segments.extend(_sinus_rate_result)
 
     # ------------------------------------------------------------------
     # 3. Detect Morphological Arrhythmias (VFib, VT, AFib, Flutter, AV Block)
@@ -2103,6 +1712,81 @@ def _detect_arrhythmias_uncached(
         n_sinus = atrial.count('sinus')
         n_deciding = n_sinus + atrial.count('fibrillatory')
         return n_deciding >= _BEAT_MIN_DECIDING and n_sinus >= _BEAT_SINUS_MAJORITY * n_deciding
+
+    # VFib needs a fibrillating stretch somewhere in a slow window: a 2 s
+    # piece (1 s steps) where, on the median of the 12 leads, the signal sits
+    # still for < _VFIB_STILL_SHARE of the time. VFib is one unbroken wave
+    # with no isoelectric baseline; sinus, escape and bundle branch block
+    # beats sit on a flat baseline between them. Measured over every VFib
+    # window of the recordings: real VFib pieces 0.00-0.05, while windows of
+    # separate slow beats called VFib had no such piece at all (seen: two
+    # escape beats and RBBB beats in one window, 65-75 s, RR 930 -> 2248 ->
+    # 750 ms and wide QRS unresolved on 9/11 beats -> VFib; still share
+    # 0.20-0.57). Judged only where the window's median RR is over
+    # _VFIB_STILL_MIN_RR_MS (under 100 bpm): fast wide complexes with short
+    # flat gaps between them (seen: polymorphic wide complexes ~130 bpm,
+    # still share 0.15-0.27) are left to the VFib rule as before.
+    # "Still": 0.5-25 Hz signal (50/60 Hz notched) moving under one piece
+    # range per second for >= 80 ms in a row.
+    _VFIB_STILL_SHARE = 0.10
+    _VFIB_STILL_MIN_RR_MS = 600.0
+
+    def _vfib_filtered(x, fs_):
+        from scipy.signal import butter as _bt, filtfilt as _ff
+        try:
+            from ..enhanced_filter import make_notch as _mk_notch
+        except ImportError:
+            from ecg.enhanced_filter import make_notch as _mk_notch
+        y = np.asarray(x, dtype=float)
+        for mains_hz in (50.0, 60.0):
+            if mains_hz < fs_ / 2.0:
+                bq = _mk_notch(mains_hz, fs_)
+                y = _ff(bq.b, bq.a, y)
+        b, a = _bt(2, [0.5 / (fs_ / 2.0), 25.0 / (fs_ / 2.0)], 'band')
+        return _ff(b, a, y)
+
+    def _vfib_still_share(y, fs_):
+        """Still share of an already filtered piece (_vfib_filtered)."""
+        rng = float(np.percentile(y, 99) - np.percentile(y, 1))
+        if rng <= 0:
+            return 1.0
+        still = np.abs(np.gradient(y)) * fs_ < rng
+        run = int(0.08 * fs_)
+        flat = 0
+        i, n = 0, still.size
+        while i < n:
+            if still[i]:
+                j = i
+                while j < n and still[j]:
+                    j += 1
+                if j - i >= run:
+                    flat += j - i
+                i = j
+            else:
+                i += 1
+        return flat / float(n)
+
+    def _vfib_piece_fibrillating(filtered_leads, start, length, fs_):
+        shares = [_vfib_still_share(y[start:start + length], fs_) for y in filtered_leads]
+        return float(np.median(shares)) < _VFIB_STILL_SHARE
+
+    def _vfib_has_fibrillating_piece(core_array, r_peaks, fs_):
+        """True when the window is fast (median RR <= _VFIB_STILL_MIN_RR_MS,
+        or under 3 beats to tell) or some 2 s piece of it (all leads,
+        unpadded) is fibrillating -- see above. A window under 2 s is not
+        judged (True)."""
+        if len(r_peaks) >= 3 and float(np.median(np.diff(np.asarray(r_peaks, dtype=float)))) * 1000.0 / fs_                 <= _VFIB_STILL_MIN_RR_MS:
+            return True
+        if len(r_peaks) < 3:
+            return True
+        piece, n = int(2.0 * fs_), core_array.shape[1]
+        if n < piece:
+            return True
+        filtered = [_vfib_filtered(core_array[i], fs_) for i in range(core_array.shape[0])]
+        for start in range(0, n - piece + 1, int(fs_)):
+            if _vfib_piece_fibrillating(filtered, start, piece, fs_):
+                return True
+        return False
 
     def _vfib_beats_organized(padded_array, r_peaks, fs_):
         """True when one lead shows an organized QRS on >= 70% of the
@@ -3395,9 +3079,12 @@ def _detect_arrhythmias_uncached(
                         # Nor where one lead shows an organized QRS on most
                         # beats (_vfib_beats_organized, beat by beat on all
                         # 12 leads); such a window goes on through the chain.
+                        # And only where the window holds a fibrillating
+                        # stretch (_vfib_has_fibrillating_piece).
                         elif (_is_vfib_window(padded_signal, core_r_peaks, fs)
                               and bundle_branch_block_result is None
-                              and not _vfib_beats_organized(padded_array, core_r_peaks, fs)):
+                              and not _vfib_beats_organized(padded_array, core_r_peaks, fs)
+                              and _vfib_has_fibrillating_piece(data_array, core_r_peaks, fs)):
                             target_morph = ('Ventricular Fibrillation', '#FF3333')
                             # Called VFib on fewer than 4 measured beats: same
                             # neighbor guard (seen: the recording's last,
@@ -3580,6 +3267,34 @@ def _detect_arrhythmias_uncached(
                 return True
         return False
 
+    def _svt_run_in(t0, t1):
+        """True when the beats of all_r_peaks (the whole-recording beat
+        list, not this window's own core_r_peaks) inside [t0, t1] still
+        pass _is_atrial_tachycardia_window's own checks (rate, RR
+        regularity, one QRS shape, P-on-T) on their own, independent of any
+        neighboring window. Mirrors _flutter_run_in's exception for the same
+        lone-window guard below: a short SVT run can fill only one window
+        with no same-label neighbor to confirm it (seen: 13 beats at a
+        steady 300 ms RR, 59.8-63.7 s, right at a recording's own end --
+        the one window before it mixed a decelerating AFib tail with the
+        new fast beats and failed the regularity check, so the real SVT
+        run never got a second window's vote and was dropped, falling back
+        to the bare 'Tachycardia' rate label)."""
+        peaks = sorted(float(p) for p in all_r_peaks if t0 - 0.01 <= p <= t1 + 0.01)
+        if len(peaks) < 6:
+            return False
+        pad_start = max(0.0, peaks[0] - 1.0)
+        pad_end = min(total_duration, peaks[-1] + 1.0)
+        sig = reader.read_range(pad_start, pad_end)
+        if sig is None or best_lead_idx >= sig.shape[0]:
+            return False
+        local_peaks = [int(round((p - pad_start) * fs)) for p in peaks]
+        try:
+            return bool(_is_atrial_tachycardia_window(
+                np.asarray(sig[best_lead_idx], dtype=float), local_peaks, fs))
+        except Exception:
+            return False
+
     _atrial = [
         m for m in morphological_candidates
         if m['label'] in ('Atrial Fibrillation', 'Atrial Flutter')
@@ -3674,10 +3389,16 @@ def _detect_arrhythmias_uncached(
             # episode fills only one window (seen: 4:1 Flutter, RR 1000 ms,
             # 1185.5-1192.6 s, one Flutter window 1185-1195 s between AFib
             # windows -- dropped, and the AFib before it ran on to 1193.4 s).
-            # The VFib on-ramp windows this guard is for have no steady
-            # 170-250 ms F-wave cycle.
+            # A lone Supraventricular Tachycardia (SVT) window gets the same
+            # exception (_svt_run_in): kept when all_r_peaks' own beats in
+            # it still pass the SVT window rule on their own (see
+            # _svt_run_in's docstring). The VFib on-ramp windows this guard
+            # is for have no steady 170-250 ms F-wave cycle and fail SVT's
+            # own rate/regularity/QRS-shape checks the same way.
             if _prev_match or _next_match or (
-                    _m['label'] == 'Atrial Flutter' and _flutter_run_in(_m['start_sec'], _m['end_sec'])):
+                    _m['label'] == 'Atrial Flutter' and _flutter_run_in(_m['start_sec'], _m['end_sec'])) or (
+                    _m['label'] == 'Supraventricular Tachycardia (SVT)'
+                    and _svt_run_in(_m['start_sec'], _m['end_sec'])):
                 _confirmed.append(_m)
         morphological_candidates = _confirmed
 
@@ -4021,6 +3742,32 @@ def _detect_arrhythmias_uncached(
                 return start_sec
             return t
 
+        def _vfib_pulled_start(new_start, old_start):
+            """_refine_vfib_edge may move a VFib start back over beats it
+            could not resolve (seen: 320.0 -> 310.1 s across clean 60 bpm
+            beats carrying 50 Hz mains on the raw samples). A pull of more
+            than 2 s is kept only as far back as the stretch is
+            fibrillating: 1 s pieces in 0.25 s steps going back from the old
+            start (_vfib_piece_fibrillating), the start set where the last
+            fibrillating piece begins."""
+            if old_start - new_start <= 2.0:
+                return new_start
+            read_start = max(0.0, new_start - 1.0)
+            blk = reader.read_range(read_start, min(total_duration, old_start + 1.0))
+            if blk is None or blk.shape[1] == 0:
+                return new_start
+            filtered = [_vfib_filtered(blk[i], fs) for i in range(blk.shape[0])]
+            piece, step = int(fs), 0.25
+            t = old_start
+            while t - 1.0 >= new_start - 1e-6:
+                i0 = int(round((t - 1.0 - read_start) * fs))
+                if i0 < 0 or i0 + piece > blk.shape[1]                         or not _vfib_piece_fibrillating(filtered, i0, piece, fs):
+                    break
+                t -= step
+            if t >= old_start:
+                return old_start
+            return max(new_start, t + step - 1.0)
+
         for idx, region in enumerate(merged_morph):
             if region['label'] != 'Ventricular Fibrillation':
                 continue
@@ -4031,6 +3778,7 @@ def _detect_arrhythmias_uncached(
                 next_atrial = idx + 1 < len(merged_morph) and merged_morph[idx + 1]['label'] in atrial and \
                     merged_morph[idx + 1]['start_sec'] - region['end_sec'] <= window_size
                 new_start = _refine_vfib_edge(region['start_sec'], 'start', require_narrow=not prev_atrial)
+                new_start = _vfib_pulled_start(new_start, region['start_sec'])
                 if idx > 0 and merged_morph[idx - 1]['label'] == 'Ventricular Tachycardia' \
                         and region['start_sec'] - merged_morph[idx - 1]['end_sec'] <= window_size:
                     vt_last = _vt_run_last_beat(merged_morph[idx - 1], new_start)
@@ -4811,7 +4559,22 @@ def _detect_arrhythmias_uncached(
             # read here; it never changes any other pair's gap-closing.
             elif nxt.get('_flatline_gap_before'):
                 continue
-            elif 0.0 < (nxt['start_sec'] - cur['end_sec']) <= window_size:
+            # Only a gap between two pieces of the SAME label is closed --
+            # the real target is a region that this step's own earlier
+            # passes (VFib's beat-exact edge refine, the AV-rank cut just
+            # above) split back into several pieces or shifted a boundary
+            # on, not two genuinely different rhythms that happen to sit
+            # close together. Without this check, a short but real
+            # in-between rhythm neither confirmed rule actually covers gets
+            # silently handed to whichever one of the two sits first (seen:
+            # Ventricular Fibrillation's own edge correctly stopped at
+            # 74.22 s, where the beats become organized/narrow, and Atrial
+            # Fibrillation's own edge correctly started at 75.95 s -- this
+            # step then closed the 74.22-75.95 s gap by stretching VFib
+            # across it, although neither rule actually found VFib or AFib
+            # there).
+            elif cur['label'] == nxt['label'] \
+                    and 0.0 < (nxt['start_sec'] - cur['end_sec']) <= window_size:
                 cur['end_sec'] = nxt['start_sec']
                 cur['end_time_str'] = nxt['start_time_str']
         merged_morph = [m for m in merged_morph if m['end_sec'] > m['start_sec']]
@@ -4820,7 +4583,7 @@ def _detect_arrhythmias_uncached(
         # a Sinus Bradycardia/Tachycardia rate segment: e.g. a 55 bpm rhythm
         # with PR 280 ms passes the sinus gate as Bradycardia too, but is
         # marked First-degree AV Block only, never both stacked.
-        detected_segments = suppress_rate_overlap(detected_segments, merged_morph)
+        detected_segments = _suppress_sinus_rate_overlap(detected_segments, merged_morph, make_time_strs)
         detected_segments.extend(merged_morph)
 
     # Bundle branch block regions, added only now -- after every rhythm
@@ -5722,7 +5485,7 @@ def _detect_arrhythmias_uncached(
             big = steps[np.abs(steps) >= _SA_MIN_STEP_MS]
             if big.size < _SA_MIN_STEPS or not (np.any(big > 0) and np.any(big < 0)):
                 continue
-            if not sinus_conduction_gate(i, j):
+            if not _sinus_conduction_gate(sinus_gate_metrics, i, j):
                 continue
             s, e = all_r_peaks[i], all_r_peaks[j]
             if runs and s <= runs[-1][1] + _SA_MERGE_GAP_SEC:
@@ -5932,6 +5695,79 @@ def _detect_arrhythmias_uncached(
             if not (seg['label'] == 'Ventricular Fibrillation'
                     and _test_overlap(seg) >= 0.5 * (float(seg['end_sec']) - float(seg['start_sec'])))
         ]
+
+        # A VFib segment that survives the drop above (< 50% test_signal)
+        # can still have a test-signal (square / pulse-train) piece inside
+        # it: the check above only flags a whole FRAME_SEC (10 s) frame, so
+        # a short test-signal stretch sharing a 10 s frame with genuine
+        # chaotic beats on either side never raises a zone there and
+        # test_spans never sees it (seen: a 6 s VFib call, 69.95-75.95 s --
+        # 69.95-73.0 s was a plain square wave, only 73.0-75.95 s was real
+        # chaotic VFib; the whole 10-20 s frame read 'ok' because the
+        # chaotic tail broke the same-every-lead correlation for the frame
+        # as a whole, so neither zones nor test_spans ever formed there).
+        # Each surviving VFib segment is rechecked here on its own, in
+        # beat-snapped pieces, and any piece span_status reads as
+        # 'test_signal' is cut out of it -- this is a square/pulse-train
+        # wave (same on every lead AND flat steps), never a real beat.
+        # Genuine chaotic VFib is unaffected: it differs lead to lead, so
+        # span_status reads it 'ok', never 'test_signal'.
+        # The cut piece itself is kept, relabelled Unidentified (>= 2 s,
+        # same floor the rest of this pass uses) rather than just dropped:
+        # left unclaimed, it has nowhere else to go (the zones/test_spans
+        # pass above never saw it either, for the same 10 s-frame reason),
+        # and fell through to the generic rate-based Tachycardia/
+        # Bradycardia label below, which reads a square wave's own regular
+        # steps as a plausible rate just as easily as real beats.
+        _vfib_trimmed = []
+        for seg in final_segments:
+            if seg['label'] != 'Ventricular Fibrillation':
+                _vfib_trimmed.append(seg)
+                continue
+            s0, s1 = float(seg['start_sec']), float(seg['end_sec'])
+            points = [s0] + [float(p) for p in all_r_peaks if s0 < p < s1] + [s1]
+            filled = [points[0]]
+            for p in points[1:]:
+                while p - filled[-1] > 1.5:
+                    filled.append(filled[-1] + 1.0)
+                filled.append(p)
+            pieces = [(s0, s1)]
+            cut_spans = []
+            for a, b in zip(filled, filled[1:]):
+                if b - a <= 0 or span_status(reader, a, b) != 'test_signal':
+                    continue
+                if cut_spans and abs(cut_spans[-1][1] - a) < 1e-6:
+                    cut_spans[-1][1] = b
+                else:
+                    cut_spans.append([a, b])
+                nxt = []
+                for p0, p1 in pieces:
+                    if b <= p0 or a >= p1:
+                        nxt.append((p0, p1))
+                        continue
+                    if a > p0:
+                        nxt.append((p0, a))
+                    if b < p1:
+                        nxt.append((b, p1))
+                pieces = nxt
+            for p0, p1 in pieces:
+                if p1 - p0 < 1.0:
+                    continue
+                piece = dict(seg)
+                if (p0, p1) != (s0, s1):
+                    piece['start_sec'], piece['end_sec'] = p0, p1
+                    piece['start_time_str'], piece['end_time_str'] = make_time_strs(p0, p1)
+                _vfib_trimmed.append(piece)
+            for c0, c1 in cut_spans:
+                if c1 - c0 < 2.0:
+                    continue
+                c_s_str, c_e_str = make_time_strs(c0, c1)
+                _vfib_trimmed.append({
+                    'start_sec': c0, 'end_sec': c1, 'label': UNIDENTIFIED, 'color': UNIDENTIFIED_COLOR,
+                    'start_time_str': c_s_str, 'end_time_str': c_e_str, 'detected_rhythm': UNIDENTIFIED,
+                })
+        final_segments = sorted(_vfib_trimmed, key=lambda x: x['start_sec'])
+
         own_rhythm = [
             (float(s['start_sec']), float(s['end_sec'])) for s in final_segments
             if s['label'] not in _rate_labels and not _is_layer_label(s['label'])
@@ -6014,8 +5850,19 @@ def _detect_arrhythmias_uncached(
     _NOISE_READ_SEC = 60.0
     _NOISE_MIN_PIECE_SEC = 2.0
     try:
-        from .analysis_pipeline import SignalQuality, HolterConfig
+        from .analysis_pipeline import SignalQuality, HolterConfig, DERIVED_LEAD_SOURCES
         _nq = SignalQuality(fs=fs, config=HolterConfig.from_clinical_config())
+        # III/aVR/aVL/aVF are not measured leads: they're computed from I/II
+        # (DERIVED_LEAD_SOURCES), so whatever noise they carry is already
+        # I/II's own noise. Scored on their own ADC samples they can still
+        # fail sqi_min purely from being small (III/aVL's amplitude in a
+        # given frontal axis can be a fraction of I/II's, e.g. one real
+        # recording: I/II SQI 0.71/0.81, aVL SQI 0.45 on the SAME noise --
+        # ~0.1 mV in each, just a bigger fraction of aVL's own ~1.4 mV
+        # peak-to-peak -- cutting 20 s of otherwise clean Mobitz I /
+        # First-degree AV Block labels). Only the source leads actually
+        # measured are checked here; a genuinely noisy I or II still cuts
+        # the block (derived leads inherit the same noise and fail too).
         noisy_blocks = []
         r0 = 0.0
         while r0 < total_duration and final_segments:
@@ -6028,7 +5875,8 @@ def _detect_arrhythmias_uncached(
                     i0, i1 = int(round((b0 - r0) * fs)), int(round((b1 - r0) * fs))
                     block = data[:, i0:i1]
                     if block.shape[1] >= int(2.0 * fs):
-                        leads = {lead_names[i]: block[i] for i in range(min(len(lead_names), block.shape[0]))}
+                        leads = {lead_names[i]: block[i] for i in range(min(len(lead_names), block.shape[0]))
+                                 if lead_names[i] not in DERIVED_LEAD_SOURCES}
                         if _nq.noisy_leads(leads):
                             if noisy_blocks and abs(noisy_blocks[-1][1] - b0) < 1e-6:
                                 noisy_blocks[-1][1] = b1
@@ -6040,8 +5888,29 @@ def _detect_arrhythmias_uncached(
             gated = []
             for seg in final_segments:
                 # Unidentified already marks a stretch with nothing to read
-                # (noisy, or no heart signal): it stays.
-                if seg['label'] == 'Unidentified':
+                # (noisy, or no heart signal): it stays. Ventricular
+                # Fibrillation / Tachycardia stay too: their own evidence is
+                # an unresolved/organized-wide QRS on the detection leads
+                # (_is_vfib_window / _is_ventricular_tachycardia_window),
+                # not a clean per-lead SQI -- VFib's genuinely chaotic
+                # waveform is exactly what SQI's own HF-noise/wander checks
+                # are built to flag, on ANY one of all 12 leads, including
+                # ones the rule never looked at. Seen: a real VFib episode
+                # (window-confirmed, beat-exact edges 0.0-14.2 s) cut to
+                # 10.0-14.2 s because lead V6 alone read SQI 0.37 (< 0.6)
+                # over 0-10 s, while I/II/aVL/aVF/V1-V5 were all >= 0.7 --
+                # the 1.0-10.0 s remnant then had no label at all and read
+                # back as Unidentified. VFib's own test-signal/non-ECG
+                # override (_test_overlap above) and the fibrillating-piece
+                # check (_vfib_has_fibrillating_piece) are untouched and
+                # still the real guards against a false VFib/VT call; this
+                # exemption only removes a second, unrelated SQI cut that a
+                # genuine episode can fail purely by being chaotic. AFib /
+                # Flutter / AV blocks / SVT / BBB / the rate labels keep
+                # going through this gate as before -- no evidence yet that
+                # they are cut the same way, and AV blocks / SVT lean on
+                # fine P-wave timing that a truly noisy lead can corrupt.
+                if seg['label'] in ('Unidentified', 'Ventricular Fibrillation', 'Ventricular Tachycardia'):
                     gated.append(seg)
                     continue
                 pieces = [(float(seg['start_sec']), float(seg['end_sec']))]
@@ -6119,6 +5988,446 @@ _PLAIN_BRADY_HR = (10.0, 60000.0 / _BRADY_MIN_RR_MS)    # Bradycardia: 10 < HR <
 # get there first (their segments block this label); a capped band left
 # beats alternating 179.6 / 180.7 bpm (RR 334 / 332 ms) with no label at all.
 _PLAIN_TACHY_HR = 100.0
+
+
+def _sinus_beat(b):
+    """One beat's own sinus evidence: a P with onset/end, a resolved QRS
+    of 40-200 ms and a measured PR -- _sinus_conduction_gate()'s per-beat
+    "valid" test plus the PR it needs."""
+    return bool(
+        b
+        and b.get('p_present')
+        and b.get('p_onset') is not None
+        and b.get('p_end') is not None
+        and b.get('qrs_bounds_resolved')
+        and b.get('q_onset') is not None
+        and 40.0 <= float(b.get('qrs_ms') or 0.0) <= 200.0
+        and b.get('pr_ms') is not None
+    )
+
+
+def _sinus_conduction_gate(metrics, start_idx, end_idx):
+    """Require organized P-to-QRS conduction before a rate label.
+
+    Bradycardia/Tachycardia are sinus labels, therefore an RR pattern by
+    itself must not create them. Most beats in the candidate must have a
+    real P before QRS, a valid and consistent PR, and a resolved,
+    consistent QRS. P polarity/duration consistency is an additional
+    guard against counting random baseline bumps as P waves.
+
+    metrics: per-beat measurements the indices refer to -- sinus_gate_metrics
+    for Sinus Tachycardia and Sinus Arrhythmia, the Sinus Bradycardia rule's
+    own (possibly missed-beat-recovered) list for Sinus Bradycardia. Every
+    caller passes its own list explicitly; there is no default here.
+    """
+    if start_idx is None or end_idx is None:
+        return False
+    left = max(0, int(start_idx))
+    right = min(len(metrics) - 1, int(end_idx))
+    if right < left:
+        return False
+    beats = [b for b in metrics[left:right + 1] if b]
+    if len(beats) < 3:
+        return False
+
+    valid = [
+        b for b in beats
+        if bool(b.get('p_present'))
+        and b.get('p_onset') is not None
+        and b.get('p_end') is not None
+        and b.get('qrs_bounds_resolved')
+        and b.get('q_onset') is not None
+        and 40.0 <= float(b.get('qrs_ms') or 0.0) <= 200.0
+    ]
+    # A sinus label needs P/QRS evidence on at least 75% of the beats;
+    # for the shortest permitted segment this means all three beats.
+    required = max(3, int(np.ceil(len(beats) * 0.75)))
+    if len(valid) < required:
+        return False
+
+    # PR is a beat-to-beat conduction measurement. Reject only when a
+    # majority of the candidate's beats disagree; an occasional missed
+    # P boundary or noise bump must not erase a genuine long brady run.
+    # For short runs (<= 30 beats), use the candidate median; for long
+    # sustained episodes (> 30 beats), use a rolling local median (+-15 beats)
+    # so natural multi-minute autonomic PR drift does not erase true sinus rhythm.
+    pr_valid = [b for b in valid if b.get('pr_ms') is not None]
+    if len(pr_valid) < required:
+        return False
+    pr_values = np.asarray([float(b['pr_ms']) for b in pr_valid], dtype=float)
+    if len(pr_values) <= 30:
+        pr_median = float(np.median(pr_values))
+        pr_consistent_count = int(np.count_nonzero(np.abs(pr_values - pr_median) <= 25.0))
+    else:
+        w = 15
+        pr_consistent_count = 0
+        for i in range(len(pr_values)):
+            lo = max(0, i - w)
+            hi = min(len(pr_values), i + w + 1)
+            loc_med = float(np.median(pr_values[lo:hi]))
+            if abs(pr_values[i] - loc_med) <= 25.0:
+                pr_consistent_count += 1
+    if pr_consistent_count < required:
+        return False
+
+    qrs_values = np.asarray([float(b['qrs_ms']) for b in valid], dtype=float)
+    if float(np.std(qrs_values)) > 20.0:
+        return False
+
+    # P-to-P timing should follow the ventricular cycle. This rejects
+    # isolated noise bumps that happen to pass the individual P-wave
+    # shape test, while allowing normal beat-to-beat rate variability.
+    p_times = np.asarray(
+        [float(b['_p_time_sec']) for b in valid if b.get('_p_time_sec') is not None],
+        dtype=float,
+    )
+    if len(p_times) < required:
+        return False
+    r_times = np.asarray(
+        [float(b['_r_time_sec']) for b in valid if b.get('_r_time_sec') is not None],
+        dtype=float,
+    )
+    if len(r_times) < required:
+        return False
+    pp_values = np.diff(p_times) * 1000.0
+    rr_for_p_values = np.diff(r_times) * 1000.0
+    if pp_values.size and rr_for_p_values.size:
+        pair_count = min(pp_values.size, rr_for_p_values.size)
+        # In sinus rhythm the atrial cycle follows the ventricular cycle;
+        # compare P-P to the matching R-R interval. This permits a real
+        # rate transition inside a long brady run while rejecting a
+        # random baseline bump whose timing does not track QRS.
+        pp_rr_error = np.abs(pp_values[:pair_count] - rr_for_p_values[:pair_count])
+        pp_rr_ok = pp_rr_error <= np.maximum(120.0, 0.15 * rr_for_p_values[:pair_count])
+        if int(np.count_nonzero(pp_rr_ok)) < max(2, int(np.ceil(pair_count * 0.75))):
+            return False
+
+    # P morphology should not randomly flip polarity or change duration
+    # from beat to beat. Amplitude magnitude is deliberately not used as
+    # a hard equality because physiological P amplitude can vary.
+    p_amplitudes = np.asarray([float(b.get('p_amplitude') or 0.0) for b in valid])
+    p_durations = np.asarray([float(b.get('p_duration_ms') or 0.0) for b in valid])
+    if len(p_amplitudes) <= 30:
+        if max(np.count_nonzero(p_amplitudes >= 0.0), np.count_nonzero(p_amplitudes < 0.0)) < required:
+            return False
+    else:
+        w = 15
+        p_pol_consistent_count = 0
+        for i in range(len(p_amplitudes)):
+            lo = max(0, i - w)
+            hi = min(len(p_amplitudes), i + w + 1)
+            win = p_amplitudes[lo:hi]
+            dom_pos = np.count_nonzero(win >= 0.0) >= np.count_nonzero(win < 0.0)
+            if (p_amplitudes[i] >= 0.0) == dom_pos:
+                p_pol_consistent_count += 1
+        if p_pol_consistent_count < required:
+            return False
+    if len(p_durations) <= 30:
+        p_duration_median = float(np.median(p_durations))
+        p_dur_consistent_count = int(np.count_nonzero(np.abs(p_durations - p_duration_median) <= 40.0))
+    else:
+        w = 15
+        p_dur_consistent_count = 0
+        for i in range(len(p_durations)):
+            lo = max(0, i - w)
+            hi = min(len(p_durations), i + w + 1)
+            loc_med = float(np.median(p_durations[lo:hi]))
+            if abs(p_durations[i] - loc_med) <= 40.0:
+                p_dur_consistent_count += 1
+    if p_dur_consistent_count < required:
+        return False
+    return True
+
+
+def _append_sinus_rate_segments(peaks, metrics, start_idx, end_idx, min_dur_sec, label, color, make_time_strs):
+    """Sinus Tachycardia / Bradycardia judged beat by beat inside one
+    rate run (beats start_idx..end_idx of `peaks`): a beat that fails
+    _sinus_beat() ends the current segment and the next passing beat
+    starts a new one. Each segment needs >= 3 beats, >= min_dur_sec and
+    _sinus_conduction_gate() on its own beats (PR / QRS / P-P / P shape
+    consistency). Was: the gate on the whole run at once, so one bad
+    stretch dropped the good one with it -- seen: Sinus Tachycardia 150
+    bpm 100.1-148.6 s, 37 of 122 beats valid (92 needed) because P was
+    rejected on every beat after 120 s, while 101-111 s alone had 21
+    of 25 and got no label.
+
+    Returns the new segments (the caller extends its own list with them --
+    this does not append to anything itself)."""
+    segments = []
+    k = start_idx
+    while k <= end_idx:
+        if not _sinus_beat(metrics[k]):
+            k += 1
+            continue
+        seg_start = k
+        while k + 1 <= end_idx and _sinus_beat(metrics[k + 1]):
+            k += 1
+        seg_end = k
+        k += 1
+        if seg_end - seg_start + 1 >= 3 \
+                and peaks[seg_end] - peaks[seg_start] >= min_dur_sec \
+                and _sinus_conduction_gate(metrics, seg_start, seg_end):
+            s_sec = peaks[seg_start]
+            e_sec = peaks[seg_end]
+            s_str, e_str = make_time_strs(s_sec, e_sec)
+            segments.append({
+                'start_sec': s_sec,
+                'end_sec': e_sec,
+                'label': label,
+                'color': color,
+                'start_time_str': s_str,
+                'end_time_str': e_str,
+                'detected_rhythm': label
+            })
+    return segments
+
+
+def _suppress_sinus_rate_overlap(rate_segments, morph_segments, make_time_strs):
+    """
+    Morphological rhythms (VFib, VTach, AFib, Flutter, AV Block) are detected
+    from actual QRS/P-wave morphology and take clinical priority over the
+    P/PR/QRS-gated, RR-rate-based Sinus Tachycardia/Bradycardia segments above.
+    Pan-Tompkins can mis-fire "R-peaks" on a chaotic VFib/VTach baseline at
+    spacing that happens to look fast or slow, which previously caused
+    Sinus Tachycardia/Bradycardia labels to be drawn on top of a confirmed
+    morphological arrhythmia. Trim (or drop) any rate-based segment so it
+    never overlaps a morphological segment's time range.
+
+    A fixed buffer is added around each morphological interval before
+    checking overlap (not to the interval's own displayed boundaries,
+    only to this comparison). Right at the transition into/out of a
+    chaotic episode, Pan-Tompkins can briefly catch one or two
+    wide-spaced peaks before/after the window that actually crossed the
+    VFib threshold, producing a short "Sinus Bradycardia"/"Sinus
+    Tachycardia" blip that sits immediately next to -- but doesn't
+    strictly overlap -- the morphological region. That blip is a
+    transition artifact, not a real rhythm, so a piece that sits entirely
+    within buffer_sec of a morphological edge is dropped.
+
+    The buffer is NOT used for trimming itself: trimming against the
+    buffered interval cut every real rate segment 5s short of the
+    morphological one (a 120 bpm Sinus Tachycardia that ran right up to
+    a VFib onset at 600.2s was cut at 595.2s, leaving an unlabeled gap
+    of steady tachycardia beats). Rate segments are trimmed at the exact
+    morphological edge.
+    """
+    if not morph_segments:
+        return rate_segments
+    buffer_sec = 5.0
+    morph_intervals = sorted((m['start_sec'], m['end_sec']) for m in morph_segments)
+
+    def _is_transition_blip(p_start, p_end):
+        return any(
+            (p_end <= m_start and p_start >= m_start - buffer_sec)
+            or (p_start >= m_end and p_end <= m_end + buffer_sec)
+            for m_start, m_end in morph_intervals
+        )
+
+    result = []
+    for seg in rate_segments:
+        pieces = [(seg['start_sec'], seg['end_sec'])]
+        for m_start, m_end in morph_intervals:
+            next_pieces = []
+            for p_start, p_end in pieces:
+                if m_end <= p_start or m_start >= p_end:
+                    next_pieces.append((p_start, p_end))
+                    continue
+                if m_start > p_start:
+                    next_pieces.append((p_start, m_start))
+                if m_end < p_end:
+                    next_pieces.append((m_end, p_end))
+            pieces = next_pieces
+        for p_start, p_end in pieces:
+            if p_end - p_start < 1.0 or _is_transition_blip(p_start, p_end):
+                continue
+            s_str, e_str = make_time_strs(p_start, p_end)
+            trimmed = dict(seg)
+            trimmed['start_sec'] = p_start
+            trimmed['end_sec'] = p_end
+            trimmed['start_time_str'] = s_str
+            trimmed['end_time_str'] = e_str
+            result.append(trimmed)
+    return result
+
+
+def _sinus_rate_segments(reader, fs, best_lead_idx, conduction_lead_idx, total_duration,
+                         all_r_peaks, all_rr_ms, sinus_gate_metrics, sinus_gate_filter, make_time_strs):
+    """Beat-exact Sinus Tachycardia / Sinus Bradycardia segments for the
+    whole recording (both built the same way: a first pass through the
+    RR-rate window, then _append_sinus_rate_segments() re-checks every
+    candidate run beat by beat through the P/PR/QRS sinus gate). Needs
+    >= 3 whole-recording beats; returns [] otherwise. Pulled out of
+    _detect_arrhythmias_uncached() as a pure extraction -- same
+    computation, same order, same inputs, only where it lives changed."""
+    from ecg.arrhythmia_detector import measure_beat
+    try:
+        from ecg.pan_tompkins import pan_tompkins
+    except ImportError:
+        from ..pan_tompkins import pan_tompkins
+
+    segments = []
+    if len(all_rr_ms) < 3:
+        # brady_r_peaks is returned too: the plain Bradycardia/Tachycardia
+        # pass later reuses the (possibly missed-beat-recovered) Sinus
+        # Bradycardia beat list as its own Bradycardia candidate beats.
+        # Unused by the caller in this branch (same as before extraction).
+        return segments, all_r_peaks
+
+    # A. Sinus Tachycardia: first pass through the P/PR/QRS sinus gate,
+    # then consecutive beats with RR <= 600ms (HR >= 100 bpm).
+    in_tachy = False
+    tachy_start_idx = None
+
+    # Lower bound 340 ms, not 333.3: _detect_p_wave suppresses P whenever
+    # the previous QRS sits within 333.3 ms, and RR at ~180 bpm jitters
+    # around that edge. Those P-less beats sat inside the run and failed
+    # the 75% P gate for the whole run, dropping valid 100-175 bpm sinus
+    # tachycardia along with them.
+    for i, rr in enumerate(all_rr_ms):
+        is_fast = (340.0 <= rr <= 600.5) or (rr <= 630.0 and in_tachy and i + 1 < len(all_rr_ms) and 340.0 <= all_rr_ms[i + 1] <= 600.5)
+        if is_fast:
+            if not in_tachy:
+                in_tachy = True
+                tachy_start_idx = i
+        else:
+            if in_tachy:
+                segments.extend(_append_sinus_rate_segments(
+                    all_r_peaks, sinus_gate_metrics, tachy_start_idx, i,
+                    1.0, 'Sinus Tachycardia', '#00FFFF', make_time_strs))
+                in_tachy = False
+                tachy_start_idx = None
+
+    if in_tachy and tachy_start_idx is not None:
+        segments.extend(_append_sinus_rate_segments(
+            all_r_peaks, sinus_gate_metrics, tachy_start_idx, len(all_rr_ms),
+            1.0, 'Sinus Tachycardia', '#00FFFF', make_time_strs))
+
+    # B. Sinus Bradycardia: first pass through the same P/PR/QRS sinus
+    # gate, then consecutive beats with RR >= _BRADY_MIN_RR_MS (HR < 60,
+    # the textbook bound -- was RR >= 1050 ms, HR < 57.1).
+    # Note: 60 bpm (1000ms RR) is Normal Sinus Rhythm (NSR: 60-100 bpm), NOT Bradycardia.
+    # Brady range: RR _BRADY_MIN_RR_MS-6000ms. Anything slower is treated
+    # as a pause/possible signal-loss interval rather than sustained sinus
+    # bradycardia.
+    #
+    # An RR this "slow" must also stay under a ceiling, or a stretch
+    # where Pan-Tompkins simply finds no peaks at all -- because the
+    # rhythm has degenerated into chaos, e.g. a VFib onset -- reads as
+    # one single multi-second "RR interval" and clears the brady RR bar
+    # easily, mislabelling the start of VFib as Sinus Bradycardia.
+    # Confirmed directly: a real recording had a 6.7s gap with zero
+    # detected peaks right where VFib began, reported as a ~7s Sinus
+    # Bradycardia episode because nothing capped how slow "slow" was
+    # allowed to be.
+    #
+    # The app's own pause_threshold_ms (2000ms, used for "RRI
+    # (>=2.0s)"/pause counting elsewhere) is NOT the right ceiling here
+    # -- tried first and confirmed wrong directly: a different real
+    # recording has genuine, sustained 30 bpm Sinus Bradycardia (RR
+    # steady at ~2000ms for 2 straight minutes), which that cutoff
+    # fragmented into disconnected ~4s pieces since roughly half its
+    # real beats landed right at/above 2000ms. 6000ms (10 bpm) instead:
+    # comfortably below the 6.7s chaos gap above while allowing the
+    # requested lower boundary.
+    _brady_max_rr_ms = 6000.0
+
+    # Missed-beat recovery, for this Sinus Bradycardia rule ONLY. The
+    # whole-recording R-peak pass above runs Pan-Tompkins on 60 s chunks,
+    # and pan_tompkins() widens its refractory period to a third of the
+    # chunk's MEDIAN RR. A chunk that is mostly a very slow rhythm (RR
+    # ~4000 ms) then gets a ~1320 ms refractory period, which drops
+    # beats of a 60 bpm rhythm in the same chunk -- two 1000 ms RR
+    # intervals read as one 2000 ms "slow" RR, and Sinus Bradycardia was
+    # drawn over plain 60 bpm beats (seen: 179.15/180.15/181.15/182.16 s,
+    # only 179.15 and 181.15 detected, Bradycardia from 179.15 s instead
+    # of 182.16 s). Each gap this rule could count as slow is re-checked
+    # by running the same pan_tompkins() on just that gap +/-3 s, where
+    # the median RR reflects the local rhythm; beats found inside the gap
+    # are added to this rule's own beat list and measured exactly like
+    # rate_beat_metrics. all_r_peaks itself is left untouched, so Sinus
+    # Tachycardia and every morphological rule see the same beats as
+    # before.
+    _recovered_beats = []
+    for i, rr in enumerate(all_rr_ms):
+        if not (_BRADY_MIN_RR_MS <= rr <= _brady_max_rr_ms):
+            continue
+        gap_start, gap_end = all_r_peaks[i], all_r_peaks[i + 1]
+        read_start = max(0.0, gap_start - 3.0)
+        read_end = min(total_duration, gap_end + 3.0)
+        gap_data = reader.read_range(read_start, read_end)
+        if gap_data is None or best_lead_idx >= gap_data.shape[0]:
+            continue
+        gap_sig = np.asarray(gap_data[best_lead_idx], dtype=float)
+        if len(gap_sig) <= 50:
+            continue
+        for p_idx in pan_tompkins(gap_sig, fs=fs):
+            peak_sec = read_start + float(p_idx) / float(fs)
+            if gap_start + 0.25 < peak_sec < gap_end - 0.25:
+                _recovered_beats.append(peak_sec)
+
+    if _recovered_beats:
+        brady_r_peaks = sorted(set(all_r_peaks) | set(_recovered_beats))
+        _metric_at = dict(zip(all_r_peaks, sinus_gate_metrics))
+        brady_beat_metrics = []
+        for k, peak_sec in enumerate(brady_r_peaks):
+            if peak_sec in _metric_at:
+                brady_beat_metrics.append(_metric_at[peak_sec])
+                continue
+            # Same measurement as sinus_gate_metrics above: conduction
+            # lead, strict P/PR, 0.5 Hz high-pass + 25 Hz low-pass; 3 s
+            # of signal on each side so the high-pass has room to settle.
+            metric = None
+            m_start = max(0.0, peak_sec - 3.0)
+            m_end = min(total_duration, peak_sec + 3.0)
+            m_data = reader.read_range(m_start, m_end)
+            if m_data is not None and conduction_lead_idx < m_data.shape[0]:
+                m_sig = sinus_gate_filter(np.asarray(m_data[conduction_lead_idx], dtype=float))
+                local_peak = int(round((peak_sec - m_start) * fs))
+                prev_rr_ms = (peak_sec - brady_r_peaks[k - 1]) * 1000.0 if k > 0 else None
+                if 0 < local_peak < len(m_sig):
+                    metric = measure_beat(m_sig, local_peak, fs, strict_pr=True, prev_rr_ms=prev_rr_ms)
+                    if metric and metric.get('p_peak') is not None:
+                        metric['_p_time_sec'] = m_start + float(metric['p_peak']) / float(fs)
+                    if metric:
+                        metric['_r_time_sec'] = peak_sec
+            brady_beat_metrics.append(metric)
+        brady_rr_ms = [
+            (brady_r_peaks[k + 1] - brady_r_peaks[k]) * 1000.0
+            for k in range(len(brady_r_peaks) - 1)
+        ]
+    else:
+        brady_r_peaks, brady_beat_metrics, brady_rr_ms = all_r_peaks, sinus_gate_metrics, all_rr_ms
+
+    in_brady = False
+    brady_start_idx = None
+
+    for i, rr in enumerate(brady_rr_ms):
+        next_rr = brady_rr_ms[i + 1] if i + 1 < len(brady_rr_ms) else None
+        is_slow = (
+            (_BRADY_MIN_RR_MS <= rr <= _brady_max_rr_ms)
+            or (
+                _BRADY_MIN_RR_MS - 30.0 <= rr <= _brady_max_rr_ms and in_brady
+                and next_rr is not None and _BRADY_MIN_RR_MS <= next_rr <= _brady_max_rr_ms
+            )
+        )
+        if is_slow:
+            if not in_brady:
+                in_brady = True
+                brady_start_idx = i
+        else:
+            if in_brady:
+                segments.extend(_append_sinus_rate_segments(
+                    brady_r_peaks, brady_beat_metrics, brady_start_idx, i,
+                    2.5, 'Sinus Bradycardia', '#00BFFF', make_time_strs))
+                in_brady = False
+                brady_start_idx = None
+
+    if in_brady and brady_start_idx is not None:
+        segments.extend(_append_sinus_rate_segments(
+            brady_r_peaks, brady_beat_metrics, brady_start_idx, len(brady_rr_ms),
+            2.5, 'Sinus Bradycardia', '#00BFFF', make_time_strs))
+
+    return segments, brady_r_peaks
 
 
 def _plain_rate_segments(peaks, hr_ok, min_dur_sec, label, color, blocked_spans, make_time_strs):
