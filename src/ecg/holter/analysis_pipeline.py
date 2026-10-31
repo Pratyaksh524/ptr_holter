@@ -309,7 +309,13 @@ class SignalQuality:
 
     def _lead_block(self, leads: Dict[str, Sequence[float]]):
         """(names, raw block, clipped mask) for equal-length leads; a derived
-        lead's clipped mask comes from its source leads."""
+        lead's clipped mask comes from its source leads, counting only their
+        clipped samples outside the source lead's own QRS -- the same QRS
+        exemption the source lead itself gets in lead_scores(). Counted
+        against the derived lead's QRS instead, a source's QRS-peak clipping
+        fell outside it where the QRS shapes differ: seen on LBBB beats, I
+        and II clipped at 4095 on their R peaks (both clean), aVL read 1.4-
+        1.7% clipped (limit 1%) and the noise gate cut every label there."""
         names = [str(name) for name in (leads or {})]
         if not names:
             return names, np.zeros((0, 0)), np.zeros((0, 0), dtype=bool)
@@ -317,10 +323,22 @@ class SignalQuality:
         n = min(r.size for r in rows)
         block = np.vstack([r[:n] for r in rows])
         clipped = (block <= ADC_CLIP_LOW) | (block >= ADC_CLIP_HIGH)
+        source_names = sorted({s for name in names for s in DERIVED_LEAD_SOURCES.get(name, ())
+                               if s in names and all(x in names for x in DERIVED_LEAD_SOURCES[name])})
+        source_outside_qrs = {}
+        if source_names and n >= max(int(self.fs * max(self.config.min_signal_seconds, 0.5)), 30):
+            src = np.vstack([block[names.index(s)] for s in source_names]).astype(float)
+            y = (src - np.median(src, axis=1, keepdims=True)) / ADC_COUNTS_PER_MV
+            for b, a in self._notches:
+                y = filtfilt(b, a, y, axis=-1)
+            qrs = self._qrs_mask(filtfilt(*self._bp, y, axis=-1))
+            for k, s in enumerate(source_names):
+                source_outside_qrs[s] = clipped[names.index(s)] & ~qrs[k]
         for i, name in enumerate(names):
             sources = DERIVED_LEAD_SOURCES.get(name)
             if sources and all(s in names for s in sources):
-                clipped[i] = np.logical_or.reduce([clipped[names.index(s)] for s in sources])
+                clipped[i] = np.logical_or.reduce([
+                    source_outside_qrs.get(s, clipped[names.index(s)]) for s in sources])
         return names, block, clipped
 
     def compute_lead_sqis(self, leads: Dict[str, Sequence[float]]) -> Dict[str, float]:

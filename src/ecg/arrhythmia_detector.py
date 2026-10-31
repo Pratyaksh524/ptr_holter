@@ -379,6 +379,7 @@ def _detect_p_wave(
     fs: float,
     strict_selection: bool = False,
     prev_rr_ms: Optional[float] = None,
+    collision_check: bool = True,
 ) -> Dict[str, object]:
     result = {
         "p_present": False,
@@ -396,11 +397,16 @@ def _detect_p_wave(
         return result
 
     # When prev_rr_ms is not explicitly passed, check if a preceding QRS
-    # complex sits within 333.3 ms of r_idx (HR >= 180 BPM collision):
-    r_amp = abs(float(signal[r_idx]) - baseline)
-    collision_zone = signal[max(0, r_idx - _ms_to_samples(333.3, fs)): max(0, r_idx - _ms_to_samples(70, fs))]
-    if collision_zone.size and r_amp > 1e-4 and float(np.max(np.abs(collision_zone - baseline))) > 0.55 * r_amp:
-        return result
+    # complex sits within 333.3 ms of r_idx (HR >= 180 BPM collision).
+    # collision_check=False skips it: callers that know the beat's RR is
+    # >= 333.3 ms (pqrst_measure) -- the zone then holds the real P wave, and
+    # a P above 55% of a small R was rejected (seen: lead II R ~200-390, P
+    # ~280, 150 bpm sinus, P on 0 of 72 beats).
+    if collision_check:
+        r_amp = abs(float(signal[r_idx]) - baseline)
+        collision_zone = signal[max(0, r_idx - _ms_to_samples(333.3, fs)): max(0, r_idx - _ms_to_samples(70, fs))]
+        if collision_zone.size and r_amp > 1e-4 and float(np.max(np.abs(collision_zone - baseline))) > 0.55 * r_amp:
+            return result
 
     p_start = max(0, r_idx - _ms_to_samples(400, fs))
     p_end = max(p_start + 1, r_idx - _ms_to_samples(50, fs))
@@ -557,6 +563,7 @@ def measure_beat(
     fs: float = DEFAULT_FS,
     strict_pr: bool = False,
     prev_rr_ms: Optional[float] = None,
+    p_collision_check: bool = True,
 ) -> Optional[Dict[str, object]]:
     signal_arr = _safe_array(signal)
     if signal_arr.size == 0 or r_idx <= 0 or r_idx >= signal_arr.size:
@@ -594,7 +601,8 @@ def measure_beat(
         beat["noise_reasons"] = ["qrs_out_of_range"]
         return beat
 
-    beat.update(_detect_p_wave(signal_arr, int(r_idx), baseline, fs, strict_selection=strict_pr, prev_rr_ms=prev_rr_ms))
+    beat.update(_detect_p_wave(signal_arr, int(r_idx), baseline, fs, strict_selection=strict_pr,
+                               prev_rr_ms=prev_rr_ms, collision_check=p_collision_check))
     if beat["p_present"] and beat["p_onset"] is not None:
         p_onset = int(beat["p_onset"])
         p_peak = int(beat.get("p_peak") or p_onset)

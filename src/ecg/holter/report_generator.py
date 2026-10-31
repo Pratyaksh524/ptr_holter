@@ -1860,8 +1860,7 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     story.append(Paragraph("QT / QTc ANALYSIS", title_style))
     story.append(HRFlowable(width="100%", thickness=2, color=ORANGE, spaceAfter=4*mm))
     
-    jsonl_path = os.path.join(session_dir, 'metrics.jsonl')
-    interval_stats = _compute_interval_stats(jsonl_path)
+    interval_stats = _compute_interval_stats(session_dir, _report_auto_segment_events)
 
     story.append(Paragraph("3. ECG INTERVAL STATISTICS", h1_style))
     story.append(HRFlowable(width="100%", thickness=1, color=ORANGE, spaceAfter=2*mm))
@@ -2188,22 +2187,24 @@ def _generate_hourly_hr_chart(session_dir: str, hourly_hr: dict) -> str:
         return ""
 
 
-def _compute_interval_stats(jsonl_path: str) -> dict:
-    """Load all interval values from JSONL for statistics."""
+def _compute_interval_stats(session_dir: str, auto_segment_events=None) -> dict:
+    """PR / QRS / QT / QTc values for the interval statistics, measured beat
+    by beat on the recording itself (pqrst_measure.interval_stats): one
+    value per 10 s frame where it can be read for that frame's rhythm --
+    no PR in AFib / VFib / Third-degree AV Block ..., nothing in a noisy or
+    Unidentified frame. Was: the live pipeline's metrics.jsonl values,
+    which carried e.g. a PR in Atrial Fibrillation and a QT past the next
+    beat at >= 120 bpm."""
     stats = {'pr_ms': [], 'qrs_ms': [], 'qt_ms': [], 'qtc_ms': []}
-    if not os.path.exists(jsonl_path):
+    ecgh_path = os.path.join(session_dir, 'recording.ecgh')
+    if not os.path.exists(ecgh_path):
         return stats
     try:
-        with open(jsonl_path) as f:
-            for line in f:
-                m = json.loads(line.strip())
-                for key in stats:
-                    val = m.get(key, 0)
-                    if val > 0:
-                        stats[key].append(val)
-    except Exception:
-        pass
-    return stats
+        from .pqrst_measure import interval_stats
+        return interval_stats(ecgh_path, auto_segment_events or [])
+    except Exception as e:
+        print(f"[HolterReport] Interval statistics error: {e}")
+        return stats
 
 
 def _auto_conclusion(summary: dict, filtered_arrhy_counts: Optional[dict] = None) -> str:

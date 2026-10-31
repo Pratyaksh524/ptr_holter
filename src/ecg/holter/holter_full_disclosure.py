@@ -1157,24 +1157,14 @@ class HolterFullDisclosureDialog(QDialog):
         # right, so it sits further left instead of flush against it.
         top_layout.addStretch()
 
-        # TODO(testing-only): PR interval / QRS duration readout, computed
-        # live from Lead II for whatever is currently on screen. Added so a
-        # tester can scroll Full Disclosure and directly compare
-        # measure_beat()'s PR/QRS numbers (the same ones the VFib/AFib/
-        # Flutter/Supraventricular Tachycardia rules in
-        # auto_segment_arrthymia_detection.py read) against the Lead II
-        # waveform, rhythm by rhythm, without a separate script. Not a
-        # clinical display value, not wired into any detection or report
-        # logic -- updated only by _update_pr_qrs_label() below. Remove this
-        # once the rule-based detectors are fully validated against real
-        # recordings (or promote it to a supported feature if it turns out
-        # useful beyond testing).
-        self.lbl_pr_qrs = QLabel("PR: -- ms   QRS: -- ms")
+        # PR / QRS / QT of the visible frame, updated by
+        # _update_pr_qrs_label() below (pqrst_measure).
+        self.lbl_pr_qrs = QLabel("PR: --   QRS: --   QT: --")
         self.lbl_pr_qrs.setStyleSheet("color: #FFD966; font-weight: bold; font-size: 13px;")
         self.lbl_pr_qrs.setToolTip(
-            "TESTING ONLY -- PR interval / QRS duration measured from Lead II's own\n"
-            "beats in the current visible window, via the same measure_beat() the\n"
-            "auto-segment rules use. Not a clinical readout."
+            "PR interval / QRS duration / QT interval of the visible frame, measured\n"
+            "beat by beat. '--' where a value can't be read for the frame's rhythm,\n"
+            "the beats disagree, or the frame is noisy / not an ECG."
         )
         top_layout.addWidget(self.lbl_pr_qrs)
 
@@ -3829,13 +3819,15 @@ class HolterFullDisclosureDialog(QDialog):
             # gets no segment band: ECGStripCanvas colours its waveform and
             # puts an "A" above lead I instead.
         }
-        # The auto detector's plain rate labels (no sinus P/PR/QRS): exact
-        # label, 'Auto' source only -- the 'bradycardia' / 'tachycardia'
-        # fallbacks above still draw any other source's bare label as
-        # Sinus Bradycardia / Tachycardia.
+        # The auto detector's plain rate labels (no sinus P/PR/QRS) and its
+        # Unidentified frames (no heart signal to read): exact label, 'Auto'
+        # source only -- the 'bradycardia' / 'tachycardia' fallbacks above
+        # still draw any other source's bare label as Sinus Bradycardia /
+        # Tachycardia.
         plain_rate_targets = {
             'bradycardia': ('Bradycardia', '#20B2AA'),
             'tachycardia': ('Tachycardia', '#F08080'),
+            'unidentified': ('Unidentified', '#808080'),
         }
         reader_start = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
         regions = []
@@ -4027,339 +4019,65 @@ class HolterFullDisclosureDialog(QDialog):
         self.time_scrollbar.setValue(int(self._current_start * 100))
         self._update_canvases(self._current_start)
 
-    @staticmethod
-    def _bundle_branch_block_global_qrs_ms(leads_data, lead_names, r_idx, fs):
-        """Global (multi-lead) QRS duration of one beat, in ms, or None.
-
-        Same measurement auto_segment_arrthymia_detection.py's bundle branch
-        block rule uses: the combined slope of leads I, II, aVL, V1, V2, V5,
-        V6 (each scaled by its own QRS size); the QRS runs from where that
-        slope first rises above 10% of its peak to where it stays below 10%
-        for 16 ms (20% when a discordant ST-T keeps it above 10%). A single
-        lead under-reads a bundle branch block's QRS -- part of it is
-        isoelectric in that lead, and its slurred terminal S / R' is cut
-        off -- e.g. Lead II read 132-134 ms where the global QRS is ~154 ms.
-        """
-        from scipy.signal import savgol_filter
-        idx = [lead_names.index(n) for n in ('I', 'II', 'aVL', 'V1', 'V2', 'V5', 'V6') if n in lead_names]
-        if len(idx) < 3:
-            return None
-        w_lo, w_hi = int(r_idx) - int(0.15 * fs), int(r_idx) + int(0.20 * fs)
-        if w_lo < 0 or w_hi > leads_data.shape[1]:
-            return None
-        velocity = np.zeros(w_hi - w_lo)
-        p_lo, p_hi = int(0.07 * fs), int(0.27 * fs)
-        for i in idx:
-            x = np.asarray(leads_data[i][w_lo:w_hi], dtype=float)
-            if x.size >= 11:
-                x = savgol_filter(x, 11, 3)
-            size = float(np.ptp(x[p_lo:p_hi])) or 1.0
-            velocity += np.abs(np.gradient(x)) / size
-        peak = p_lo + int(np.argmax(velocity[p_lo:p_hi]))
-        quiet = max(1, int(0.016 * fs))
-
-        def edge(threshold, step):
-            run = 0
-            rng = range(peak, -1, -1) if step < 0 else range(peak, velocity.size)
-            for k in rng:
-                run = run + 1 if velocity[k] < threshold else 0
-                if run >= quiet:
-                    return k + quiet - 1 if step < 0 else k - quiet + 1
-            return None
-
-        onset = edge(0.10 * float(velocity[peak]), -1)
-        offset = edge(0.10 * float(velocity[peak]), +1)
-        if offset is None:
-            offset = edge(0.20 * float(velocity[peak]), +1)
-        if onset is None or offset is None or offset <= onset:
-            return None
-        return (offset - onset) * 1000.0 / fs
-
     def _update_pr_qrs_label(self, start_sec: float, end_sec: float):
-        """TODO(testing-only): recompute PR interval / QRS duration from
-        Lead II's own beats in the currently visible window, purely so a
-        tester can verify measure_beat()'s numbers directly against the
-        on-screen waveform while scrolling -- not used by any detection or
-        report logic. See the comment on lbl_pr_qrs's creation (top bar
-        setup) for the removal/promotion plan. Called from
-        _update_time_and_arrhythmia_labels() on every scroll/window change,
-        so it keeps following Lead II's current rhythm pattern as the user
-        scrolls horizontally."""
+        """PR / QRS / QT of the visible frame, beat by beat on the recording
+        (pqrst_measure.measure_beats), shown only where they can be read for
+        the frame's rhythm (pqrst_measure.summarize): '--' for a value that
+        is not measurable -- no P in AFib / Flutter / VFib / VT / SVT /
+        Third-degree AV Block, no QRS / QT in VFib, fewer than 75% of the
+        beats measured or their spread too wide, a noisy frame or one with
+        no heart signal (the same waveform on every lead) -- and the PR
+        range in Mobitz I. Rhythms are the auto-marked segments in the frame
+        (only once "Auto Arrhythmia Detection" has been clicked). Called on
+        every scroll / window change. Display only."""
         if not hasattr(self, 'lbl_pr_qrs'):
             return
         try:
-            from ecg.pan_tompkins import pan_tompkins
-            from ecg.arrhythmia_detector import measure_beat
+            from .pqrst_measure import measure_beats, summarize, frame_status
+            reader = getattr(getattr(self, '_engine', None), '_reader', None) or getattr(self, '_reader', None)
+            if reader is None:
+                self.lbl_pr_qrs.setText("PR: --   QRS: --   QT: --")
+                return
+            key = (round(float(start_sec), 3), round(float(end_sec), 3))
+            cache = getattr(self, '_pqrst_frame_cache', None)
+            if cache is None:
+                cache = self._pqrst_frame_cache = {}
+            if key not in cache:
+                if len(cache) > 256:
+                    cache.clear()
+                cache[key] = (measure_beats(reader, start_sec, end_sec), frame_status(reader, start_sec, end_sec))
+            beats, status = cache[key]
 
-            # Use the Lead-II canvas that is currently visible as the
-            # primary source.  It is the exact waveform the user is looking
-            # at after a horizontal scroll, so it cannot disagree with the
-            # displayed recording because of a stale dialog reader or a
-            # refresh race.  The reader path below is only an initial-load
-            # fallback, before the canvas has received its data.
-            #
-            # Measure from the canvas's pre-filter _raw_data, not its
-            # display-smoothed _data: the strip's Gaussian pass
-            # (see ECGStripCanvas.set_data) shifts P-wave/QRS onsets enough
-            # to move this readout.
-            lead_ii_canvas = next(
-                (c for c in getattr(self, '_canvases', [])
-                 if getattr(c, 'lead_name', '') == 'II'),
-                None,
-            )
-            canvas_data = getattr(lead_ii_canvas, '_raw_data', None) if lead_ii_canvas is not None else None
-            if canvas_data is None and lead_ii_canvas is not None:
-                canvas_data = getattr(lead_ii_canvas, '_data', None)
-            canvas_start = getattr(lead_ii_canvas, '_start_sec', None) if lead_ii_canvas is not None else None
-            canvas_fs = getattr(lead_ii_canvas, '_fs', None) if lead_ii_canvas is not None else None
-
-            if canvas_data is not None and len(canvas_data) >= 50 \
-                    and canvas_start is not None and canvas_fs:
-                sig = np.asarray(canvas_data, dtype=float)
-                raw_sig = sig  # before the 25 Hz filter below; see bundle branch block note
-                fs = float(canvas_fs)
-                source_start = float(canvas_start)
-                # PR/QRS logic was tuned on the strip's old Butterworth 25 Hz
-                # filtfilt output; reproduce that exact input here so the
-                # display-only Gaussian filter cannot change these values.
-                if getattr(lead_ii_canvas, '_raw_data', None) is not None:
-                    try:
-                        # 50/60 Hz notches first: the recording holds raw
-                        # serial samples, and the 25 Hz Butterworth alone
-                        # leaves ~6% of the mains hum -- every 20 ms ripple
-                        # peak then passes the P search's prominence gate and
-                        # the strict search (closest wave to the QRS) takes
-                        # one for the P, so PR read "--" on every beat (seen:
-                        # 0/10 beats, 10/10 at 168 ms with the notch). The
-                        # canvas pads the notch with real neighbouring
-                        # samples, so it does not ring at the strip edges.
-                        if hasattr(lead_ii_canvas, 'mains_free_raw'):
-                            mains_free = lead_ii_canvas.mains_free_raw()
-                            if mains_free is not None and len(mains_free) == sig.size:
-                                sig = np.asarray(mains_free, dtype=float)
-                        from scipy.signal import butter, filtfilt
-                        b, a = butter(2, 25.0 / (fs / 2.0), btype='lowpass')
-                        sig = filtfilt(b, a, sig)
-                    except Exception:
-                        pass
-            else:
-                reader = getattr(getattr(self, '_engine', None), '_reader', None)
-                if reader is None:
-                    reader = getattr(self, '_reader', None)
-                if reader is None:
-                    self.lbl_pr_qrs.setText("PR: -- ms   QRS: -- ms")
-                    return
-                lead_names = list(getattr(reader, 'lead_names', []) or [])
-                if 'II' not in lead_names:
-                    self.lbl_pr_qrs.setText("PR: --   QRS: -- ")
-                    return
-                lead_idx = lead_names.index('II')
-                fs = getattr(reader, 'fs', None) or getattr(self._engine, 'fs', 500) or 500
-                total_duration = getattr(self._engine, 'duration_sec', end_sec)
-                pad_start = max(0.0, start_sec - 1.0)
-                pad_end = min(total_duration, end_sec + 1.0)
-                chunk = reader.read_range(pad_start, pad_end)
-                if chunk is None or lead_idx >= chunk.shape[0] or chunk.shape[1] < 50:
-                    self.lbl_pr_qrs.setText("PR: -- ms   QRS: -- ms")
-                    return
-                sig = np.asarray(chunk[lead_idx], dtype=float)
-                raw_sig = sig
-                source_start = pad_start
-
-            peaks = [
-                p for p in pan_tompkins(sig, fs=fs)
-                if start_sec <= source_start + p / fs < end_sec
-            ]
-
-            # AF/Flutter have no consistently identifiable sinus P wave, so
-            # the generic beat measurer's PR candidate is not meaningful in
-            # those auto-marked regions. This is display-only suppression;
-            # auto-segment detection and its thresholds are unchanged.
-            atrial_arrhythmia_active = False
-            ventricular_fibrillation_active = False
-            ventricular_tachycardia_active = False
-            bundle_branch_block_active = False
+            rhythms = []
             if getattr(self, '_auto_marking_visible', False):
                 # Persisted event stores can contain legacy/non-dict entries
-                # after reopening a recording. One malformed entry must not
-                # abort the independent Lead-II measurement and blank both
-                # PR/QRS values.
+                # after reopening a recording; skip them.
                 for event in getattr(self._engine, '_structured_events', []) or []:
                     if not isinstance(event, dict):
                         continue
                     try:
-                        event_label = str(event.get('label', event.get('type', '')) or '').lower()
                         event_start = float(event.get('timestamp', 0.0) or 0.0)
                         event_end = float(event.get('end_timestamp', event_start) or event_start)
                     except (TypeError, ValueError, AttributeError):
                         continue
-                    if event_start > end_sec or event_end < start_sec:
-                        continue
-                    if event_label in {'atrial fibrillation', 'atrial flutter'}:
-                        atrial_arrhythmia_active = True
-                    elif event_label in {'ventricular fibrillation', 'vfib'} \
-                            or 'ventricular fibrillation' in event_label:
-                        ventricular_fibrillation_active = True
-                    elif event_label in {'ventricular tachycardia', 'vtach'} \
-                            or 'ventricular tachycardia' in event_label:
-                        ventricular_tachycardia_active = True
-                    elif 'bundle branch block' in event_label:
-                        bundle_branch_block_active = True
+                    if event_start <= end_sec and event_end >= start_sec:
+                        rhythms.append(str(event.get('label', event.get('type', '')) or ''))
 
-            pr_values, qrs_values = [], []
-            # Bundle branch block: all leads over the same span as the Lead II
-            # signal above (same start, same sample count), for the global QRS.
-            bbb_leads_data, bbb_lead_names = None, []
-            if bundle_branch_block_active:
-                try:
-                    bbb_reader = getattr(getattr(self, '_engine', None), '_reader', None) or getattr(self, '_reader', None)
-                    if bbb_reader is not None:
-                        bbb_lead_names = list(getattr(bbb_reader, 'lead_names', []) or [])
-                        bbb_leads_data = bbb_reader.read_range(source_start, source_start + raw_sig.size / fs)
-                        # Same filter the auto-segment bundle branch block
-                        # gate applies before this exact global-QRS
-                        # measurement (0.5-40 Hz bandpass + 50 Hz notch):
-                        # mains hum on the chest leads otherwise pushes the
-                        # onset/offset search past the real QRS edges (seen:
-                        # 226 ms shown here for a beat the filtered detector
-                        # measured at 158-174 ms, same recording).
-                        if bbb_leads_data is not None:
-                            from .analysis_pipeline import SignalPreprocessor, HolterConfig
-                            _bbb_preproc = SignalPreprocessor(fs=fs, config=HolterConfig.from_clinical_config())
-                            bbb_leads_data = np.vstack([
-                                np.asarray(_bbb_preproc.process(np.asarray(lead, dtype=float)), dtype=float)
-                                for lead in bbb_leads_data
-                            ])
-                except Exception:
-                    bbb_leads_data = None
-            for i, p in enumerate(peaks):
-                prev_rr_ms = (float(p) - float(peaks[i - 1])) * 1000.0 / fs if i > 0 else None
-                if bundle_branch_block_active:
-                    # Right/Left bundle branch block (auto-marked here): the
-                    # same measurement the bundle branch block detector uses.
-                    # The beat is taken at Lead II's own dominant QRS
-                    # deflection (40 ms before to 100 ms after the detected
-                    # peak) on the unfiltered signal: at the detected peak --
-                    # a small r ahead of a deep S in RBBB, or the dip just
-                    # before the QRS in LBBB -- the P-wave search either
-                    # mistook the P for a too-close QRS or picked that dip
-                    # and found no P, so PR read "--" on every beat. The
-                    # wide BBB QRS often never returns cleanly to baseline,
-                    # so its width is shown whether or not that boundary
-                    # "resolved". Measured: RBBB PR 148-152 / QRS 132-134 ms,
-                    # LBBB PR 152-154 / QRS 130-132 ms.
-                    a_lo = max(0, int(p) - int(0.04 * fs))
-                    a_hi = min(raw_sig.size, int(p) + int(0.10 * fs))
-                    if a_hi <= a_lo:
-                        continue
-                    anchor = a_lo + int(np.argmax(np.abs(raw_sig[a_lo:a_hi] - np.median(raw_sig))))
-                    beat = measure_beat(raw_sig, anchor, fs, strict_pr=True, prev_rr_ms=prev_rr_ms)
-                    if not beat:
-                        continue
-                    # The strict P search takes the wave CLOSEST to the QRS;
-                    # a wide bundle branch block QRS starts with a slurred
-                    # notch 50-80 ms before the dominant deflection, which it
-                    # takes for the P -- that "P" sits after the QRS onset, so
-                    # no PR came out and the header read "PR: --" on every
-                    # beat (seen: LBBB, 0 of 14 beats strict, 144-152 ms on all
-                    # 14 with the search below). Only where the strict search
-                    # found no PR, the non-strict search -- the most PROMINENT
-                    # wave, the real P -- is used, as the bundle branch block
-                    # detector does; only at RR >= 500 ms, as there: faster,
-                    # the previous T wave can be taken for a P.
-                    if beat.get('pr_ms') is None and prev_rr_ms is not None and prev_rr_ms >= 500.0:
-                        relaxed = measure_beat(raw_sig, anchor, fs, strict_pr=False, prev_rr_ms=prev_rr_ms)
-                        if relaxed and relaxed.get('pr_ms') is not None:
-                            beat = dict(beat)
-                            beat['pr_ms'] = relaxed['pr_ms']
-                    # QRS: the global multi-lead duration (see
-                    # _bundle_branch_block_global_qrs_ms); Lead II's own
-                    # width only if all leads couldn't be read.
-                    global_qrs = None
-                    if bbb_leads_data is not None:
-                        global_qrs = self._bundle_branch_block_global_qrs_ms(
-                            bbb_leads_data, bbb_lead_names, int(p), fs)
-                    if global_qrs is not None and 40.0 <= global_qrs <= 250.0:
-                        qrs_values.append(global_qrs)
-                    elif bbb_leads_data is None and 40.0 <= float(beat.get('qrs_ms') or 0.0) <= 220.0:
-                        qrs_values.append(float(beat['qrs_ms']))
-                    if beat.get('pr_ms') is not None:
-                        pr_values.append(beat['pr_ms'])
-                    continue
-                beat = measure_beat(sig, int(p), fs, strict_pr=True, prev_rr_ms=prev_rr_ms)
-                if not beat:
-                    continue
+            values = summarize(beats, rhythms, status)
 
-                # Broad-complex runs can have no isoelectric point around an
-                # individual beat. measure_beat() then returns the bounded
-                # wide-QRS estimate (typically 160 ms from the +/-80 ms
-                # search window) with qrs_bounds_resolved=False. Do not let
-                # that make the Full Disclosure header say "--" when the
-                # measured width is clearly in the wide-QRS range. This is a
-                # display/measurement fallback only; auto segment detection
-                # still requires resolved QRS boundaries exactly as before.
-                qrs_ms = float(beat.get('qrs_ms') or 0.0)
-                qrs_resolved = bool(beat.get('qrs_bounds_resolved'))
-                # VFib has no organized, measurable QRS complex. Keep the
-                # display as '--' for an active VFib segment even when the
-                # bounded +/-80 ms fallback happens to return 160 ms. The
-                # fallback remains available for organized wide-complex
-                # rhythms (for example VT/wide-QRS tachycardia).
-                if not ventricular_fibrillation_active and (qrs_resolved or 120.0 <= qrs_ms <= 220.0):
-                    qrs_values.append(qrs_ms)
-                # VFib has no organized atrial-to-ventricular conduction.
-                # Any PR candidate inside its chaotic baseline is only a
-                # coincidental noise-to-wave distance, never a clinical PR
-                # interval. Suppress it for the complete visible VFib
-                # window, just as the QRS readout above is suppressed.
-                if not atrial_arrhythmia_active and not ventricular_fibrillation_active \
-                        and not ventricular_tachycardia_active \
-                        and beat.get('pr_ms') is not None:
-                    pr_values.append(beat['pr_ms'])
-
-            # PR candidates can occasionally contain one incorrectly picked
-            # P onset (for example 80/194 ms beside a true 150-170 ms PR).
-            # A plain standard-deviation gate lets those isolated candidates
-            # hide the valid window-wide PR. Use a robust median/MAD majority
-            # filter instead: the median is the center, MAD estimates normal
-            # beat-to-beat spread, and the clinical display tolerance keeps a
-            # minimum 25 ms band. This affects only the visible readout; the
-            # sinus-conduction gate used by auto classification remains
-            # unchanged.
-            effective_window_fast = False
-            if len(peaks) >= 2:
-                w_rr_ms = np.diff(np.asarray(peaks, dtype=float)) * 1000.0 / fs
-                if w_rr_ms.size and float(np.median(w_rr_ms)) < 333.3:
-                    effective_window_fast = True
-
-            if ventricular_fibrillation_active or ventricular_tachycardia_active or atrial_arrhythmia_active or effective_window_fast:
-                pr_txt = "--"
-            elif len(pr_values) >= 2:
-                # ``pr_values`` is collected as a Python list. Convert it
-                # before vector arithmetic; otherwise every multi-beat
-                # window raises ``TypeError`` and the outer fallback blanks
-                # both PR and QRS as ``--``.
-                pr_array = np.asarray(pr_values, dtype=float)
-                pr_center = float(np.median(pr_array))
-                pr_mad = float(np.median(np.abs(pr_array - pr_center)))
-                pr_tolerance = max(25.0, 3.0 * pr_mad)
-                pr_inliers = pr_array[np.abs(pr_array - pr_center) <= pr_tolerance]
-                if len(pr_inliers) >= max(2, int(np.ceil(len(pr_values) * 0.5))):
-                    pr_txt = f"{float(np.median(pr_inliers)):.0f} ms"
-                else:
-                    pr_txt = "--"
-            elif len(pr_values) == 1:
-                pr_txt = f"{float(pr_values[0]):.0f} ms"
+            def ms(v):
+                return f"{v:.0f} ms" if v is not None else "--"
+            if values['pr_range'] is not None:
+                lo, hi = values['pr_range']
+                pr_txt = f"{lo:.0f}-{hi:.0f} ms"
             else:
-                pr_txt = "--"
-            qrs_txt = f"{float(np.median(qrs_values)):.0f} ms" if qrs_values else "--"
-            self.lbl_pr_qrs.setText(f"PR: {pr_txt}   QRS: {qrs_txt} ")
+                pr_txt = ms(values['pr_ms'])
+            self.lbl_pr_qrs.setText(f"PR: {pr_txt}   QRS: {ms(values['qrs_ms'])}   QT: {ms(values['qt_ms'])} ")
         except Exception as e:
-            print(f"[Full Disclosure] PR/QRS testing label error: {e}")
-            self.lbl_pr_qrs.setText("PR: -- ms   QRS: -- ms")
+            print(f"[Full Disclosure] PR/QRS/QT label error: {e}")
+            self.lbl_pr_qrs.setText("PR: --   QRS: --   QT: --")
 
     def _update_time_and_arrhythmia_labels(self, start_sec: float, end_sec: float):
-        # TODO(testing-only): see _update_pr_qrs_label()'s own docstring.
         self._update_pr_qrs_label(start_sec, end_sec)
 
         # Update real-time display
@@ -4440,6 +4158,7 @@ class HolterFullDisclosureDialog(QDialog):
                         'second-degree av block (mobitz i)',
                         'second-degree av block (mobitz ii)',
                         'third-degree av block',
+                        'unidentified',
                     }:
                         active_auto.append((event_start, event_end, label))
             if active_auto:
