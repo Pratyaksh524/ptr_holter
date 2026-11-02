@@ -4192,6 +4192,112 @@ def _detect_arrhythmias_uncached(
             except Exception as e:
                 print(f"[Auto Arrhythmia Detect] AFib/Flutter boundary refine error: {e}")
 
+        # Supraventricular Tachycardia (SVT) carved out of an Atrial
+        # Fibrillation / Atrial Flutter region the window vote already
+        # claimed. A short SVT run -- its own window never covers it alone,
+        # see _svt_run_in above -- sitting between two AFib/Flutter windows
+        # gets bridged over by the merge step above, and inside that merged
+        # region the beat-by-beat AFib/Flutter split right below reads
+        # SVT's very fast, very regular RR as "undetermined" (its TP
+        # segment has no room to judge, _beat_tp_active) and the run simply
+        # inherits whichever AFib/Flutter label surrounds it (seen directly:
+        # a 200 bpm, 8-9 s SVT run swallowed whole into AFib on two
+        # different recordings).
+        # Reuses the same evidence the standalone SVT gap-fill lower in
+        # this function requires (_svt_runs_in_gap: steady 200-333 ms RR
+        # within 8% of the run's own median, one QRS shape, a sharp narrow
+        # QRS by slope) at a shorter minimum run length -- 5 beats (4 RR
+        # intervals), not 15: a run already sitting inside an AFib/Flutter
+        # call, meeting that same shape/regularity bar, is lower risk to
+        # mistake for genuine AFib/Flutter than free time is, and the
+        # AFib/Flutter beat-by-beat split right after this already drops
+        # any run of its own under 4 intervals on its own merits anyway.
+        # Only ever carves into an AFib/Flutter region; every other label
+        # and rule is untouched.
+        _SVT_ATRIAL_MIN_BEATS = 5
+        _svt_carve_label = 'Supraventricular Tachycardia (SVT)'
+
+        def _svt_runs_in_atrial(region_start, region_end):
+            peaks = [p for p in _sorted_peaks if region_start <= p < region_end]
+            if len(peaks) < _SVT_ATRIAL_MIN_BEATS:
+                return []
+            read_lo = max(0.0, region_start - 1.0)
+            sig = reader.read_range(read_lo, min(total_duration, region_end + 2.5))
+            if sig is None or best_lead_idx >= sig.shape[0]:
+                return []
+            _b, _a = _butter(2, [0.5 / (float(fs) / 2.0), 40.0 / (float(fs) / 2.0)], btype='band')
+            x = _filtfilt(_b, _a, np.asarray(sig[best_lead_idx], dtype=float))
+            half = int(0.05 * fs)
+            runs, i = [], 0
+            while i < len(peaks) - 1:
+                j, rrs = i, []
+                while j + 1 < len(peaks):
+                    rr = peaks[j + 1] - peaks[j]
+                    if not (0.200 <= rr <= 0.3334):
+                        break
+                    if len(rrs) >= 3 and abs(rr - float(np.median(rrs))) > 0.08 * float(np.median(rrs)):
+                        break
+                    rrs.append(rr)
+                    j += 1
+                run = peaks[i:j + 1]
+                if len(run) >= _SVT_ATRIAL_MIN_BEATS:
+                    idx = [int(round((p - read_lo) * fs)) for p in run]
+                    shapes = np.array([x[k - half:k + half] - float(np.mean(x[k - half:k + half]))
+                                       for k in idx if k - half >= 0 and k + half <= len(x)])
+                    sharp = []
+                    for k in (idx[::4] or idx[:1]):
+                        w = (x[k - half:k - half + int(2.0 * fs)]
+                             if k - half >= 0 and k - half + int(2.0 * fs) <= len(x) else None)
+                        if w is not None and float(np.ptp(w)) > 0:
+                            sharp.append(float(np.max(np.abs(np.diff(w)))) * float(fs) / float(np.ptp(w)))
+                    if len(shapes) >= 3 and sharp:
+                        template = np.median(shapes, axis=0)
+                        corrs = [float(np.corrcoef(s, template)[0, 1]) for s in shapes if np.any(s)]
+                        if corrs and float(np.median(corrs)) >= 0.9 and float(np.median(sharp)) >= 40.0:
+                            runs.append((run[0], run[-1]))
+                i = max(j, i + 1)
+            return runs
+
+        try:
+            _svt_carved = []
+            for region in merged_morph:
+                if region['label'] not in _atrial_labels:
+                    _svt_carved.append(region)
+                    continue
+                cuts = _svt_runs_in_atrial(float(region['start_sec']), float(region['end_sec']))
+                if not cuts:
+                    _svt_carved.append(region)
+                    continue
+                pieces = [(float(region['start_sec']), float(region['end_sec']))]
+                for c0, c1 in cuts:
+                    nxt_pieces = []
+                    for p0, p1 in pieces:
+                        if c1 <= p0 or c0 >= p1:
+                            nxt_pieces.append((p0, p1))
+                            continue
+                        if c0 > p0:
+                            nxt_pieces.append((p0, c0))
+                        if c1 < p1:
+                            nxt_pieces.append((c1, p1))
+                    pieces = nxt_pieces
+                for p0, p1 in pieces:
+                    if p1 - p0 < 0.5:
+                        continue
+                    piece = dict(region)
+                    piece['start_sec'], piece['end_sec'] = p0, p1
+                    piece['start_time_str'], piece['end_time_str'] = make_time_strs(p0, p1)
+                    _svt_carved.append(piece)
+                for c0, c1 in cuts:
+                    c_s_str, c_e_str = make_time_strs(c0, c1)
+                    _svt_carved.append({
+                        'start_sec': c0, 'end_sec': c1, 'label': _svt_carve_label,
+                        'color': '#FFA500', 'start_time_str': c_s_str, 'end_time_str': c_e_str,
+                        'detected_rhythm': _svt_carve_label,
+                    })
+            merged_morph = sorted(_svt_carved, key=lambda x: x['start_sec'])
+        except Exception as e:
+            print(f"[Auto Arrhythmia Detect] SVT-in-AFib/Flutter carve error: {e}")
+
         # Atrial Fibrillation / Atrial Flutter, beat by beat, inside each
         # region the windows found: every RR interval is Flutter (steady F
         # wave cycle, _interval_is_flutter), AFib (active TP segment and no F
@@ -5219,6 +5325,196 @@ def _detect_arrhythmias_uncached(
         final_segments.sort(key=lambda x: x['start_sec'])
     except Exception as e:
         print(f"[Auto Arrhythmia Detect] Supraventricular Tachycardia gap check error: {e}")
+
+    # Ventricular Tachycardia (VT) carved out of a Ventricular Fibrillation
+    # (VFib) call already made above. The window loop's own R-peaks
+    # (core_r_peaks) come from one Pan-Tompkins call per window, which sets
+    # ONE amplitude threshold for that whole padded window. A VT run's QRS
+    # is often 5-7x smaller than a neighbouring sinus or VFib-onset beat's
+    # (measured directly: ~170-300 vs ~1300-2000), so a window straddling
+    # VT and either neighbour sets its threshold off the bigger beats and
+    # misses most of VT's own -- the broken RR that is left then satisfies
+    # VFib's "no organized QRS, no steady RR" rule instead (confirmed: a
+    # window scoped to VT's own 5 s found 13/13 of its beats at a steady
+    # 374 ms RR; the production 10 s window, padded +/-2 s into the
+    # neighbouring sinus/VFib amplitude, found only 1-6 of the same beats).
+    # This pass re-reads short, local stretches (padded a beat's width, not
+    # a whole window) and runs Pan-Tompkins fresh on each, across the same
+    # top-3 amplitude leads the window loop itself uses
+    # (peak_detection_lead_indices) -- avoiding that dilution rather than
+    # reusing all_r_peaks (same single-threshold problem, over a 60 s
+    # chunk and one lead -- confirmed it misses this same VT run entirely)
+    # or the window loop's own core_r_peaks.
+    # A run of >= _VT_LOCAL_MIN_BEATS (5) consecutive beats is VT when its
+    # RR is regular (every interval within 12% of the run's own median,
+    # the same regularity _is_ventricular_tachycardia_window asks of its
+    # own window-found core) and its rate is >= 100/min, and >= 75% of the
+    # run's beats measure a wide QRS (120-220 ms, std <= 25 ms across
+    # them) -- the same two gates that window rule already requires,
+    # evaluated on a run of beats instead of on one window. Only ever
+    # carves VT out of an existing Ventricular Fibrillation call; every
+    # other label and rule is untouched, and this runs last, after every
+    # other rhythm and boundary rule above has already settled.
+    _VT_LOCAL_MIN_BEATS = 5
+    _vt_carve_label = 'Ventricular Tachycardia'
+
+    def _vt_local_peaks(scan_start, scan_end):
+        """R-peaks in [scan_start, scan_end), found fresh on short, tightly
+        local reads -- not all_r_peaks' 60 s single-lead chunks, whose one
+        threshold dilutes the same way a whole window's does. Union across
+        the recording's top-3 amplitude leads, merged within 100 ms as one
+        beat, the same leads and merge rule the window loop's own
+        core_r_peaks use."""
+        out = []
+        # Measured on the VT run this pass exists for: step=4/pad=1 still
+        # dilutes (its first read spans the VT run's own neighbouring loud
+        # beat, same problem as the 10 s window), step<=1.5/pad<=0.5 does
+        # not -- every true VT beat recovered, none from the loud beats
+        # bleeding in.
+        step, pad = 1.5, 0.5
+        t = scan_start
+        while t < scan_end:
+            w1 = min(scan_end, t + step)
+            p0, p1 = max(0.0, t - pad), min(total_duration, w1 + pad)
+            blk = reader.read_range(p0, p1)
+            if blk is not None:
+                found = []
+                for li in peak_detection_lead_indices:
+                    if li < blk.shape[0]:
+                        lead_sig = np.asarray(blk[li], dtype=float)
+                        if len(lead_sig) > 50:
+                            found.extend(p0 + float(idx) / fs for idx in pan_tompkins(lead_sig, fs=fs))
+                found.sort()
+                for p in found:
+                    if t <= p < w1 and (not out or p - out[-1] >= 0.1):
+                        out.append(p)
+            t = w1
+        return out
+
+    def _vt_beat_qrs_ms(peak_sec):
+        half = 0.4
+        seg_start = max(0.0, peak_sec - half)
+        seg_end = min(total_duration, peak_sec + half)
+        sig = reader.read_range(seg_start, seg_end)
+        if sig is None or best_lead_idx >= sig.shape[0]:
+            return None
+        lead_sig = np.asarray(sig[best_lead_idx], dtype=float)
+        local_idx = int(round((peak_sec - seg_start) * fs))
+        if local_idx <= 0 or local_idx >= len(lead_sig):
+            return None
+        beat = measure_beat(lead_sig, local_idx, fs)
+        return beat.get('qrs_ms') if beat else None
+
+    def _vt_trim_to_core(run):
+        """Trim a beat run (absolute seconds) to its own longest
+        stable-RR core, dropping transition beats at either edge -- a
+        sinus/VFib-onset beat still closing in on VT's own rate must not
+        get carved in as VT. Reuses _ventricular_tachycardia_core_start
+        exactly as the window rule already uses it to trim VT's start
+        (forwards on the run, then again on the run reversed, for the
+        end) -- the same definition of "VT's own core", not a new one."""
+        if len(run) < 4:
+            return run
+        start_t = _ventricular_tachycardia_core_start([p * fs for p in run], fs)
+        if start_t is None:
+            return run
+        trimmed = [p for p in run if p >= start_t - 1e-9]
+        if len(trimmed) < 4:
+            return trimmed
+        rev_samples = [(trimmed[-1] - p) * fs for p in reversed(trimmed)]
+        end_rel = _ventricular_tachycardia_core_start(rev_samples, fs)
+        if end_rel is None:
+            return trimmed
+        end_t = trimmed[-1] - end_rel
+        return [p for p in trimmed if start_t - 1e-9 <= p <= end_t + 1e-9]
+
+    def _vt_is_test_signal(run_start, run_end):
+        try:
+            from .pqrst_measure import span_status
+            # Not just 'test_signal' (flat-step square/pulse train): the
+            # square wave this check exists for actually read 'non_ecg'
+            # (leads I/V1/V5 correlate >= 0.95 -- the square repeats
+            # identically on every lead, just without the flat step
+            # 'test_signal' itself looks for). Either way the span isn't
+            # distinguishable heart activity; only 'ok' is let through.
+            return span_status(reader, max(0.0, run_start - 0.5),
+                                min(total_duration, run_end + 0.5)) != 'ok'
+        except Exception:
+            return False
+
+    def _vt_runs_in(scan_start, scan_end):
+        peaks = _vt_local_peaks(scan_start, scan_end)
+        if len(peaks) < _VT_LOCAL_MIN_BEATS:
+            return []
+        runs, i = [], 0
+        while i < len(peaks) - 1:
+            j, rrs = i, []
+            while j + 1 < len(peaks):
+                rr = peaks[j + 1] - peaks[j]
+                if not (0.0 < rr <= 0.6):
+                    break
+                if len(rrs) >= 3 and abs(rr - float(np.median(rrs))) > 0.12 * float(np.median(rrs)):
+                    break
+                rrs.append(rr)
+                j += 1
+            run = _vt_trim_to_core(peaks[i:j + 1])
+            if len(run) >= _VT_LOCAL_MIN_BEATS:
+                qrs_vals = [_vt_beat_qrs_ms(p) for p in run]
+                wide = [q for q in qrs_vals if q is not None and 120.0 <= q <= 220.0]
+                # A run this regular and this uniform in width (std == 0
+                # across every beat, not just low) is itself suspicious --
+                # confirmed on a test recording: a repeating square/triangle
+                # wave inside a VFib call gave 12 beats of exactly 250 ms RR
+                # and exactly 160.0 ms QRS, bit for bit, no real beat is
+                # that perfectly identical. Same check the VFib trim already
+                # uses for the same reason (span_status == 'test_signal':
+                # the waveform repeats identically across leads I/V1/V5,
+                # flat steps). A real wide-complex run is unaffected.
+                if (len(wide) >= max(3, int(np.ceil(0.75 * len(run)))) and float(np.std(wide)) <= 25.0
+                        and not _vt_is_test_signal(run[0], run[-1])):
+                    runs.append((run[0], run[-1]))
+            i = max(j, i + 1)
+        return runs
+
+    try:
+        _vt_carved = []
+        for seg in final_segments:
+            if seg['label'] != 'Ventricular Fibrillation':
+                _vt_carved.append(seg)
+                continue
+            cuts = _vt_runs_in(float(seg['start_sec']), float(seg['end_sec']))
+            if not cuts:
+                _vt_carved.append(seg)
+                continue
+            pieces = [(float(seg['start_sec']), float(seg['end_sec']))]
+            for c0, c1 in cuts:
+                nxt_pieces = []
+                for p0, p1 in pieces:
+                    if c1 <= p0 or c0 >= p1:
+                        nxt_pieces.append((p0, p1))
+                        continue
+                    if c0 > p0:
+                        nxt_pieces.append((p0, c0))
+                    if c1 < p1:
+                        nxt_pieces.append((c1, p1))
+                pieces = nxt_pieces
+            for p0, p1 in pieces:
+                if p1 - p0 < 1.0:
+                    continue
+                piece = dict(seg)
+                piece['start_sec'], piece['end_sec'] = p0, p1
+                piece['start_time_str'], piece['end_time_str'] = make_time_strs(p0, p1)
+                _vt_carved.append(piece)
+            for c0, c1 in cuts:
+                c_s_str, c_e_str = make_time_strs(c0, c1)
+                _vt_carved.append({
+                    'start_sec': c0, 'end_sec': c1, 'label': _vt_carve_label,
+                    'color': '#E67E22', 'start_time_str': c_s_str, 'end_time_str': c_e_str,
+                    'detected_rhythm': _vt_carve_label,
+                })
+        final_segments = sorted(_vt_carved, key=lambda x: x['start_sec'])
+    except Exception as e:
+        print(f"[Auto Arrhythmia Detect] VT-in-VFib carve error: {e}")
 
     # ------------------------------------------------------------------
     # Artifact: its own rule. Marks stretches where some leads carry
