@@ -240,8 +240,15 @@ def measure_beats(reader, start_sec: float, end_sec: float) -> List[Dict[str, An
     b, a = butter(2, 25.0 / (fs / 2.0), btype='lowpass')
     lead_ii = filtfilt(b, a, lead_ii)
 
+    # The preprocessor notches 50 Hz only; 60 Hz is notched here too, for
+    # these measurements alone. Seen: 60 Hz interference kept the QRS slope
+    # above its 10% end level -- QRS read 114-154 ms (true 90) or not at
+    # all, and QT with it. The detector's own use of the preprocessor is
+    # unchanged.
     preproc = SignalPreprocessor(fs=fs, config=HolterConfig.from_clinical_config())
-    leads = np.vstack([np.asarray(preproc.process(lead), dtype=float) for lead in data])
+    notch_60 = make_notch(60.0, fs)
+    leads = np.vstack([filtfilt(notch_60.b, notch_60.a, np.asarray(preproc.process(lead), dtype=float))
+                       for lead in data])
     qrs_idx = [lead_names.index(n) for n in QRS_LEADS if n in lead_names]
     t_idx = [lead_names.index(n) for n in T_LEADS if n in lead_names]
 
@@ -364,7 +371,7 @@ def summarize(beats: List[Dict[str, Any]], rhythms: Iterable[str] = (), status: 
 
 
 _CACHE_FILENAME = 'pqrst_cache.json'
-_CACHE_VERSION = 3
+_CACHE_VERSION = 4
 
 
 def recording_frames(path: str) -> List[Dict[str, Any]]:
