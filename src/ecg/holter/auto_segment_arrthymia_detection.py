@@ -7006,6 +7006,11 @@ def convert_to_structured_events(detected_segments: List[Dict[str, Any]]) -> Lis
             'end_timestamp': seg['end_sec'],
             'color': seg['color'],
             'source': 'Auto',
+            # Carried through so apply_auto_segments_to_engine's same-label
+            # merge (below) can tell two touching Artifact regions of a
+            # DIFFERENT mains kind (50 Hz vs 60 Hz) apart -- see its own
+            # comment. None on every other label; harmless there.
+            'artifact_kind': seg.get('artifact_kind'),
         })
 
     # Sort by timestamp
@@ -7270,7 +7275,20 @@ def apply_auto_segments_to_engine(
             if label_merged:
                 last = label_merged[-1]
                 last_end = float(last.get('end_timestamp', 0.0) or 0.0)
-                if start <= last_end + 0.25:
+                # Two touching/close Artifact regions of a DIFFERENT mains
+                # kind (50 Hz vs 60 Hz) are not the same event and must not
+                # merge: confirmed directly this erased the one edge
+                # between them (e.g. 0-16.08s 60 Hz, 16.08-35.57s 50/60
+                # mix) that apply_artifact_wiggle_from_recording needs to
+                # find the wiggle at -- merged into one 0-53.47s span, that
+                # internal edge no longer exists to check at all, and the
+                # "A" mark there never appears. Same-kind Artifact pairs
+                # (the normal case) are unaffected. Every other label has
+                # no artifact_kind (None == None), so this never changes
+                # their own merge behaviour.
+                if label == 'artifact' and last.get('artifact_kind') != ev.get('artifact_kind'):
+                    pass
+                elif start <= last_end + 0.25:
                     last['end_timestamp'] = max(last_end, end)
                     # Prefer this waveform detector's own 'auto'/
                     # 'arrhythmia' source over a stored replay source
