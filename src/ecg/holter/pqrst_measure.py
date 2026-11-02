@@ -75,8 +75,13 @@ VARIABLE_PR_RHYTHMS = ('second-degree av block (mobitz i)',)
 # spread (interquartile range) is within this many ms.
 MIN_BEAT_FRACTION = 0.75
 SPREAD_MS = {'pr_ms': 25.0, 'qrs_ms': 20.0, 'qt_ms': 30.0}
-# [min, max) QRS of every beat for summarize(narrow_qrs_non_ecg=True).
-NARROW_QRS_MS = (40.0, 110.0)
+# Max QRS/RR duty cycle (each beat's own QRS as a fraction of its own RR)
+# for summarize(narrow_qrs_non_ecg=True). A real QRS complex is always a
+# small fraction of its own cycle, at any rate; confirmed directly: two
+# genuine QRS-shaped (R+S) test pulses measured 5.6-14.6% on every beat,
+# a square test wave measured 63% (160 ms QRS at a 250 ms RR) -- well
+# clear of this bound either way.
+QRS_DUTY_CYCLE_MAX = 0.25
 
 BEAT_LEADS = ('I', 'V1', 'V6')
 QRS_LEADS = ('I', 'II', 'aVL', 'V1', 'V2', 'V5', 'V6')
@@ -357,16 +362,28 @@ def summarize(beats: List[Dict[str, Any]], rhythms: Iterable[str] = (), status: 
     the rhythm segments in the frame. See the rules at the top of the
     module.
 
-    narrow_qrs_non_ecg: on a 'non_ecg' frame (the same waveform on every
-    lead), still give QRS -- only QRS -- when every measured beat is a
-    narrow QRS (NARROW_QRS_MS) and the usual _robust_value checks pass.
-    Seen: a simulator QRS-only pulse, QRS 56-64 ms on every beat, shown as
-    '--'; a test triangle wave measured 118-160 ms there and stays '--'.
-    Off by default: only the on-screen label asks for it."""
+    narrow_qrs_non_ecg: on a 'non_ecg' or 'test_signal' frame (the same
+    waveform on every lead, the second additionally flat-stepped), still
+    give QRS -- only QRS -- when every measured beat's own QRS is a small
+    fraction of that beat's own RR (QRS_DUTY_CYCLE_MAX), i.e. it looks
+    like a real QRS complex regardless of its exact width or the
+    recording's rate, and the usual _robust_value checks still pass.
+    'noise' status is not included -- that is signal actually too
+    degraded to trust, not a same-everywhere test waveform.
+    Seen: two genuine QRS-shaped (R+S) simulator pulses, 56-64 ms at a
+    1000 ms RR and 144-146 ms at a 1000 ms RR, both shown as '--' before
+    this; a test square wave (160 ms QRS at a 250 ms RR -- 64% duty
+    cycle) and a triangle wave (QRS never resolved on any beat) both
+    correctly stay '--' with this on. Off by default: only the on-screen
+    label asks for it."""
     out = {'pr_ms': None, 'qrs_ms': None, 'qt_ms': None, 'pr_range': None}
-    if narrow_qrs_non_ecg and status == 'non_ecg' and beats:
-        qrs = [float(b['qrs_ms']) for b in beats if b.get('qrs_ms') is not None]
-        if qrs and all(NARROW_QRS_MS[0] <= q < NARROW_QRS_MS[1] for q in qrs):
+    if narrow_qrs_non_ecg and status in ('non_ecg', 'test_signal') and beats:
+        duty = [
+            float(b['qrs_ms']) / float(b['rr_ms'])
+            for b in beats
+            if b.get('qrs_ms') is not None and b.get('rr_ms')
+        ]
+        if duty and all(d <= QRS_DUTY_CYCLE_MAX for d in duty):
             out['qrs_ms'] = _robust_value(beats, 'qrs_ms')
         return out
     if status != 'ok' or not beats:
