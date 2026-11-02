@@ -3414,6 +3414,21 @@ def _detect_arrhythmias_uncached(
             # _svt_run_in's docstring). The VFib on-ramp windows this guard
             # is for have no steady 170-250 ms F-wave cycle and fail SVT's
             # own rate/regularity/QRS-shape checks the same way.
+            # NOTE: a matching lone-Atrial-Fibrillation exception
+            # (_afib_run_in, same shape as the two above) was tried and
+            # reverted -- confirmed directly it also un-drops a lone AFib
+            # window that is itself a false call on a genuine grouped
+            # Mobitz I run (PR cycling 164/224/368/dropped in a repeating
+            # 4-beat pattern, read as "irregular enough" by the window
+            # rule's own AFib check), which then merged with a real AFib
+            # window 20 s later into one wrong AFib span covering both.
+            # Unlike Flutter/SVT, whose own lone-window false positives are
+            # specifically VFib on-ramps (too chaotic to reach
+            # _classify_atrial_window's QRS-resolved entry gate at all),
+            # AFib's lone-window false positives include exactly this kind
+            # of regular-but-grouped rhythm, which does clear that gate.
+            # _afib_run_in re-checking the same window's own beats with the
+            # same rule that was already wrong about them confirms nothing.
             if _prev_match or _next_match or (
                     _m['label'] == 'Atrial Flutter' and _flutter_run_in(_m['start_sec'], _m['end_sec'])) or (
                     _m['label'] == 'Supraventricular Tachycardia (SVT)'
@@ -4806,6 +4821,24 @@ def _detect_arrhythmias_uncached(
                     ])
                 except Exception:
                     filtered = raw
+            # 60 Hz notch, on top of _atrial_preproc's own 50 Hz-only one,
+            # for this beat-level Bundle Branch Block measurement alone --
+            # _atrial_preproc itself (shared by the AFib/Flutter/VFib
+            # window rules) is untouched. Confirmed directly: under 60 Hz
+            # interference, every beat's width/shape measurement here
+            # failed outright (None) for ~60 s straight -- a genuine
+            # RBBB-> First-degree AV Block-> LBBB transition underneath
+            # went completely unmarked except for First-degree (its own,
+            # different measurement happened to tolerate the 60 Hz).
+            try:
+                from ..enhanced_filter import make_notch as _bbb_make_notch
+                _bbb_notch = _bbb_make_notch(60.0, fs)
+                filtered = np.vstack([
+                    _filtfilt(_bbb_notch.b, _bbb_notch.a, np.asarray(lead, dtype=float))
+                    for lead in filtered
+                ])
+            except Exception:
+                pass
             lead_ii = np.asarray(filtered[conduction_lead_idx], dtype=float) \
                 if conduction_lead_idx < filtered.shape[0] else None
             best = np.asarray(raw[best_lead_idx], dtype=float) if best_lead_idx < raw.shape[0] else None
@@ -4852,9 +4885,7 @@ def _detect_arrhythmias_uncached(
         segments = []
         run = []
 
-        def _close(run):
-            if len(run) < _BUNDLE_BRANCH_BLOCK_BEAT_MIN or not _consistent(run):
-                return
+        def _append_bbb_segment(run):
             label = run[0][1]
             s_sec, e_sec = float(run[0][0]), float(run[-1][0])
             s_str, e_str = make_time_strs(s_sec, e_sec)
@@ -4868,6 +4899,40 @@ def _detect_arrhythmias_uncached(
                 'detected_rhythm': label,
                 '_rr': float(np.median(np.diff([b[0] for b in run]))),
             })
+
+        def _close(run):
+            if len(run) < _BUNDLE_BRANCH_BLOCK_BEAT_MIN:
+                return
+            if _consistent(run):
+                _append_bbb_segment(run)
+                return
+            # A run otherwise one QRS shape/width can still fail _consistent
+            # purely on PR: two genuinely different, each internally stable
+            # PR levels in one run (seen: 12 beats PR 238-242 ms, then 14
+            # beats PR 148-152 ms, step right at the 13th beat) fail the
+            # single-median-PR test as a whole (only the larger group's
+            # beats are "near the median", 54% < the 75% bar) even though
+            # each half easily clears that same bar on its own. Try the
+            # biggest PR jumps in the run as a split point (not every k --
+            # a real step is the actual cause, not an arbitrary valid-but-
+            # wrong boundary some other k might also happen to pass at);
+            # split there only when BOTH halves independently pass the
+            # exact same _consistent() check the whole run already had to.
+            # No match: the run is dropped, same as before this existed.
+            prs = [b[2] for b in run]
+            jumps = sorted(
+                range(1, len(prs)),
+                key=lambda i: abs(prs[i] - prs[i - 1]),
+                reverse=True,
+            )
+            for k in jumps[:3]:
+                if k < _BUNDLE_BRANCH_BLOCK_BEAT_MIN or (len(run) - k) < _BUNDLE_BRANCH_BLOCK_BEAT_MIN:
+                    continue
+                left, right = run[:k], run[k:]
+                if _consistent(left) and _consistent(right):
+                    _append_bbb_segment(left)
+                    _append_bbb_segment(right)
+                    return
 
         for beat in beats:
             if run and beat[1] == run[0][1]:
@@ -6617,31 +6682,139 @@ def _sinus_rate_segments(reader, fs, best_lead_idx, conduction_lead_idx, total_d
 
     # A. Sinus Tachycardia: first pass through the P/PR/QRS sinus gate,
     # then consecutive beats with RR <= 600ms (HR >= 100 bpm).
-    in_tachy = False
-    tachy_start_idx = None
-
+    #
     # Lower bound 340 ms, not 333.3: _detect_p_wave suppresses P whenever
     # the previous QRS sits within 333.3 ms, and RR at ~180 bpm jitters
     # around that edge. Those P-less beats sat inside the run and failed
     # the 75% P gate for the whole run, dropping valid 100-175 bpm sinus
     # tachycardia along with them.
-    for i, rr in enumerate(all_rr_ms):
-        is_fast = (340.0 <= rr <= 600.5) or (rr <= 630.0 and in_tachy and i + 1 < len(all_rr_ms) and 340.0 <= all_rr_ms[i + 1] <= 600.5)
-        if is_fast:
-            if not in_tachy:
-                in_tachy = True
-                tachy_start_idx = i
-        else:
-            if in_tachy:
-                segments.extend(_append_sinus_rate_segments(
-                    all_r_peaks, sinus_gate_metrics, tachy_start_idx, i,
-                    1.0, 'Sinus Tachycardia', '#00FFFF', make_time_strs))
-                in_tachy = False
-                tachy_start_idx = None
+    def _fast_ranges(rr_ms):
+        ranges = []
+        in_run = False
+        start = None
+        for i, rr in enumerate(rr_ms):
+            is_fast = (340.0 <= rr <= 600.5) or (rr <= 630.0 and in_run and i + 1 < len(rr_ms) and 340.0 <= rr_ms[i + 1] <= 600.5)
+            if is_fast:
+                if not in_run:
+                    in_run = True
+                    start = i
+            else:
+                if in_run:
+                    ranges.append((start, i))
+                    in_run = False
+        if in_run:
+            ranges.append((start, len(rr_ms)))
+        return ranges
 
-    if in_tachy and tachy_start_idx is not None:
+    _tachy_ranges = _fast_ranges(all_rr_ms)
+
+    # Missed-beat recovery for this Sinus Tachycardia rule, reactive
+    # instead of a blanket pre-scan the way Sinus Bradycardia's below
+    # is: a blanket scan over every RR that COULD be 2-4 merged fast
+    # beats would also match huge stretches of plain NSR -- a 700 ms
+    # NSR RR and two merged ~350 ms beats are the same number; only
+    # re-reading the raw signal tells them apart, and doing that for
+    # every such RR in a whole recording is far more work than this
+    # rare chunk-boundary artifact (same root cause as the Sinus
+    # Bradycardia recovery's own comment below: pan_tompkins() widens
+    # its refractory period to a third of the 60 s chunk's MEDIAN RR;
+    # a chunk that is mostly a slow rhythm right before a fast run
+    # starts gets a refractory period wide enough to drop every other
+    # beat of that fast run -- confirmed directly: two 428 ms RR
+    # intervals read as one 856 ms, even three as one 1286 ms, with no
+    # mains/signal noise anywhere near it, purely from a preceding ~150 s
+    # 41 bpm run dominating that 60 s chunk's own median -- 173.1-180.4 s
+    # read as if it were still under 100 bpm, and Sinus Tachycardia
+    # started 7.3 s late).
+    # Instead: once a run above is already confirmed fast, walk backward
+    # from its own start while the RR interval just before it divides
+    # evenly (within 15%) by 2, 3 or 4 into the run's own established
+    # rate -- re-read just that one gap (+/-3 s, same technique as the
+    # Sinus Bradycardia recovery) and re-run Pan-Tompkins locally, where
+    # the gap's own short local median RR keeps the refractory period
+    # correctly tight. Beats found whose resulting intervals are
+    # themselves in the fast band are spliced in and the run is
+    # extended one gap further back; this repeats until a gap doesn't
+    # divide cleanly, or nothing new turns up, or the signal can't be
+    # read. all_r_peaks itself is left untouched, so every other rule
+    # sees the same beats as before.
+    _tachy_recovered = {}
+    for start_idx, end_idx in _tachy_ranges:
+        run_rrs = all_rr_ms[start_idx:end_idx]
+        if not run_rrs:
+            continue
+        run_rr = float(np.median(run_rrs))
+        if run_rr <= 0:
+            continue
+        j = start_idx
+        while j > 0:
+            prev_rr = all_rr_ms[j - 1]
+            k = round(prev_rr / run_rr)
+            if k < 2 or k > 4 or abs(prev_rr - k * run_rr) > 0.15 * k * run_rr:
+                break
+            gap_start, gap_end = all_r_peaks[j - 1], all_r_peaks[j]
+            read_start = max(0.0, gap_start - 3.0)
+            read_end = min(total_duration, gap_end + 3.0)
+            gap_data = reader.read_range(read_start, read_end)
+            if gap_data is None or best_lead_idx >= gap_data.shape[0]:
+                break
+            gap_sig = np.asarray(gap_data[best_lead_idx], dtype=float)
+            if len(gap_sig) <= 50:
+                break
+            found = sorted(
+                read_start + float(p_idx) / float(fs)
+                for p_idx in pan_tompkins(gap_sig, fs=fs)
+                if gap_start + 0.25 < read_start + float(p_idx) / float(fs) < gap_end - 0.25
+            )
+            if not found:
+                break
+            new_points = [gap_start] + found + [gap_end]
+            new_rrs = [1000.0 * (b - a) for a, b in zip(new_points, new_points[1:])]
+            if not all(340.0 <= x <= 630.0 for x in new_rrs):
+                break
+            _tachy_recovered.setdefault(j - 1, []).extend(found)
+            j -= 1
+
+    if _tachy_recovered:
+        tachy_r_peaks = []
+        for idx, p in enumerate(all_r_peaks):
+            tachy_r_peaks.append(p)
+            tachy_r_peaks.extend(sorted(_tachy_recovered.get(idx, [])))
+        tachy_r_peaks = sorted(set(tachy_r_peaks))
+        _metric_at = dict(zip(all_r_peaks, sinus_gate_metrics))
+        tachy_beat_metrics = []
+        for k, peak_sec in enumerate(tachy_r_peaks):
+            if peak_sec in _metric_at:
+                tachy_beat_metrics.append(_metric_at[peak_sec])
+                continue
+            # Same measurement as sinus_gate_metrics above: conduction
+            # lead, strict P/PR, 0.5 Hz high-pass + 25 Hz low-pass.
+            metric = None
+            m_start = max(0.0, peak_sec - 3.0)
+            m_end = min(total_duration, peak_sec + 3.0)
+            m_data = reader.read_range(m_start, m_end)
+            if m_data is not None and conduction_lead_idx < m_data.shape[0]:
+                m_sig = sinus_gate_filter(np.asarray(m_data[conduction_lead_idx], dtype=float))
+                local_peak = int(round((peak_sec - m_start) * fs))
+                prev_rr_ms = (peak_sec - tachy_r_peaks[k - 1]) * 1000.0 if k > 0 else None
+                if 0 < local_peak < len(m_sig):
+                    metric = measure_beat(m_sig, local_peak, fs, strict_pr=True, prev_rr_ms=prev_rr_ms)
+                    if metric and metric.get('p_peak') is not None:
+                        metric['_p_time_sec'] = m_start + float(metric['p_peak']) / float(fs)
+                    if metric:
+                        metric['_r_time_sec'] = peak_sec
+            tachy_beat_metrics.append(metric)
+        tachy_rr_ms = [
+            (tachy_r_peaks[k + 1] - tachy_r_peaks[k]) * 1000.0
+            for k in range(len(tachy_r_peaks) - 1)
+        ]
+        _tachy_ranges = _fast_ranges(tachy_rr_ms)
+    else:
+        tachy_r_peaks, tachy_beat_metrics = all_r_peaks, sinus_gate_metrics
+
+    for start_idx, end_idx in _tachy_ranges:
         segments.extend(_append_sinus_rate_segments(
-            all_r_peaks, sinus_gate_metrics, tachy_start_idx, len(all_rr_ms),
+            tachy_r_peaks, tachy_beat_metrics, start_idx, end_idx,
             1.0, 'Sinus Tachycardia', '#00FFFF', make_time_strs))
 
     # B. Sinus Bradycardia: first pass through the same P/PR/QRS sinus
