@@ -75,6 +75,8 @@ VARIABLE_PR_RHYTHMS = ('second-degree av block (mobitz i)',)
 # spread (interquartile range) is within this many ms.
 MIN_BEAT_FRACTION = 0.75
 SPREAD_MS = {'pr_ms': 25.0, 'qrs_ms': 20.0, 'qt_ms': 30.0}
+# [min, max) QRS of every beat for summarize(narrow_qrs_non_ecg=True).
+NARROW_QRS_MS = (40.0, 110.0)
 
 BEAT_LEADS = ('I', 'V1', 'V6')
 QRS_LEADS = ('I', 'II', 'aVL', 'V1', 'V2', 'V5', 'V6')
@@ -347,13 +349,26 @@ def _robust_value(beats: List[Dict[str, Any]], key: str) -> Optional[float]:
     return float(np.median(values))
 
 
-def summarize(beats: List[Dict[str, Any]], rhythms: Iterable[str] = (), status: str = 'ok') -> Dict[str, Any]:
+def summarize(beats: List[Dict[str, Any]], rhythms: Iterable[str] = (), status: str = 'ok',
+              narrow_qrs_non_ecg: bool = False) -> Dict[str, Any]:
     """PR / QRS / QT of one frame for display: {'pr_ms', 'qrs_ms', 'qt_ms'}
     (None = not reliably measurable, shown as '--') plus 'pr_range' (min,
     max) for a rhythm whose PR varies beat to beat. `rhythms`: labels of
     the rhythm segments in the frame. See the rules at the top of the
-    module."""
+    module.
+
+    narrow_qrs_non_ecg: on a 'non_ecg' frame (the same waveform on every
+    lead), still give QRS -- only QRS -- when every measured beat is a
+    narrow QRS (NARROW_QRS_MS) and the usual _robust_value checks pass.
+    Seen: a simulator QRS-only pulse, QRS 56-64 ms on every beat, shown as
+    '--'; a test triangle wave measured 118-160 ms there and stays '--'.
+    Off by default: only the on-screen label asks for it."""
     out = {'pr_ms': None, 'qrs_ms': None, 'qt_ms': None, 'pr_range': None}
+    if narrow_qrs_non_ecg and status == 'non_ecg' and beats:
+        qrs = [float(b['qrs_ms']) for b in beats if b.get('qrs_ms') is not None]
+        if qrs and all(NARROW_QRS_MS[0] <= q < NARROW_QRS_MS[1] for q in qrs):
+            out['qrs_ms'] = _robust_value(beats, 'qrs_ms')
+        return out
     if status != 'ok' or not beats:
         return out
     labels = [str(r).lower() for r in rhythms]

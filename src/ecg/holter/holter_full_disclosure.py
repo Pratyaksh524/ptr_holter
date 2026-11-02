@@ -4069,7 +4069,7 @@ class HolterFullDisclosureDialog(QDialog):
                     if event_start <= end_sec and event_end >= start_sec:
                         rhythms.append(str(event.get('label', event.get('type', '')) or ''))
 
-            values = summarize(beats, rhythms, status)
+            values = summarize(beats, rhythms, status, narrow_qrs_non_ecg=True)
 
             def ms(v):
                 return f"{v:.0f} ms" if v is not None else "--"
