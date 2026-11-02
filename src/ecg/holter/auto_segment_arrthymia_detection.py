@@ -948,7 +948,26 @@ def _detect_arrhythmias_uncached(
     except Exception:
         _apply_dft_filter = None
 
+    try:
+        from ..enhanced_filter import make_notch as _make_notch
+    except Exception:
+        _make_notch = None
+
+    # 50 and 60 Hz notches first, as the Full Disclosure strip does
+    # (holter_widgets._remove_mains): the 25 Hz low-pass below still passes
+    # part of the mains, and with the simulator's mains on, that hid every
+    # P wave -- seen: sinus 30 bpm, P on 10/10 beats before a 50 Hz stretch,
+    # 0/10 inside it (10/10, PR 152-174 ms, with the notch), so Sinus
+    # Bradycardia stopped there and only the rate-only Bradycardia remained.
     def _sinus_gate_filter(x):
+        if _make_notch is not None:
+            for _mains_hz in (50.0, 60.0):
+                if _mains_hz < float(fs) / 2.0:
+                    try:
+                        _bq = _make_notch(_mains_hz, float(fs))
+                        x = _filtfilt(_bq.b, _bq.a, np.asarray(x, dtype=float))
+                    except Exception:
+                        pass
         if _apply_dft_filter is not None:
             try:
                 x = np.asarray(_apply_dft_filter(x, float(fs), "0.5"), dtype=float)
@@ -5731,7 +5750,6 @@ def _detect_arrhythmias_uncached(
                 while p - filled[-1] > 1.5:
                     filled.append(filled[-1] + 1.0)
                 filled.append(p)
-            pieces = [(s0, s1)]
             cut_spans = []
             for a, b in zip(filled, filled[1:]):
                 if b - a <= 0 or span_status(reader, a, b) != 'test_signal':
@@ -5740,6 +5758,14 @@ def _detect_arrhythmias_uncached(
                     cut_spans[-1][1] = b
                 else:
                     cut_spans.append([a, b])
+            # Only a test-signal stretch of >= 2 s is cut (a square / pulse
+            # train runs for seconds): a lone 1 s piece reading test_signal
+            # is the flat join between VFib and a flatline, and cutting it
+            # just split one VFib episode into pieces with 1 s holes (seen:
+            # 594.3-595.3 s and 607.3-608.3 s).
+            cut_spans = [c for c in cut_spans if c[1] - c[0] >= 2.0]
+            pieces = [(s0, s1)]
+            for a, b in cut_spans:
                 nxt = []
                 for p0, p1 in pieces:
                     if b <= p0 or a >= p1:
@@ -5864,6 +5890,9 @@ def _detect_arrhythmias_uncached(
         # measured are checked here; a genuinely noisy I or II still cuts
         # the block (derived leads inherit the same noise and fail too).
         noisy_blocks = []
+        # Noisy blocks where at least one failing lead is flat (a flatline,
+        # not chaos) -- the only ones that still cut VFib / VT, see below.
+        flat_noisy_blocks = []
         r0 = 0.0
         while r0 < total_duration and final_segments:
             r1 = min(total_duration, r0 + _NOISE_READ_SEC)
@@ -5877,11 +5906,19 @@ def _detect_arrhythmias_uncached(
                     if block.shape[1] >= int(2.0 * fs):
                         leads = {lead_names[i]: block[i] for i in range(min(len(lead_names), block.shape[0]))
                                  if lead_names[i] not in DERIVED_LEAD_SOURCES}
-                        if _nq.noisy_leads(leads):
+                        noisy = _nq.noisy_leads(leads)
+                        if noisy:
                             if noisy_blocks and abs(noisy_blocks[-1][1] - b0) < 1e-6:
                                 noisy_blocks[-1][1] = b1
                             else:
                                 noisy_blocks.append([b0, b1])
+                            _names, _blk, _clip = _nq._lead_block(leads)
+                            _scores, _flat = _nq.lead_scores(_blk, _clip)
+                            if any(bool(f) for n, f in zip(_names, _flat) if n in noisy):
+                                if flat_noisy_blocks and abs(flat_noisy_blocks[-1][1] - b0) < 1e-6:
+                                    flat_noisy_blocks[-1][1] = b1
+                                else:
+                                    flat_noisy_blocks.append([b0, b1])
                     b0 = b1
             r0 = r1
         if noisy_blocks:
@@ -5889,7 +5926,9 @@ def _detect_arrhythmias_uncached(
             for seg in final_segments:
                 # Unidentified already marks a stretch with nothing to read
                 # (noisy, or no heart signal): it stays. Ventricular
-                # Fibrillation / Tachycardia stay too: their own evidence is
+                # Fibrillation / Tachycardia are cut only by a block whose
+                # failing lead is flat (flat_noisy_blocks), not by one that
+                # fails from chaos: their own evidence is
                 # an unresolved/organized-wide QRS on the detection leads
                 # (_is_vfib_window / _is_ventricular_tachycardia_window),
                 # not a clean per-lead SQI -- VFib's genuinely chaotic
@@ -5910,11 +5949,18 @@ def _detect_arrhythmias_uncached(
                 # going through this gate as before -- no evidence yet that
                 # they are cut the same way, and AV blocks / SVT lean on
                 # fine P-wave timing that a truly noisy lead can corrupt.
-                if seg['label'] in ('Unidentified', 'Ventricular Fibrillation', 'Ventricular Tachycardia'):
+                # A flat failing lead is no signal, not chaos, so it still
+                # cuts VFib / VT as before (seen: VFib 595.4-607.3 s, then a
+                # flatline on 6-8 of 8 leads -- without this, VFib ran on
+                # over the flatline to 645 s instead of being cut at 630 s;
+                # the real VFib blocks above failed on one non-flat lead).
+                if seg['label'] == 'Unidentified':
                     gated.append(seg)
                     continue
+                cut_blocks = flat_noisy_blocks if seg['label'] in (
+                    'Ventricular Fibrillation', 'Ventricular Tachycardia') else noisy_blocks
                 pieces = [(float(seg['start_sec']), float(seg['end_sec']))]
-                for n0, n1 in noisy_blocks:
+                for n0, n1 in cut_blocks:
                     nxt = []
                     for p0, p1 in pieces:
                         if n1 <= p0 or n0 >= p1:

@@ -41,12 +41,12 @@ try:
     from .theme import (COL_BLACK, COL_DARK, COL_GREEN, COL_GREEN_DRK, COL_WHITE, COL_GRID_MAJOR, COL_GRID_MINOR,
                         TOOL_RULER, TOOL_CALIPER, TOOL_MAGNIFY, TOOL_SELECT)
     from .holter_ui import ECGStripCanvas, MagnifierOverlay
-    from .panels.holter_widgets import keep_artifact_wiggle_in_all_leads
+    from .panels.holter_widgets import apply_artifact_wiggle_from_recording
 except ImportError:
     from ecg.holter.theme import (COL_BLACK, COL_DARK, COL_GREEN, COL_GREEN_DRK, COL_WHITE, COL_GRID_MAJOR, COL_GRID_MINOR,
                                    TOOL_RULER, TOOL_CALIPER, TOOL_MAGNIFY, TOOL_SELECT)
     from ecg.holter.holter_ui import ECGStripCanvas, MagnifierOverlay
-    from ecg.holter.panels.holter_widgets import keep_artifact_wiggle_in_all_leads
+    from ecg.holter.panels.holter_widgets import apply_artifact_wiggle_from_recording
 
 try:
     from utils.settings_manager import SettingsManager
@@ -3830,7 +3830,10 @@ class HolterFullDisclosureDialog(QDialog):
         plain_rate_targets = {
             'bradycardia': ('Bradycardia', '#20B2AA'),
             'tachycardia': ('Tachycardia', '#F08080'),
-            'unidentified': ('Unidentified', '#808080'),
+            # Unidentified gets no band/text here on the strip -- it stays
+            # only in the bottom-right "Arrhythmia: ... at HH:MM:SS" readout
+            # (see the active_auto label set further below, which still
+            # includes 'unidentified' and is unchanged).
         }
         reader_start = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
         regions = []
@@ -4662,8 +4665,12 @@ class HolterFullDisclosureDialog(QDialog):
                            context_before=before_i, context_after=after_i)
             else:
                 c.set_data(x, np.zeros(expected_len, dtype=np.float32), beat_annotations=beat_annotations, start_sec=start_sec, structured_events=visible_structured_events, fast_preview=not update_extras)
-        # Artifact wiggle is coloured only where every lead shows it.
-        keep_artifact_wiggle_in_all_leads(self._canvases)
+        # Artifact wiggle is coloured only where every lead shows it, judged
+        # on a fixed stretch of the recording around each Artifact edge so
+        # the mark does not come and go while scrolling.
+        apply_artifact_wiggle_from_recording(
+            self._canvases, getattr(self._engine, '_reader', None),
+            getattr(self._engine, '_structured_events', []))
 
         # Refresh the measurement header after the current waveform has been
         # installed on every canvas.  The status/header update runs earlier

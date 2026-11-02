@@ -166,6 +166,153 @@ def keep_artifact_wiggle_in_all_leads(canvases):
         c.update()
 
 
+# Each Artifact edge is judged on these fixed 10 s "virtual strips" (start =
+# edge + offset), the same check the visible strip used to run; a wiggle
+# found on any of them is kept. Extra filter room read on each side.
+_ARTIFACT_STRIP_OFFSETS_SEC = (-8.0, -5.0, -2.0)
+_ARTIFACT_STRIP_SEC = 10.0
+_ARTIFACT_EDGE_PAD_SEC = 2.0
+_artifact_wiggle_cache = {}
+
+
+def _display_filtered(raw, fs, lead_in, n):
+    """The strip's own display filtering (ECGStripCanvas.set_data) on a
+    padded read: 50/60 Hz notch, 0.5 Hz high-pass, 3-point median, 25 Hz
+    Gaussian; returns the n samples starting at lead_in."""
+    x = _remove_mains(np.asarray(raw, dtype=float), fs)
+    if apply_dft_filter is not None:
+        x = np.asarray(apply_dft_filter(x, fs, "0.5"), dtype=float)
+    x = x[lead_in:lead_in + n]
+    if gaussian_lowpass is not None and x.size >= 3:
+        p = np.pad(x, (1, 1), mode="edge")
+        x = gaussian_lowpass(np.median(np.stack((p[:-2], p[1:-1], p[2:]), axis=0), axis=0), 25.0, fs)
+    return np.asarray(x, dtype=float)
+
+
+def _artifact_edge_wiggle(reader, edge, events):
+    """{lead name: [(t0, t1), ...]} (recording seconds) of the visible wiggle
+    at one Artifact edge. The strip's own check (_visible_mains_wiggle, then
+    the every-lead rule) is run on fixed 10 s virtual strips around the edge
+    (_ARTIFACT_STRIP_OFFSETS_SEC) and their marks are united -- the same
+    answer however the real strip is scrolled. Cached per edge."""
+    key = (str(getattr(reader, 'path', id(reader))), round(float(edge), 3),
+           tuple((round(float(e['timestamp']), 3), round(float(e['end_timestamp']), 3)) for e in events))
+    if key in _artifact_wiggle_cache:
+        return _artifact_wiggle_cache[key]
+    out = {}
+    try:
+        fs = float(getattr(reader, 'fs', 500) or 500)
+        total = float(getattr(reader, 'duration_sec', edge + 20.0) or (edge + 20.0))
+        names = list(getattr(reader, 'lead_names', []) or [])
+        for off in _ARTIFACT_STRIP_OFFSETS_SEC:
+            w0 = max(0.0, edge + off)
+            w1 = min(total, w0 + _ARTIFACT_STRIP_SEC)
+            r0 = max(0.0, w0 - _ARTIFACT_EDGE_PAD_SEC)
+            r1 = min(total, w1 + _ARTIFACT_EDGE_PAD_SEC)
+            blk = reader.read_range(r0, r1)
+            lead_in, n = int(round((w0 - r0) * fs)), int(round((w1 - w0) * fs))
+            if blk is None or n < int(fs):
+                continue
+            spans_by_lead = {}
+            for i, name in enumerate(names[:blk.shape[0]]):
+                raw = np.asarray(blk[i], dtype=float)
+                if raw.size < lead_in + n or float(np.ptp(raw)) <= 0.0:
+                    continue
+                d = _display_filtered(raw, fs, lead_in, n)
+                spans_by_lead[name] = _visible_mains_wiggle(d, fs, w0, events)
+            if not spans_by_lead:
+                continue
+            # Every-lead rule (keep_artifact_wiggle_in_all_leads) on this strip.
+            pad = int(0.25 * fs)
+            common = np.ones(n, dtype=bool)
+            for spans in spans_by_lead.values():
+                has = np.zeros(n, dtype=bool)
+                for a, b in spans:
+                    has[max(0, a - pad):min(n, b + pad + 1)] = True
+                common &= has
+            for name, spans in spans_by_lead.items():
+                for a, b in spans:
+                    t0, t1 = w0 + a / fs, w0 + b / fs
+                    if abs(0.5 * (t0 + t1) - edge) <= 1.5 and common[min(a, n - 1):min(b, n - 1) + 1].any():
+                        out.setdefault(name, []).append((t0, t1))
+        for name, spans in out.items():
+            spans.sort()
+            merged = [list(spans[0])]
+            for t0, t1 in spans[1:]:
+                if t0 <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], t1)
+                else:
+                    merged.append([t0, t1])
+            out[name] = [tuple(m) for m in merged]
+    except Exception:
+        out = {}
+    _artifact_wiggle_cache[key] = out
+    return out
+
+
+def apply_artifact_wiggle_from_recording(canvases, reader, events):
+    """Colour each strip's Artifact wiggle from the recording itself, not
+    from what the strip happens to show: the wiggle at each auto Artifact
+    edge is judged once on a fixed stretch around that edge
+    (_artifact_edge_wiggle), so it stays put while scrolling. Was judged on
+    the visible 10 s strip, whose own quiet part set the threshold -- a
+    noisy stretch scrolling into view lifted it over the wiggle in a few
+    leads and the every-lead rule then dropped the mark (seen: threshold
+    6.8 with the strip at 32 s, 34.6 at 33 s, wiggle 38.4; aVL/V1/V2 lost
+    it and the mark vanished). Same check, now on fixed virtual strips per
+    edge (_artifact_edge_wiggle). Call after set_data() on all canvases."""
+    if reader is None:
+        keep_artifact_wiggle_in_all_leads(canvases)
+        return
+    artifacts = [
+        ev for ev in events or []
+        if isinstance(ev, dict) and str(ev.get('source', '')).lower() == 'auto'
+        and str(ev.get('label', ev.get('type', '')) or '').strip().lower() == 'artifact'
+        and ev.get('end_timestamp') is not None
+    ]
+    # Only edges whose wiggle zone (+/- 1 s) can reach the shown strip.
+    shown = [(float(getattr(c, '_start_sec', 0.0) or 0.0),
+              float(getattr(c, '_start_sec', 0.0) or 0.0)
+              + np.asarray(c._data).size / float(getattr(c, '_fs', 500) or 500))
+             for c in canvases if getattr(c, '_data', None) is not None and np.asarray(c._data).size]
+    view0 = min((a for a, _ in shown), default=0.0) - 1.5
+    view1 = max((b for _, b in shown), default=0.0) + 1.5
+    times = {}
+    for ev in artifacts:
+        for edge in (float(ev.get('timestamp', 0.0) or 0.0), float(ev['end_timestamp'])):
+            if not (view0 <= edge <= view1):
+                continue
+            near = [e for e in artifacts
+                    if float(e['timestamp']) < edge + _ARTIFACT_STRIP_SEC
+                    and float(e['end_timestamp']) > edge - _ARTIFACT_STRIP_SEC]
+            for name, spans in _artifact_edge_wiggle(reader, edge, near).items():
+                times.setdefault(name, []).extend(spans)
+    # One edge shared by two Artifacts (one ends where the next starts) is
+    # judged twice; merge so each wiggle is listed once.
+    for name, spans in times.items():
+        spans.sort()
+        merged = [list(spans[0])]
+        for t0, t1 in spans[1:]:
+            if t0 <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], t1)
+            else:
+                merged.append([t0, t1])
+        times[name] = [tuple(m) for m in merged]
+    for c in canvases:
+        data = getattr(c, '_data', None)
+        n = np.asarray(data).size if data is not None else 0
+        fs = float(getattr(c, '_fs', 500) or 500)
+        s0 = float(getattr(c, '_start_sec', 0.0) or 0.0)
+        out = []
+        for t0, t1 in times.get(getattr(c, 'lead_name', ''), []):
+            a, b = int(round((t0 - s0) * fs)), int(round((t1 - s0) * fs))
+            if b < 0 or a >= n:
+                continue
+            out.append((max(0, a), min(n - 1, b)))
+        c._artifact_wiggle = out
+        c.update()
+
+
 # 6. HOLTER RR / HR TREND CANVAS
 class HolterRRTrendCanvas(QWidget):
     clicked = pyqtSignal(int)
