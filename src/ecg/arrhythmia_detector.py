@@ -380,6 +380,7 @@ def _detect_p_wave(
     strict_selection: bool = False,
     prev_rr_ms: Optional[float] = None,
     collision_check: bool = True,
+    collision_skip_prev_qrs_ms: Optional[float] = None,
 ) -> Dict[str, object]:
     result = {
         "p_present": False,
@@ -402,9 +403,17 @@ def _detect_p_wave(
     # >= 333.3 ms (pqrst_measure) -- the zone then holds the real P wave, and
     # a P above 55% of a small R was rejected (seen: lead II R ~200-390, P
     # ~280, 150 bpm sinus, P on 0 of 72 beats).
+    # collision_skip_prev_qrs_ms (with prev_rr_ms): the zone starts no
+    # earlier than that long after the previous R, so the previous beat's
+    # own QRS is not read as a wave colliding with this P. Seen: 175 bpm
+    # sinus, RR 342 ms -- R - 333 ms landed 9 ms after the previous R, its
+    # downstroke read 58-68% of R and P was rejected on 25 of 25 beats.
     if collision_check:
         r_amp = abs(float(signal[r_idx]) - baseline)
-        collision_zone = signal[max(0, r_idx - _ms_to_samples(333.3, fs)): max(0, r_idx - _ms_to_samples(70, fs))]
+        zone_start = r_idx - _ms_to_samples(333.3, fs)
+        if collision_skip_prev_qrs_ms is not None and prev_rr_ms is not None:
+            zone_start = max(zone_start, r_idx - _ms_to_samples(prev_rr_ms - collision_skip_prev_qrs_ms, fs))
+        collision_zone = signal[max(0, zone_start): max(0, r_idx - _ms_to_samples(70, fs))]
         if collision_zone.size and r_amp > 1e-4 and float(np.max(np.abs(collision_zone - baseline))) > 0.55 * r_amp:
             return result
 
@@ -564,6 +573,7 @@ def measure_beat(
     strict_pr: bool = False,
     prev_rr_ms: Optional[float] = None,
     p_collision_check: bool = True,
+    p_collision_skip_prev_qrs_ms: Optional[float] = None,
 ) -> Optional[Dict[str, object]]:
     signal_arr = _safe_array(signal)
     if signal_arr.size == 0 or r_idx <= 0 or r_idx >= signal_arr.size:
@@ -602,7 +612,8 @@ def measure_beat(
         return beat
 
     beat.update(_detect_p_wave(signal_arr, int(r_idx), baseline, fs, strict_selection=strict_pr,
-                               prev_rr_ms=prev_rr_ms, collision_check=p_collision_check))
+                               prev_rr_ms=prev_rr_ms, collision_check=p_collision_check,
+                               collision_skip_prev_qrs_ms=p_collision_skip_prev_qrs_ms))
     if beat["p_present"] and beat["p_onset"] is not None:
         p_onset = int(beat["p_onset"])
         p_peak = int(beat.get("p_peak") or p_onset)

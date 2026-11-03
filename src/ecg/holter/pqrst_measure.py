@@ -377,7 +377,11 @@ def summarize(beats: List[Dict[str, Any]], rhythms: Iterable[str] = (), status: 
     correctly stay '--' with this on. Off by default: only the on-screen
     label asks for it."""
     out = {'pr_ms': None, 'qrs_ms': None, 'qt_ms': None, 'pr_range': None}
+    labels = [str(r).lower() for r in rhythms]
+    has = lambda names: any(any(n in lbl for n in names) for lbl in labels)
     if narrow_qrs_non_ecg and status in ('non_ecg', 'test_signal') and beats:
+        if has(NO_QRS_RHYTHMS):
+            return out
         duty = [
             float(b['qrs_ms']) / float(b['rr_ms'])
             for b in beats
@@ -388,8 +392,6 @@ def summarize(beats: List[Dict[str, Any]], rhythms: Iterable[str] = (), status: 
         return out
     if status != 'ok' or not beats:
         return out
-    labels = [str(r).lower() for r in rhythms]
-    has = lambda names: any(any(n in lbl for n in names) for lbl in labels)
     if not has(NO_QRS_RHYTHMS):
         out['qrs_ms'] = _robust_value(beats, 'qrs_ms')
         out['qt_ms'] = _robust_value(beats, 'qt_ms')

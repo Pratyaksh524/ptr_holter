@@ -107,6 +107,9 @@ class HolterReplayEngine:
                             elif 'av block' in arr_label:
                                 label_code = 'P'
                                 color = '#FF00FF'  # Magenta
+                            elif 'atrial tachycardia' in arr_label:
+                                label_code = 'S'
+                                color = '#FF7F50'  # Coral
                             elif 'sinus bradycardia' in arr_label or 'bradycardia' in arr_label:
                                 label_code = 'S'
                                 color = '#00BFFF'  # Deep Sky Blue
@@ -205,6 +208,9 @@ class HolterReplayEngine:
                     elif 'av block' in label_lower:
                         label_code = 'P'
                         color = '#FF00FF'  # Magenta
+                    elif 'atrial tachycardia' in label_lower:
+                        label_code = 'S'
+                        color = '#FF7F50'  # Coral
                     elif 'sinus bradycardia' in label_lower or 'bradycardia' in label_lower:
                         label_code = 'S'
                         color = '#00BFFF'  # Deep Sky Blue

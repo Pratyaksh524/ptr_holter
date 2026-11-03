@@ -2502,6 +2502,7 @@ class HolterFullDisclosureDialog(QDialog):
                 'afib': 'Atrial Fibrillation',
                 'atrial flutter': 'Atrial Flutter',
                 'aflutter': 'Atrial Flutter',
+                'atrial tachycardia': 'Atrial Tachycardia',
                 'sinus bradycardia': 'Sinus Bradycardia',
                 'bradycardia': 'Sinus Bradycardia',
                 'sinus tachycardia': 'Sinus Tachycardia',
@@ -3794,6 +3795,9 @@ class HolterFullDisclosureDialog(QDialog):
             'afib': ('Atrial Fibrillation', '#B36BFF'),
             'atrial flutter': ('Atrial Flutter', '#FF69B4'),
             'aflutter': ('Atrial Flutter', '#FF69B4'),
+            # Before the bare 'tachycardia' fallback, which would draw it as
+            # Sinus Tachycardia.
+            'atrial tachycardia': ('Atrial Tachycardia', '#FF7F50'),
             'sinus bradycardia': ('Sinus Bradycardia', '#00BFFF'),
             'bradycardia': ('Sinus Bradycardia', '#00BFFF'),
             'sinus tachycardia': ('Sinus Tachycardia', '#00FFFF'),
