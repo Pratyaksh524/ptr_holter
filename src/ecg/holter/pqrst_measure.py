@@ -50,7 +50,36 @@ IDENTICAL_LEADS_CORR = 0.95
 # trains 0.64-0.74; the simulator's VFib 0.03-0.21.
 TEST_SIGNAL_FLAT_STEP = 0.002
 TEST_SIGNAL_FLAT_FRACTION = 0.5
+# A test wave that is not flat-stepped (a 10 Hz sine, a 2 Hz triangle) is
+# still the same on every lead AND repeats cycle for cycle: the normalised
+# autocorrelation of Lead II (_periodicity) is 0.99-1.0 for it. The
+# simulator's VFib is the same on every lead too, but repeats nothing: 0.45-
+# 0.50 in every VFib window of every recording (113 recordings, 10 s frames).
+TEST_SIGNAL_PERIODICITY = 0.97
 STATUS_CONTEXT_SEC = 2.0
+
+
+def _periodicity(x, fs: float) -> float:
+    """How exactly `x` repeats itself: the highest normalised (unbiased)
+    autocorrelation at a lag past the first drop below 0.5 and up to half the
+    signal -- ~1.0 for a periodic wave (sine / triangle / square, any
+    frequency with >= 2 cycles), ~0.5 for the simulator's VFib, lower for
+    anything else. 0.0 when it never drops below 0.5 or is too short."""
+    x = np.asarray(x, dtype=float)
+    x = x - float(np.mean(x))
+    n = x.size
+    if n < int(2 * fs) or not np.any(x):
+        return 0.0
+    f = np.fft.rfft(x, 2 * n)
+    ac = np.fft.irfft(f * np.conj(f))[:n]
+    r = (ac / np.maximum(n - np.arange(n), 1)) / (ac[0] / n)
+    below = np.flatnonzero(r < 0.5)
+    if below.size == 0:
+        return 0.0
+    lo, hi = int(below[0]), n // 2
+    if hi <= lo + 2:
+        return 0.0
+    return float(np.max(r[lo:hi]))
 
 
 def span_status(reader, start_sec: float, end_sec: float) -> str:
@@ -311,9 +340,10 @@ def measure_beats(reader, start_sec: float, end_sec: float) -> List[Dict[str, An
 
 def frame_status(reader, start_sec: float, end_sec: float) -> str:
     """'test_signal' (the same waveform on every lead and Lead II flat over
-    >= TEST_SIGNAL_FLAT_FRACTION of the samples: a square / triangle /
-    pulse test train), 'non_ecg' (the same waveform on every lead otherwise
-    -- e.g. the simulator's VFib), 'noise' (Lead II signal quality under
+    >= TEST_SIGNAL_FLAT_FRACTION of the samples -- a square / triangle /
+    pulse test train -- or repeating cycle for cycle, _periodicity >=
+    TEST_SIGNAL_PERIODICITY -- a sine / triangle), 'non_ecg' (the same
+    waveform on every lead otherwise -- e.g. the simulator's VFib), 'noise' (Lead II signal quality under
     sqi_min) or 'ok'. At least 2 s of signal; shorter reads 'ok'."""
     from .analysis_pipeline import SignalPreprocessor, SignalQuality, HolterConfig
     lead_names = list(getattr(reader, 'lead_names', []) or [])
@@ -334,6 +364,8 @@ def frame_status(reader, start_sec: float, end_sec: float) -> str:
                     step = np.abs(np.diff(lead_ii))
                     flat = float(np.mean(step <= TEST_SIGNAL_FLAT_STEP * float(np.ptp(lead_ii))))
                     if flat >= TEST_SIGNAL_FLAT_FRACTION:
+                        return 'test_signal'
+                    if _periodicity(lead_ii, fs) >= TEST_SIGNAL_PERIODICITY:
                         return 'test_signal'
                 return 'non_ecg'
     if 'II' in lead_names:

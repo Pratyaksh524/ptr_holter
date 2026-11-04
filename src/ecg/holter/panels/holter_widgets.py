@@ -189,6 +189,106 @@ def _display_filtered(raw, fs, lead_in, n):
     return np.asarray(x, dtype=float)
 
 
+class StableBeatTimes:
+    """R-peak times for the RR / HR labels of the Full Disclosure strips,
+    found once per FIXED chunk of the recording (CHUNK_SEC, aligned at
+    multiples of CHUNK_SEC) instead of on whatever slice is on screen, so a
+    beat's label does not change while the strip is scrolled.
+
+    Why: Pan-Tompkins' threshold is mean + k * std of its envelope over the
+    whole signal it is given. Run on the visible slice, one scroll step that
+    brings a big artifact into the slice's edge (seen: a sine burst at the
+    right edge) lifts that threshold above every ordinary beat -- 39 peaks
+    on the strip at one position, 2 peaks 1 s further on, and all the RR / HR
+    numbers gone. Here a chunk's peaks depend only on that chunk (+/-
+    KEEP_PAD_SEC, so a beat on a chunk edge is still found; peaks outside
+    the chunk are dropped, and two found within 0.2 s of each other at a
+    join count once, as in the detector). The chunk is read with
+    FILTER_PAD_SEC of real samples around it only to run the display filters
+    (they bend the first / last second of a short slice).
+
+    Same recipe as the strip's own detection: the strip's display filtering
+    of Lead I, Pan-Tompkins, and a companion lead (II, V5, V6, V4, V3, V2,
+    aVF) when it is >= 1.3x larger or Lead I gives <= 2 peaks and it finds
+    more. Used only for the RR / HR numbers; the strip's other peak uses
+    (vertical lines, click snapping) are unchanged."""
+
+    CHUNK_SEC = 10.0
+    KEEP_PAD_SEC = 0.5
+    FILTER_PAD_SEC = 2.0
+    ALT_LEADS = ('II', 'V5', 'V6', 'V4', 'V3', 'V2', 'aVF')
+    MIN_GAP_SEC = 0.2
+    HOLE_SEC = 2.0
+
+    def __init__(self, reader):
+        self._reader = reader
+        self._cache = {}
+
+    def _chunk_peaks(self, k):
+        reader = self._reader
+        fs = float(reader.fs)
+        names = [str(n) for n in (getattr(reader, 'lead_names', None) or [])]
+        dur = float(reader.duration_sec)
+        c0, c1 = k * self.CHUNK_SEC, min(dur, (k + 1) * self.CHUNK_SEC)
+        if c1 - c0 < 0.5 or 'I' not in names:
+            return []
+        r0 = max(0.0, c0 - self.FILTER_PAD_SEC - self.KEEP_PAD_SEC)
+        r1 = min(dur, c1 + self.FILTER_PAD_SEC + self.KEEP_PAD_SEC)
+        raw = reader.read_range(r0, r1)
+        if raw is None or raw.shape[1] < int(fs):
+            return []
+        # The detection slice: the chunk +/- KEEP_PAD_SEC (clipped to the read).
+        a = int(round((max(r0, c0 - self.KEEP_PAD_SEC) - r0) * fs))
+        b = int(round((min(r1, c1 + self.KEEP_PAD_SEC) - r0) * fs))
+        b = min(b, raw.shape[1])
+        if b - a < 50:
+            return []
+        try:
+            from ecg.pan_tompkins import pan_tompkins
+        except ImportError:
+            from ...pan_tompkins import pan_tompkins
+
+        def filtered(lead):
+            return _display_filtered(raw[names.index(lead)], fs, a, b - a)
+
+        sig = filtered('I')
+        best = pan_tompkins(sig, fs=fs)
+        ptp_i = float(np.ptp(sig)) if sig.size else 0.0
+        # A beat-free stretch >= HOLE_SEC in Lead I's peaks (chunk edges
+        # included). Seen: the simulator switching mid-chunk from narrow
+        # beats to wide beats with a 5x taller Lead I envelope -- the
+        # chunk-wide threshold (mean + 0.5 std) then sits just above every
+        # narrow beat, Lead I keeps only the wide ones and the strip shows
+        # one 5257 ms label across 5 unlabelled beats. Lead II found all 12.
+        # Then the companion leads are tried too (more peaks still wins).
+        t_a = r0 + a / fs
+        edges = [max(c0, t_a)] + sorted(t_a + int(p) / fs for p in best) + [min(c1, r0 + b / fs)]
+        has_hole = max(y - x for x, y in zip(edges, edges[1:])) >= self.HOLE_SEC
+        for lead in self.ALT_LEADS:
+            if lead not in names or names.index(lead) >= raw.shape[0]:
+                continue
+            alt = filtered(lead)
+            if float(np.ptp(alt)) > ptp_i * 1.3 or len(best) <= 2 or has_hole:
+                alt_peaks = pan_tompkins(alt, fs=fs)
+                if len(alt_peaks) > len(best):
+                    best = alt_peaks
+        return sorted(t for t in (t_a + int(p) / fs for p in best) if c0 <= t < c1)
+
+    def peaks_between(self, start_sec, end_sec):
+        """Sorted peak times (s) inside [start_sec, end_sec]."""
+        dur = float(self._reader.duration_sec)
+        k0 = int(max(0.0, start_sec) // self.CHUNK_SEC)
+        k1 = int(min(dur, end_sec) // self.CHUNK_SEC)
+        merged = []
+        for k in range(k0, k1 + 1):
+            if k not in self._cache:
+                self._cache[k] = self._chunk_peaks(k)
+            for t in self._cache[k]:
+                if not merged or t - merged[-1] >= self.MIN_GAP_SEC:
+                    merged.append(t)
+        return [t for t in merged if start_sec <= t <= end_sec]
+
+
 def _artifact_edge_wiggle(reader, edge, events):
     """{lead name: [(t0, t1), ...]} (recording seconds) of the visible wiggle
     at one Artifact edge. The strip's own check (_visible_mains_wiggle, then
@@ -1156,6 +1256,10 @@ class ECGStripCanvas(QWidget):
         self._show_vertical_lines = show_vertical_lines  # Control whether to show R-peak vertical lines
         self._show_annotations = show_annotations  # Control whether to show beat badge labels
         self._show_rr_numbers = show_rr_numbers  # Control whether to show RR interval numbers (e.g. 476, 632)
+        # Optional StableBeatTimes: when set (Full Disclosure sets it on its
+        # strips), the RR / HR numbers come from beats found on fixed chunks
+        # of the recording, not from this strip's visible slice.
+        self._beat_time_source = None
         self._disable_all_coloring = disable_all_coloring  # CRITICAL: Disable ALL coloring (for replay/overview)
         # When False, this canvas paints no black fill / grid of its own -
         # used when a shared background widget behind several canvases
@@ -2408,12 +2512,26 @@ class ECGStripCanvas(QWidget):
                 self._peak_cache_start_sec = self._start_sec
                 self._peak_organized_cache = organized_map
 
+            # The RR / HR numbers use the scroll-independent beat times when
+            # a source is set (see StableBeatTimes); `detected_peaks` itself,
+            # and everything else that reads it, stays as detected on this
+            # slice. No beats from the source (or an error): the slice's own.
+            label_peaks = detected_peaks
+            beat_source = getattr(self, '_beat_time_source', None)
+            if beat_source is not None:
+                try:
+                    stable_peaks = beat_source.peaks_between(self._start_sec, end_sec)
+                    if stable_peaks:
+                        label_peaks = stable_peaks
+                except Exception as e:
+                    print(f"[ECGStripCanvas] stable beat times error: {e}")
+
             # Calculate and store RR intervals from detected peaks (always keep for internal use)
-            if detected_peaks:
+            if label_peaks:
                 self._rr_intervals = []
-                for i in range(len(detected_peaks) - 1):
-                    curr_ts = detected_peaks[i]
-                    next_ts = detected_peaks[i + 1]
+                for i in range(len(label_peaks) - 1):
+                    curr_ts = label_peaks[i]
+                    next_ts = label_peaks[i + 1]
                     rr_ms = (next_ts - curr_ts) * 1000.0
 
                     # A genuinely chaotic/VFib-like stretch must never leak a
@@ -2432,8 +2550,8 @@ class ECGStripCanvas(QWidget):
                     # EVERY beat in Flutter/AFib/AV-Block/Tachycardia/NSR
                     # test windows alone (0 false suppressions in each).
                     lo = max(0, i - 2)
-                    hi = min(len(detected_peaks), i + 2 + 2)
-                    neighborhood = [organized_map.get(detected_peaks[j], True) for j in range(lo, hi)]
+                    hi = min(len(label_peaks), i + 2 + 2)
+                    neighborhood = [organized_map.get(label_peaks[j], True) for j in range(lo, hi)]
                     unresolved_fraction = (len(neighborhood) - sum(neighborhood)) / max(1, len(neighborhood))
                     no_clean_qrs = len(neighborhood) >= 3 and unresolved_fraction > 0.5
 
@@ -2678,6 +2796,11 @@ class ECGStripCanvas(QWidget):
                     v_end = float(ev.get('end_timestamp', ev.get('end_ts', v_start)) or v_start)
                     if v_end > v_start:
                         vfib_regions.append((v_start, v_end))
+            # VFib spans Full Disclosure got from its own background
+            # detection run: hide the numbers there whether or not "Auto
+            # Arrhythmia Detection" was pressed (its events above only exist
+            # once it was).
+            vfib_regions.extend(getattr(self, '_vfib_label_spans', None) or [])
 
             def _in_vfib_region(a, b):
                 return any(a <= v_end and b >= v_start for v_start, v_end in vfib_regions)

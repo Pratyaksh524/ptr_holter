@@ -41,12 +41,12 @@ try:
     from .theme import (COL_BLACK, COL_DARK, COL_GREEN, COL_GREEN_DRK, COL_WHITE, COL_GRID_MAJOR, COL_GRID_MINOR,
                         TOOL_RULER, TOOL_CALIPER, TOOL_MAGNIFY, TOOL_SELECT)
     from .holter_ui import ECGStripCanvas, MagnifierOverlay
-    from .panels.holter_widgets import apply_artifact_wiggle_from_recording
+    from .panels.holter_widgets import apply_artifact_wiggle_from_recording, StableBeatTimes
 except ImportError:
     from ecg.holter.theme import (COL_BLACK, COL_DARK, COL_GREEN, COL_GREEN_DRK, COL_WHITE, COL_GRID_MAJOR, COL_GRID_MINOR,
                                    TOOL_RULER, TOOL_CALIPER, TOOL_MAGNIFY, TOOL_SELECT)
     from ecg.holter.holter_ui import ECGStripCanvas, MagnifierOverlay
-    from ecg.holter.panels.holter_widgets import apply_artifact_wiggle_from_recording
+    from ecg.holter.panels.holter_widgets import apply_artifact_wiggle_from_recording, StableBeatTimes
 
 try:
     from utils.settings_manager import SettingsManager
@@ -746,6 +746,23 @@ class HolterFullDisclosureDialog(QDialog):
         except Exception as e:
             print(f"[Full Disclosure] Asystole detection unavailable: {e}")
 
+        # VFib stretches, only to hide lead I's RR / HR numbers there (the
+        # intervals Pan-Tompkins measures across VFib are noise). Taken from
+        # the same background detector the "Auto Arrhythmia Detection"
+        # button runs -- its result is cached, so the button is instant after
+        # this -- but, like Asystole above, NOT gated by _auto_marking_visible:
+        # the numbers are hidden whether or not the button was pressed.
+        # Never merged into self._engine._structured_events, never drawn, no
+        # segment overlay; the numbers show until the scan finishes.
+        self._vfib_label_spans = []
+        try:
+            reader_path_vfib = getattr(getattr(self._engine, '_reader', None), 'path', None)
+            if reader_path_vfib:
+                from .auto_segment_arrthymia_detection import detect_arrhythmias_async
+                detect_arrhythmias_async(reader_path_vfib, self._on_vfib_label_spans_ready)
+        except Exception as e:
+            print(f"[Full Disclosure] VFib label scan unavailable: {e}")
+
         # If the user already clicked "Auto Arrhythmia Detection" earlier in
         # this session (persisted flag, see _persist_auto_marking_enabled),
         # reopening Full Disclosure should show that marking again right
@@ -861,6 +878,23 @@ class HolterFullDisclosureDialog(QDialog):
                 self._refresh_segment_overlay()
             except Exception as e:
                 print(f"[Full Disclosure] Error redrawing auto regions after Asystole scan: {e}")
+
+    def _on_vfib_label_spans_ready(self, segments):
+        """Background detection finished (see the VFib label block in
+        __init__): hand the VFib spans to the strips so lead I stops drawing
+        RR / HR numbers inside them, and repaint. Display only -- nothing
+        here touches auto-marking, the segment overlay or the events."""
+        spans = []
+        for seg in segments or []:
+            if str(seg.get('label', '')) == 'Ventricular Fibrillation':
+                try:
+                    spans.append((float(seg['start_sec']), float(seg['end_sec'])))
+                except (KeyError, TypeError, ValueError):
+                    continue
+        self._vfib_label_spans = spans
+        for c in getattr(self, '_canvases', []) or []:
+            c._vfib_label_spans = spans
+            c.update()
 
     def _persist_auto_marking_enabled(self):
         """Record on disk that auto arrhythmia marking was enabled for this
@@ -4645,9 +4679,21 @@ class HolterFullDisclosureDialog(QDialog):
         visible_structured_events = self._structured_events_for_canvas(start_sec, end_sec)
         asystole_spans = self._asystole_spans()
 
+        # RR / HR numbers from beats found on fixed chunks of the recording,
+        # not on each scroll position's own slice (which dropped them all
+        # when a big artifact reached the slice edge). One per reader.
+        if getattr(self, '_beat_time_source_reader', None) is not self._reader:
+            try:
+                self._beat_time_source = StableBeatTimes(self._reader)
+            except Exception:
+                self._beat_time_source = None
+            self._beat_time_source_reader = self._reader
+
         # Optimization: Process data in parallel using numpy vectorization
         for i, c in enumerate(self._canvases):
             c._asystole_spans = asystole_spans
+            c._vfib_label_spans = getattr(self, '_vfib_label_spans', [])
+            c._beat_time_source = getattr(self, '_beat_time_source', None)
             if i < data.shape[0] and data.shape[1] > 0:
                 d_i = data[i]
                 before_i = ctx_before[i] if ctx_before is not None else None
