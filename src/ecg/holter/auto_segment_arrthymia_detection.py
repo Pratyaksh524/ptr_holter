@@ -963,7 +963,12 @@ def _detect_arrhythmias_uncached(
         if chunk_data is not None and best_lead_idx < chunk_data.shape[0]:
             lead_sig = np.asarray(chunk_data[best_lead_idx], dtype=float)
             if len(lead_sig) > 50:
-                p_indices = pan_tompkins(lead_sig, fs=fs)
+                p_indices, p_without_shape = pan_tompkins(lead_sig, fs=fs, split_shape_match=True)
+                if len(p_indices) != len(p_without_shape):
+                    p_indices = _keep_confirmed_shape_beats(p_indices, p_without_shape, [
+                        pan_tompkins(np.asarray(chunk_data[li], dtype=float), fs=fs)
+                        for li in peak_detection_lead_indices
+                        if li != best_lead_idx and li < chunk_data.shape[0]], fs)
                 for p_idx in p_indices:
                     peak_sec = pad_start + (float(p_idx) / float(fs))
                     if peak_sec < t_cursor or peak_sec >= t_end:
@@ -3201,23 +3206,39 @@ def _detect_arrhythmias_uncached(
                         # robust against one lead's transient dropout.
                         merge_tol_samples = max(1, int(0.1 * fs))
                         all_peak_times = []
+                        # The same beats without the ones Pan-Tompkins adds
+                        # by shape match at a beat-size step: the VFib rule
+                        # below is judged on these (see STEP_SHAPE_* in
+                        # pan_tompkins -- shape cannot tell VFib waves from
+                        # beats).
+                        vfib_peak_times = []
+                        lead_peak_pairs = []
                         for lead_idx in peak_detection_lead_indices:
                             if lead_idx >= padded_array.shape[0]:
                                 continue
                             lead_sig = np.asarray(padded_array[lead_idx], dtype=float)
                             if len(lead_sig) <= 50:
                                 continue
-                            all_peak_times.extend(pan_tompkins(lead_sig, fs=fs))
-                        all_peak_times.sort()
-                        all_peaks = []
-                        for p in all_peak_times:
-                            if all_peaks and (p - all_peaks[-1]) < merge_tol_samples:
-                                continue
-                            all_peaks.append(p)
-                        core_r_peaks = [
-                            p for p in all_peaks
-                            if current_time <= pad_start + p / fs < window_end
-                        ]
+                            lead_peak_pairs.append(pan_tompkins(lead_sig, fs=fs, split_shape_match=True))
+                        for k, (lead_peaks, lead_vfib_peaks) in enumerate(lead_peak_pairs):
+                            if len(lead_peaks) != len(lead_vfib_peaks):
+                                lead_peaks = _keep_confirmed_shape_beats(
+                                    lead_peaks, lead_vfib_peaks,
+                                    [p for j, (p, _) in enumerate(lead_peak_pairs) if j != k], fs)
+                            all_peak_times.extend(lead_peaks)
+                            vfib_peak_times.extend(lead_vfib_peaks)
+
+                        def _window_core_peaks(peak_times):
+                            merged = []
+                            for p in sorted(peak_times):
+                                if merged and (p - merged[-1]) < merge_tol_samples:
+                                    continue
+                                merged.append(p)
+                            return merged, [p for p in merged
+                                            if current_time <= pad_start + p / fs < window_end]
+
+                        all_peaks, core_r_peaks = _window_core_peaks(all_peak_times)
+                        _, vfib_core_r_peaks = _window_core_peaks(vfib_peak_times)
                         # Bundle branch block: its own layer, judged on every
                         # (non-noisy) window before the rhythm chain below. Its
                         # only effect on that chain is the VFib veto there.
@@ -3239,10 +3260,24 @@ def _detect_arrhythmias_uncached(
                         # read as an unresolved QRS / missing P. R-peaks
                         # above stay from the raw signal.
                         rule_signal = _mains_dft_filter(padded_signal)
+                        # Where the shape match added beats to this window,
+                        # whether it is VFib is decided exactly as without
+                        # them (the VT check first, then the VFib checks
+                        # below, all on vfib_core_r_peaks); None = no such
+                        # beats here, the chain below runs as it always did.
+                        vfib_without_shape_beats = None
+                        if [int(p) for p in vfib_core_r_peaks] != [int(p) for p in core_r_peaks]:
+                            vfib_without_shape_beats = bool(
+                                not _is_ventricular_tachycardia_window(rule_signal, vfib_core_r_peaks, fs)
+                                and _is_vfib_window(rule_signal, vfib_core_r_peaks, fs)
+                                and _classify_bundle_branch_block_window(
+                                    padded_array, vfib_core_r_peaks, padded_signal, fs) is None
+                                and not _vfib_beats_organized(padded_array, vfib_core_r_peaks, fs)
+                                and _vfib_has_fibrillating_piece(data_array, vfib_core_r_peaks, fs))
                         # Resolve the organized-wide-complex overlap first:
                         # the same unresolved QRS flag can otherwise make a
                         # regular monomorphic VT window look like VFib.
-                        if _is_ventricular_tachycardia_window(rule_signal, core_r_peaks, fs):
+                        if not vfib_without_shape_beats and _is_ventricular_tachycardia_window(rule_signal, core_r_peaks, fs):
                             # Burnt orange distinguishes organized VT from
                             # VFib red and Supraventricular Tachycardia orange.
                             target_morph = ('Ventricular Tachycardia', '#E67E22')
@@ -3261,10 +3296,11 @@ def _detect_arrhythmias_uncached(
                         # 12 leads); such a window goes on through the chain.
                         # And only where the window holds a fibrillating
                         # stretch (_vfib_has_fibrillating_piece).
-                        elif (_is_vfib_window(rule_signal, core_r_peaks, fs)
-                              and bundle_branch_block_result is None
-                              and not _vfib_beats_organized(padded_array, core_r_peaks, fs)
-                              and _vfib_has_fibrillating_piece(data_array, core_r_peaks, fs)):
+                        elif (vfib_without_shape_beats if vfib_without_shape_beats is not None else (
+                                _is_vfib_window(rule_signal, core_r_peaks, fs)
+                                and bundle_branch_block_result is None
+                                and not _vfib_beats_organized(padded_array, core_r_peaks, fs)
+                                and _vfib_has_fibrillating_piece(data_array, core_r_peaks, fs))):
                             target_morph = ('Ventricular Fibrillation', '#FF3333')
                             # Called VFib on fewer than 4 measured beats: same
                             # neighbor guard (seen: the recording's last,
@@ -7447,6 +7483,27 @@ def _split_atrial_tachycardia(segments, peaks, metrics, reader, fs, sinus_gate_f
                 piece['color'] = _AT_COLOR
             out.append(piece)
     return out
+
+
+# A beat only Pan-Tompkins' shape match at a beat-size step found
+# (pan_tompkins STEP_SHAPE_*) is kept only when another peak-detection lead
+# has a beat within this distance: an amplitude change moves every lead
+# together, noise on one lead does not. Seen: V6 alone full of narrow-band
+# noise (lead II clean sinus) on 2026-10-30_14-55-20 -- the match took 9
+# noise peaks there for beats and a 10 s label changed.
+_SHAPE_BEAT_AGREE_SEC = 0.08
+
+
+def _keep_confirmed_shape_beats(beats, beats_without_shape, other_leads_beats, fs):
+    """beats_without_shape plus each beat of `beats` not in it that some
+    lead in other_leads_beats (sample indices, same array) also has within
+    _SHAPE_BEAT_AGREE_SEC."""
+    base = sorted(int(p) for p in beats_without_shape)
+    tol = _SHAPE_BEAT_AGREE_SEC * fs
+    others = [np.asarray(o, dtype=float) for o in other_leads_beats if len(o)]
+    extra = sorted(set(int(p) for p in beats) - set(base))
+    keep = [p for p in extra if any(float(np.min(np.abs(o - p))) <= tol for o in others)]
+    return np.array(sorted(base + keep), dtype=int)
 
 
 # Beats the best lead's Pan-Tompkins missed, recovered when every other

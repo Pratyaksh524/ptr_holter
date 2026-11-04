@@ -3,12 +3,18 @@ from scipy.signal import butter, filtfilt
 from scipy.ndimage import uniform_filter1d
 
 
-def pan_tompkins(ecg, fs=500):
+def pan_tompkins(ecg, fs=500, step_shape_match=True, split_shape_match=False):
     """
     Pan-Tompkins QRS detection algorithm implementation.
     Args:
         ecg: 1D numpy array of ECG signal
         fs: Sampling frequency (Hz)
+        step_shape_match: False leaves out the beats only the shape match
+                 at a beat-size step adds (see _beats_at_size_steps) -- the
+                 beats exactly as before that match existed.
+        split_shape_match: True returns (r_peaks, r_peaks without the shape
+                 match's beats) from one pass -- for the VFib rule, see
+                 STEP_SHAPE_*.
     Returns:
         r_peaks: Indices of detected R peaks (aligned to the bandpassed ECG,
                  not the integrated envelope).
@@ -33,7 +39,8 @@ def pan_tompkins(ecg, fs=500):
 
     x = np.asarray(ecg, dtype=float)
     if x.size < 10 or not np.isfinite(fs) or fs <= 0:
-        return np.array([], dtype=int)
+        empty = np.array([], dtype=int)
+        return (empty, empty) if split_shape_match else empty
 
     filtered = bandpass_filter(x, 5, 15, fs)
     # 2. Differentiate
@@ -265,7 +272,8 @@ def pan_tompkins(ecg, fs=500):
         peaks = np.array(sorted(set(peaks.tolist()) | set(rescued)), dtype=int)
 
     if peaks.size == 0:
-        return np.array([], dtype=int)
+        empty = np.array([], dtype=int)
+        return (empty, empty) if split_shape_match else empty
 
     # 6. Search-back: map each envelope peak to the true R-peak location
     # by finding max(|bandpassed ECG|) within +/-75 ms.
@@ -282,7 +290,8 @@ def pan_tompkins(ecg, fs=500):
         r_locs.append(r)
 
     if not r_locs:
-        return np.array([], dtype=int)
+        empty = np.array([], dtype=int)
+        return (empty, empty) if split_shape_match else empty
 
     r_locs = np.array(sorted(set(r_locs)), dtype=int)
 
@@ -304,10 +313,14 @@ def pan_tompkins(ecg, fs=500):
     # because a much bigger stretch of beats in the same array set the
     # threshold (see _beats_at_size_steps). An array with no size step gets
     # nothing added -- identical to before.
-    added = _beats_at_size_steps(filtered, mwa, fs, dedup)
-    if added:
-        dedup = sorted(dedup + added)
-    return np.array(dedup, dtype=int)
+    added, shape_added = _beats_at_size_steps(filtered, mwa, fs, dedup,
+                                              shape_match=step_shape_match or split_shape_match)
+    without_shape = np.array(sorted(dedup + added), dtype=int)
+    if split_shape_match:
+        return np.array(sorted(dedup + added + shape_added), dtype=int), without_shape
+    if step_shape_match and shape_added:
+        return np.array(sorted(dedup + added + shape_added), dtype=int)
+    return without_shape
 
 
 # Beat-size step detection (FIX-PT4). Values measured on recorded data
@@ -334,17 +347,88 @@ STEP_MIN_SIZE = 20.0
 # on 2026-10-31_15-33-42 got a regular 240 bpm "beat" on every rise and read
 # as Ventricular Tachycardia (GUARD: square-wave test signal -> no VT).
 STEP_MAX_ACTIVE = 0.55
-# Only a piece whose own beats come at a steady rate gets beats added (RR
+# A piece whose own beats come at a steady rate gets beats added (RR
 # spread / mean <= this). An organized rhythm whose size stepped (sinus,
 # tachycardia, SVT, flutter, VT, regular escape) qualifies; a chaotic or
-# irregular piece (VFib, AFib, dropped beats) keeps exactly the beats found
-# before. Seen without it: VF on MIT-BIH 207 has its own size swings; beats
-# were added inside it and VF duration sensitivity fell 27.7% -> 6.2%.
+# irregular piece (VFib, AFib, dropped beats) goes to the shape match below
+# instead. Seen without either: VF on MIT-BIH 207 has its own size swings;
+# beats were added inside it and VF duration sensitivity fell 27.7% -> 6.2%.
 STEP_MAX_RR_CV = 0.20
+# Shape match for a piece whose RR is not steady. A size step changes how
+# tall the beats are, not their shape, so a candidate is added only when its
+# QRS-band shape (+-80 ms around R, scaled to its own size, best of +-10 ms
+# shifts) correlates >= 0.95 with the median shape of the beats already
+# found just before the step (or just after it, for an array's first piece):
+# up to 5 beats within 5 s, at least 3 of them matching that median shape
+# themselves. No RR condition, so AFib, flutter with a changing block,
+# Mobitz and dropped beats are covered. Measured 2026-11-04 on
+# 2026-11-04_16-49-27 (flutter 2:1 -> 4:1 -> 3:1 after a drop to ~0.18x, 48
+# beats missed): correlation 1.00 for every beat across all four size steps
+# there (flutter, AFib, sinus brady, Mobitz). Shape cannot tell VFib from
+# beats (MIT-BIH VFL windows match their own median shape at 0.97, a
+# simulator's VFib at 0.90-1.00), so the VFib rule in
+# auto_segment_arrthymia_detection is handed beats WITHOUT this match
+# (pan_tompkins(step_shape_match=False)).
+STEP_SHAPE_HALF_SEC = 0.08
+STEP_SHAPE_SHIFT_SEC = 0.01
+STEP_SHAPE_REF_SEC = 5.0
+STEP_SHAPE_REF_BEATS = 5
+STEP_SHAPE_MIN_REF = 3
+STEP_SHAPE_MIN_CORR = 0.95
+# ... and is at least half as tall as the piece's other matching beats, and
+# more than 0.30 s from any beat already there (seen at 0.23-0.26 s: the
+# second hump of a beat already found, counted again).
+STEP_SHAPE_MIN_SIZE_FRAC = 0.5
+STEP_SHAPE_MIN_GAP_SEC = 0.30
 
 
-def _beats_at_size_steps(filtered, mwa, fs, existing):
-    """Beats (sample indices) to ADD to `existing`. The array is cut where
+def _unit_shape(filtered, r, half):
+    """filtered[r-half:r+half] with its mean removed, scaled to unit length
+    (None at the array edge or on a flat stretch)."""
+    if r - half < 0 or r + half > len(filtered):
+        return None
+    v = np.asarray(filtered[r - half:r + half], dtype=float)
+    v = v - float(np.mean(v))
+    n = float(np.linalg.norm(v))
+    return v / n if n > 0 else None
+
+
+def _step_shape_template(filtered, fs, existing, s, e):
+    """Median unit shape of the beats found just before sample s (or, when
+    there are too few, just after e) -- None when there is no consistent
+    shape to compare with. See STEP_SHAPE_*."""
+    half = max(1, int(round(STEP_SHAPE_HALF_SEC * fs)))
+    ref = int(round(STEP_SHAPE_REF_SEC * fs))
+    ex = sorted(int(p) for p in existing)
+    before = [p for p in ex if s - ref <= p < s][-STEP_SHAPE_REF_BEATS:]
+    after = [p for p in ex if e <= p < e + ref][:STEP_SHAPE_REF_BEATS]
+    for refs in (before, after):
+        shapes = [w for w in (_unit_shape(filtered, p, half) for p in refs) if w is not None]
+        if len(shapes) < STEP_SHAPE_MIN_REF:
+            continue
+        tmpl = np.median(np.asarray(shapes), axis=0)
+        n = float(np.linalg.norm(tmpl))
+        if n <= 0:
+            continue
+        tmpl = tmpl / n
+        if sum(float(np.dot(w, tmpl)) >= STEP_SHAPE_MIN_CORR for w in shapes) >= STEP_SHAPE_MIN_REF:
+            return tmpl
+    return None
+
+
+def _matches_step_shape(filtered, r, tmpl, fs):
+    half = max(1, int(round(STEP_SHAPE_HALF_SEC * fs)))
+    shift = int(round(STEP_SHAPE_SHIFT_SEC * fs))
+    for d in range(-shift, shift + 1):
+        w = _unit_shape(filtered, r + d, half)
+        if w is not None and float(np.dot(w, tmpl)) >= STEP_SHAPE_MIN_CORR:
+            return True
+    return False
+
+
+def _beats_at_size_steps(filtered, mwa, fs, existing, shape_match=True):
+    """Beats (sample indices) to ADD to `existing`, as (from steady-rate
+    pieces, from the shape match). The array is cut where
     the beat size steps up or down; each piece gets its own threshold (the
     same mean + k*std rule and k fallbacks as pan_tompkins, from that
     piece's own envelope only), so a small-amplitude stretch is no longer
@@ -360,10 +444,15 @@ def _beats_at_size_steps(filtered, mwa, fs, existing):
     inside the 0.22 s refractory the narrower wave (slope relative to its
     own height) is the QRS -- a beat at the exact moment of a step can have
     a small QRS and a big T. A candidate within 0.22 s of an existing beat
-    is not added."""
+    is not added.
+
+    A piece whose RR is not steady (STEP_MAX_RR_CV) is searched the same
+    way, but there (and for any candidate landing inside it) only a beat
+    shaped like the beats next to the step is used -- see STEP_SHAPE_*.
+    shape_match=False skips such a piece, as before that match existed."""
     n_sec = int(len(filtered) // fs)
     if n_sec < STEP_HOLD_SEC + 2 or not len(existing):
-        return []
+        return [], []
     sec = int(fs)
     size = np.array([float(np.max(np.abs(filtered[k * sec:(k + 1) * sec]))) for k in range(n_sec)])
     steps = []
@@ -377,7 +466,7 @@ def _beats_at_size_steps(filtered, mwa, fs, existing):
                 if not steps or k - steps[-1] >= STEP_MIN_PIECE_SEC:
                     steps.append(k)
     if not steps:
-        return []
+        return [], []
 
     from scipy.signal import find_peaks
     bounds = [0] + [k * sec for k in steps] + [len(filtered)]
@@ -385,6 +474,8 @@ def _beats_at_size_steps(filtered, mwa, fs, existing):
     near = max(1, int(round(0.12 * fs)))
     found = []
     skipped = []
+    shaped = []        # (s, e, template) of each piece judged by shape
+    shape_found = []   # (sample, index into shaped) found by those pieces
     for s, e in zip(bounds, bounds[1:]):
         piece_size = [size[k] for k in range(s // sec, min(n_sec, max(s // sec + 1, e // sec)))]
         if not piece_size or float(np.median(piece_size)) < STEP_MIN_SIZE:
@@ -409,26 +500,66 @@ def _beats_at_size_steps(filtered, mwa, fs, existing):
         own = np.sort(np.asarray([lo + p for p in pk if s <= lo + p < e], dtype=float))
         rr = np.diff(own)
         if rr.size < 2 or float(np.std(rr)) > STEP_MAX_RR_CV * float(np.mean(rr)):
-            skipped.append((s, e))
+            tmpl = _step_shape_template(filtered, fs, existing, s, e) if shape_match else None
+            if tmpl is None:
+                skipped.append((s, e))
+                continue
+            shaped.append((s, e, tmpl))
+            shape_found.extend((int(lo + p), len(shaped) - 1) for p in pk)
             continue
         found.extend(int(lo + p) for p in pk)
     # A neighbour's 1 s edge search must not add beats inside a skipped piece.
     found = [p for p in found if not any(a <= p < b for a, b in skipped)]
-    if not found:
-        return []
+    shape_found = [(p, k) for p, k in shape_found if not any(a <= p < b for a, b in skipped)]
+    if not found and not shape_found:
+        return [], []
 
     sh = max(1, int(round(0.075 * fs)))
     slope = np.abs(np.gradient(filtered))
+    # Candidates from steady-rate pieces and from shape-judged pieces are
+    # cleaned and added separately: the steady-rate ones exactly as before
+    # the shape match existed, the shape ones only where that left a gap.
     cands = set()
-    for p in sorted(set(found)):
+    shape_cands = {}   # piece index -> {(r, slope, sharpness, height)}
+    for p, origin in sorted(set([(p, -1) for p in found] + shape_found)):
         a, b = max(0, p - sh), min(len(filtered), p + sh + 1)
         r = a + int(np.argmax(np.abs(filtered[a:b])))
         w0, w1 = max(0, r - sh), min(len(filtered), r + sh + 1)
         sl = float(slope[w0:w1].max())
         height = float(np.ptp(filtered[w0:w1])) or 1.0
-        cands.add((r, sl, sl / height))
-    cands = sorted(cands)
+        # Found inside a shape-judged piece (or by one): the beat must have
+        # the shape of the beats next to that piece's step.
+        k = next((i for i, (ps, pe, _) in enumerate(shaped) if ps <= p < pe), origin)
+        if k < 0:
+            cands.add((r, sl, sl / height))
+        elif _matches_step_shape(filtered, r, shaped[k][2], fs):
+            shape_cands.setdefault(k, set()).add((r, sl, sl / height, height))
 
+    refractory = int(round(0.22 * fs))
+    added = _clean_step_candidates(filtered, sorted(cands), existing, fs, refractory)
+
+    # A shape-judged beat is as tall as the piece's other matching beats
+    # (>= STEP_SHAPE_MIN_SIZE_FRAC of their median): a small bump on a flat
+    # stretch can have a QRS-like shape once scaled to its own size. Seen:
+    # 5 such bumps between slow beats when the size check was missing.
+    shape_added = []
+    shape_list = []
+    for group in shape_cands.values():
+        med = float(np.median([q[3] for q in group]))
+        shape_list.extend(q[:3] for q in group if q[3] >= STEP_SHAPE_MIN_SIZE_FRAC * med)
+    if shape_list:
+        gap = max(refractory, int(round(STEP_SHAPE_MIN_GAP_SEC * fs)))
+        shape_added = _clean_step_candidates(filtered, sorted(set(shape_list)),
+                                             sorted(list(existing) + added), fs, gap)
+    return added, shape_added
+
+
+def _clean_step_candidates(filtered, cands, existing, fs, min_gap):
+    """Clean (r, slope, sharpness) candidates as described in
+    _beats_at_size_steps; returns the ones more than min_gap samples from
+    every `existing` beat."""
+    if not cands:
+        return []
     refractory = int(round(0.22 * fs))
     same_qrs = int(round(0.10 * fs))
     t_window = int(round(0.36 * fs))
@@ -458,7 +589,7 @@ def _beats_at_size_steps(filtered, mwa, fs, existing):
     for r, _, _ in keep:
         j = int(np.searchsorted(ex, r))
         nearest = min(abs(r - ex[q]) for q in (j - 1, j) if 0 <= q < len(ex))
-        if nearest > refractory:
+        if nearest > min_gap:
             added.append(int(r))
     return added
 
