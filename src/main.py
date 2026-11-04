@@ -40,7 +40,7 @@ from PyQt5.QtWidgets import (QApplication, QComboBox, QDialog, QHBoxLayout, QLab
 
 from ecg.holter.analysis_worker import HolterAnalysisWorker
 from ecg.holter.holter_ui import (HolterMainWindow, HolterStartDialog, _find_latest_completed_session,
-                                  _resolve_recordings_dir)
+                                  _resolve_recordings_dir, ask_recording_details_or_discard)
 from ecg.holter.live_12lead_plotter import FS, DeviceAcquisition, Live12LeadPlotter
 from ecg.holter.stream_writer import HolterStreamWriter
 
@@ -224,15 +224,17 @@ class ComprehensiveMainWindow(QMainWindow):
         session_dir = summary.get("session_dir", "")
         if not session_dir:
             return
-        dialog = HolterStartDialog(self, patient_info={}, output_dir=session_dir)
-        dialog.setWindowTitle("Save Comprehensive ECG Analysis Recording Details")
-        if dialog.exec_() == QDialog.Accepted and dialog.get_result():
-            patient_info = dialog.get_result()[0]
-            try:
-                with open(os.path.join(session_dir, "patient.json"), "w") as f:
-                    json.dump(patient_info, f, indent=4)
-            except Exception as e:
-                print(f"[Comprehensive] could not save patient.json: {e}")
+        # Closing the details dialog (X / Cancel) discards the recording
+        # instead of saving it -- see ask_recording_details_or_discard.
+        patient_info = ask_recording_details_or_discard(self, session_dir, {})
+        if patient_info is None:
+            self.statusBar().showMessage("Recording discarded", 5000)
+            return
+        try:
+            with open(os.path.join(session_dir, "patient.json"), "w") as f:
+                json.dump(patient_info, f, indent=4)
+        except Exception as e:
+            print(f"[Comprehensive] could not save patient.json: {e}")
         QMessageBox.information(self, APP_NAME, f"Recording saved to:\n{session_dir}")
 
     def _open_previous(self):

@@ -885,6 +885,60 @@ class HolterStartDialog(QDialog):
         return None
 
 
+def _discard_session_dir(session_dir: str) -> bool:
+    """Delete one finished recording's folder. Only a folder directly under
+    a 'recordings' directory that holds a recording (recording.ecgh or
+    session.json) is ever removed -- anything else is left alone and
+    reported as not discarded. True when the folder is gone."""
+    try:
+        path = os.path.abspath(session_dir or "")
+        if not path or not os.path.isdir(path):
+            return False
+        if os.path.basename(os.path.dirname(path)).lower() != "recordings":
+            return False
+        if not (os.path.exists(os.path.join(path, "recording.ecgh"))
+                or os.path.exists(os.path.join(path, "session.json"))):
+            return False
+        for attempt in range(3):
+            try:
+                shutil.rmtree(path)
+                return True
+            except Exception:
+                # Windows: a file handle released a moment ago can still
+                # block the delete briefly.
+                gc.collect()
+                time.sleep(0.3)
+        return not os.path.exists(path)
+    except Exception as e:
+        print(f"[Comprehensive] could not discard {session_dir}: {e}")
+        return False
+
+
+def ask_recording_details_or_discard(parent, session_dir: str, patient_info: dict = None):
+    """After a recording stops: ask for its patient details. Closing the
+    details dialog (X or Cancel) does NOT save the recording -- after a
+    Yes/No confirmation (deleting it cannot be undone) the recording folder
+    is deleted; No reopens the details dialog. Returns the entered patient
+    info, or None when the recording was discarded."""
+    info = dict(patient_info or {})
+    while True:
+        dialog = HolterStartDialog(parent, patient_info=info, output_dir=session_dir)
+        dialog.setWindowTitle("Save Comprehensive ECG Analysis Recording Details")
+        if dialog.exec_() == QDialog.Accepted and dialog.get_result():
+            return dialog.get_result()[0]
+        answer = _show_message_box(
+            parent, QMessageBox.Warning, "Discard Recording?",
+            "The recording details were not saved.\n\n"
+            "Discard this recording? It will be deleted and cannot be recovered.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer == QMessageBox.Yes:
+            if not _discard_session_dir(session_dir):
+                _show_message_box(
+                    parent, QMessageBox.Warning, "Discard Recording",
+                    f"The recording could not be deleted:\n{session_dir}")
+            return None
+
+
 # -----------------------------------------------------------------------------
 # 2. HOLTER STATUS BAR  (Live recording indicator)
 # -----------------------------------------------------------------------------
@@ -2601,19 +2655,22 @@ class HolterMainWindow(QDialog):
                 if hasattr(self._status_bar, 'cleanup'):
                     self._status_bar.cleanup()
             
-            # Show dialog to collect patient info AFTER recording
-            dialog = HolterStartDialog(self, patient_info=self.patient_info or {}, output_dir=self.session_dir)
-            dialog.setWindowTitle("Save Comprehensive ECG Analysis Recording Details")
-            if dialog.exec_() == QDialog.Accepted:
-                patient_info, dur, out_dir = dialog.get_result()
-                summary['patient_info'] = patient_info
-                self.patient_info = patient_info
-                import json
-                try:
-                    with open(os.path.join(summary.get('session_dir', ''), "patient.json"), 'w') as f:
-                        json.dump(patient_info, f, indent=4)
-                except Exception as e:
-                    print(f"Failed to save patient.json: {e}")
+            # Show dialog to collect patient info AFTER recording. Closing it
+            # (X / Cancel) discards the recording instead of saving it.
+            session_dir = summary.get('session_dir', '') or self.session_dir
+            patient_info = ask_recording_details_or_discard(self, session_dir, self.patient_info)
+            if patient_info is None:
+                self.session_dir = ""
+                self.close()
+                return
+            summary['patient_info'] = patient_info
+            self.patient_info = patient_info
+            import json
+            try:
+                with open(os.path.join(summary.get('session_dir', ''), "patient.json"), 'w') as f:
+                    json.dump(patient_info, f, indent=4)
+            except Exception as e:
+                print(f"Failed to save patient.json: {e}")
 
             QMessageBox.information(self, "Recording Complete",
                                     f"Comprehensive ECG Analysis recording saved to:\n{summary.get('session_dir', '')}")
