@@ -61,6 +61,23 @@ class _TemplateMetricCard(QFrame):
         layout.addWidget(lbl)
         layout.addWidget(self.value)
 
+class _LeadTagLabel(QLabel):
+    """Header text of one lead cell in the 12-lead template view. Callers
+    set plain "II  Tachy"; it is shown as the lead name in bold white and
+    the template class in the accent colour."""
+
+    def setText(self, text):
+        from html import escape
+        parts = str(text or "").split(None, 1)
+        lead = escape(parts[0]) if parts else ""
+        cls = escape(parts[1].strip()) if len(parts) > 1 else ""
+        html = f"<span style='color:{COL_WHITE};font-weight:800;'>{lead}</span>"
+        if cls:
+            html += (f"&nbsp;&nbsp;<span style='color:{UI_MUTED};'>•</span>&nbsp;&nbsp;"
+                     f"<span style='color:{UI_ACCENT_HOVER};font-weight:700;'>{cls}</span>")
+        super().setText(html)
+
+
 class TemplateCardWidget(QFrame):
     clicked = pyqtSignal(object, object)  # (card, event)
     double_clicked = pyqtSignal(object)   # (card)
@@ -464,29 +481,57 @@ class HolterBeatTemplatePanel(QWidget):
         self._splitter = QSplitter(Qt.Horizontal)
         self._splitter.addWidget(self._scroll)
 
-        self._detail_grid_host = QWidget()
-        self._detail_grid_host.setStyleSheet(f"background:{COL_BLACK};border-left:1px solid {UI_BORDER};")
-        self._detail_layout = QGridLayout(self._detail_grid_host)
-        self._detail_layout.setContentsMargins(4, 4, 4, 4)
-        self._detail_layout.setSpacing(4)
+        # 12-lead view of the selected template, in the same card style as
+        # the metric cards / template cards above it.
+        self._detail_grid_host = QFrame()
+        self._detail_grid_host.setObjectName("tpDetailCard")
+        self._detail_grid_host.setStyleSheet(
+            f"QFrame#tpDetailCard{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-radius:10px;}}")
+        detail_outer = QVBoxLayout(self._detail_grid_host)
+        detail_outer.setContentsMargins(10, 8, 10, 10)
+        detail_outer.setSpacing(8)
+
+        detail_head = QHBoxLayout()
+        detail_head.setSpacing(10)
+        detail_title = QLabel("12-Lead Template View")
+        detail_title.setStyleSheet(f"QLabel{{color:{UI_TEXT};font-size:13px;font-weight:bold;background:transparent;"
+                                   f"border:none;border-left:3px solid {UI_ACCENT};padding:4px 10px;}}")
+        detail_hint = QLabel("Click a template card to see its beat on all 12 leads")
+        detail_hint.setStyleSheet(f"color:{UI_MUTED};font-size:11px;background:transparent;border:none;")
+        detail_hint.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        detail_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)  # never widens the panel
+        detail_head.addWidget(detail_title)
+        detail_head.addWidget(detail_hint, 1)
+        detail_outer.addLayout(detail_head)
+
+        self._detail_layout = QGridLayout()
+        self._detail_layout.setContentsMargins(0, 0, 0, 0)
+        self._detail_layout.setHorizontalSpacing(8)
+        self._detail_layout.setVerticalSpacing(8)
+        detail_outer.addLayout(self._detail_layout, 1)
         self._detail_canvases = []
         lead_names_12 = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
         for i in range(12):
             lead_name = lead_names_12[i]
             frame = QFrame()
             frame.setObjectName("tpLeadFrame")
-            frame.setStyleSheet(f"QFrame#tpLeadFrame{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:6px;}}")
+            frame.setStyleSheet(f"QFrame#tpLeadFrame{{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                                f"stop:0 {UI_PANEL_ALT}, stop:1 {UI_CARD});border:1px solid {UI_BORDER};"
+                                f"border-radius:10px;}}")
             flayout = QVBoxLayout(frame)
-            flayout.setContentsMargins(2, 2, 2, 2)
-            flayout.setSpacing(0)
+            flayout.setContentsMargins(6, 4, 6, 6)
+            flayout.setSpacing(4)
 
             info = QWidget()
-            info.setFixedHeight(16)
+            info.setFixedHeight(20)
+            info.setStyleSheet("background:transparent;border:none;")
             info_layout = QHBoxLayout(info)
             info_layout.setContentsMargins(2, 0, 2, 0)
             info_layout.setSpacing(4)
-            lbl_type = QLabel(lead_name)
-            lbl_type.setStyleSheet(f"color:{COL_WHITE};font-weight:bold;font-size:10px;border:none;background:transparent;")
+            lbl_type = _LeadTagLabel()
+            lbl_type.setTextFormat(Qt.RichText)
+            lbl_type.setStyleSheet("font-size:11px;border:none;background:transparent;")
+            lbl_type.setText(lead_name)
             info_layout.addWidget(lbl_type)
             info_layout.addStretch()
             flayout.addWidget(info)
@@ -494,13 +539,26 @@ class HolterBeatTemplatePanel(QWidget):
             canvas = ECGStripCanvas(height=60, color=COL_GREEN, pen_width=1.0, lead_name=lead_name, show_vertical_lines=False, show_annotations=True, show_rr_numbers=False, disable_all_coloring=False)
             canvas.set_paper_speed(25)
             canvas.set_gain(1.5)
+            # Fill the cell: the trace height scales with the canvas height.
+            canvas.setMinimumHeight(44)
+            canvas.setMaximumHeight(16777215)
+            canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             flayout.addWidget(canvas, 1)
 
             self._detail_layout.addWidget(frame, i // 3, i % 3)
             self._detail_canvases.append({"frame": frame, "canvas": canvas, "type": lbl_type, "lead_name": lead_name})
+        for r in range(4):
+            self._detail_layout.setRowStretch(r, 1)
+        for c in range(3):
+            self._detail_layout.setColumnStretch(c, 1)
 
+        # Cards column wide enough for one whole card (320 px) + scrollbar.
+        self._scroll.setMinimumWidth(340)
         self._splitter.addWidget(self._detail_grid_host)
-        self._splitter.setSizes([220, 780])
+        self._splitter.setSizes([360, 1000])
+        self._splitter.setStretchFactor(0, 0)
+        self._splitter.setStretchFactor(1, 1)
+        self._splitter.setChildrenCollapsible(False)
         layout.addWidget(self._splitter, 1)
 
     def update_from_metrics(self, metrics_list: list, summary: dict):
