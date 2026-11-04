@@ -250,6 +250,93 @@ def _artifact_edge_wiggle(reader, edge, events):
     return out
 
 
+# Inside an Artifact, away from its edges, the display notch can still leave
+# a visible wiggle where the interference itself jumps (seen: 50 Hz Artifact
+# 16:50:04-16:50:47, the 60 Hz part jumping from ~130 to ~536 at a rhythm
+# change, 16:50:20 -- wiggle 77-83 on the strip vs ~3-7 around it, on every
+# lead, and left uncoloured since it was 16 s from either edge). Judged on
+# fixed tiles of the recording (so it stays put while scrolling): a lead's
+# wiggle is where its 40-70 Hz envelope is over _INTERIOR_WIGGLE_FACTOR x
+# its own 90th percentile in that tile (QRS left out), inside an Artifact.
+_ARTIFACT_TILE_SEC = 20.0
+_INTERIOR_WIGGLE_FACTOR = 3.0
+_artifact_tile_cache = {}
+
+
+def _interior_mains_wiggle(d, fs):
+    """Sample spans of the displayed strip `d` whose 40-70 Hz envelope
+    stands out from the strip's own residual (see _ARTIFACT_TILE_SEC)."""
+    if scipy_filtfilt is None or d.size < int(fs) or fs <= 140:
+        return []
+    from scipy.signal import butter
+    from scipy.ndimage import binary_closing, binary_dilation, maximum_filter1d, median_filter
+    d = np.asarray(d, dtype=float)
+    bb, ab = butter(2, [40.0 / (fs / 2.0), 70.0 / (fs / 2.0)], 'band')
+    env = maximum_filter1d(np.abs(scipy_filtfilt(bb, ab, d)), max(1, int(0.025 * fs)))
+    swing = np.abs(d - median_filter(d, size=int(0.2 * fs) | 1, mode='nearest'))
+    qrs = binary_dilation(swing > 0.25 * float(np.percentile(swing, 99.5)),
+                          structure=np.ones(int(0.04 * fs) + 1, dtype=bool))
+    if qrs.all():
+        return []
+    ref = float(np.percentile(env[~qrs], 90))
+    if ref <= 0.0:
+        return []
+    wiggle = binary_closing(env > _INTERIOR_WIGGLE_FACTOR * ref,
+                            structure=np.ones(int(0.1 * fs) + 1, dtype=bool)) & ~qrs
+    spans = []
+    for i in np.flatnonzero(wiggle):
+        if spans and i == spans[-1][1] + 1:
+            spans[-1][1] = i
+        else:
+            spans.append([i, i])
+    return [(a, b) for a, b in spans if b - a >= int(0.03 * fs)]
+
+
+def _artifact_tile_wiggle(reader, tile0, art_spans):
+    """{lead name: [(t0, t1), ...]} (recording seconds) of the interior
+    wiggle in one tile [tile0, tile0 + _ARTIFACT_TILE_SEC), kept only inside
+    an Artifact (art_spans) and only where every lead shows it (within
+    0.25 s), as the edge check does. Cached per tile."""
+    key = (str(getattr(reader, 'path', id(reader))), round(float(tile0), 3),
+           tuple((round(a, 3), round(b, 3)) for a, b in art_spans))
+    if key in _artifact_tile_cache:
+        return _artifact_tile_cache[key]
+    out = {}
+    try:
+        fs = float(getattr(reader, 'fs', 500) or 500)
+        total = float(getattr(reader, 'duration_sec', tile0 + _ARTIFACT_TILE_SEC) or (tile0 + _ARTIFACT_TILE_SEC))
+        names = list(getattr(reader, 'lead_names', []) or [])
+        w0, w1 = tile0, min(total, tile0 + _ARTIFACT_TILE_SEC)
+        r0, r1 = max(0.0, w0 - _ARTIFACT_EDGE_PAD_SEC), min(total, w1 + _ARTIFACT_EDGE_PAD_SEC)
+        blk = reader.read_range(r0, r1)
+        lead_in, n = int(round((w0 - r0) * fs)), int(round((w1 - w0) * fs))
+        if blk is not None and n >= int(fs):
+            spans_by_lead = {}
+            for i, name in enumerate(names[:blk.shape[0]]):
+                raw = np.asarray(blk[i], dtype=float)
+                if raw.size < lead_in + n or float(np.ptp(raw)) <= 0.0:
+                    continue
+                spans_by_lead[name] = _interior_mains_wiggle(_display_filtered(raw, fs, lead_in, n), fs)
+            if spans_by_lead:
+                pad = int(0.25 * fs)
+                common = np.ones(n, dtype=bool)
+                for spans in spans_by_lead.values():
+                    has = np.zeros(n, dtype=bool)
+                    for a, b in spans:
+                        has[max(0, a - pad):min(n, b + pad + 1)] = True
+                    common &= has
+                for name, spans in spans_by_lead.items():
+                    for a, b in spans:
+                        t0, t1 = w0 + a / fs, w0 + b / fs
+                        if common[min(a, n - 1):min(b, n - 1) + 1].any() \
+                                and any(s <= t0 and t1 <= e for s, e in art_spans):
+                            out.setdefault(name, []).append((t0, t1))
+    except Exception:
+        out = {}
+    _artifact_tile_cache[key] = out
+    return out
+
+
 def apply_artifact_wiggle_from_recording(canvases, reader, events):
     """Colour each strip's Artifact wiggle from the recording itself, not
     from what the strip happens to show: the wiggle at each auto Artifact
@@ -287,6 +374,17 @@ def apply_artifact_wiggle_from_recording(canvases, reader, events):
                     and float(e['end_timestamp']) > edge - _ARTIFACT_STRIP_SEC]
             for name, spans in _artifact_edge_wiggle(reader, edge, near).items():
                 times.setdefault(name, []).extend(spans)
+    # Interior wiggle (_artifact_tile_wiggle), on the tiles the view touches.
+    art_spans = sorted((float(ev['timestamp']), float(ev['end_timestamp'])) for ev in artifacts)
+    tile = _ARTIFACT_TILE_SEC
+    k = int(np.floor(max(0.0, view0) / tile))
+    while k * tile < view1:
+        t0, t1 = k * tile, (k + 1) * tile
+        inside = [(a, b) for a, b in art_spans if a < t1 and b > t0]
+        if inside:
+            for name, spans in _artifact_tile_wiggle(reader, t0, inside).items():
+                times.setdefault(name, []).extend(spans)
+        k += 1
     # One edge shared by two Artifacts (one ends where the next starts) is
     # judged twice; merge so each wiggle is listed once.
     for name, spans in times.items():
