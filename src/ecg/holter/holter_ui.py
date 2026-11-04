@@ -43,7 +43,7 @@ from PyQt5.QtWidgets import (
     QSizePolicy, QScrollArea, QGridLayout, QSpinBox, QMessageBox,
     QFileDialog, QApplication, QProgressBar, QSplitter, QTextEdit, QInputDialog, QDoubleSpinBox,
     QAbstractItemView, QToolButton, QButtonGroup, QMenu, QScrollBar, QStackedWidget)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QPoint, QPointF, QRect, QObject, QEvent, QSize
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QPoint, QPointF, QRect, QObject, QEvent, QSize, QRectF
 from PyQt5.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QPixmap, QPainterPath, QIcon
 
 try:
@@ -504,101 +504,249 @@ def _get_recording_start_end_times(session_dir: str, duration_sec: float) -> tup
 # 1. HOLTER START DIALOG
 # -----------------------------------------------------------------------------
 
+class _EcgSetupHeader(QFrame):
+    """Header of HolterStartDialog: the title over a strip of ECG paper with
+    a green P-QRS-T trace running across it. Painted, no image files."""
+
+    def __init__(self, title: str, tagline: str, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(118)
+        self.setAttribute(Qt.WA_StyledBackground, False)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 16, 24, 14)
+        lay.setSpacing(2)
+        t = QLabel(title)
+        t.setStyleSheet(f"background:transparent;border:none;color:{COL_GREEN};"
+                        f"font-size:21px;font-weight:800;letter-spacing:0.5px;")
+        s = QLabel(tagline)
+        s.setStyleSheet("background:transparent;border:none;color:#7FD9A0;"
+                        "font-size:10px;font-weight:700;letter-spacing:2px;")
+        lay.addWidget(t)
+        lay.addWidget(s)
+        lay.addStretch(1)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect().adjusted(1, 1, -1, -1)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(r), 10, 10)
+        p.fillPath(path, QColor(COL_GRAY))
+        p.setClipPath(path)
+
+        # ECG paper grid: 1 mm minor lines, every 5th line major.
+        step = 8
+        for i, x in enumerate(range(r.left(), r.right(), step)):
+            p.setPen(QPen(QColor(0, 255, 0, 34 if i % 5 == 0 else 14), 1))
+            p.drawLine(x, r.top(), x, r.bottom())
+        for i, y in enumerate(range(r.top(), r.bottom(), step)):
+            p.setPen(QPen(QColor(0, 255, 0, 34 if i % 5 == 0 else 14), 1))
+            p.drawLine(r.left(), y, r.right(), y)
+
+        # P-QRS-T beats along the lower part of the header.
+        base = r.bottom() - 26
+        beat = [(0, 0), (10, 0), (16, -5), (22, 0), (30, 0), (33, 4), (37, -30),
+                (41, 10), (45, 0), (56, 0), (66, -9), (76, 0), (96, 0)]
+        # Whole beats across the full width, the leftover split evenly at
+        # both ends so the trace sits centred in the header.
+        beat_w = beat[-1][0]
+        n_beats = max(1, int(r.width() // beat_w))
+        x0 = r.left() + (r.width() - n_beats * beat_w) / 2.0
+        trace = QPainterPath()
+        trace.moveTo(r.left(), base)
+        trace.lineTo(x0, base)
+        for _ in range(n_beats):
+            for dx, dy in beat:
+                trace.lineTo(x0 + dx, base + dy)
+            x0 += beat_w
+        trace.lineTo(r.right(), base)
+        glow = QPen(QColor(0, 255, 0, 45), 6)
+        glow.setJoinStyle(Qt.RoundJoin)
+        p.setPen(glow)
+        p.drawPath(trace)
+        line = QPen(QColor(COL_GREEN), 1.6)
+        line.setJoinStyle(Qt.RoundJoin)
+        p.setPen(line)
+        p.drawPath(trace)
+
+        p.setClipping(False)
+        p.setPen(QPen(QColor(COL_GREEN), 2))
+        p.drawPath(path)
+        p.end()
+
+
 class HolterStartDialog(QDialog):
+    # Colours of this dialog only (the green / dark / orange theme as before).
+    _CARD_BG = "#1A2230"
+    _FIELD_BG = COL_DARK
+    _FIELD_BORDER = "#4A5568"
+    _LABEL = "#8FE3AE"
+
     def __init__(self, parent=None, patient_info: dict = None, output_dir: str = "recordings"):
         super().__init__(parent)
         self.setWindowTitle("Comprehensive ECG Analysis - Setup")
         self.setMinimumWidth(640)
-        self.setStyleSheet(f"background: #0F1724; color: {COL_WHITE};")
+        self.setStyleSheet(f"""
+            QDialog {{ background: #0F1724; color: {COL_WHITE}; }}
+            QLabel {{ background: transparent; border: none; }}
+            QToolTip {{ background: {COL_DARK}; color: {COL_WHITE}; border: 1px solid {COL_GREEN}; }}
+        """)
         self.output_dir = output_dir
         self._result_info = None
         self._result_duration = 24
         self._result_dir = output_dir
         self._build_ui(patient_info or {})
 
+    # -- small builders -------------------------------------------------------
+    def _field_style(self, widget: str) -> str:
+        return f"""
+            {widget} {{
+                border: 1px solid {self._FIELD_BORDER}; border-radius: 6px;
+                padding: 8px 10px; font-size: 13px;
+                background: {self._FIELD_BG}; color: {COL_GREEN};
+                selection-background-color: #1F7A45; selection-color: {COL_WHITE};
+            }}
+            {widget}:hover {{ border-color: #6B7A90; }}
+            {widget}:focus {{ border: 1px solid {COL_GREEN}; background: #383838; }}
+        """ + (f"QLineEdit:read-only {{ color: #B7F5CB; background: #2C2C2C; }}" if widget == "QLineEdit" else "")
+
+    @staticmethod
+    def _arrow_png() -> str:
+        """Path of a small green down-arrow PNG for the combo boxes (Qt
+        style sheets take an image file for it), drawn once per run."""
+        import tempfile
+        path = os.path.join(tempfile.gettempdir(), "holter_setup_combo_arrow.png")
+        if not os.path.exists(path):
+            pm = QPixmap(24, 16)
+            pm.fill(Qt.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(COL_GREEN))
+            p.drawPolygon(QPointF(2, 3), QPointF(22, 3), QPointF(12, 14))
+            p.end()
+            pm.save(path, "PNG")
+        return path.replace("\\", "/")
+
+    def _combo_style(self) -> str:
+        return self._field_style("QComboBox") + f"""
+            QComboBox::drop-down {{
+                subcontrol-origin: padding; subcontrol-position: center right;
+                width: 30px; border-left: 1px solid {self._FIELD_BORDER};
+                border-top-right-radius: 6px; border-bottom-right-radius: 6px;
+                background: #2A2A2A;
+            }}
+            QComboBox::down-arrow {{ image: url("{self._arrow_png()}"); width: 12px; height: 8px; }}
+            QComboBox QAbstractItemView {{
+                background: {COL_DARK}; color: {COL_WHITE}; outline: 0;
+                border: 1px solid {COL_GREEN}; padding: 4px;
+                selection-background-color: #1F7A45; selection-color: {COL_WHITE};
+            }}
+        """
+
+    def _green_combo(self, items) -> QComboBox:
+        combo = QComboBox()
+        combo.addItems(items)
+        combo.setMinimumHeight(38)
+        combo.setStyleSheet(self._combo_style())
+        pal = combo.palette()
+        for role in (QPalette.Text, QPalette.ButtonText, QPalette.WindowText):
+            pal.setColor(role, QColor(COL_GREEN))
+        combo.setPalette(pal)
+        return combo
+
+    def _field_label(self, text: str, required: bool = False) -> QLabel:
+        star = f" <span style='color:{COL_TIMESTAMP};'>*</span>" if required else ""
+        lbl = QLabel(f"{text}{star}")
+        lbl.setTextFormat(Qt.RichText)
+        lbl.setMinimumWidth(150)
+        lbl.setStyleSheet(f"font-weight:700;font-size:13px;color:{self._LABEL};")
+        return lbl
+
+    def _section(self, title: str, icon: str):
+        """A card with a header strip (green bar, icon, title, divider)."""
+        card = QFrame()
+        card.setObjectName("setupCard")
+        card.setStyleSheet(f"QFrame#setupCard{{background:{self._CARD_BG};border:1px solid #2E3B4E;"
+                           f"border-radius:10px;}}")
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(18, 14, 18, 16)
+        outer.setSpacing(12)
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        bar = QFrame()
+        bar.setFixedSize(4, 18)
+        bar.setStyleSheet(f"background:{COL_GREEN};border-radius:2px;")
+        ic = QLabel(icon)
+        ic.setStyleSheet(f"font-size:15px;color:{COL_GREEN};")
+        tl = QLabel(title.upper())
+        tl.setStyleSheet(f"font-size:12px;font-weight:800;letter-spacing:2px;color:{COL_GREEN};")
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setStyleSheet("background:#2E3B4E;")
+        head.addWidget(bar)
+        head.addWidget(ic)
+        head.addWidget(tl)
+        head.addWidget(line, 1)
+        outer.addLayout(head)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(10)
+        grid.setColumnStretch(1, 1)
+        outer.addLayout(grid)
+        return card, grid
+
+    # -- UI ---------------------------------------------------------------------
     def _build_ui(self, info: dict):
         layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(14)
+        layout.setContentsMargins(22, 22, 22, 22)
 
-        title = QLabel("Comprehensive ECG Analysis - Professional Setup")
-        title.setStyleSheet(f"background:{COL_GRAY};color:{COL_GREEN};border:2px solid {COL_GREEN};"
-                            f"font-size:20px;font-weight:bold;padding:16px;border-radius:8px;")
-        layout.addWidget(title)
+        layout.addWidget(_EcgSetupHeader("Comprehensive ECG Analysis - Professional Setup",
+                                         "12-LEAD HOLTER  •  PATIENT & STUDY CONFIGURATION"))
 
         subtitle = QLabel("Enter patient details, choose study duration, and launch the 12-lead ECG workspace.")
         subtitle.setWordWrap(True)
-        subtitle.setStyleSheet(f"color:#cccccc;font-size:13px;padding:4px;")
+        subtitle.setStyleSheet("color:#C9D3DF;font-size:13px;padding:0 4px;")
         layout.addWidget(subtitle)
 
-        # Patient info group
-        pg = QGroupBox("Patient Information")
-        pg.setStyleSheet(f"QGroupBox{{font-weight:bold;color:{COL_GREEN};border:1px solid {COL_GREEN_DRK};"
-                         f"border-radius:8px;margin-top:12px;padding-top:20px;background:{COL_BLACK};}}")
-        pg_layout = QGridLayout(pg)
-        pg_layout.setSpacing(10)
+        # Patient info card
+        pg, pg_layout = self._section("Patient Information", "♥")
 
         fields = [
-            ("Patient Name", "patient_name", info.get("patient_name", "")),
-            ("Age", "age", str(info.get("age", ""))),
-            ("Email", "email", info.get("email", "")),
-            ("Doctor", "doctor", info.get("doctor", "")),
-            ("Organisation", "org", info.get("Org.", info.get("org", ""))),
-            ("Phone", "phone", info.get("doctor_mobile", info.get("phone", ""))),
+            ("Patient Name", "patient_name", info.get("patient_name", ""), "Full name", True),
+            ("Age", "age", str(info.get("age", "")), "Years", False),
+            ("Email", "email", info.get("email", ""), "name@example.com", False),
+            ("Doctor", "doctor", info.get("doctor", ""), "Referring physician", False),
+            ("Organisation", "org", info.get("Org.", info.get("org", "")), "Hospital / clinic", False),
+            ("Phone", "phone", info.get("doctor_mobile", info.get("phone", "")), "Contact number", False),
         ]
+        placeholder_pal = QPalette()
+        placeholder_pal.setColor(QPalette.PlaceholderText, QColor("#7A8699"))
         self._fields = {}
-        for row, (label, key, default) in enumerate(fields):
-            lbl = QLabel(label + ":")
-            lbl.setStyleSheet(f"font-weight:bold;font-size:13px;color:{COL_GREEN};")
+        for row, (label, key, default, hint, required) in enumerate(fields):
             edit = QLineEdit(default)
-            edit.setStyleSheet(f"QLineEdit{{border:1px solid {COL_GREEN_DRK};border-radius:4px;padding:8px;"
-                               f"font-size:13px;background:{COL_DARK};color:{COL_GREEN};}}"
-                               f"QLineEdit:focus{{border-color:{COL_GREEN};}}")
-            pg_layout.addWidget(lbl, row, 0)
+            edit.setPlaceholderText(hint)
+            edit.setPalette(placeholder_pal)
+            edit.setMinimumHeight(38)
+            edit.setStyleSheet(self._field_style("QLineEdit"))
+            pg_layout.addWidget(self._field_label(label, required), row, 0)
             pg_layout.addWidget(edit, row, 1)
             self._fields[key] = edit
 
-        lbl_g = QLabel("Gender:")
-        lbl_g.setStyleSheet(f"font-weight:bold;font-size:13px;color:{COL_GREEN};")
-        self._gender = QComboBox()
-        self._gender.addItems(["Select", "Male", "Female", "Other"])
+        self._gender = self._green_combo(["Select", "Male", "Female", "Other"])
         idx = self._gender.findText(info.get("gender", info.get("sex", "Select")))
         if idx >= 0: self._gender.setCurrentIndex(idx)
-        self._gender.setStyleSheet(f"""
-            QComboBox {{
-                border:1px solid {COL_GREEN_DRK}; border-radius:4px; padding:8px;
-                background:{COL_DARK}; color:{COL_GREEN};
-            }}
-            QComboBox QAbstractItemView {{
-                background:{COL_DARK}; color:white; selection-background-color:{COL_GREEN_DRK};
-            }}
-        """)
-        pg_layout.addWidget(lbl_g, len(fields), 0)
+        pg_layout.addWidget(self._field_label("Gender"), len(fields), 0)
         pg_layout.addWidget(self._gender, len(fields), 1)
         layout.addWidget(pg)
 
-        # Recording settings group
-        rg = QGroupBox("Recording Settings")
-        rg.setStyleSheet(f"QGroupBox{{font-weight:bold;color:{COL_GREEN};border:1px solid {COL_GREEN_DRK};"
-                         f"border-radius:8px;margin-top:12px;padding-top:20px;background:{COL_BLACK};}}")
-        rg_layout = QGridLayout(rg)
-        rg_layout.setSpacing(10)
+        # Recording settings card
+        rg, rg_layout = self._section("Recording Settings", "⏱")
 
-        dur_lbl = QLabel("Duration:")
-        dur_lbl.setStyleSheet(f"font-weight:bold;font-size:13px;color:{COL_GREEN};")
-        self._duration = QComboBox()
-        self._duration.addItems(["24 hours", "48 hours", "Custom"])
-        self._duration.setStyleSheet(f"""
-            QComboBox {{
-                border:1px solid {COL_GREEN_DRK}; border-radius:4px; padding:8px;
-                background:{COL_DARK}; color:{COL_GREEN};
-            }}
-            QComboBox QAbstractItemView {{
-                background:{COL_DARK}; color:white; selection-background-color:{COL_GREEN_DRK};
-            }}
-        """)
+        self._duration = self._green_combo(["24 hours", "48 hours", "Custom"])
         self._duration.currentTextChanged.connect(lambda t: self._custom_hours.setVisible(t == "Custom"))
-        rg_layout.addWidget(dur_lbl, 0, 0)
+        rg_layout.addWidget(self._field_label("Duration"), 0, 0)
         rg_layout.addWidget(self._duration, 0, 1)
 
         self._custom_hours = QSpinBox()
@@ -606,54 +754,94 @@ class HolterStartDialog(QDialog):
         self._custom_hours.setValue(24)
         self._custom_hours.setSuffix(" hours")
         self._custom_hours.setVisible(False)
-        self._custom_hours.setStyleSheet(f"border:1px solid {COL_GREEN_DRK};border-radius:4px;padding:8px;"
-                                         f"font-size:13px;background:{COL_DARK};color:{COL_GREEN};")
+        self._custom_hours.setMinimumHeight(38)
+        self._custom_hours.setStyleSheet(self._field_style("QSpinBox"))
         rg_layout.addWidget(self._custom_hours, 1, 1)
 
-        out_lbl = QLabel("Output Directory:")
-        out_lbl.setStyleSheet(f"font-weight:bold;font-size:13px;color:{COL_GREEN};")
-        rg_layout.addWidget(out_lbl, 2, 0)
+        rg_layout.addWidget(self._field_label("Output Directory"), 2, 0)
         dir_row = QHBoxLayout()
-        self._dir_label = QLabel(self.output_dir)
-        self._dir_label.setStyleSheet(f"font-size:12px;color:{COL_GREEN};")
+        dir_row.setSpacing(8)
+        # Read-only field: same text() / setText() as the old label, but a
+        # long path scrolls inside the box instead of stretching the dialog.
+        self._dir_label = QLineEdit(self.output_dir)
+        self._dir_label.setReadOnly(True)
+        self._dir_label.setToolTip(self.output_dir)
+        self._dir_label.setMinimumHeight(38)
+        self._dir_label.setCursorPosition(0)
+        self._dir_label.setStyleSheet(self._field_style("QLineEdit") + "QLineEdit{font-size:12px;}")
+        self._dir_label.textChanged.connect(self._dir_label.setToolTip)
         dir_row.addWidget(self._dir_label, 1)
-        browse_btn = QPushButton("Browse")
-        browse_btn.setStyleSheet(_style_btn())
+        browse_btn = QPushButton("\U0001F4C1  Browse")
+        browse_btn.setCursor(Qt.PointingHandCursor)
+        browse_btn.setMinimumHeight(38)
+        browse_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #24324A; color: {COL_WHITE};
+                border: 1px solid #3B4F70; border-radius: 6px;
+                padding: 0 16px; font-size: 12px; font-weight: 700;
+            }}
+            QPushButton:hover {{ background: #2D3F5C; border-color: {COL_GREEN}; color: {COL_GREEN}; }}
+            QPushButton:pressed {{ background: #1C2840; }}
+        """)
         browse_btn.clicked.connect(self._browse_dir)
         dir_row.addWidget(browse_btn)
         rg_layout.addLayout(dir_row, 2, 1)
 
+        rg_layout.addWidget(self._field_label("Recorded Sessions"), 3, 0)
         self._rec_count_label = QLabel("")
-        self._rec_count_label.setStyleSheet(f"font-size:13px;color:{COL_GREEN};font-weight:700;")
-        rg_layout.addWidget(QLabel("Recorded Sessions:"), 3, 0)
-        rg_layout.addWidget(self._rec_count_label, 3, 1)
+        self._rec_count_label.setStyleSheet(
+            f"QLabel{{font-size:12px;color:{COL_GREEN};font-weight:800;background:#123222;"
+            f"border:1px solid #1F7A45;border-radius:12px;padding:4px 14px;}}")
+        count_row = QHBoxLayout()
+        count_row.addWidget(self._rec_count_label)
+        count_row.addStretch(1)
+        rg_layout.addLayout(count_row, 3, 1)
         self._refresh_rec_count()
         layout.addWidget(rg)
 
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(12)
         cancel_btn = QPushButton("Cancel")
-        cancel_btn.setStyleSheet(_style_btn(COL_GRAY, COL_WHITE, COL_GREEN_DRK))
+        cancel_btn.setCursor(Qt.PointingHandCursor)
+        cancel_btn.setMinimumSize(120, 50)
+        cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COL_GRAY}; color: {COL_WHITE};
+                border: 1px solid #555555; border-radius: 8px;
+                padding: 0 22px; font-size: 13px; font-weight: 700;
+            }}
+            QPushButton:hover {{ background: #454545; border-color: #888888; }}
+            QPushButton:pressed {{ background: #2F2F2F; }}
+        """)
         cancel_btn.clicked.connect(self.reject)
-        start_btn = QPushButton("Open ECG Workspace")
+        start_btn = QPushButton("♥  Open ECG Workspace")
+        start_btn.setCursor(Qt.PointingHandCursor)
         start_btn.setStyleSheet(f"""
             QPushButton {{
                 background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
                     stop:0 #ff6600, stop:1 #e65c00);
                 color: white;
-                border: none;
+                border: 1px solid #ff8533;
                 border-radius: 8px;
                 padding: 14px 24px;
-                font-size: 14px;
-                font-weight: bold;
+                font-size: 15px;
+                font-weight: 800;
+                letter-spacing: 0.5px;
             }}
-            QPushButton:hover {{ background: #ff7a26; }}
+            QPushButton:hover {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                    stop:0 #ff7a26, stop:1 #ff6a14); border-color: #ffb07a; }}
             QPushButton:pressed {{ background: #cc5200; }}
         """)
-        start_btn.setMinimumHeight(48)
+        start_btn.setMinimumHeight(50)
+        start_btn.setDefault(True)
         start_btn.clicked.connect(self._on_start)
         btn_row.addWidget(cancel_btn)
         btn_row.addWidget(start_btn, 1)
         layout.addLayout(btn_row)
+
+        hint = QLabel(f"<span style='color:{COL_TIMESTAMP};'>*</span> Required field")
+        hint.setStyleSheet("color:#7A8699;font-size:11px;padding:0 4px;")
+        layout.addWidget(hint)
 
     def _browse_dir(self):
         d = QFileDialog.getExistingDirectory(self, "Select Output Directory", self.output_dir)
@@ -1982,6 +2170,8 @@ class HolterMainWindow(QDialog):
         scroll_insight.setStyleSheet(f"QScrollArea{{background:{COL_BLACK};border:none;}}")
         self._insight_panel = HolterInsightPanel()
         self._insight_panel.update_text(self.patient_info, self._summary)
+        self._insight_panel.preview_requested.connect(self._build_report_preview)
+        self._insight_panel.set_session_dir(self.session_dir)
         scroll_insight.setWidget(self._insight_panel)
         self._tabs.addTab(scroll_insight, _make_icon("PREVIEW"), "PREVIEW")
 
@@ -2006,6 +2196,9 @@ class HolterMainWindow(QDialog):
                 self._last_active_tab_name = tab_name
                 if tab_name in ("OVERVIEW", "REPLAY"):
                     QTimer.singleShot(0, self._refresh_st_episodes)
+                if tab_name == "PREVIEW" and hasattr(self, "_insight_panel"):
+                    # Rebuild the preview if the recording's data changed.
+                    self._insight_panel.refresh()
                 is_recordings = (tab_name == "RECORDINGS")
                 self._tabs.tabBar().setVisible(not is_recordings)
                 # The record browser (reached via "View Previous Recording",
@@ -2279,6 +2472,7 @@ class HolterMainWindow(QDialog):
             self._summary_cards.update_summary(self._summary)
         if hasattr(self, '_insight_panel'):
             self._insight_panel.update_text(self.patient_info, self._summary)
+            self._insight_panel.set_session_dir(self.session_dir)
         if hasattr(self, '_overview_panel'):
             self._overview_panel.update_summary(self._summary)
         if hasattr(self, '_expert_panel'):
@@ -2425,6 +2619,47 @@ class HolterMainWindow(QDialog):
                                     f"Comprehensive ECG Analysis recording saved to:\n{summary.get('session_dir', '')}")
             self.load_completed_session(summary.get('session_dir', ''), summary.get('patient_info', {}))
 
+    def _build_report_preview(self):
+        """PREVIEW tab asked for a preview: build the same PDF as Generate
+        Report, but into the temp folder (nothing saved with the recording),
+        on a worker thread, and hand it to the panel."""
+        from PyQt5.QtCore import QThread, pyqtSignal
+
+        class PreviewWorker(QThread):
+            done = pyqtSignal(str)
+            error = pyqtSignal(str)
+
+            def __init__(self, session_dir, patient_info, summary):
+                super().__init__()
+                self.session_dir = session_dir
+                self.patient_info = patient_info
+                self.summary = summary
+
+            def run(self):
+                try:
+                    from .report_generator import generate_holter_report_preview
+                    self.done.emit(generate_holter_report_preview(
+                        session_dir=self.session_dir,
+                        patient_info=self.patient_info,
+                        summary=self.summary,
+                    ))
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    self.error.emit(str(e))
+
+        panel = getattr(self, '_insight_panel', None)
+        if panel is None or not self.session_dir:
+            if panel is not None:
+                panel.preview_failed("No recording is open.")
+            return
+        worker = PreviewWorker(self.session_dir, self.patient_info, self._summary)
+        worker.done.connect(panel.show_preview)
+        worker.error.connect(panel.preview_failed)
+        worker.finished.connect(worker.deleteLater)
+        self._preview_worker = worker
+        worker.start()
+
     def _generate_report(self):
         from PyQt5.QtWidgets import QProgressDialog
         from PyQt5.QtCore import QThread, pyqtSignal
@@ -2465,6 +2700,8 @@ class HolterMainWindow(QDialog):
         
         def on_finished(path):
             progress.close()
+            if hasattr(self, '_insight_panel'):
+                self._insight_panel.load_pdf(path)
             msg = QMessageBox(self)
             msg.setWindowTitle("Report Generated")
             msg.setText(f"Comprehensive ECG Analysis report saved:\n{path}")

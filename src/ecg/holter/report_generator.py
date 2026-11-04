@@ -219,13 +219,46 @@ def generate_holter_report(session_dir: str,
         return output_path.replace('.pdf', '.txt')
 
     try:
-        return _generate_pdf_report(session_dir, patient_info, summary,
-                                     output_path, settings_manager)
+        with _PDF_BUILD_LOCK:
+            return _generate_pdf_report(session_dir, patient_info, summary,
+                                         output_path, settings_manager)
     except Exception as e:
         print(f"[HolterReport] PDF generation error: {e}")
         traceback.print_exc()
         return _generate_text_report(session_dir, patient_info, summary,
                                       output_path.replace('.pdf', '.txt'))
+
+
+# One PDF build at a time: the build writes its chart images to fixed names
+# in session_dir (full_disclosure_page_N.png, hourly_hr_chart.png, ...), so a
+# preview build and a "Generate Report" build of the same recording must not
+# overlap.
+import threading as _threading
+_PDF_BUILD_LOCK = _threading.Lock()
+
+
+def generate_holter_report_preview(session_dir: str,
+                                   patient_info: dict,
+                                   summary: dict,
+                                   settings_manager=None) -> str:
+    """The same PDF as generate_holter_report, written to the system temp
+    folder instead of session_dir -- for the PREVIEW tab, so looking at the
+    report never saves one. Older previews of this recording are removed.
+    Raises on failure (no text-report fallback)."""
+    import tempfile
+    out_dir = os.path.join(tempfile.gettempdir(), 'holter_report_preview')
+    os.makedirs(out_dir, exist_ok=True)
+    stem = os.path.basename(os.path.normpath(session_dir)) or 'recording'
+    for f in os.listdir(out_dir):
+        if f.startswith(stem + '_preview_') and f.endswith('.pdf'):
+            try:
+                os.remove(os.path.join(out_dir, f))
+            except OSError:
+                pass  # still open in the viewer; replaced next time
+    output_path = os.path.join(out_dir, f'{stem}_preview_{time.time_ns()}.pdf')
+    with _PDF_BUILD_LOCK:
+        return _generate_pdf_report(session_dir, patient_info, summary,
+                                    output_path, settings_manager)
 
 
 _NSR_CONFIRM_READERS: Dict[str, object] = {}

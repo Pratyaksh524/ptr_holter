@@ -254,24 +254,42 @@ class StableBeatTimes:
         sig = filtered('I')
         best = pan_tompkins(sig, fs=fs)
         ptp_i = float(np.ptp(sig)) if sig.size else 0.0
-        # A beat-free stretch >= HOLE_SEC in Lead I's peaks (chunk edges
-        # included). Seen: the simulator switching mid-chunk from narrow
-        # beats to wide beats with a 5x taller Lead I envelope -- the
-        # chunk-wide threshold (mean + 0.5 std) then sits just above every
-        # narrow beat, Lead I keeps only the wide ones and the strip shows
-        # one 5257 ms label across 5 unlabelled beats. Lead II found all 12.
-        # Then the companion leads are tried too (more peaks still wins).
-        t_a = r0 + a / fs
-        edges = [max(c0, t_a)] + sorted(t_a + int(p) / fs for p in best) + [min(c1, r0 + b / fs)]
-        has_hole = max(y - x for x, y in zip(edges, edges[1:])) >= self.HOLE_SEC
         for lead in self.ALT_LEADS:
             if lead not in names or names.index(lead) >= raw.shape[0]:
                 continue
             alt = filtered(lead)
-            if float(np.ptp(alt)) > ptp_i * 1.3 or len(best) <= 2 or has_hole:
+            if float(np.ptp(alt)) > ptp_i * 1.3 or len(best) <= 2:
                 alt_peaks = pan_tompkins(alt, fs=fs)
                 if len(alt_peaks) > len(best):
                     best = alt_peaks
+        t_a = r0 + a / fs
+        # Fill beat-free holes (>= HOLE_SEC, chunk edges included) in the
+        # chosen lead from a companion lead -- only its peaks INSIDE a hole
+        # are added, the chosen lead's own peaks never change. Seen: the
+        # simulator switching mid-chunk from narrow beats to wide beats with
+        # a 5x taller Lead I envelope; the chunk-wide threshold (mean +
+        # 0.5 std) then sits just above every narrow beat, Lead I keeps only
+        # the wide ones and the strip shows one 5257 ms label over five
+        # unlabelled beats, where Lead II finds all of them.
+        # The MIN_GAP_SEC margin keeps a hole off the chosen lead's own peaks
+        # (the same beat seen a few ms apart on another lead); it is not
+        # applied at the chunk edges, which are not beats.
+        own = sorted(int(p) for p in best)
+        lo, hi = int(round((max(c0, t_a) - t_a) * fs)), int(round((min(c1, r0 + b / fs) - t_a) * fs))
+        margin = int(round(self.MIN_GAP_SEC * fs))
+        edges = [(lo, 0)] + [(p, margin) for p in own] + [(hi, 0)]
+        holes = [(x + mx, y - my) for (x, mx), (y, my) in zip(edges, edges[1:])
+                 if y - x >= self.HOLE_SEC * fs]
+        if holes:
+            fill = []
+            for lead in self.ALT_LEADS:
+                if lead not in names or names.index(lead) >= raw.shape[0]:
+                    continue
+                inside = [int(p) for p in pan_tompkins(filtered(lead), fs=fs)
+                          if any(h0 < int(p) < h1 for h0, h1 in holes)]
+                if len(inside) > len(fill):
+                    fill = inside
+            best = own + fill
         return sorted(t for t in (t_a + int(p) / fs for p in best) if c0 <= t < c1)
 
     def peaks_between(self, start_sec, end_sec):
