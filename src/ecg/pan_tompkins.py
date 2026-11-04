@@ -299,7 +299,168 @@ def pan_tompkins(ecg, fs=500):
         else:
             dedup.append(int(r))
 
+    # FIX-PT4: beats at a beat-size step, ADD-ONLY. Every beat found above is
+    # kept exactly as it is; this only adds beats the steps above missed
+    # because a much bigger stretch of beats in the same array set the
+    # threshold (see _beats_at_size_steps). An array with no size step gets
+    # nothing added -- identical to before.
+    added = _beats_at_size_steps(filtered, mwa, fs, dedup)
+    if added:
+        dedup = sorted(dedup + added)
     return np.array(dedup, dtype=int)
+
+
+# Beat-size step detection (FIX-PT4). Values measured on recorded data
+# (2026-11-04, amplitude-test recordings 12-31-46 and 14-14-07 plus 18
+# recordings with Asystole):
+STEP_RATIO = 1.6        # per-second beat size changes >= 1.6x (or <= 1/1.6)
+STEP_HOLD_SEC = 2       # ... and the new size holds (+-35%) for the next 2 s,
+STEP_HOLD_TOL = 0.35    # so one spike / artifact does not split anything
+STEP_MIN_PIECE_SEC = 3  # two splits at least 3 s apart
+STEP_EDGE_SEC = 1.0     # each piece is searched 1 s past its edges (a step
+                        # falls mid-second; the beat right at it is covered)
+# A piece whose median per-second QRS-band (5-15 Hz) size is under this is a
+# flat line (Asystole, lead off): nothing is added there. Measured: Asystole
+# 0-3.8, the smallest real beats in these recordings 116-296 (QRS 2-11 mV);
+# 20 is about 0.3 mV QRS peak-to-peak at this device's 200 ADC/mV. Without it
+# 11-50 fake beats were added inside Asystole on 4 recordings.
+STEP_MIN_SIZE = 20.0
+# A piece whose QRS-band signal is "active" (over 30% of its own top) more
+# than this fraction of the time is a continuous wave, not beats with a
+# quiet baseline between them -- a triangle / sine test signal. Nothing is
+# added there (that piece keeps exactly the beats found before). Measured:
+# triangle 63%, sine 80%; real beats 10-33% (sinus at every amplitude and
+# rate tried, AFlutter, VFib), VT 48-50%. Without it the triangle test wave
+# on 2026-10-31_15-33-42 got a regular 240 bpm "beat" on every rise and read
+# as Ventricular Tachycardia (GUARD: square-wave test signal -> no VT).
+STEP_MAX_ACTIVE = 0.55
+# Only a piece whose own beats come at a steady rate gets beats added (RR
+# spread / mean <= this). An organized rhythm whose size stepped (sinus,
+# tachycardia, SVT, flutter, VT, regular escape) qualifies; a chaotic or
+# irregular piece (VFib, AFib, dropped beats) keeps exactly the beats found
+# before. Seen without it: VF on MIT-BIH 207 has its own size swings; beats
+# were added inside it and VF duration sensitivity fell 27.7% -> 6.2%.
+STEP_MAX_RR_CV = 0.20
+
+
+def _beats_at_size_steps(filtered, mwa, fs, existing):
+    """Beats (sample indices) to ADD to `existing`. The array is cut where
+    the beat size steps up or down; each piece gets its own threshold (the
+    same mean + k*std rule and k fallbacks as pan_tompkins, from that
+    piece's own envelope only), so a small-amplitude stretch is no longer
+    judged against a big one elsewhere in the same array. Seen: amplitude
+    dropped to ~1/3, then to ~0.2 of the beats around it on a simulator
+    recording -- 49 real, regular beats missed (one right after each step,
+    32 in a row in the deepest dip, 15 at the end of a 60 s chunk).
+
+    Candidates are cleaned before use: same QRS (< 0.10 s) keeps the bigger
+    point; the classic Pan-Tompkins T-wave rule (within 0.36 s of the last
+    beat and under half its slope = its T wave) unless the gap matches the
+    following RR (+-25%: a small beat after a big one at a fast rate);
+    inside the 0.22 s refractory the narrower wave (slope relative to its
+    own height) is the QRS -- a beat at the exact moment of a step can have
+    a small QRS and a big T. A candidate within 0.22 s of an existing beat
+    is not added."""
+    n_sec = int(len(filtered) // fs)
+    if n_sec < STEP_HOLD_SEC + 2 or not len(existing):
+        return []
+    sec = int(fs)
+    size = np.array([float(np.max(np.abs(filtered[k * sec:(k + 1) * sec]))) for k in range(n_sec)])
+    steps = []
+    for k in range(1, n_sec - STEP_HOLD_SEC):
+        if size[k - 1] <= 0 or size[k] <= 0:
+            continue
+        ratio = size[k] / size[k - 1]
+        if ratio >= STEP_RATIO or ratio <= 1.0 / STEP_RATIO:
+            hold = size[k:k + STEP_HOLD_SEC + 1]
+            if np.all(np.abs(hold - size[k]) <= STEP_HOLD_TOL * size[k]):
+                if not steps or k - steps[-1] >= STEP_MIN_PIECE_SEC:
+                    steps.append(k)
+    if not steps:
+        return []
+
+    from scipy.signal import find_peaks
+    bounds = [0] + [k * sec for k in steps] + [len(filtered)]
+    edge = int(round(STEP_EDGE_SEC * fs))
+    near = max(1, int(round(0.12 * fs)))
+    found = []
+    skipped = []
+    for s, e in zip(bounds, bounds[1:]):
+        piece_size = [size[k] for k in range(s // sec, min(n_sec, max(s // sec + 1, e // sec)))]
+        if not piece_size or float(np.median(piece_size)) < STEP_MIN_SIZE:
+            skipped.append((s, e))
+            continue
+        mag = np.abs(filtered[s:e])
+        if mag.size and float(np.mean(mag > 0.3 * float(np.percentile(mag, 99)))) > STEP_MAX_ACTIVE:
+            skipped.append((s, e))
+            continue
+        core = mwa[s:e]
+        if core.size < 3:
+            continue
+        lo, hi = max(0, s - edge), min(len(mwa), e + edge)
+        pk = np.array([], dtype=int)
+        for k in (0.50, 0.30, 0.15, 0.10):
+            try:
+                pk, _ = find_peaks(mwa[lo:hi], height=float(np.mean(core)) + k * float(np.std(core)), distance=near)
+            except Exception:
+                pk = np.array([], dtype=int)
+            if pk.size >= 2:
+                break
+        own = np.sort(np.asarray([lo + p for p in pk if s <= lo + p < e], dtype=float))
+        rr = np.diff(own)
+        if rr.size < 2 or float(np.std(rr)) > STEP_MAX_RR_CV * float(np.mean(rr)):
+            skipped.append((s, e))
+            continue
+        found.extend(int(lo + p) for p in pk)
+    # A neighbour's 1 s edge search must not add beats inside a skipped piece.
+    found = [p for p in found if not any(a <= p < b for a, b in skipped)]
+    if not found:
+        return []
+
+    sh = max(1, int(round(0.075 * fs)))
+    slope = np.abs(np.gradient(filtered))
+    cands = set()
+    for p in sorted(set(found)):
+        a, b = max(0, p - sh), min(len(filtered), p + sh + 1)
+        r = a + int(np.argmax(np.abs(filtered[a:b])))
+        w0, w1 = max(0, r - sh), min(len(filtered), r + sh + 1)
+        sl = float(slope[w0:w1].max())
+        height = float(np.ptp(filtered[w0:w1])) or 1.0
+        cands.add((r, sl, sl / height))
+    cands = sorted(cands)
+
+    refractory = int(round(0.22 * fs))
+    same_qrs = int(round(0.10 * fs))
+    t_window = int(round(0.36 * fs))
+    keep = []
+    for i, (r, sl, sharp) in enumerate(cands):
+        if keep:
+            pr, psl, psharp = keep[-1]
+            gap = r - pr
+            ahead = [cands[j][0] - cands[j - 1][0] for j in range(i + 1, min(len(cands), i + 7))]
+            ahead = [g for g in ahead if g >= refractory]
+            ref = float(np.median(ahead)) if ahead else None
+            on_rhythm = ref is not None and abs(gap - ref) <= 0.25 * ref
+            if gap < t_window and sl < 0.5 * psl and not on_rhythm:
+                continue
+            if gap < same_qrs:
+                if abs(filtered[r]) > abs(filtered[pr]):
+                    keep[-1] = (r, sl, sharp)
+                continue
+            if gap < refractory:
+                if sharp > psharp:
+                    keep[-1] = (r, sl, sharp)
+                continue
+        keep.append((r, sl, sharp))
+
+    ex = np.asarray(sorted(existing), dtype=int)
+    added = []
+    for r, _, _ in keep:
+        j = int(np.searchsorted(ex, r))
+        nearest = min(abs(r - ex[q]) for q in (j - 1, j) if 0 <= q < len(ex))
+        if nearest > refractory:
+            added.append(int(r))
+    return added
 
 
 def detectRPeaks(filtered_signal, fs=500):
