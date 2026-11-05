@@ -6,9 +6,11 @@ report -- not auto arrhythmia marks.
 Independent of the auto arrhythmia detection (auto marking): it is not called
 from it and does not read its rhythm segments. It reads the recording itself
 (ECGHFileReader.read_range, the raw 12 leads the Full Disclosure view shows)
-and filters every lead exactly as the Full Disclosure strip does
-(_fd_filter): 0.5 Hz DFT high-pass (zero-phase, 2 s mirror padding), 3-point
-median, Gaussian low-pass 35 Hz twice (zero-phase).
+and filters every lead with _fd_filter: 0.5 Hz DFT high-pass (zero-phase,
+2 s mirror padding), 3-point median, one zero-phase 25 Hz Gaussian low-pass
+-- the Full Disclosure strip's (ECGStripCanvas.set_data) filter without its
+50/60 Hz mains removal (the 25 Hz Gaussian keeps 13 % of 50 Hz, 5 % of 60
+Hz).
 
 ST Elevation / ST Depression (detect_st_episodes), frame by frame:
   1. The recording is read in 10 s frames (1.5 s padding each side).
@@ -152,10 +154,11 @@ _T_NOT_JUDGED = {'limb': ('aVR',), 'chest': ('V1',)}   # inverted T is normal th
 
 
 def _fd_filter(x: np.ndarray, fs: float) -> np.ndarray:
-    """One lead filtered exactly as the Full Disclosure strip displays it
-    (panels/holter_widgets.ECGStripCanvas.set_data): 0.5 Hz DFT high-pass
-    (zero-phase, mirrored 2 s padding), 3-point median, Gaussian low-pass
-    35 Hz twice (zero-phase, no ringing at the J point)."""
+    """One lead: 0.5 Hz DFT high-pass (zero-phase, mirrored 2 s padding),
+    3-point median, one 25 Hz Gaussian low-pass (zero-phase, no ringing at
+    the J point). As the Full Disclosure strip (ECGStripCanvas.set_data)
+    but without its mains removal. Was 35 Hz twice, which is the same
+    filter (two passes = one ~24.7 Hz pass)."""
     from ..ecg_filters import apply_dft_filter
     from ..enhanced_filter import gaussian_lowpass
     x = np.asarray(x, dtype=float)
@@ -166,8 +169,7 @@ def _fd_filter(x: np.ndarray, fs: float) -> np.ndarray:
     if x.size >= 3:
         p = np.pad(x, (1, 1), mode='edge')
         x = np.median(np.stack((p[:-2], p[1:-1], p[2:]), axis=0), axis=0)
-    x = gaussian_lowpass(x, 35.0, float(fs))
-    return gaussian_lowpass(x, 35.0, float(fs))
+    return gaussian_lowpass(x, 25.0, float(fs))
 
 
 def _read_chunk(reader, t: float, t_end: float, total: float, fs: float):

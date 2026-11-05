@@ -6,12 +6,12 @@ shown in the Overview table and the report -- not auto arrhythmia marks.
 Independent of the auto arrhythmia detection. Run with the ischemia findings
 (ischemia_detection.compute_ischemia, same cache and background job). It
 reads the recording itself (ECGHFileReader.read_range, the raw 12 leads the
-Full Disclosure view shows) and filters every lead the way the Full
-Disclosure strip displays it (panels/holter_widgets.ECGStripCanvas.set_data):
+Full Disclosure view shows) and filters every lead with _strip_filter:
 50 / 60 Hz notches (_remove_mains), 0.5 Hz DFT high-pass (zero-phase), 3-point
-median, Gaussian low-pass 35 Hz twice -- with 2 s of real neighbouring
-samples on each side, as the strip pads. Only the beats inside the frame
-count.
+median, one zero-phase 25 Hz Gaussian low-pass -- with 2 s of real
+neighbouring samples on each side, as the strip pads. The same filter as
+the Full Disclosure strip (panels/holter_widgets.ECGStripCanvas.set_data).
+Only the beats inside the frame count.
 
 Frame by frame (detect_qrs_axis):
   1. The recording is read in 10 s frames.
@@ -88,8 +88,10 @@ def _wrap(deg):
 
 
 def _strip_filter(x: np.ndarray, fs: float) -> np.ndarray:
-    """One lead, already padded with real neighbouring samples, filtered as
-    the Full Disclosure strip displays it."""
+    """One lead, already padded with real neighbouring samples: mains
+    removal, 0.5 Hz high-pass, 3-point median, one 25 Hz Gaussian pass, as
+    the Full Disclosure strip. Was 35 Hz twice, the same response (two
+    passes = one ~24.7 Hz pass)."""
     from ..ecg_filters import apply_dft_filter
     from ..enhanced_filter import gaussian_lowpass
     try:
@@ -104,8 +106,7 @@ def _strip_filter(x: np.ndarray, fs: float) -> np.ndarray:
     if x.size >= 3:
         p = np.pad(x, (1, 1), mode='edge')
         x = np.median(np.stack((p[:-2], p[1:-1], p[2:]), axis=0), axis=0)
-    x = gaussian_lowpass(x, 35.0, float(fs))
-    return gaussian_lowpass(x, 35.0, float(fs))
+    return gaussian_lowpass(x, 25.0, float(fs))
 
 
 def _read_frame(reader, t: float, t_end: float, total: float, fs: float):

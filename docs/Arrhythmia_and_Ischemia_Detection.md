@@ -599,10 +599,10 @@ Each edge moves out beat by beat (at most one window) while RR stays within ±15
 ## C2. Data and filter
 
 - The recording is read in **10 s frames**, with 1.5 s padding each side. A last piece ≥ 5 s is kept.
-- Every lead goes through the same filter as the Full Disclosure strip (`_fd_filter`):
+- Every lead goes through `_fd_filter`, the Full Disclosure strip's filter without its 50/60 Hz mains removal:
   1. 0.5 Hz DFT high-pass (zero-phase, 2 s mirror padding),
   2. 3-point median,
-  3. Gaussian low-pass 35 Hz, twice.
+  3. Gaussian low-pass 25 Hz, once (zero-phase). Was 35 Hz twice, the same response (≈ one 24.7 Hz pass).
 - **Reference lead** for R peaks: II (else V5, I, V6).
 
 ## C3. ST Elevation / ST Depression — `detect_st_episodes()`
