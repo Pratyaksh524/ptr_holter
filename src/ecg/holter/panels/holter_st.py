@@ -122,14 +122,38 @@ class HolterSTPanel(QWidget):
         normal_layout.setContentsMargins(0, 0, 0, 0)
         normal_layout.setSpacing(8)
 
+        scroll_css = (
+            f"QScrollArea{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:6px;}}"
+            f"QScrollBar:vertical{{background:{UI_PANEL};width:10px;margin:0;border:none;}}"
+            f"QScrollBar::handle:vertical{{background:{UI_BORDER};min-height:24px;border-radius:5px;margin:2px;}}"
+            f"QScrollBar::handle:vertical:hover{{background:#3A5378;}}"
+            f"QScrollBar::add-line,QScrollBar::sub-line{{width:0;height:0;}}")
+
+        def _lead_block(name, widget, object_name):
+            """One lead: "Lead X" on a slim header line (green accent), the
+            strip / trend under it, a faint rule below."""
+            block = QFrame()
+            block.setObjectName(object_name)
+            block.setStyleSheet(f"QFrame#{object_name}{{background:transparent;border:none;"
+                                f"border-bottom:1px solid {UI_BORDER};}}")
+            block_l = QVBoxLayout(block)
+            block_l.setContentsMargins(0, 0, 0, 4)
+            block_l.setSpacing(2)
+            lbl = QLabel(f"Lead {name}")
+            lbl.setStyleSheet(f"color:{COL_GREEN};font-size:11px;font-weight:bold;background:transparent;"
+                              f"border:none;border-left:2px solid {COL_GREEN};padding:0px 6px;")
+            block_l.addWidget(lbl)
+            block_l.addWidget(widget)
+            return block
+
         # Left: ECG strip + controls
         left = QWidget()
         left.setObjectName("stLeftCard")
         left.setAttribute(Qt.WA_StyledBackground, True)
         left.setStyleSheet(_card_style("QWidget#stLeftCard"))
         left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(8, 8, 8, 8)
-        left_layout.setSpacing(6)
+        left_layout.setContentsMargins(10, 10, 10, 10)
+        left_layout.setSpacing(8)
 
         ecg_ttl = QLabel("12-Lead ECG")
         ecg_ttl.setStyleSheet(_card_title_style())
@@ -137,41 +161,53 @@ class HolterSTPanel(QWidget):
 
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setStyleSheet(f"QScrollArea{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:6px;}}")
-        
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setStyleSheet(scroll_css)
+
         scroll_content = QWidget()
         scroll_content.setStyleSheet("background:transparent;")
         scroll_layout = QVBoxLayout(scroll_content)
-        scroll_layout.setContentsMargins(4, 4, 4, 4)
-        scroll_layout.setSpacing(4)
-        
+        scroll_layout.setContentsMargins(6, 6, 6, 6)
+        scroll_layout.setSpacing(6)
+
         self._ch_strips = []
         lead_names = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
         for i in range(12):
-            lbl = QLabel(f"Lead {lead_names[i]}")
-            lbl.setStyleSheet(f"color:{COL_GREEN};font-size:11px;font-weight:bold;border:none;background:transparent;")
-            scroll_layout.addWidget(lbl)
-            
             # Disable vertical lines for ST Tendency panel
             strip = ECGStripCanvas(height=80, show_vertical_lines=False)
             strip.lead_name = lead_names[i]
-            scroll_layout.addWidget(strip)
+            scroll_layout.addWidget(_lead_block(lead_names[i], strip, "stLeadBlock"))
             self._ch_strips.append(strip)
-            
+
         scroll_area.setWidget(scroll_content)
         left_layout.addWidget(scroll_area, 1)
 
-        # Mini overview
+        # Mini overview (Lead II rhythm strip) in its own box
+        rhythm_box = QFrame()
+        rhythm_box.setObjectName("stRhythmBox")
+        rhythm_box.setStyleSheet(f"QFrame#stRhythmBox{{background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};"
+                                 f"border-radius:6px;}}")
+        rhythm_l = QVBoxLayout(rhythm_box)
+        rhythm_l.setContentsMargins(8, 6, 8, 8)
+        rhythm_l.setSpacing(4)
+        rhythm_ttl = QLabel("Rhythm Strip  \u00b7  Lead II")
+        rhythm_ttl.setStyleSheet(_card_title_style())
+        rhythm_l.addWidget(rhythm_ttl)
         self._mini_strip = ECGStripCanvas(height=60, color="#00AA00")
-        left_layout.addWidget(self._mini_strip)
+        rhythm_l.addWidget(self._mini_strip)
+        left_layout.addWidget(rhythm_box)
 
+        # Actions: rescan | step | remove | reset
         nav_row = QHBoxLayout()
         nav_row.setSpacing(6)
-        for lbl in ["ReScan", "Next Event", "Remove All", "Remove", "Reset"]:
-            btn = QPushButton(lbl)
-            btn.setStyleSheet(_style_btn())
-            btn.setFixedHeight(30)
-            nav_row.addWidget(btn)
+        for g, names in enumerate([["ReScan"], ["Next Event"], ["Remove All", "Remove"], ["Reset"]]):
+            if g:
+                nav_row.addSpacing(8)
+            for lbl in names:
+                btn = QPushButton(lbl)
+                btn.setStyleSheet(_style_btn())
+                btn.setFixedHeight(30)
+                nav_row.addWidget(btn, 1)
         left_layout.addLayout(nav_row)
         normal_layout.addWidget(left, 3)
 
@@ -181,29 +217,35 @@ class HolterSTPanel(QWidget):
         right.setAttribute(Qt.WA_StyledBackground, True)
         right.setStyleSheet(_card_style("QWidget#stRightCard"))
         right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(8, 8, 8, 8)
-        right_layout.setSpacing(6)
-        
+        right_layout.setContentsMargins(10, 10, 10, 10)
+        right_layout.setSpacing(8)
+
+        st_head = QHBoxLayout()
         self._st_title = QLabel("ST tendency(mV)")
         self._st_title.setStyleSheet(_card_title_style())
-        right_layout.addWidget(self._st_title)
+        st_head.addWidget(self._st_title)
+        st_hint = QLabel("Full recording, per lead")
+        st_hint.setStyleSheet(f"color:{UI_MUTED};font-size:11px;background:transparent;border:none;")
+        st_hint.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        st_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        st_hint.setMinimumWidth(0)
+        st_head.addWidget(st_hint, 1)
+        right_layout.addLayout(st_head)
 
         self._st_canvases = []
         st_scroll = QScrollArea()
         st_scroll.setWidgetResizable(True)
-        st_scroll.setStyleSheet(f"QScrollArea{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:6px;}}")
+        st_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        st_scroll.setStyleSheet(scroll_css)
         st_scroll_content = QWidget()
         st_scroll_content.setStyleSheet("background:transparent;")
         st_scroll_layout = QVBoxLayout(st_scroll_content)
-        st_scroll_layout.setContentsMargins(4, 4, 4, 4)
-        st_scroll_layout.setSpacing(4)
+        st_scroll_layout.setContentsMargins(6, 6, 6, 6)
+        st_scroll_layout.setSpacing(6)
         lead_names = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
         for name in lead_names:
-            ch_lbl = QLabel(f"Lead {name}")
-            ch_lbl.setStyleSheet(f"color:{COL_GREEN};font-size:10px;border:none;background:transparent;")
-            st_scroll_layout.addWidget(ch_lbl)
             canvas = STCanvas(height=70)
-            st_scroll_layout.addWidget(canvas)
+            st_scroll_layout.addWidget(_lead_block(name, canvas, "stTrendBlock"))
             self._st_canvases.append(canvas)
         st_scroll.setWidget(st_scroll_content)
         right_layout.addWidget(st_scroll, 1)
@@ -212,12 +254,14 @@ class HolterSTPanel(QWidget):
         conclusion_frame.setObjectName("stConclusionCard")
         conclusion_frame.setStyleSheet(f"QFrame#stConclusionCard{{background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};border-radius:6px;}}")
         cf_layout = QVBoxLayout(conclusion_frame)
-        cf_layout.setContentsMargins(8, 6, 8, 6)
+        cf_layout.setContentsMargins(8, 6, 8, 8)
+        cf_layout.setSpacing(6)
         cf_lbl = QLabel("Conclusion")
-        cf_lbl.setStyleSheet(_card_title_style().replace("font-size:12px", "font-size:11px"))
+        cf_lbl.setStyleSheet(_card_title_style())
         cf_layout.addWidget(cf_lbl)
         self._conclusion_edit = QTextEdit()
-        self._conclusion_edit.setFixedHeight(60)
+        self._conclusion_edit.setFixedHeight(64)
+        self._conclusion_edit.setPlaceholderText("Write the ST / T findings for the report")
         self._conclusion_edit.setStyleSheet(f"QTextEdit{{background:{UI_BG};color:{UI_TEXT};"
                                              f"border:1px solid {UI_BORDER};border-radius:4px;font-size:11px;padding:4px;}}"
                                              f"QTextEdit:focus{{border:1px solid {UI_ACCENT};}}")
@@ -227,7 +271,8 @@ class HolterSTPanel(QWidget):
         for lbl in ["Save as template", "Quote templates"]:
             btn = QPushButton(lbl)
             btn.setStyleSheet(_style_btn())
-            save_row.addWidget(btn)
+            btn.setFixedHeight(30)
+            save_row.addWidget(btn, 1)
         cf_layout.addLayout(save_row)
         right_layout.addWidget(conclusion_frame)
         normal_layout.addWidget(right, 2)

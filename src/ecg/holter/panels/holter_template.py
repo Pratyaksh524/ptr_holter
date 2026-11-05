@@ -62,7 +62,7 @@ class _TemplateMetricCard(QFrame):
         layout.addWidget(self.value)
 
 class _LeadTagLabel(QLabel):
-    """Header text of one lead cell in the 12-lead template view. Callers
+    """Header text of one lead cell in the Template view. Callers
     set plain "II  Tachy"; it is shown as the lead name in bold white and
     the template class in the accent colour."""
 
@@ -493,7 +493,7 @@ class HolterBeatTemplatePanel(QWidget):
 
         detail_head = QHBoxLayout()
         detail_head.setSpacing(10)
-        detail_title = QLabel("12-Lead Template View")
+        detail_title = QLabel("Template View")
         detail_title.setStyleSheet(f"QLabel{{color:{UI_TEXT};font-size:13px;font-weight:bold;background:transparent;"
                                    f"border:none;border-left:3px solid {UI_ACCENT};padding:4px 10px;}}")
         detail_hint = QLabel("Click a template card to see its beat on all 12 leads")

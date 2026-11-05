@@ -83,9 +83,18 @@ class HolterAFPanel(QWidget):
         left_layout.setContentsMargins(10, 10, 10, 10)
         left_layout.setSpacing(8)
 
+        # Title, and how many episodes the list holds on the right.
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
         title = QLabel("AF Analysis")
         title.setStyleSheet(_card_title_style())
-        left_layout.addWidget(title)
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        self._count_badge = QLabel("0 episodes")
+        self._count_badge.setStyleSheet(f"color:{UI_TEXT};font-size:11px;font-weight:700;background:{UI_PANEL_ALT};"
+                                        f"border:1px solid {UI_BORDER};border-radius:10px;padding:2px 10px;")
+        title_row.addWidget(self._count_badge)
+        left_layout.addLayout(title_row)
 
         cols = ["Start time", "Duration", "Type"]
         self._af_table = QTableWidget(0, len(cols))
@@ -96,24 +105,32 @@ class HolterAFPanel(QWidget):
         self._af_table.setShowGrid(False)
         self._af_table.setStyleSheet(_table_style())
         self._af_table.verticalHeader().setVisible(False)
+        self._af_table.verticalHeader().setDefaultSectionSize(30)
         self._af_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._af_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._af_table.setCursor(Qt.PointingHandCursor)
         self._af_table.cellClicked.connect(self._on_af_row_clicked)
         left_layout.addWidget(self._af_table, 1)
 
-        no_items = QLabel("There are no items to show.")
+        # Empty state, centred over the empty table (kept centred on resize).
+        no_items = QLabel("No AF / Atrial Flutter episodes\n"
+                          "Auto-detected and manually marked episodes appear here")
+        no_items.setParent(self._af_table.viewport())
         no_items.setAlignment(Qt.AlignCenter)
-        no_items.setStyleSheet(f"color:{UI_MUTED};font-style:italic;padding:8px;border:none;background:transparent;")
+        no_items.setWordWrap(True)
+        no_items.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        no_items.setStyleSheet(f"color:{UI_MUTED};font-size:12px;font-style:italic;padding:8px;"
+                               f"border:none;background:transparent;")
         self._no_items_lbl = no_items
-        left_layout.addWidget(no_items)
+        self._af_table.viewport().installEventFilter(self)
 
+        # Actions: step through events, remove.
         nav_row = QHBoxLayout()
         nav_row.setSpacing(6)
-        for lbl in ["AF Analysis", "Parameters", "Prev Event", "Next Event", "Remove All", "Remove"]:
-
+        for lbl in ["Prev Event", "Next Event", "Remove All", "Remove"]:
             btn = QPushButton(lbl)
             btn.setStyleSheet(_style_btn())
-            nav_row.addWidget(btn)
+            nav_row.addWidget(btn, 1)
         left_layout.addLayout(nav_row)
         layout.addWidget(left, 2)
 
@@ -124,7 +141,7 @@ class HolterAFPanel(QWidget):
         right.setStyleSheet(_card_style("QWidget#afRightCard"))
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(10, 10, 10, 10)
-        right_layout.setSpacing(6)
+        right_layout.setSpacing(8)
 
         ecg_ttl = QLabel("12-Lead ECG")
         ecg_ttl.setStyleSheet(_card_title_style())
@@ -132,38 +149,76 @@ class HolterAFPanel(QWidget):
 
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setStyleSheet(f"QScrollArea{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:6px;}}")
-        
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setStyleSheet(
+            f"QScrollArea{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:6px;}}"
+            f"QScrollBar:vertical{{background:{UI_PANEL};width:10px;margin:0;border:none;}}"
+            f"QScrollBar::handle:vertical{{background:{UI_BORDER};min-height:24px;border-radius:5px;margin:2px;}}"
+            f"QScrollBar::handle:vertical:hover{{background:#3A5378;}}"
+            f"QScrollBar::add-line,QScrollBar::sub-line{{width:0;height:0;}}")
+
         scroll_content = QWidget()
         scroll_content.setStyleSheet("background:transparent;")
         scroll_layout = QVBoxLayout(scroll_content)
-        scroll_layout.setContentsMargins(4, 4, 4, 4)
-        scroll_layout.setSpacing(4)
-        
+        scroll_layout.setContentsMargins(6, 6, 6, 6)
+        scroll_layout.setSpacing(8)
+
         self._thumb_strips = []
         lead_names = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
         for i in range(12):
+            # One block per lead: "Lead X" on a slim header line, the strip under it.
+            block = QFrame()
+            block.setObjectName("afLeadBlock")
+            block.setStyleSheet(f"QFrame#afLeadBlock{{background:transparent;border:none;"
+                                f"border-bottom:1px solid {UI_BORDER};}}")
+            block_l = QVBoxLayout(block)
+            block_l.setContentsMargins(0, 0, 0, 6)
+            block_l.setSpacing(2)
             lbl = QLabel(f"Lead {lead_names[i]}")
-            lbl.setStyleSheet(f"color:{COL_GREEN};font-size:11px;font-weight:bold;border:none;background:transparent;")
-            scroll_layout.addWidget(lbl)
-            
+            lbl.setStyleSheet(f"color:{COL_GREEN};font-size:11px;font-weight:bold;background:transparent;"
+                              f"border:none;border-left:2px solid {COL_GREEN};padding:0px 6px;")
+            block_l.addWidget(lbl)
+
             # Disable vertical lines and labels for AF Analysis panel
             strip = ECGStripCanvas(height=120, show_vertical_lines=False)
             strip.lead_name = lead_names[i]
-            scroll_layout.addWidget(strip)
+            block_l.addWidget(strip)
+            scroll_layout.addWidget(block)
             self._thumb_strips.append(strip)
-            
+
         scroll_area.setWidget(scroll_content)
         right_layout.addWidget(scroll_area, 1)
 
+        # Bottom: Lead II rhythm strip, full width.
+        def _section(title_text, widget):
+            box = QFrame()
+            box.setObjectName("afBottomBox")
+            box.setStyleSheet(f"QFrame#afBottomBox{{background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};"
+                              f"border-radius:6px;}}")
+            box_l = QVBoxLayout(box)
+            box_l.setContentsMargins(8, 6, 8, 8)
+            box_l.setSpacing(4)
+            cap = QLabel(title_text)
+            cap.setStyleSheet(_card_title_style())
+            box_l.addWidget(cap)
+            box_l.addWidget(widget, 1)
+            return box
+
         # Disable vertical lines for bottom ECG strip too
         self._af_ecg_strip = ECGStripCanvas(height=70, show_vertical_lines=False)
-        right_layout.addWidget(self._af_ecg_strip)
-
-        self._af_lorenz = LorenzCanvas()
-        self._af_lorenz.setFixedHeight(160)
-        right_layout.addWidget(self._af_lorenz)
+        self._af_ecg_strip.setMinimumHeight(90)
+        self._af_ecg_strip.setMaximumHeight(130)
+        self._af_ecg_strip.setMinimumWidth(120)
+        self._af_ecg_strip.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        right_layout.addWidget(_section("Rhythm Strip  \u00b7  Lead II", self._af_ecg_strip))
         layout.addWidget(right, 3)
+
+    def eventFilter(self, obj, event):
+        # Keep the empty-state text centred over the table's viewport.
+        lbl = getattr(self, "_no_items_lbl", None)
+        if lbl is not None and obj is self._af_table.viewport() and event.type() == QEvent.Resize:
+            lbl.setGeometry(obj.rect())
+        return super().eventFilter(obj, event)
 
     def set_replay_engine(self, engine):
         self._replay_engine = engine
@@ -286,6 +341,7 @@ class HolterAFPanel(QWidget):
         recording_start_timestamp = self._recording_start_timestamp()
 
         self._af_table.setRowCount(len(segments))
+        self._count_badge.setText(f"{len(segments)} episode" + ("" if len(segments) == 1 else "s"))
         if segments:
             self._no_items_lbl.hide()
             for i, seg in enumerate(segments):

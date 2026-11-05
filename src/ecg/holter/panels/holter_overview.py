@@ -211,7 +211,7 @@ class HolterExpertReviewPanel(QWidget):
         # 12-lead header: title on the accent bar, what the strips show on the right.
         head = QHBoxLayout()
         head.setSpacing(10)
-        hdr = QLabel("12-Lead ECG Overview")
+        hdr = QLabel("Overview")
         hdr.setStyleSheet(_card_title_style())
         head_hint = QLabel("Current replay frame  ·  rhythm strip: Lead II")
         head_hint.setStyleSheet(f"color:{UI_MUTED};font-size:11px;background:transparent;border:none;")

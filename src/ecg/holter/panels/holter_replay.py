@@ -198,64 +198,117 @@ class HolterReplayPanel(QWidget):
         ecg_right.setStyleSheet(_card_style("QFrame#rpEcgCard"))
         ecg_right_layout = QVBoxLayout(ecg_right)
         ecg_right_layout.setContentsMargins(8, 8, 8, 8)
-        ecg_right_layout.setSpacing(4)
-        ecg_ttl = QLabel("12-Lead ECG")
+        ecg_right_layout.setSpacing(6)
+        ecg_ttl = QLabel("Replay")
         ecg_ttl.setStyleSheet(_card_title_style())
         ecg_right_layout.addWidget(ecg_ttl)
 
-        #  "  "  12-lead scrollable grid (1 column, 12 rows)  "  " 
+        #  "  "  12-lead grid (1 column, 12 rows) sharing the card's height;
+        # below each row's minimum height the list scrolls instead of squeezing.
         leads_scroll = QScrollArea()
         leads_scroll.setWidgetResizable(True)
         leads_scroll.setFrameShape(QFrame.NoFrame)
         leads_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         leads_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        leads_scroll.setStyleSheet(f"QScrollArea{{background:{UI_PANEL};border:none;}}")
+        leads_scroll.setStyleSheet(
+            f"QScrollArea{{background:{UI_PANEL};border:none;}}"
+            f"QScrollBar:vertical{{background:{UI_PANEL};width:10px;margin:0;border:none;}}"
+            f"QScrollBar::handle:vertical{{background:{UI_BORDER};min-height:24px;border-radius:5px;margin:2px;}}"
+            f"QScrollBar::handle:vertical:hover{{background:#3A5378;}}"
+            f"QScrollBar::add-line,QScrollBar::sub-line{{width:0;height:0;}}")
         leads_container = QWidget()
         leads_container.setStyleSheet(f"background:{UI_PANEL};")
         leads_vbox = QVBoxLayout(leads_container)
-        leads_vbox.setContentsMargins(2, 2, 2, 2)
-        leads_vbox.setSpacing(2)
+        leads_vbox.setContentsMargins(0, 0, 4, 0)
+        leads_vbox.setSpacing(0)
+
+        def _lead_label(text):
+            """Lead name in the left gutter: plain green, centred."""
+            lbl = QLabel(text)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:12px;border:none;background:transparent;")
+            return lbl
+
+        def _lead_row(lbl, strip, divider_below=True, caption=None):
+            """Tinted gutter (lead name, optional caption above it) | strip;
+            a faint line under each row. Rows sit edge to edge, so the
+            gutters read as one column down the card."""
+            row = QWidget()
+            row.setStyleSheet("background:transparent;")
+            row_l = QHBoxLayout(row)
+            row_l.setContentsMargins(0, 0, 0, 0)
+            row_l.setSpacing(6)
+            gutter = QFrame()
+            gutter.setObjectName("rpLeadGutter")
+            gutter.setFixedWidth(42)
+            gutter.setStyleSheet(f"QFrame#rpLeadGutter{{background:{UI_PANEL_ALT};border:none;"
+                                 f"border-right:1px solid {UI_BORDER};}}")
+            gutter_l = QVBoxLayout(gutter)
+            gutter_l.setContentsMargins(0, 0, 0, 0)
+            gutter_l.setSpacing(0)
+            gutter_l.addStretch(1)
+            if caption:
+                cap = QLabel(caption)
+                cap.setAlignment(Qt.AlignCenter)
+                cap.setStyleSheet(f"color:{UI_MUTED};font-size:8px;font-weight:700;letter-spacing:1px;"
+                                  f"border:none;background:transparent;")
+                gutter_l.addWidget(cap)
+            gutter_l.addWidget(lbl)
+            gutter_l.addStretch(1)
+            row_l.addWidget(gutter)
+            strip.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            strip_wrap = QWidget()
+            strip_wrap.setStyleSheet("background:transparent;")
+            sw_l = QVBoxLayout(strip_wrap)
+            sw_l.setContentsMargins(0, 2, 0, 2)
+            sw_l.setSpacing(0)
+            sw_l.addWidget(strip)
+            row_l.addWidget(strip_wrap, 1)
+            if not divider_below:
+                return row
+            wrap = QWidget()
+            wrap.setStyleSheet("background:transparent;")
+            wrap_l = QVBoxLayout(wrap)
+            wrap_l.setContentsMargins(0, 0, 0, 0)
+            wrap_l.setSpacing(0)
+            wrap_l.addWidget(row, 1)
+            line = QFrame()
+            line.setFixedHeight(1)
+            line.setStyleSheet(f"background:{UI_BORDER};border:none;")
+            wrap_l.addWidget(line)
+            return wrap
 
         self._lead_names_ordered = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
         self._lead_strips = {}   # lead_name -> ECGStripCanvas
         self._ch_strips = []     # backward-compat list for gain/speed handlers
         self._detected_r_peaks = []  # Store R-peak timestamps for vertical line overlay
-        
-        for lead in self._lead_names_ordered:
-            row = QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(4)
-            lbl = QLabel(lead)
-            lbl.setFixedWidth(34)
-            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            lbl.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;")
-            # Height 60px makes them compact enough to fit well, but scrollable if needed
+
+        for i, lead in enumerate(self._lead_names_ordered):
             # Replay mode: disable ALL coloring (disable_all_coloring=True) - no arrhythmia colors, just green
             strip = ECGStripCanvas(height=60, color="#00FF00", pen_width=0.9, lead_name=lead, show_annotations=False, disable_all_coloring=True)
             strip.set_gain(1.0)
+            strip.setMinimumHeight(30)
+            strip.setMaximumHeight(16777215)
             self._lead_strips[lead] = strip
             self._ch_strips.append(strip)
-            row.addWidget(lbl)
-            row.addWidget(strip, 1)
-            leads_vbox.addLayout(row)
+            leads_vbox.addWidget(_lead_row(_lead_label(lead), strip,
+                                           divider_below=i < len(self._lead_names_ordered) - 1), 1)
 
         leads_scroll.setWidget(leads_container)
-        ecg_right_layout.addWidget(leads_scroll, 3)
+        ecg_right_layout.addWidget(leads_scroll, 1)
 
-        # Full-width rhythm strip (Lead II) at bottom
-        rhythm_row = QHBoxLayout()
-        rhythm_row.setContentsMargins(0, 0, 0, 0)
-        rhythm_row.setSpacing(4)
-        rhythm_lbl = QLabel("II")
+        # Full-width rhythm strip (Lead II) at bottom, set off by a rule above it
+        rhythm_rule = QFrame()
+        rhythm_rule.setFixedHeight(1)
+        rhythm_rule.setStyleSheet(f"background:{UI_BORDER};border:none;")
+        ecg_right_layout.addWidget(rhythm_rule)
+        rhythm_lbl = _lead_label("II")
         self._mini_lead_lbl = rhythm_lbl
-        rhythm_lbl.setFixedWidth(34)
-        rhythm_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        rhythm_lbl.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;background:transparent;")
         # Replay mode: disable ALL coloring
         self._mini_strip = ECGStripCanvas(height=60, color="#00AA00", pen_width=0.9, show_annotations=False, disable_all_coloring=True)
-        rhythm_row.addWidget(rhythm_lbl)
-        rhythm_row.addWidget(self._mini_strip, 1)
-        ecg_right_layout.addLayout(rhythm_row)
+        self._mini_strip.setMinimumHeight(48)
+        self._mini_strip.setMaximumHeight(80)
+        ecg_right_layout.addWidget(_lead_row(rhythm_lbl, self._mini_strip, divider_below=False, caption="RHYTHM"))
 
         top_splitter.addWidget(ecg_right)
 
