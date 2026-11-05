@@ -4,7 +4,7 @@
 Measured against the Fluke ProSim 8 reference table
 (ecg.metrics.reference_intervals) on the "Test_case TT" recording
 (2026-10-30_16-03-13), normal sinus 60-160 bpm: PR 168 ms (ref 166), QRS 90
-(ref 85-91), QT 240-350 (ref 246-363, 3-13 ms short).
+(ref 85-91), QT 242-346 (ref 246-363, 4-17 ms short; tangent T end).
 
   - Beats: Pan-Tompkins on leads I, V1 and V6; a beat counts when >= 2 of
     them find it within 100 ms. One lead alone drops beats where its QRS
@@ -24,10 +24,10 @@ Measured against the Fluke ProSim 8 reference table
     keeps it up) -- the bundle branch block rule's measurement. A single
     lead starts the QRS late (lead II: 32 ms before R, global: ~48 ms) and
     cuts off a slurred terminal S / R'.
-  - QT: global QRS onset to the latest T end on leads II, V2, V3, V5 (see
-    _t_end). The T wave is searched within the beat's own RR -- a fixed
-    600 ms window ran into the next beat's QRS at >= 120 bpm (QT 465-637 ms
-    read). Lead II alone read QT 30 ms short.
+  - QT: global QRS onset to the latest T end on leads II, V2, V3, V5; T end
+    by the tangent method (see _t_end). The T wave is searched within the
+    beat's own RR -- a fixed 600 ms window ran into the next beat's QRS at
+    >= 120 bpm (QT 465-637 ms read). Lead II alone read QT 30 ms short.
 """
 
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -119,7 +119,7 @@ PAD_SEC = 2.0
 BEAT_MERGE_SEC = 0.10
 COLLISION_RR_MS = 333.3
 RELAXED_P_MIN_RR_MS = 500.0
-T_END_FRACTION = 0.05
+T_LIMB_FRACTION = 0.25   # _t_end: the T wave's descending limb ends where it falls to this fraction of its peak
 
 
 def _beat_samples(data: np.ndarray, lead_names: Sequence[str], fs: float) -> List[int]:
@@ -208,14 +208,27 @@ def _quiet_qrs_leads(leads: np.ndarray, qrs_idx: Sequence[int], r: int, prev_rr_
 
 
 def _t_end(x: np.ndarray, onset: int, offset: int, r: int, next_rr_ms: float, fs: float) -> Optional[int]:
-    """T end (sample index) on one lead, or None. The T peak is searched
-    from 60 ms after the QRS end to 55% of the next RR (at most 450 ms) --
-    later, the next P wave rising toward the window end was taken for the T
-    peak at 150 bpm; its end up to 75% of the next RR (at most 600 ms).
-    Where the T wave doesn't fall under 5% of its peak before the next P
-    (it stopped at 6-8% on some 150 bpm beats), the end is where the
-    tangent at its steepest descent crosses the baseline. 150 bpm: QT on
-    67% -> 100% of the beats, 250 ms (ref 252)."""
+    """T end (sample index) on one lead, or None: the tangent method -- where
+    the tangent at the steepest descent of the T wave crosses the PR
+    baseline. The T peak is searched from 60 ms after the QRS end to 55% of
+    the next RR (at most 450 ms) -- later, the next P wave rising toward the
+    window end was taken for the T peak at 150 bpm; its end up to 75% of the
+    next RR (at most 600 ms).
+
+    The steepest descent is looked for only on the T wave's own descending
+    limb (peak to where it first falls to 25% of the peak, + 20 ms), with
+    the slope over +-10 ms. Was: the first point under 5% of the peak, the
+    tangent only where that never came. On human recordings the signal after
+    the T wave does not come back to the PR baseline -- the PR segment sits
+    30-48 ADC below the TP segment (atrial repolarization) and a U wave
+    follows -- and settled right at the 5% level (2026-10-28_17-39-47, V2 /
+    V3: T peak ~1230 ADC, after it +55..+120), so the end jumped between
+    ~400 and the window edge (~600 ms) beat to beat: QT shown on 20 of 153
+    frames, mostly ~575 ms; now all 153, 362-394 ms. Simulator (no Ta / U
+    wave): QT unchanged within -12..+1 ms (Test_case TT -6..+2 ms). A
+    one-sample slope over the whole tail picked noise spikes after the T
+    wave (T end ~580-620 ms on single beats), hence the limb and the
+    +-10 ms slope."""
     base_lo, base_hi = onset - int(0.04 * fs), onset - int(0.01 * fs)
     lo = offset + int(0.06 * fs)
     peak_hi = min(x.size, r + int(min(0.45, 0.55 * next_rr_ms / 1000.0) * fs))
@@ -234,16 +247,20 @@ def _t_end(x: np.ndarray, onset: int, offset: int, r: int, next_rr_ms: float, fs
     # and the end was read at the window edge (QT ~345 ms on half the beats
     # beside ~240 ms on the rest).
     seg = seg[:int(np.argmin(seg)) + 1]
-    if seg.size < 3:
+    if seg.size < 5:
         return None
-    below = np.where(seg < T_END_FRACTION * seg[0])[0]
-    if below.size:
-        return t_peak + int(below[0])
-    slope = np.gradient(seg)
-    steepest = int(np.argmin(slope))
-    if slope[steepest] >= 0:
+    below = np.where(seg <= T_LIMB_FRACTION * seg[0])[0]
+    limb_end = min(seg.size, (int(below[0]) if below.size else seg.size) + int(0.02 * fs) + 1)
+    hw = max(1, int(0.01 * fs))
+    steepest, slope = None, 0.0
+    for i in range(hw, limb_end - hw):
+        s = (seg[i + hw] - seg[i - hw]) / (2.0 * hw)
+        if s < slope:
+            steepest, slope = i, s
+    if steepest is None:
         return None
-    cross = steepest + seg[steepest] / -slope[steepest]
+    level = float(np.mean(seg[steepest - hw:steepest + hw + 1]))
+    cross = steepest + level / -slope
     return t_peak + int(round(cross)) if t_peak + cross <= end_hi + 0.05 * fs else None
 
 
@@ -437,7 +454,7 @@ def summarize(beats: List[Dict[str, Any]], rhythms: Iterable[str] = (), status: 
 
 
 _CACHE_FILENAME = 'pqrst_cache.json'
-_CACHE_VERSION = 4
+_CACHE_VERSION = 5   # 5: QT by the tangent method (_t_end)
 
 
 def recording_frames(path: str) -> List[Dict[str, Any]]:
