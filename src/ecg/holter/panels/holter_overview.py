@@ -203,60 +203,88 @@ class HolterExpertReviewPanel(QWidget):
         #  "  "  Center: scrollable 12-lead ECG grid  "  "
         center = QFrame()
         center.setObjectName("ovCenterCard")
-        center.setStyleSheet(f"QFrame#ovCenterCard{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:8px;}}")
+        center.setStyleSheet(_card_style("QFrame#ovCenterCard"))
         center_l = QVBoxLayout(center)
-        center_l.setContentsMargins(4, 6, 4, 4)
-        center_l.setSpacing(4)
+        center_l.setContentsMargins(10, 8, 10, 10)
+        center_l.setSpacing(8)
 
-        # 12-lead header
+        # 12-lead header: title on the accent bar, what the strips show on the right.
+        head = QHBoxLayout()
+        head.setSpacing(10)
         hdr = QLabel("12-Lead ECG Overview")
         hdr.setStyleSheet(_card_title_style())
-        center_l.addWidget(hdr)
+        head_hint = QLabel("Current replay frame  ·  rhythm strip: Lead II")
+        head_hint.setStyleSheet(f"color:{UI_MUTED};font-size:11px;background:transparent;border:none;")
+        head_hint.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        # May shrink (cut at the left edge) instead of widening the card.
+        head_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        head_hint.setMinimumWidth(0)
+        head.addWidget(hdr)
+        head.addWidget(head_hint, 1)
+        center_l.addLayout(head)
 
+        # The 12 leads, one row each, sharing the card's height; below their
+        # minimum height the list scrolls instead of squeezing.
         leads_scroll = QScrollArea()
         leads_scroll.setWidgetResizable(True)
         leads_scroll.setFrameShape(QFrame.NoFrame)
         leads_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         leads_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        leads_scroll.setStyleSheet(f"QScrollArea{{background:{COL_BLACK};border:none;}}")
+        leads_scroll.setStyleSheet(
+            f"QScrollArea{{background:transparent;border:none;}}"
+            f"QScrollArea > QWidget > QWidget{{background:transparent;}}"
+            f"QScrollBar:vertical{{background:{UI_PANEL};width:10px;margin:0;border:none;}}"
+            f"QScrollBar::handle:vertical{{background:{UI_BORDER};min-height:24px;border-radius:5px;margin:2px;}}"
+            f"QScrollBar::handle:vertical:hover{{background:#3A5378;}}"
+            f"QScrollBar::add-line,QScrollBar::sub-line{{width:0;height:0;}}")
         leads_container = QWidget()
-        leads_container.setStyleSheet(f"background:{COL_BLACK};")
+        leads_container.setStyleSheet("background:transparent;")
         leads_vbox = QVBoxLayout(leads_container)
-        leads_vbox.setContentsMargins(2, 2, 2, 2)
-        leads_vbox.setSpacing(2)
+        leads_vbox.setContentsMargins(0, 0, 4, 0)
+        leads_vbox.setSpacing(4)
+
+        def _lead_row(name, strip, object_name):
+            """One framed row: lead tag in a fixed gutter, strip filling the rest."""
+            row = QFrame()
+            row.setObjectName(object_name)
+            row.setStyleSheet(f"QFrame#{object_name}{{background:{COL_BLACK};border:1px solid {UI_BORDER};"
+                              f"border-radius:6px;}}")
+            row_l = QHBoxLayout(row)
+            row_l.setContentsMargins(4, 2, 4, 2)
+            row_l.setSpacing(6)
+            tag = QLabel(name)
+            tag.setFixedWidth(40)
+            tag.setAlignment(Qt.AlignCenter)
+            tag.setStyleSheet(f"color:{COL_GREEN};font-weight:800;font-size:11px;"
+                              f"background:rgba(11,18,32,200);border:1px solid {COL_GREEN_DRK};"
+                              f"border-radius:4px;padding:1px 0px;")
+            row_l.addWidget(tag, 0, Qt.AlignVCenter)
+            strip.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            row_l.addWidget(strip, 1)
+            return row
 
         self._lead_names_12 = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
         self._expert_lead_strips = {}  # lead_name -> ECGStripCanvas
         for lead in self._lead_names_12:
-            row_h = QHBoxLayout()
-            row_h.setContentsMargins(0, 0, 0, 0)
-            row_h.setSpacing(4)
-            lbl = QLabel(lead)
-            lbl.setFixedWidth(34)
-            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            lbl.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;background:transparent;")
             # Expert/Overview mode: disable ALL coloring (disable_all_coloring=True) - no arrhythmia colors, just green
             strip = ECGStripCanvas(height=60, color="#00FF00", pen_width=0.9, lead_name=lead, show_vertical_lines=False, show_annotations=False, disable_all_coloring=True)
             strip.set_gain(1.0)
+            strip.setMinimumHeight(36)
+            strip.setMaximumHeight(16777215)
             self._expert_lead_strips[lead] = strip
-            row_h.addWidget(lbl)
-            row_h.addWidget(strip, 1)
-            leads_vbox.addLayout(row_h)
+            leads_vbox.addWidget(_lead_row(lead, strip, "ovLeadRow"), 1)
 
         leads_scroll.setWidget(leads_container)
         center_l.addWidget(leads_scroll, 1)
 
         # Rhythm strip at bottom (Lead II) - also disable vertical lines and ALL coloring
-        rhythm_row = QHBoxLayout()
-        rhythm_row.setSpacing(4)
-        rlbl = QLabel("II")
-        rlbl.setFixedWidth(34)
-        rlbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        rlbl.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;background:transparent;")
+        rhythm_ttl = QLabel("Rhythm Strip")
+        rhythm_ttl.setStyleSheet(_card_title_style())
+        center_l.addWidget(rhythm_ttl)
         self._mini = ECGStripCanvas(height=40, color="#00AA00", pen_width=0.9, show_vertical_lines=False, show_annotations=False, disable_all_coloring=True)
-        rhythm_row.addWidget(rlbl)
-        rhythm_row.addWidget(self._mini, 1)
-        center_l.addLayout(rhythm_row)
+        self._mini.setMinimumHeight(44)
+        self._mini.setMaximumHeight(64)
+        center_l.addWidget(_lead_row("II", self._mini, "ovRhythmRow"))
 
         body.addWidget(center)
 

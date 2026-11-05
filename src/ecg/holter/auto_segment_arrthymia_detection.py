@@ -897,6 +897,19 @@ def _detect_arrhythmias_uncached(
     if not lead_names:
         lead_names = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
 
+    # Every rule below reads the recording with mains interference (50 / 60
+    # Hz) subtracted instead of only notched: a notch rings for ~1 s where
+    # the interference starts, stops or switches frequency, and that ringing
+    # hid P waves and QRS ends from the rules (see mains_cancel). Where no
+    # mains is found the samples are exactly the recording's own. Only the
+    # mains Artifact layer reads raw_reader -- it measures the interference.
+    raw_reader = reader
+    try:
+        from .mains_cancel import MainsCancelledReader
+    except ImportError:
+        from ecg.holter.mains_cancel import MainsCancelledReader
+    reader = MainsCancelledReader(raw_reader)
+
     # Long recording: the window loop below starts now in worker processes
     # and runs alongside the whole-recording pass (see _PARALLEL_* above).
     _parallel_window_handle = None
@@ -6222,7 +6235,7 @@ def _detect_arrhythmias_uncached(
             b0 = 0.0
             while b0 < total_duration:
                 b1 = min(total_duration, b0 + 10.0)
-                blk = reader.read_range(b0, b1)
+                blk = raw_reader.read_range(b0, b1)
                 if blk is not None and blk.shape[1] >= int(fs) and max(_mains_share(blk[_mains_ii])) >= _MAINS_SCREEN:
                     z0, z1 = max(0.0, b0 - 10.0), min(total_duration, b1 + 10.0)
                     if zones and z0 <= zones[-1][1]:
@@ -6243,7 +6256,7 @@ def _detect_arrhythmias_uncached(
                     continue
                 mid = 0.5 * (a + b)
                 lo, hi = max(0.0, min(a, mid - 0.5)), min(total_duration, max(b, mid + 0.5))
-                data = reader.read_range(lo, hi)
+                data = raw_reader.read_range(lo, hi)
                 if data is None:
                     continue
                 shares = [_mains_share(data[i]) for i in _mains_leads if i < data.shape[0]]

@@ -268,18 +268,8 @@ class PageGridBackground(QWidget):
 
             # Draw Level 3: large block boundaries (always visible)
         else:
-            # Default Dark Mode
+            # Default Dark Mode: plain background, no grid lines.
             painter.fillRect(self.rect(), QColor(COL_BLACK))
-            minor_pen = QPen(QColor(COL_GRID_MINOR))
-            minor_pen.setWidth(1)
-            major_pen = QPen(QColor(COL_GRID_MAJOR))
-            major_pen.setWidth(1)
-            for gx in range(0, w, 20):
-                painter.setPen(major_pen if gx % 100 == 0 else minor_pen)
-                painter.drawLine(gx, 0, gx, h)
-            for gy in range(0, h, 20):
-                painter.setPen(major_pen if gy % 100 == 0 else minor_pen)
-                painter.drawLine(0, gy, w, gy)
 
         painter.end()
 
