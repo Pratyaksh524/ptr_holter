@@ -6612,6 +6612,17 @@ def _detect_arrhythmias_uncached(
                 p_to_r.append((all_r_peaks[q] - (base + (i0 + best) / fs)) * 1000.0)
             return waves, p_to_r
 
+        def _pause_ratio_k(base_rr, pause_rr):
+            """2 if pause_rr is ~2x base_rr (one blocked P), 3 if ~3x (two
+            blocked P in a row), else 0 -- same bands used below."""
+            if base_rr <= 0:
+                return 0
+            if 1.7 * base_rr <= pause_rr <= 2.3 * base_rr:
+                return 2
+            if 2.7 * base_rr <= pause_rr <= 3.3 * base_rr:
+                return 3
+            return 0
+
         for j in range(4, _n):
             run = list(range(j - 3, j + 1))
             if not all(_free(q) for q in run):
@@ -6620,16 +6631,44 @@ def _detect_arrhythmias_uncached(
                 continue
             pre_rr = [_rr(q) for q in range(j - 2, j)]
             base_rr = float(np.median(pre_rr))
-            if base_rr <= 0 or max(pre_rr) - min(pre_rr) > 0.1 * base_rr:
-                continue
-            k = 2 if 1.7 * base_rr <= _rr(j) <= 2.3 * base_rr else (
-                3 if 2.7 * base_rr <= _rr(j) <= 3.3 * base_rr else 0)
+            steady = base_rr > 0 and max(pre_rr) - min(pre_rr) <= 0.1 * base_rr
+            k = _pause_ratio_k(base_rr, _rr(j)) if steady else 0
+            narrow_pr = False
+            if not k:
+                # The two RRs right before the pause disagree (steady,
+                # above, failed) -- most often because the beat right
+                # before the pause is itself the first beat of a new
+                # conduction: a rhythm / bundle-branch-block change landing
+                # on the very beat before a blocked P, so beat j-2 (still
+                # the old conduction) and j-1 (the new one) were never
+                # going to agree. That beat's own single RR is still a fair
+                # "normal cycle" to judge the pause against; the fixed-PR
+                # check is narrowed to the two beats either side of the
+                # pause (j-1, j) rather than j-2 too -- j-2 can genuinely
+                # carry the old conduction's own, different PR, which must
+                # not be compared to the new one's. Seen on
+                # 2026-11-05_12-16-28: Mobitz I (narrow QRS) ends, RBBB
+                # (wide QRS) begins, and the very next beat is dropped --
+                # RR 930 then 1062 ms (13%, fails steady above) but PR
+                # 242 ms on both the beat right before and right after the
+                # pause, 3 waves found in the gap.
+                k = _pause_ratio_k(_rr(j - 1), _rr(j))
+                narrow_pr = True
             if not k:
                 continue
             waves, prs = _pause_evidence(j)
-            if waves < k or any(v is None for v in prs) or max(prs) - min(prs) > 20.0:
+            if waves < k:
                 continue
-            r0, r1 = all_r_peaks[j - 2], all_r_peaks[j]
+            if narrow_pr:
+                p_before, p_after = prs[1], prs[2]
+                if p_before is None or p_after is None or abs(p_before - p_after) > 20.0:
+                    continue
+                r0 = all_r_peaks[j - 1]
+            elif any(v is None for v in prs) or max(prs) - min(prs) > 20.0:
+                continue
+            else:
+                r0 = all_r_peaks[j - 2]
+            r1 = all_r_peaks[j]
             if new_av and new_av[-1][0] == _AV_MOBITZ_II and r0 <= new_av[-1][2] + 1e-6:
                 new_av[-1][2] = r1
             else:
