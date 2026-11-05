@@ -3040,7 +3040,27 @@ class ECGStripCanvas(QWidget):
 
 # 6c. MAGNIFIER OVERLAY
 class MagnifierOverlay(QWidget):
-    """Shared magnifier popup for the replay panel so zoom is never clipped by strip bounds."""
+    """Shared magnifier popup for the replay panel so zoom is never clipped by strip bounds.
+
+    Full Disclosure (a host with _display_theme_mode), graph and dark mode:
+    the clicked lead on its own calibrated ECG paper, the same on every
+    screen and window size -- 1 mm = _LENS_PX_PER_MM px, 10 mm/mV x the
+    strip's gain, the strip's paper speed in mm/s -- so at 10 mm/mV, 25 mm/s
+    a small box (1 mm) is 0.1 mV x 40 ms and ST can be counted in boxes.
+    Colours follow the mode (_LENS_COLORS). (The strips themselves are
+    fitted to the window -- 4096 ADC per row height, 10 s per strip width --
+    so boxes on the screen paper do not give mV / ms.) Other hosts: the
+    lead's samples, auto-scaled to the lens."""
+
+    _LENS_PX_PER_MM = 16.0
+    _LENS_COLORS = {
+        'graph': {'panel': "#FFFFFF", 'paper': "#FFE8EA", 'mm': "#EE9AA6", 'mm5': "#D9566A",
+                  'trace': None, 'cross': (31, 78, 154, 170), 'border': "#990000",
+                  'title': "#990000", 'hint': "#555555"},
+        'dark': {'panel': "#000000", 'paper': "#000000", 'mm': "#1E3A26", 'mm5': "#2F7A45",
+                 'trace': "#22FF44", 'cross': (255, 255, 255, 120), 'border': COL_YELLOW,
+                 'title': "#FFFFFF", 'hint': "#BBBBBB"},
+    }
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3090,6 +3110,133 @@ class MagnifierOverlay(QWidget):
         self.hide()
         self.update()
 
+    @staticmethod
+    def _paper_lens_theme(host):
+        """'graph' / 'dark' for a Full Disclosure host (its display theme),
+        else None."""
+        mode = getattr(host, '_display_theme_mode', None)
+        if mode is None or getattr(host, '_canvas_frame', None) is None:
+            return None
+        return 'graph' if str(mode).lower() == 'graph' else 'dark'
+
+    def _paint_paper_lens(self, host, theme):
+        src = self._source_widget
+        if not hasattr(src, '_get_display_signal'):
+            return
+        try:
+            focus_host = src.mapTo(host, self._focus_pos)
+            d, mn, rng = src._get_display_signal()
+        except Exception:
+            return
+        if d.size < 2:
+            return
+        w, h = host.width(), host.height()
+        panel_w = min(520, max(320, int(w * 0.38)))
+        panel_h = min(420, max(220, int(h * 0.45)))
+        hx, hy = focus_host.x(), focus_host.y()
+        panel_x = hx + 24
+        panel_y = hy - panel_h - 18
+        if panel_x + panel_w > w - 8:
+            panel_x = hx - panel_w - 24
+        panel_x = max(8, panel_x)
+        if panel_y < 8:
+            panel_y = hy + 18
+        if panel_y + panel_h > h - 8:
+            panel_y = max(8, h - panel_h - 8)
+        panel = QRect(panel_x, panel_y, panel_w, panel_h)
+        inner = panel.adjusted(6, 24, -6, -6)
+        self._panel_rect, self._inner_rect = panel, inner
+
+        try:
+            from ..ischemia_detection import _SCREEN_ADC_PER_MV as adc_per_mv
+        except Exception:
+            adc_per_mv = 1133.0
+        mm = self._LENS_PX_PER_MM
+        fs = float(getattr(src, '_fs', self._fs) or 500.0)
+        speed = float(getattr(src, '_speed', self._speed) or 25.0)
+        gain = float(getattr(src, '_gain', self._gain) or 1.0)
+        px_per_sample = mm * speed / fs
+        # d already carries the gain, so 10 mm per mV of d.
+        px_per_unit = mm * 10.0 / adc_per_mv
+
+        # Clicked point -> sample and display value, inverting the strip's own
+        # mapping (ECGStripCanvas.paintEvent: x = i * w / (n - 1), 4 px margin).
+        sw, sh = max(1, src.width()), max(1, src.height())
+        fx_src = max(0, min(self._focus_pos.x(), sw - 1))
+        fy_src = max(0, min(self._focus_pos.y(), sh - 1))
+        ic = fx_src * (d.size - 1) / float(sw)
+        plot_h = max(1.0, float(sh) - 8.0)
+        vc = mn + (4.0 + plot_h - fy_src) / plot_h * rng
+        cx, cy = inner.center().x(), inner.center().y()
+        col = self._LENS_COLORS[theme]
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(col['panel']))
+        painter.drawRoundedRect(panel, 10, 10)
+        painter.save()
+        painter.setBrush(Qt.NoBrush)
+        painter.setClipRect(inner)
+        painter.fillRect(inner, QColor(col['paper']))
+
+        # Paper: 1 mm and 5 mm lines through the lens centre.
+        pen_mm, pen_5mm = QPen(QColor(col['mm']), 1), QPen(QColor(col['mm5']), 1.6)
+        nx = int(inner.width() / (2 * mm)) + 2
+        ny = int(inner.height() / (2 * mm)) + 2
+        for major in (False, True):
+            painter.setPen(pen_5mm if major else pen_mm)
+            for k in range(-nx, nx + 1):
+                if (k % 5 == 0) == major:
+                    painter.drawLine(QPointF(cx + k * mm, inner.top()), QPointF(cx + k * mm, inner.bottom()))
+            for k in range(-ny, ny + 1):
+                if (k % 5 == 0) == major:
+                    painter.drawLine(QPointF(inner.left(), cy + k * mm), QPointF(inner.right(), cy + k * mm))
+
+        # The clicked lead's trace on that paper.
+        half = inner.width() / 2.0 / px_per_sample
+        i0 = max(0, int(ic - half) - 1)
+        i1 = min(d.size, int(ic + half) + 2)
+        if i1 - i0 >= 2:
+            path = QPainterPath()
+            for i in range(i0, i1):
+                lx = cx + (i - ic) * px_per_sample
+                ly = cy - (d[i] - vc) * px_per_unit
+                if i == i0:
+                    path.moveTo(lx, ly)
+                else:
+                    path.lineTo(lx, ly)
+            pen = QPen(QColor(col['trace'] or getattr(src, '_color', '#000000')))
+            pen.setWidthF(2.0)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(pen)
+            painter.drawPath(path)
+        painter.restore()
+
+        # Crosshair on the clicked point.
+        cross = QPen(QColor(*col['cross']), 1, Qt.DashLine)
+        painter.setPen(cross)
+        painter.drawLine(QPointF(cx, inner.top()), QPointF(cx, inner.bottom()))
+        painter.drawLine(QPointF(inner.left(), cy), QPointF(inner.right(), cy))
+
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(col['border']), 3))
+        painter.drawRoundedRect(panel, 10, 10)
+        painter.setPen(QPen(QColor(col['title'])))
+        font = painter.font()
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(QRect(panel.left() + 10, panel.top() + 3, panel.width() - 20, 20),
+                         Qt.AlignLeft | Qt.AlignVCenter,
+                         f"{self._lead_name or 'Lead'}   small box 1 mm, large box 5 mm")
+        font.setBold(False)
+        painter.setFont(font)
+        painter.setPen(QPen(QColor(col['hint'])))
+        painter.drawText(QRect(panel.left() + 10, panel.top() + 3, panel.width() - 20, 20),
+                         Qt.AlignRight | Qt.AlignVCenter, f"{10 * gain:g} mm/mV  {speed:g} mm/s")
+        painter.end()
+
     def paintEvent(self, event):
         if not self._visible or self._data is None or self._source_widget is None:
             return
@@ -3099,6 +3246,11 @@ class MagnifierOverlay(QWidget):
 
         host = self.parentWidget()
         if host is None:
+            return
+
+        theme = self._paper_lens_theme(host)
+        if theme is not None:
+            self._paint_paper_lens(host, theme)
             return
 
         painter = QPainter(self)

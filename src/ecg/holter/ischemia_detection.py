@@ -98,6 +98,11 @@ _MM_PER_MV = 10.0
 # ~113 ADC per graph-paper mm. Checked against a recording on that screen
 # (V2 / V3 / V5 / aVF peak-to-peak: 111-116 ADC per mm). A fixed number, so
 # the values don't change with the window size.
+# It is also the recorder's own ADC per mV: simulator ST set to +0.1 / +0.2 /
+# +0.3 / -0.1 / -0.2 / -0.3 mV read +110 / +222 / +339 / -123 / -237 / -352
+# ADC in Lead II ("ST test all", 2026-10-23_13-54-51), ~1140 ADC per mV
+# (theme.ADC_TO_MV's 200 does not fit this recorder). The graph-mode
+# magnifier (panels/holter_widgets.MagnifierOverlay) draws mV with it.
 _SCREEN_ADC_PER_MV = 1133.0
 _ADC_TO_MM = _MM_PER_MV / _SCREEN_ADC_PER_MV
 
