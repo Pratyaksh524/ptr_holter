@@ -33,11 +33,61 @@ import numpy as np
 MAINS_RMS_MIN = 50.0
 MAINS_SHARE_MIN = 0.2
 MAINS_HOLD_SEC = 1.0
+# A single step (or a couple) misread as 0 right at a 50<->60 switch --
+# the switch instant's 0.5 s window straddles both frequencies, so
+# neither's share reaches MAINS_SHARE_MIN there -- stops BOTH sides from
+# ever qualifying as a change (each needs MAINS_HOLD_SEC of its own kind
+# right up to the point), so the two stretches were never cut apart and
+# the shorter one was never subtracted. Seen on 2026-11-05_10-53-47: one
+# 0.1 s step between a 15.2 s run of 60 Hz and a 6.3 s run of 50 Hz.
+# Filled only when BOTH neighbours already independently hold for
+# MAINS_HOLD_SEC (the same bar an ordinary change point must clear) --
+# never inside a genuinely noisy/flickering stretch, where neither side
+# holds (seen on 2026-11-04_18-22-58: a 0.3 s gap there sits between a
+# 0.6 s and a 0.1 s run, both short, so it is correctly left alone and
+# that whole messy stretch still waits for its own real 1 s read).
+MAINS_GAP_FILL_MAX_STEPS = 3
 _STEP_WIN_SEC = 0.5
 _STEP_SEC = 0.1
 _FIT_WIN_SEC = 1.0
 _FIT_HOP_SEC = 0.5
 _CHUNK_SEC = 60.0
+
+
+def _fill_short_mains_gaps(kinds, hold_steps):
+    """kinds with a short run of 0 (<= MAINS_GAP_FILL_MAX_STEPS) filled in
+    wherever both the run right before it and the run right after it are
+    non-zero and already >= hold_steps long on their own -- see
+    MAINS_GAP_FILL_MAX_STEPS. The fill is split down the middle (first half
+    takes the kind before, second half the kind after); only used so the
+    change-point search below has a kind to compare at every step, the
+    search itself (and the exact sample it settles on) is unchanged."""
+    out = kinds.copy()
+    n = len(kinds)
+    i = 0
+    while i < n:
+        j = i
+        while j < n and kinds[j] == kinds[i]:
+            j += 1
+        run_kind, run_start, run_len = int(kinds[i]), i, j - i
+        if (run_kind == 0 and run_len <= MAINS_GAP_FILL_MAX_STEPS
+                and run_start > 0 and j < n):
+            before_kind, before_len = int(kinds[run_start - 1]), 1
+            k = run_start - 2
+            while k >= 0 and kinds[k] == before_kind:
+                before_len += 1
+                k -= 1
+            after_kind, after_len = int(kinds[j]), 1
+            k = j + 1
+            while k < n and kinds[k] == after_kind:
+                after_len += 1
+                k += 1
+            if before_kind != 0 and after_kind != 0 and before_len >= hold_steps and after_len >= hold_steps:
+                mid = run_start + (run_len + 1) // 2
+                out[run_start:mid] = before_kind
+                out[mid:j] = after_kind
+        i = j
+    return out
 
 
 def _mains_kinds(x, fs):
@@ -176,6 +226,7 @@ class MainsCancelledReader:
             return self._stretches
         centers = np.arange(kinds.size) * step + win // 2
         hold = int(round(MAINS_HOLD_SEC / _STEP_SEC))
+        kinds = _fill_short_mains_gaps(kinds, hold)
         changes = []
         for j in range(hold, kinds.size - hold + 1):
             if (kinds[j] != kinds[j - 1] and np.all(kinds[j - hold:j] == kinds[j - 1])
