@@ -45,6 +45,229 @@ from ..holter_helpers import (
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas
 
+
+# ---------------------------------------------------------------------------
+# Template cards from the recorded beats + the auto segment detection.
+#
+# One card per beat label.  The live beat labels (metrics.jsonl all_beats /
+# template_summary, analysis_worker._label_beat) are N / S / V / Tachy /
+# Brady / Pause only: they come from rate and QRS width and never say AF.
+# The AF, AFL and Unidentified cards therefore come from the auto segment
+# detection (auto_segment_arrthymia_detection.detect_arrhythmias, the same
+# result the "Auto Arrhythmia Detection" button shows; it is used here
+# whether or not the button was pressed):
+#   * every recorded beat inside an Atrial Fibrillation / Atrial Flutter /
+#     Unidentified segment is taken out of its own label's card (where
+#     segments overlap, AF / AFL wins over Unidentified),
+#   * the AF / AFL / Unidentified card counts the R peaks of those segments,
+#     found on Lead II with Pan-Tompkins (the recorded beat list does not
+#     cover every beat, e.g. 61 of 752 beats on 2026-11-04_09-33-24).
+#     Unidentified is signal with no readable P / QRS / T, so its "beats"
+#     are whatever Pan-Tompkins picks there; the card is shown even with
+#     none, so the stretch can still be looked at.
+# The card's beat (first_timestamp: the 12-lead view and the seek on click)
+# is the label's first recorded beat outside those segments; for N it is first
+# looked for where no auto segment touches its view window (else a beat from
+# the first stretch with no segment), so the N card shows a sinus beat.
+# ---------------------------------------------------------------------------
+_SEGMENT_CARD_KINDS = {'Atrial Fibrillation': 'AF', 'Atrial Flutter': 'AFL',
+                       'Unidentified': 'Unidentified'}
+_SEGMENT_CARDS = ('AF', 'AFL', 'Unidentified')
+_TEMPLATE_VIEW_PRE_SEC = 0.60    # _update_detail_grid shows first_timestamp
+_TEMPLATE_VIEW_POST_SEC = 0.90   # -0.60 s .. +0.90 s
+_R_PEAK_PIECE_SEC = 60.0         # Lead II is read in pieces of this length
+_R_PEAK_PAD_SEC = 1.0            # overlap so peaks at a piece edge are found
+_NSR_SEARCH_MAX_SEC = 60.0       # signal searched per gap for a sinus beat
+
+
+def _segment_spans(segments):
+    """(card spans as (start, end, 'AF'|'AFL'|'Unidentified'), every span as
+    (start, end)) from detect_arrhythmias() segments; empty lists for None."""
+    af_spans, all_spans = [], []
+    for seg in segments or []:
+        try:
+            s, e = float(seg['start_sec']), float(seg['end_sec'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if e <= s:
+            continue
+        all_spans.append((s, e))
+        kind = _SEGMENT_CARD_KINDS.get(str(seg.get('label', '')))
+        if kind:
+            af_spans.append((s, e, kind))
+    af_spans.sort()
+    all_spans.sort()
+    return af_spans, all_spans
+
+
+def _span_kind(ts, af_spans):
+    """'AF' / 'AFL' / 'Unidentified' when ts is inside such a span (AF / AFL
+    first where they overlap), else None."""
+    found = None
+    for s, e, kind in af_spans:
+        if s <= ts < e:
+            if kind != 'Unidentified':
+                return kind
+            found = kind
+    return found
+
+
+def _view_clear_of_spans(ts, spans):
+    """True when the beat's whole 12-lead view window touches no span (a
+    beat just past a segment's end, e.g. 4 ms after an SVT, is not sinus)."""
+    a, b = ts - _TEMPLATE_VIEW_PRE_SEC, ts + _TEMPLATE_VIEW_POST_SEC
+    return not any(s < b and a < e for s, e in spans)
+
+
+def _lead_ii_r_peaks(reader, start, end):
+    """R peak times (s) between start and end on Lead II (Pan-Tompkins),
+    reading the signal in _R_PEAK_PIECE_SEC pieces."""
+    from ...pan_tompkins import pan_tompkins
+    fs = float(reader.fs)
+    names = list(getattr(reader, 'lead_names', []) or [])
+    lead = names.index('II') if 'II' in names else min(1, max(len(names) - 1, 0))
+    duration = float(getattr(reader, 'duration_sec', end) or end)
+    peaks = []
+    t = float(start)
+    while t < end:
+        t_end = min(t + _R_PEAK_PIECE_SEC, end)
+        a, b = max(0.0, t - _R_PEAK_PAD_SEC), min(duration, t_end + _R_PEAK_PAD_SEC)
+        data = reader.read_range(a, b)
+        if isinstance(data, np.ndarray) and data.ndim == 2 and data.shape[0] > lead and data.shape[1] > int(0.5 * fs):
+            for p in pan_tompkins(np.asarray(data[lead], dtype=float), fs=fs):
+                ts = a + float(p) / fs
+                if t <= ts < t_end:
+                    peaks.append(round(ts, 3))
+        t = t_end
+    return peaks
+
+
+def _viewable_beat(peaks, start, end):
+    """First peak whose whole 12-lead view window lies inside [start, end),
+    else the first peak, else None."""
+    for ts in peaks:
+        if ts - _TEMPLATE_VIEW_PRE_SEC >= start and ts + _TEMPLATE_VIEW_POST_SEC <= end:
+            return ts
+    return peaks[0] if peaks else None
+
+
+def _sinus_beat_from_signal(reader, all_spans):
+    """A beat from the first stretch with no auto segment at all (the
+    detector found nothing there), for an N card whose recorded N beats all
+    sit inside auto segments.  None when there is no such stretch."""
+    duration = float(getattr(reader, 'duration_sec', 0.0) or 0.0)
+    gaps, t = [], 0.0
+    for s, e in sorted(all_spans):
+        if s > t:
+            gaps.append((t, s))
+        t = max(t, e)
+    if duration > t:
+        gaps.append((t, duration))
+    min_len = _TEMPLATE_VIEW_PRE_SEC + _TEMPLATE_VIEW_POST_SEC + 1.0
+    for s, e in gaps:
+        if e - s < min_len:
+            continue
+        e = min(e, s + _NSR_SEARCH_MAX_SEC)
+        ts = _viewable_beat(_lead_ii_r_peaks(reader, s, e), s, e)
+        if ts is not None:
+            return ts
+    return None
+
+
+def _build_template_rows(metrics_list, segments=None, reader=None):
+    """Template card rows (one per beat label, plus AF / AFL / Unidentified) from the
+    metrics chunks and the auto segment detection; see the note above.
+    Without segments or a reader the cards are the recorded labels only."""
+    af_spans, all_spans = _segment_spans(segments)
+    if reader is None:
+        af_spans = []          # segment beats cannot be counted: leave them
+    items = {}
+    for metric in metrics_list or []:
+        beats = [b for b in (metric.get('all_beats') or []) if isinstance(b, dict)]
+        # Recorded beats inside AF / AFL / Unidentified leave their label's
+        # card (counts per label per chunk match template_summary exactly).
+        moved = {}
+        for b in beats:
+            if _span_kind(float(b.get('timestamp', 0.0) or 0.0), af_spans):
+                lbl = str(b.get('label', 'N') or 'N')
+                moved[lbl] = moved.get(lbl, 0) + 1
+        for row in (metric.get('template_summary') or []):
+            label = str(row.get('label', 'N') or 'N').strip() or 'N'
+            count = int(row.get('count', 0) or 0)
+            take = min(count, moved.get(label, 0))
+            moved[label] = moved.get(label, 0) - take
+            count -= take
+            if count <= 0:
+                continue
+            item = items.setdefault(label, {
+                'label': label, 'count': 0, 'rr': [], 'qrs': [],
+                'first_timestamp': None, '_sinus_ts': None,
+            })
+            item['count'] += count
+            item['rr'].append(float(row.get('avg_rr_ms', 0.0) or 0.0))
+            item['qrs'].append(float(row.get('avg_qrs_ms', 0.0) or 0.0))
+            # fallback until a beat of this label is seen below
+            if item['first_timestamp'] is None:
+                item['first_timestamp'] = float(row.get('first_timestamp', metric.get('t', 0.0)) or 0.0)
+        for b in beats:
+            label = str(b.get('label', 'N') or 'N').strip() or 'N'
+            item = items.get(label)
+            ts = float(b.get('timestamp', 0.0) or 0.0)
+            if item is None or _span_kind(ts, af_spans):
+                continue
+            if item.get('_seen') is None or ts < item['_seen']:
+                item['_seen'] = ts
+            if _view_clear_of_spans(ts, all_spans) and (item['_sinus_ts'] is None or ts < item['_sinus_ts']):
+                item['_sinus_ts'] = ts
+
+    for label, item in items.items():
+        if item.get('_seen') is not None:
+            item['first_timestamp'] = item['_seen']
+        if label == 'N' and all_spans:
+            sinus = item['_sinus_ts']
+            if sinus is None and reader is not None:
+                sinus = _sinus_beat_from_signal(reader, all_spans)
+            if sinus is not None:
+                item['first_timestamp'] = sinus
+
+    for kind in _SEGMENT_CARDS:
+        spans = [(s, e) for s, e, k in af_spans if k == kind]
+        peaks, rr, view_ts = [], [], None
+        for s, e in spans:
+            # an Unidentified peak inside an overlapping AF / AFL span is
+            # counted on that card only
+            p = [ts for ts in _lead_ii_r_peaks(reader, s, e) if _span_kind(ts, af_spans) == kind]
+            if view_ts is None:
+                view_ts = _viewable_beat(p, s, e)
+            rr.extend(float(v) * 1000.0 for v in np.diff(p))
+            peaks.extend(p)
+        if peaks or (spans and kind == 'Unidentified'):
+            if view_ts is None:      # Unidentified with no peak: its start
+                view_ts = spans[0][0] + _TEMPLATE_VIEW_PRE_SEC
+            items[kind] = {
+                'label': kind, 'count': len(peaks), 'rr': rr, 'qrs': [],
+                'first_timestamp': view_ts,
+            }
+
+    rows = sorted(items.values(), key=lambda it: it['count'], reverse=True)
+    out = []
+    for i, it in enumerate(rows, start=1):
+        out.append({
+            'template_key': it['label'],
+            'template_id': f'T{i}',
+            'label': it['label'],
+            'count': it['count'],
+            'rr': it['rr'],
+            'qrs': it['qrs'],
+            'first_timestamp': float(it['first_timestamp'] or 0.0),
+            'viewed': True,
+            'ambiguous': False,
+            'inserted': False,
+            'demix': False,
+            'auto_update': False,
+        })
+    return out
+
 # 8. HOLTER TEMPLATE PANEL (template gallery)
 class _TemplateMetricCard(QFrame):
     def __init__(self, title: str, value: str = "", accent: str = COL_GREEN, parent=None):
@@ -154,9 +377,10 @@ class TemplateCardWidget(QFrame):
         self.id_edit.setFixedWidth(70)
         self.id_edit.setPlaceholderText("T ID")
         self.class_combo = QComboBox()
-        # Updated options: N, S, V, P, AF, X, Other, Unconfirmed
-        self.class_combo.addItems(["N", "S", "V", "P", "AF", "X", "Other", "Unconfirmed"])
-        self.class_combo.setFixedWidth(95)  # Increased width for "Unconfirmed"
+        # Options: N, S, V, P, AF, X, Other, Unidentified (was Unconfirmed;
+        # Unidentified = the auto detector's no-readable-signal stretches)
+        self.class_combo.addItems(["N", "S", "V", "P", "AF", "X", "Other", "Unidentified"])
+        self.class_combo.setFixedWidth(95)  # wide enough for "Unidentified"
         self.count_pill = QLabel("0 beats")
         self.count_pill.setAlignment(Qt.AlignCenter)
         self.count_pill.setStyleSheet(f"color:{UI_TEXT};font-size:11px;font-weight:800;background:{UI_PANEL_ALT};border:1px solid {self._accent};border-radius:10px;padding:4px 8px;")
@@ -202,7 +426,7 @@ class TemplateCardWidget(QFrame):
         self.view_toggle.setCheckable(True)
         self.view_toggle.setChecked(True)
         self.view_toggle.setText("\u25c9")
-        self.view_toggle.setToolTip("Viewed / unconfirmed")
+        self.view_toggle.setToolTip("Viewed / not viewed")
         self.view_toggle.setFixedSize(26, 26)
         self.view_toggle.setStyleSheet(f"""
             QToolButton {{
@@ -389,6 +613,9 @@ class HolterBeatTemplatePanel(QWidget):
         self._card_widgets = []
         self._waveform_cache = {}
         self._replay_engine = None
+        self._last_metrics = []
+        self._last_summary = {}
+        self._segments_pending_path = None
         self._build_ui()
 
     def _find_template_host(self):
@@ -416,12 +643,13 @@ class HolterBeatTemplatePanel(QWidget):
         self._stat_cards = {
             "total": _TemplateMetricCard("Total beats", "0", COL_TEXT),
             "templates": _TemplateMetricCard("Templates", "0", COL_TEXT),
-            "unconfirmed": _TemplateMetricCard("Unconfirmed", "0", UI_WARNING),
+            # beats on the Unidentified card(s) (was "Unconfirmed": cards not viewed)
+            "unidentified": _TemplateMetricCard("Unidentified", "0", UI_WARNING),
             "beat_distribution": _TemplateMetricCard("Beat distribution", "N: 0", UI_TEXT),
         }
         stats.addWidget(self._stat_cards["total"], 0, 0)
         stats.addWidget(self._stat_cards["templates"], 0, 1)
-        stats.addWidget(self._stat_cards["unconfirmed"], 0, 2)
+        stats.addWidget(self._stat_cards["unidentified"], 0, 2)
         stats.addWidget(self._stat_cards["beat_distribution"], 0, 3)
         layout.addLayout(stats)
 
@@ -440,7 +668,9 @@ class HolterBeatTemplatePanel(QWidget):
             ("AF", "AF"),
             ("X", "X"),
             ("Other", "Other"),
-            ("unconfirmed", "Unconfirmed"),
+            # was "Unconfirmed" (cards marked not viewed); now the cards of
+            # the auto detector's Unidentified segments (see _build_template_rows)
+            ("unidentified", "Unidentified"),
         ]:
             btn = QPushButton(text)
             btn.setCheckable(True)
@@ -454,7 +684,7 @@ class HolterBeatTemplatePanel(QWidget):
                 "AF": "Show atrial fibrillation/flutter templates",
                 "X": "Show artifact templates",
                 "Other": "Show uncategorized templates",
-                "unconfirmed": "Show templates not yet confirmed",
+                "unidentified": "Show the Unidentified template (signal with no readable P / QRS / T)",
             }.get(key, text))
             btn.setFixedHeight(28)
             btn.setStyleSheet(_style_filter_btn(active=(key == "all")))
@@ -562,47 +792,55 @@ class HolterBeatTemplatePanel(QWidget):
         layout.addWidget(self._splitter, 1)
 
     def update_from_metrics(self, metrics_list: list, summary: dict):
-        class_totals = dict(summary.get('beat_class_totals', {}) or {})
-        if not class_totals:
-            for metric in metrics_list or []:
-                for cls, count in (metric.get('beat_class_counts', {}) or {}).items():
-                    class_totals[cls] = class_totals.get(cls, 0) + int(count or 0)
-        total_beats = int(summary.get("total_beats", 0) or sum(class_totals.values()) or 0)
-        template_map = {}
-        for metric in metrics_list or []:
-            for row in (metric.get('template_summary', []) or []):
-                tkey = str(row.get('template_key') or row.get('template_id') or row.get('label') or 'T')
-                item = template_map.setdefault(tkey, {
-                    'template_key': tkey,
-                    'template_id': row.get('template_id', 'T'),
-                    'label': row.get('label', 'N'),
-                    'count': 0,
-                    'rr': [],
-                    'qrs': [],
-                    'first_timestamp': float(row.get('first_timestamp', metric.get('t', 0.0)) or 0.0),
-                    'viewed': bool(row.get('viewed', True)),
-                    'ambiguous': bool(row.get('ambiguous', False)),
-                    'inserted': bool(row.get('inserted', False)),
-                    'demix': bool(row.get('demix', False)),
-                    'auto_update': bool(row.get('auto_update', False)),
-                })
-                item['count'] += int(row.get('count', 0) or 0)
-                item['rr'].append(float(row.get('avg_rr_ms', 0.0) or 0.0))
-                item['qrs'].append(float(row.get('avg_qrs_ms', 0.0) or 0.0))
-                item['first_timestamp'] = min(item['first_timestamp'], float(row.get('first_timestamp', item['first_timestamp']) or item['first_timestamp']))
-        self._template_rows = sorted(template_map.values(), key=lambda x: x['count'], reverse=True)
-
-        unconfirmed = sum(1 for row in self._template_rows if not row.get("viewed", True))
-        self._stat_cards["total"].value.setText(f"{total_beats:,}")
-        self._stat_cards["templates"].value.setText(str(len(self._template_rows)))
-        self._stat_cards["unconfirmed"].value.setText(str(unconfirmed))
-        dist_parts = []
-        for key in ("N", "V", "S", "F", "Q"):
-            if int(class_totals.get(key, 0) or 0) > 0:
-                dist_parts.append(f"{key}: {int(class_totals.get(key, 0)):,}")
-        self._stat_cards["beat_distribution"].value.setText("  ".join(dist_parts) if dist_parts else "No beat classes")
+        """Build the cards: one per beat label plus AF / AFL / Unidentified (see
+        _build_template_rows).  The chunks' own template ids (C01, C02 ...)
+        restart in every chunk, so they are not used to join chunks: joined
+        by id, chunk 1's N, V and Tachy clusters all became one card.
+        The auto segments come from the detection cache; when the detection
+        has not run yet it is started in the background and the cards are
+        rebuilt when it is done (independent of the Auto Arrhythmia
+        Detection button)."""
+        self._last_metrics = metrics_list
+        self._last_summary = summary
+        engine = self._get_replay_engine()
+        reader = getattr(engine, "_reader", None) if engine is not None else None
+        segments = self._auto_segments(reader)
+        try:
+            self._template_rows = _build_template_rows(metrics_list, segments, reader)
+        except Exception as e:
+            print(f"[Template] AF / AFL / Unidentified cards unavailable: {e}")
+            self._template_rows = _build_template_rows(metrics_list, None, None)
+        self._waveform_cache.clear()      # a card's beat may have moved
         self._refresh_stats()
         self._render_cards()
+
+    def _auto_segments(self, reader):
+        """detect_arrhythmias() segments for the recording, or None while the
+        detection is still running (it then rebuilds the cards when done)."""
+        path = getattr(reader, "path", None) if reader is not None else None
+        if not path:
+            return None
+        try:
+            from ..auto_segment_arrthymia_detection import detect_arrhythmias_async, get_cached_detection
+        except Exception as e:
+            print(f"[Template] Auto segment detection unavailable: {e}")
+            return None
+        cached = get_cached_detection(path)
+        if cached is not None:
+            return cached
+        if getattr(self, "_segments_pending_path", None) != path:
+            self._segments_pending_path = path
+
+            def _on_ready(_segments, p=path):
+                if self._segments_pending_path != p:
+                    return
+                self._segments_pending_path = None
+                eng = self._get_replay_engine()
+                if getattr(getattr(eng, "_reader", None), "path", None) == p:
+                    self.update_from_metrics(self._last_metrics, self._last_summary)
+
+            detect_arrhythmias_async(path, _on_ready)
+        return None
 
     def set_replay_engine(self, engine):
         self._replay_engine = engine
@@ -620,8 +858,10 @@ class HolterBeatTemplatePanel(QWidget):
             
             if self._current_filter == "all":
                 filtered.append(row)
-            elif self._current_filter == "unconfirmed" and not row.get("viewed", True):
+            elif self._current_filter == "unidentified" and label == "Unidentified":
                 filtered.append(row)
+            elif label == "Unidentified":
+                continue        # only under All and Unidentified, not Other
             elif self._current_filter == "AF" and code in {"AF", "F", "Q"}:
                 filtered.append(row)
             elif self._current_filter == "Other" and code == "Other":
@@ -632,16 +872,17 @@ class HolterBeatTemplatePanel(QWidget):
 
     def _refresh_stats(self):
         total_beats = sum(int(row.get("count", 0) or 0) for row in self._template_rows)
-        unconfirmed = sum(1 for row in self._template_rows if not row.get("viewed", True))
+        unidentified = sum(int(row.get("count", 0) or 0) for row in self._template_rows
+                           if str(row.get("label", "")).strip() == "Unidentified")
         label_totals = {}
         for row in self._template_rows:
             label = str(row.get("label", "N") or "N").strip() or "N"
             label_totals[label] = label_totals.get(label, 0) + int(row.get("count", 0) or 0)
         self._stat_cards["total"].value.setText(f"{int(total_beats):,}")
         self._stat_cards["templates"].value.setText(str(len(self._template_rows)))
-        self._stat_cards["unconfirmed"].value.setText(str(unconfirmed))
+        self._stat_cards["unidentified"].value.setText(f"{int(unidentified):,}")
 
-        preferred = ["N", "S", "V", "P", "AF", "X", "Unconfirmed"]
+        preferred = ["N", "S", "V", "P", "AF", "X", "Unidentified"]
         dist_parts = []
         for key in preferred:
             value = int(label_totals.pop(key, 0) or 0)
@@ -680,9 +921,19 @@ class HolterBeatTemplatePanel(QWidget):
             self._selected_template_key = self._selected_template_keys[0]
         else:
             self._selected_template_key = ""
-            
-        if self._selected_template_key:
+
+        # The 12-lead view follows a card that is on screen.  With no card
+        # (a filter with no templates, e.g. AF before any AF beat) it is
+        # cleared instead of keeping the previous filter's template.
+        if visible:
             self._update_detail_grid(self._selected_template_key)
+        elif not self._card_widgets:
+            self._clear_detail_grid()
+
+    def _clear_detail_grid(self):
+        for item in getattr(self, "_detail_canvases", []):
+            item["canvas"].set_data([], [])
+            item["type"].setText(item["lead_name"])
 
     def _row_for_key(self, template_key: str):
         template_key = str(template_key or "")
@@ -784,11 +1035,7 @@ class HolterBeatTemplatePanel(QWidget):
             if row is None:
                 return
             row["label"] = str(text or "N").strip() or "N"
-            
-            if text == "Unconfirmed":
-                row["viewed"] = False
-            else:
-                row["viewed"] = True  # Mark as viewed for other classifications
+            row["viewed"] = True  # choosing a class marks the card viewed
             
             self._refresh_stats()
             # Defer card rendering to avoid destroying card during signal
@@ -1002,7 +1249,7 @@ class HolterBeatTemplatePanel(QWidget):
         menu = QMenu(self)
         menu.setStyleSheet(f"QMenu {{ background: {UI_PANEL}; color: {UI_TEXT}; border: 1px solid {UI_BORDER}; padding: 6px; }} QMenu::item {{ padding: 6px 20px 6px 18px; border-radius: 4px; }} QMenu::item:selected {{ background: #1E3A5F; color: {UI_TEXT}; }} QMenu::separator {{ height: 1px; background: {UI_BORDER}; margin: 6px 4px; }}")
         prop_menu = menu.addMenu("Template properties")
-        # Updated options: N, S, V, P, AF, X, Other, Unconfirmed
+        # Options: N, S, V, P, AF, X, Other, Unidentified (was Unconfirmed)
         for title, code in [
             ("Normal (N)", "N"),
             ("Atrial Premature (S)", "S"),
@@ -1011,7 +1258,7 @@ class HolterBeatTemplatePanel(QWidget):
             ("Atrial Fibrillation (AF)", "AF"),
             ("Artifact (X)", "X"),
             ("Other", "Other"),
-            ("Unconfirmed", "Unconfirmed")
+            ("Unidentified", "Unidentified")
         ]:
             action = prop_menu.addAction(title)
             action.triggered.connect(lambda checked=False, c=code: self._apply_template_label(target_keys, c))

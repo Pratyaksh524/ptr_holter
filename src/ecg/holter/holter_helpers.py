@@ -128,6 +128,12 @@ def _normalize_beat_class(label) -> str:
         return "S"
     if raw.startswith("V") or "PVC" in raw or "VENT" in raw:
         return "V"
+    # The auto "Pause" beat label (RR >= 4 s, analysis_worker._label_beat)
+    # is not a paced beat, but it starts with "P" and so fell into the
+    # Paced button below.  It goes to "Other", like the auto Tachy and
+    # Brady labels, so "P" holds paced beats only.
+    if raw.startswith("PAUSE"):
+        return "Other"
     if raw.startswith("P") or "PACED" in raw:
         return "P"
     if "AF" in raw or "AFL" in raw or raw in {"F", "Q"}:
