@@ -120,6 +120,9 @@ BEAT_MERGE_SEC = 0.10
 COLLISION_RR_MS = 333.3
 RELAXED_P_MIN_RR_MS = 500.0
 T_LIMB_FRACTION = 0.25   # _t_end: the T wave's descending limb ends where it falls to this fraction of its peak
+# _t_end above 250 bpm (next RR under this): T peak searched from 30 ms (not
+# 60 ms) after the QRS end, and the T end must come 40 ms before the next R.
+FAST_T_MAX_RR_MS = 240.0
 
 
 def _beat_samples(data: np.ndarray, lead_names: Sequence[str], fs: float) -> List[int]:
@@ -228,9 +231,17 @@ def _t_end(x: np.ndarray, onset: int, offset: int, r: int, next_rr_ms: float, fs
     wave): QT unchanged within -12..+1 ms (Test_case TT -6..+2 ms). A
     one-sample slope over the whole tail picked noise spikes after the T
     wave (T end ~580-620 ms on single beats), hence the limb and the
-    +-10 ms slope."""
+    +-10 ms slope.
+
+    Above 250 bpm (next RR < FAST_T_MAX_RR_MS) the T peak (~R+95 ms at 270
+    bpm) came before R + QRS end + 60 ms (R+108 ms), so no QT was read from
+    260 bpm up. There the search starts 30 ms after the QRS end -- the ST
+    segment is gone at that rate -- and a T end at or after the next R
+    - 40 ms is dropped. 55% of the RR still keeps the next P out. Slower
+    beats are measured as before."""
+    fast = next_rr_ms < FAST_T_MAX_RR_MS
     base_lo, base_hi = onset - int(0.04 * fs), onset - int(0.01 * fs)
-    lo = offset + int(0.06 * fs)
+    lo = offset + int((0.03 if fast else 0.06) * fs)
     peak_hi = min(x.size, r + int(min(0.45, 0.55 * next_rr_ms / 1000.0) * fs))
     end_hi = min(x.size, r + int(min(0.60, 0.75 * next_rr_ms / 1000.0) * fs))
     if base_lo < 0 or peak_hi - lo < 10:
@@ -261,7 +272,12 @@ def _t_end(x: np.ndarray, onset: int, offset: int, r: int, next_rr_ms: float, fs
         return None
     level = float(np.mean(seg[steepest - hw:steepest + hw + 1]))
     cross = steepest + level / -slope
-    return t_peak + int(round(cross)) if t_peak + cross <= end_hi + 0.05 * fs else None
+    if t_peak + cross > end_hi + 0.05 * fs:
+        return None
+    end = t_peak + int(round(cross))
+    if fast and end >= r + int((next_rr_ms - 40.0) / 1000.0 * fs):
+        return None
+    return end
 
 
 def measure_beats(reader, start_sec: float, end_sec: float) -> List[Dict[str, Any]]:
@@ -454,7 +470,7 @@ def summarize(beats: List[Dict[str, Any]], rhythms: Iterable[str] = (), status: 
 
 
 _CACHE_FILENAME = 'pqrst_cache.json'
-_CACHE_VERSION = 5   # 5: QT by the tangent method (_t_end)
+_CACHE_VERSION = 6   # 5: QT by the tangent method (_t_end); 6: QT above 250 bpm
 
 
 def recording_frames(path: str) -> List[Dict[str, Any]]:
