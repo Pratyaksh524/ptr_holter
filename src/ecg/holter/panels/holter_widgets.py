@@ -2223,8 +2223,8 @@ class ECGStripCanvas(QWidget):
         # Auto-Detection Pattern-Specific QRS Peak Coloring
         # ------------------------------------------------------------------
         # Colors each auto-detected QRS peak using its EXACT badge pattern color
-        # (e.g. VT Run=#FF0000, Bigeminy=#FF6600, Couplet=#FF3333, Single PVC=#FF6666,
-        #        SVT Run=#00CCFF, PAC Bigeminy=#00FFFF, PAC Couplet=#66FFFF, Single PAC=#99FFFF)
+        # (e.g. PVC Triplet/Quadruplet/Run=#FF0000, Bigeminy=#FF6600, Couplet=#FF3333, Single PVC=#FF6666,
+        #        PAC Triplet/Quadruplet/Run=#00CCFF, PAC Bigeminy=#00FFFF, PAC Couplet=#66FFFF, Single PAC=#99FFFF)
         #
         # IMPORTANT: Manual beats (is_manual=True) are COMPLETELY EXCLUDED from this pass.
         # Manual marking coloring is handled exclusively by the _structured_events loop above.

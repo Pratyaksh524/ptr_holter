@@ -4111,7 +4111,41 @@ class HolterFullDisclosureDialog(QDialog):
             print(f"[Full Disclosure] PR/QRS/QT label error: {e}")
             self.lbl_pr_qrs.setText("PR: --   QRS: --   QT: --")
 
+    def _ectopic_window_badges(self, start_sec: float, end_sec: float):
+        """Beat badges (PVC / PAC patterns) inside [start_sec, end_sec], built
+        once over the whole recording from ectopic_beats_detector -- so a
+        trigeminy or a run is not cut at the window edge -- or None while
+        that has not been computed for this recording yet. It is then
+        started in the background (independent of the Auto Arrhythmia
+        Detection button) and this label is redrawn when it is done."""
+        path = getattr(getattr(self._engine, '_reader', None), 'path', None)
+        if not path:
+            return None
+        if getattr(self, '_ectopic_badges_path', None) != path:
+            from .ectopic_beats_detector import (
+                detect_ectopic_beats_async, get_cached_ectopic_beats, pattern_beats,
+            )
+            beats = get_cached_ectopic_beats(path)
+            if beats is None:
+                if getattr(self, '_ectopic_pending_path', None) != path:
+                    self._ectopic_pending_path = path
+
+                    def _done(_beats, p=path):
+                        self._ectopic_pending_path = None
+                        window = getattr(self, '_last_label_window', None)
+                        if window and getattr(getattr(self._engine, '_reader', None), 'path', None) == p:
+                            self._update_time_and_arrhythmia_labels(*window)
+
+                    detect_ectopic_beats_async(path, _done)
+                return None
+            from .holter_summary_calc import get_template_beats_for_badges
+            self._ectopic_badges = get_template_beats_for_badges(
+                pattern_beats(beats, getattr(self._engine, '_metrics', None)), [])
+            self._ectopic_badges_path = path
+        return [b for b in self._ectopic_badges if start_sec <= float(b.get('timestamp', 0.0)) <= end_sec]
+
     def _update_time_and_arrhythmia_labels(self, start_sec: float, end_sec: float):
+        self._last_label_window = (start_sec, end_sec)
         self._update_pr_qrs_label(start_sec, end_sec)
 
         # Update real-time display
@@ -4216,8 +4250,8 @@ class HolterFullDisclosureDialog(QDialog):
         except Exception as e:
             print(f"[Full Disclosure] Error updating auto rhythm label: {e}")
         
-        # Beat badges (Single PVC, PVC/PAC Couplet, Bigeminy..., VT Run, SVT
-        # Run, AFib, Paced) describe the raw beat stream, so they are only
+        # Beat badges (Single PVC, PVC/PAC Couplet / Triplet / Quadruplet /
+        # Run, Bigeminy..., AFib, Paced) describe the raw beat stream, so they are only
         # shown before "Auto Arrhythmia Detection" is clicked. Once auto
         # marking is on, this label comes only from the auto-detected
         # segments above (and the Normal Sinus Rhythm fallback below).
@@ -4231,7 +4265,12 @@ class HolterFullDisclosureDialog(QDialog):
             # Generate badges for current window using the same logic as badge display
             try:
                 from ecg.holter.holter_summary_calc import get_template_beats_for_badges
-                badges = get_template_beats_for_badges(window_beats, window_events)
+                # PVC patterns from ectopic_beats_detector (every beat of the
+                # recording, classified from the signal); the live beat labels
+                # below only until it has run for this recording.
+                badges = self._ectopic_window_badges(start_sec, end_sec)
+                if badges is None:
+                    badges = get_template_beats_for_badges(window_beats, window_events)
                 
                 # Filter badges to show V, S, AF, P beats
                 arrhythmia_badges = [b for b in badges if b.get('code') in ['V', 'S', 'AF', 'P']]

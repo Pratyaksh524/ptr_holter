@@ -2368,6 +2368,44 @@ class HolterMainWindow(QDialog):
                 except Exception:
                     pass
 
+    def _ectopic_pattern_beats(self):
+        """ectopic_beats_detector's beats for this recording (pattern_beats),
+        or None while not computed yet -- then it is started in the
+        background and the event lists are rebuilt when it is done."""
+        path = getattr(getattr(self._replay_engine, '_reader', None), 'path', None) if self._replay_engine else None
+        if not path:
+            return None
+        try:
+            from .ectopic_beats_detector import (
+                detect_ectopic_beats_async, get_cached_ectopic_beats, pattern_beats,
+            )
+        except Exception as e:
+            print(f"[Holter] ectopic beats unavailable: {e}")
+            return None
+        beats = get_cached_ectopic_beats(path)
+        if beats is not None:
+            return pattern_beats(beats, self._metrics_list)
+        if getattr(self, '_ectopic_pending_path', None) != path:
+            self._ectopic_pending_path = path
+
+            def _done(_beats, p=path):
+                self._ectopic_pending_path = None
+                if getattr(getattr(self._replay_engine, '_reader', None), 'path', None) == p:
+                    self._reload_event_lists()
+
+            detect_ectopic_beats_async(path, _done)
+        return None
+
+    def _reload_event_lists(self):
+        """Rebuild the linked events and reload the panels that list them."""
+        events = self._build_linked_events()
+        if hasattr(self, '_events_panel'):
+            self._events_panel.load_events(events, self._summary)
+        if hasattr(self, '_edit_event_panel'):
+            self._edit_event_panel.load_events(events, self._summary)
+        if hasattr(self, '_edit_strips_panel'):
+            self._edit_strips_panel.load_events(events, self._summary, self._metrics_list)
+
     def _build_linked_events(self) -> list:
         events = []
         # 1. Manual marks and user-saved events from replay engine
@@ -2400,10 +2438,14 @@ class HolterMainWindow(QDialog):
                         'time_str': _sec_to_hms(base_t),
                     })
 
-        # 3. Generate auto-detection badge events (SVT, VT, Couplet, Bigeminy, PVC, PAC, etc.)
+        # 3. Generate auto-detection badge events (PVC / PAC single, couplet ... run, bigeminy, etc.)
         try:
             from .holter_summary_calc import get_template_beats_for_badges
-            badges = get_template_beats_for_badges(all_beats, [])
+            # Beats from ectopic_beats_detector when it has run for this
+            # recording (else started in the background; the event lists
+            # reload when it is done) -- the live labels until then.
+            ectopic = self._ectopic_pattern_beats()
+            badges = get_template_beats_for_badges(ectopic if ectopic is not None else all_beats, [])
             for b in badges:
                 badge_name = b.get('name', '').strip()
                 if not badge_name:

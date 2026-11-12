@@ -678,8 +678,8 @@ def _build_timeline_events(session_dir: str,
                     'source': 'Auto'
                 })
 
-    #    Ectopic beat pattern badge events (Single PVC, PVC Couplet, Bigeminy, Trigeminy,
-    #    Quadrigeminy, VT Run, Single PAC, PAC Couplet, SVT Run, AFib from sliding window)
+    #    Ectopic beat pattern badge events (Single PVC, PVC Couplet / Triplet / Quadruplet / Run,
+    #    Bigeminy, Trigeminy, Quadrigeminy, Single PAC, PAC Couplet ... PAC Run, AFib from sliding window)
     #    are intentionally NOT added to the Event Timeline.
     #    Only auto-segment rhythm events (VF, AFib, AFlutter, Sinus Brady, Sinus Tachy)
     #    and manual markings are shown in the timeline.
@@ -687,7 +687,7 @@ def _build_timeline_events(session_dir: str,
     # 7. Generate auto-detection badge events (SVT, VT, Couplet, Bigeminy, PVC, PAC, etc.)
     # TODO: Baad mein enable karna — abhi Event Timeline mein sirf auto-segment rhythm events
     #       (VF, AFib, AFlutter, Sinus Brady, Sinus Tachy) aur manual markings dikhne chahiye.
-    #       Ectopic beat pattern labels (Single PVC, Couplet, Bigeminy, VT Run, PAC, SVT Run)
+    #       Ectopic beat pattern labels (Single PVC, Couplet, Bigeminy, PVC Run, PAC, PAC Run)
     #       timeline mein add karne ka kaam baad mein karein.
     # try:
     #     from .holter_summary_calc import get_template_beats_for_badges
@@ -934,16 +934,43 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
                         _grid_rr_ms.append(_rr_f)
                 except (TypeError, ValueError):
                     pass
+        # VE / SVE patterns from ectopic_beats_detector (every beat, labelled
+        # from the signal; computed here when not cached); the live labels
+        # above only when the recording file cannot be read.
+        try:
+            from .ectopic_beats_detector import detect_ectopic_beats, pattern_beats
+            from .file_format import ECGHFileReader
+            _ecgh = os.path.join(session_dir, 'recording.ecgh')
+            if os.path.exists(_ecgh):
+                _rd = ECGHFileReader(_ecgh)
+                try:
+                    _grid_beats = pattern_beats(detect_ectopic_beats(_rd), _grid_metrics)
+                finally:
+                    try:
+                        _rd.close()
+                    except Exception:
+                        pass
+        except Exception as _e:
+            print(f"[HolterReport] ectopic beats unavailable, live labels used: {_e}")
         _grid_beats.sort(key=lambda b: float(b.get('timestamp', 0.0) or 0.0))
         label_beat_sequences(_grid_beats)
 
-        _ve_patterns = {'single': 0, 'couplet': 0, 'bigeminy': 0, 'trigeminy': 0, 'run': 0}
-        _sve_patterns = {'single': 0, 'couplet': 0, 'bigeminy': 0, 'trigeminy': 0, 'run': 0}
+        # Couplet (2) / Triplet (3) / Quadruplet (4) / Run (5+ consecutive,
+        # label_beat_sequences) are counted once per episode, on its first
+        # beat -- was once per beat, so one 18-beat run read "VT run: 18".
+        # Single / Bigeminy / Trigeminy (+ Quadrigeminy) count ectopic beats.
+        _pattern_keys = {'single': 0, 'couplet': 0, 'triplet': 0, 'quadruplet': 0,
+                         'bigeminy': 0, 'trigeminy': 0, 'run': 0}
+        _ve_patterns = dict(_pattern_keys)
+        _sve_patterns = dict(_pattern_keys)
         _ve_total = _sve_total = 0
         _ve_run_lengths = []
         _sve_run_lengths = []
+        _prev_code = None
         for _b in _grid_beats:
             code = _b.get('short_code', '')
+            first_of_episode = code != _prev_code
+            _prev_code = code
             if code not in ('V', 'S'):
                 continue
             bucket = _ve_patterns if code == 'V' else _sve_patterns
@@ -953,14 +980,19 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
                 _sve_total += 1
             pl = str(_b.get('rhythm_pattern', '') or '').lower()
             if 'run' in pl:
-                bucket['run'] += 1
-                (_ve_run_lengths if code == 'V' else _sve_run_lengths).append(int(_b.get('run_length', 0) or 0))
+                if first_of_episode:
+                    bucket['run'] += 1
+                    (_ve_run_lengths if code == 'V' else _sve_run_lengths).append(int(_b.get('run_length', 0) or 0))
             elif 'quadrigeminy' in pl or 'trigeminy' in pl:
                 bucket['trigeminy'] += 1
             elif 'bigeminy' in pl:
                 bucket['bigeminy'] += 1
             elif 'couplet' in pl:
-                bucket['couplet'] += 1
+                bucket['couplet'] += 1 if first_of_episode else 0
+            elif 'triplet' in pl:
+                bucket['triplet'] += 1 if first_of_episode else 0
+            elif 'quadruplet' in pl:
+                bucket['quadruplet'] += 1 if first_of_episode else 0
             else:
                 bucket['single'] += 1
 
@@ -1108,19 +1140,25 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         ve_panel = _grid_panel("VE and Rhythm", [
             ("Single", f"{_ve_patterns['single']} ({_grid_pct(_ve_patterns['single'], _ve_total)})"),
             ("Couplet", str(_ve_patterns['couplet'])),
+            # one line, not two: with two rows the panel grew enough to push
+            # page 1's last Clinical Impression line onto page 2
+            ("Triplet / Quadruplet", f"{_ve_patterns['triplet']} / {_ve_patterns['quadruplet']}"),
             ("Bigeminy", str(_ve_patterns['bigeminy'])),
             ("Trigeminy", str(_ve_patterns['trigeminy'])),
-            ("VT run", str(_ve_patterns['run'])),
-            ("Longest VT run", str(_longest_ve_run)),
+            ("PVC run", str(_ve_patterns['run'])),
+            ("Longest PVC run", str(_longest_ve_run)),
             ("Total VE", str(_ve_total)),
         ])
         sve_panel = _grid_panel("SVE and Rhythm", [
             ("Single", f"{_sve_patterns['single']} ({_grid_pct(_sve_patterns['single'], _sve_total)})"),
             ("Couplet", str(_sve_patterns['couplet'])),
+            # one line, not two: with two rows the panel grew enough to push
+            # page 1's last Clinical Impression line onto page 2
+            ("Triplet / Quadruplet", f"{_sve_patterns['triplet']} / {_sve_patterns['quadruplet']}"),
             ("Bigeminy", str(_sve_patterns['bigeminy'])),
             ("Trigeminy", str(_sve_patterns['trigeminy'])),
-            ("SVT run", str(_sve_patterns['run'])),
-            ("Longest SVT run", str(_longest_sve_run)),
+            ("PAC run", str(_sve_patterns['run'])),
+            ("Longest PAC run", str(_longest_sve_run)),
             ("Total SVE", str(_sve_total)),
         ])
         hrv_panel = _grid_panel("Heart Rate Variability", [
