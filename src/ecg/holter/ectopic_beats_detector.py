@@ -57,7 +57,8 @@ V V V V as a run instead of N N V N N V (trigeminy).
     auto Ventricular Tachycardia segment (the old ones are kept when
     nothing else is there).
   - Beats inside an auto segment where no QRS can be trusted (Ventricular
-    Fibrillation, Asystole, Artifact, Unidentified), with fewer than
+    Fibrillation, Asystole, Artifact, Unidentified -- not a mains 50 / 60 Hz
+    Artifact, see _blocks_qrs), with fewer than
     MIN_SHAPE_LEADS usable leads, or (when not V) with no QRS bounds get
     'Q' (not classified). Everything else not V is 'N'.
   - PACs ('S'): a second pass over the N beats, _classify_pacs (early,
@@ -142,6 +143,7 @@ NORMAL_RR_MIN_FRACTION = 0.88    # RRs used for the running normal RR
 NORMAL_RR_MAX_FRACTION = 1.30
 
 NO_QRS_SEGMENTS = ('Ventricular Fibrillation', 'Asystole', 'Artifact', 'Unidentified')
+MAINS_ARTIFACT_KINDS = ('50 Hz', '60 Hz')   # 'artifact_kind' of the segment detector's mains Artifact
 
 _DEBUG = False
 _memory_cache: Dict[str, Dict[str, Any]] = {}     # key -> {'beats': [...], 'spans': signature}
@@ -183,10 +185,31 @@ def _cache_key(path: Optional[str]) -> Optional[str]:
     return f"ectopic|{k}|cfg={clinical_config_fingerprint()}"
 
 
+def _blocks_qrs(seg) -> bool:
+    """True when auto segment `seg` is one whose beats get 'Q' (no QRS
+    trusted): a NO_QRS_SEGMENTS label -- except a mains (50 / 60 Hz)
+    Artifact. That one only marks interference at one frequency; this
+    module's filters (the preprocessing's 50 Hz notch + a 60 Hz notch) take
+    it out and the QRS under it reads as usual. Blocking it hid every PVC /
+    PAC under the interference: a recording with 50 / 60 Hz switched on
+    throughout had a PVC at 7.68 s (QRS 268 ms) inside Artifact 0.0-11.6 s
+    (60 Hz) and the
+    label read Normal Sinus Rhythm (2026-11-12_12-30-47).
+    Its beats are still not learnt from while a template exists (see
+    start() in _detect_uncached)."""
+    label = str(seg.get('label', ''))
+    if label not in NO_QRS_SEGMENTS:
+        return False
+    return not (label == 'Artifact' and seg.get('artifact_kind') in MAINS_ARTIFACT_KINDS)
+
+
 def _spans_signature(segments) -> str:
-    """Hash of the auto segments this module reads (their label and span)."""
+    """Hash of the auto segments this module reads (label, span and, for an
+    Artifact, its kind: a mains one does not block beats, it only keeps them
+    out of the template)."""
     used = set(NO_QRS_SEGMENTS) | set(NO_PAC_SEGMENTS) | {'Ventricular Tachycardia'}
-    spans = sorted((str(x.get('label', '')), round(float(x['start_sec']), 3), round(float(x['end_sec']), 3))
+    spans = sorted((str(x.get('label', '')), round(float(x['start_sec']), 3), round(float(x['end_sec']), 3),
+                    str(x.get('artifact_kind') or ''))
                    for x in (segments or [])
                    if str(x.get('label', '')) in used
                    and x.get('start_sec') is not None and x.get('end_sec') is not None)
@@ -578,7 +601,7 @@ def _p_shape(leads: np.ndarray, r: int, fs: float, clip: Optional[np.ndarray] = 
 
 def _no_qrs_spans(segments):
     return sorted((float(s['start_sec']), float(s['end_sec'])) for s in (segments or [])
-                  if str(s.get('label', '')) in NO_QRS_SEGMENTS
+                  if _blocks_qrs(s)
                   and s.get('start_sec') is not None and s.get('end_sec') is not None)
 
 
@@ -778,12 +801,19 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
         TEMPLATE_INIT_BEATS (the narrow ones when >= 30% are, so a bigeminy
         start does not take the PVC for the template), and the RRs between
         consecutive ones with its shape (so a PVC early on is already
-        premature; seen: the first PVC of a trigeminy at beat 3 read N)."""
+        premature; seen: the first PVC of a trigeminy at beat 3 read N).
+        Beats under a mains (50 / 60 Hz) Artifact are classified but learnt
+        from only when there is no template yet (a recording that starts
+        under the interference): the segment detector does not name a
+        rhythm under it -- VT ran on under one (2026-11-03_11-24-57, VT
+        135.3-145.0 and 155.5-187.6 s, mains in between), its beats became
+        the template and 86 VT beats read N."""
         group = []
         for k in range(k0, len(feats)):
             if k > k0 and restart_at[k]:
                 break
-            if feats[k][1] is not None and not blocked(feats[k][0]) and not in_vt(feats[k][0]):
+            if (feats[k][1] is not None and not blocked(feats[k][0]) and not in_vt(feats[k][0])
+                    and (template is None or not in_mains(feats[k][0]))):
                 group.append(feats[k])
             if len(group) >= TEMPLATE_INIT_BEATS:
                 break
@@ -818,6 +848,13 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
 
     def in_vt(ts):
         return any(s_ <= ts < e_ for s_, e_ in vt_spans)
+
+    mains_spans = [(float(x['start_sec']), float(x['end_sec'])) for x in (segments or [])
+                   if str(x.get('label', '')) == 'Artifact' and x.get('artifact_kind') in MAINS_ARTIFACT_KINDS
+                   and x.get('start_sec') is not None and x.get('end_sec') is not None]
+
+    def in_mains(ts):
+        return any(s_ <= ts < e_ for s_, e_ in mains_spans)
 
     template, ref_rr = None, []
 
@@ -993,19 +1030,27 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
     # (very different and wide). INCART, threshold 0.7: true PVCs kept
     # 2485 of 2559, false V 111 -> 58.
     live = [c for c in v_cands if out[c[0]]['label'] == 'V' and c[1] is not None]
+    # Late PVCs first: one has no early coupling to vouch for it, so it stays
+    # V only when several other V beats of the recording have its shape. A
+    # late candidate that fails is N before the test below, which must not
+    # count it: still in the list, it made a lone premature PVC (QRS 154 ms,
+    # 2026-10-30_13-51-01 at 4.9 s) look not-alone and lose its "clear
+    # evidence" pass.
+    for i, v, c, q in live:
+        if i not in late_idx:
+            continue
+        matches = 0
+        for j, u, *_ in live:
+            if abs(j - i) > 1 and u.shape == v.shape:
+                sim = _similarity(v, u)
+                if not np.isnan(sim) and sim >= LATE_PARTNER_CORR:
+                    matches += 1
+        if matches < LATE_MIN_PARTNERS:
+            out[i]['label'] = 'N'
+    live = [cand for cand in live if out[cand[0]]['label'] == 'V']
     for n_, (i, v, c, q) in enumerate(live):
         best, others = -1.0, 0
         if i in late_idx:
-            # a late PVC has no early coupling to vouch for it: it stays V
-            # only when several other V beats of the recording have its shape
-            matches = 0
-            for j, u, *_ in live:
-                if abs(j - i) > 1 and u.shape == v.shape:
-                    sim = _similarity(v, u)
-                    if not np.isnan(sim) and sim >= LATE_PARTNER_CORR:
-                        matches += 1
-            if matches < LATE_MIN_PARTNERS:
-                out[i]['label'] = 'N'
             continue
         for step in range(1, len(live)):
             for m in (n_ - step, n_ + step):
