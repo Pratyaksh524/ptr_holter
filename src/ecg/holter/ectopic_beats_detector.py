@@ -45,7 +45,8 @@ V V V V as a run instead of N N V N N V (trigeminy).
     (beyond its own neighbours) >= PARTNER_CORR goes back to N -- noise
     that makes a normal beat "different" does not repeat, a ventricular
     focus does. The only V of a recording stays V when its shape is very
-    different and its QRS wide.
+    different, its QRS wide, it came early against the beat before it too
+    and no sinus P wave comes before it (_lone_v_is_ectopic).
   - Template: started from the first beats (the narrow ones when there are
     enough, so a bigeminy start does not take the PVC for the template),
     moved only by N beats with similarity >= TEMPLATE_UPDATE_CORR, and
@@ -603,6 +604,37 @@ def _p_shape(leads: np.ndarray, r: int, fs: float, clip: Optional[np.ndarray] = 
     return seg
 
 
+def _lone_v_is_ectopic(out, pcorrs, i) -> bool:
+    """The only V of a recording (no partner for the repeat test) needs more
+    than a very different, wide shape -- noise on a normal beat gives that
+    too (shape similarity -0.01, QRS 188 ms read on an 82 ms beat,
+    sushil_20_mins 2026-10-30_14-30-07 at 431.5 s). It stays V only when
+      - it came early against the beat before it as well, RR <=
+        PREMATURE_FRACTION x that beat's RR (not needed after a V: the
+        second beat of a couplet). Early only against the running normal
+        RR is a rate that drifted: that beat was "premature" (738 ms
+        against a normal RR of 863 in Sinus Arrhythmia) at the RR of the
+        beat before it (736 ms). The same test drops a normal beat right
+        after a VT (RR 1.71 / 1.86 x the one before) and one on a 50/60 Hz
+        switch (1.00);
+      - no sinus P wave comes before it: P stretch similarity <
+        LATE_PVC_P_MAX (not judged when it cannot be measured). Seen: the
+        first conducted beat of a new rhythm, P 0.98.
+    INCART / MIT-BIH lone PVCs measured RR 0.51-0.65 x the beat before and
+    P similarity <= 0.39: all 5 kept."""
+    if i <= 0:
+        return True
+    prev = out[i - 1]
+    if prev.get('label') != 'V':
+        rr, prev_rr = out[i].get('rr_ms'), prev.get('rr_ms')
+        if rr is not None and prev_rr and rr > PREMATURE_FRACTION * prev_rr:
+            return False
+    pc = pcorrs[i] if i < len(pcorrs) else None
+    if pc is not None and pc >= LATE_PVC_P_MAX:
+        return False
+    return True
+
+
 def _no_qrs_spans(segments):
     return sorted((float(s['start_sec']), float(s['end_sec'])) for s in (segments or [])
                   if _blocks_qrs(s)
@@ -1046,8 +1078,8 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
     # 10 + 9 false V, each <= 0.66 to any other). A V with no other V
     # (beyond its own neighbours) >= PARTNER_CORR goes back to N; a V that
     # is the only one in the recording stays V only with clear evidence
-    # (very different and wide). INCART, threshold 0.7: true PVCs kept
-    # 2485 of 2559, false V 111 -> 58.
+    # (very different and wide, and _lone_v_is_ectopic). INCART, threshold
+    # 0.7: true PVCs kept 2485 of 2559, false V 111 -> 58.
     live = [c for c in v_cands if out[c[0]]['label'] == 'V' and c[1] is not None]
     # Late PVCs first: one has no early coupling to vouch for it, so it stays
     # V only when several other V beats of the recording have its shape. A
@@ -1086,7 +1118,7 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
                 break
         if best >= PARTNER_CORR:
             continue
-        if others == 0 and c < VERY_DIFFERENT_CORR and q is not None and q >= WIDE_QRS_MS:
+        if others == 0 and c < VERY_DIFFERENT_CORR and q is not None and q >= WIDE_QRS_MS                 and _lone_v_is_ectopic(out, pcorrs, i):
             continue
         out[i]['label'] = 'N'
     _classify_pacs(out, corrs, segments, pcorrs)

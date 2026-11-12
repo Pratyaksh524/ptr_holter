@@ -97,6 +97,8 @@ ECTOPIC_MARK_COLORS = {
     'dark': {'V': '#FF1744', 'S': '#2979FF'},
     'graph': {'V': '#B71C1C', 'S': '#1565C0'},
 }
+# y (px from the lead I strip's top) of the "V" / "S" letter and its time.
+ECTOPIC_LABEL_BASELINE = 28
 
 
 def _visible_mains_wiggle(d, fs, start_sec, events):
@@ -2422,21 +2424,60 @@ class ECGStripCanvas(QWidget):
             painter.restore()
 
         # "V" / "S" above each coloured PVC / PAC beat, on lead I only (like
-        # the Artifact "A"), in the beat's colour.
+        # the Artifact "A"), in the beat's colour, with the beat's system time
+        # (HH:MM:SS, as the bottom label shows it) just right of the letter in
+        # a smaller font. Beats too close for that (the 1 / 2 Min views) share
+        # one time, their first beat's, after the last letter; a time that
+        # would still run into the next letter is left out. Letters are always
+        # drawn. Baseline ECTOPIC_LABEL_BASELINE: below the
+        # segment band's name / start / end time (Full Disclosure overlay,
+        # baseline 20 px from its top, ~15 px into this strip -- at the top
+        # they ran into each other) and above the HR / RR numbers (top ~31 px).
         if ectopic_marks and getattr(self, 'lead_name', '') == 'I':
+            from datetime import datetime
             painter.save()
             mark_font = painter.font()
             mark_font.setBold(True)
             mark_font.setPointSize(10)
+            time_font = painter.font()
+            time_font.setBold(False)
+            time_font.setPointSize(8)
+            painter.setFont(time_font)
+            time_fm = painter.fontMetrics()
             painter.setFont(mark_font)
             fm = painter.fontMetrics()
+            reader_start = self._get_reader_start_time()
             strip_end = self._start_sec + n / float(self._fs or 500)
-            for m_t, m_code in ectopic_marks:
-                if not (self._start_sec <= m_t <= strip_end):
-                    continue
-                idx = min(max(int((m_t - self._start_sec) * self._fs), 0), n - 1)
-                painter.setPen(QColor(ectopic_palette[m_code]))
-                painter.drawText(int(xs[idx] - fm.horizontalAdvance(m_code) / 2), fm.ascent(), m_code)
+            shown = sorted((m_t, m_code) for m_t, m_code in ectopic_marks if self._start_sec <= m_t <= strip_end)
+            letter_x = [int(xs[min(max(int((m_t - self._start_sec) * self._fs), 0), n - 1)]
+                            - fm.horizontalAdvance(m_code) / 2) for m_t, m_code in shown]
+            # Beats too close for a time between their letters (a couplet in
+            # the 1 / 2 Min views) form one group: its letters, then the time
+            # of its first beat -- as the bottom label times a couplet / run.
+            time_w = time_fm.horizontalAdvance('00:00:00')
+            groups = []
+            for k in range(len(shown)):
+                if groups:
+                    j = groups[-1][-1]
+                    if letter_x[j] + fm.horizontalAdvance(shown[j][1]) + 3 + time_w > letter_x[k] - 4:
+                        groups[-1].append(k)
+                        continue
+                groups.append([k])
+            for g, group in enumerate(groups):
+                painter.setFont(mark_font)
+                for k in group:
+                    painter.setPen(QColor(ectopic_palette[shown[k][1]]))
+                    painter.drawText(letter_x[k], ECTOPIC_LABEL_BASELINE, shown[k][1])
+                if reader_start:
+                    first_t, first_code = shown[group[0]]
+                    last = group[-1]
+                    txt = datetime.fromtimestamp(reader_start + first_t).strftime('%H:%M:%S')
+                    tx = letter_x[last] + fm.horizontalAdvance(shown[last][1]) + 3
+                    limit = letter_x[groups[g + 1][0]] - 4 if g + 1 < len(groups) else w
+                    if tx + time_fm.horizontalAdvance(txt) <= limit:
+                        painter.setPen(QColor(ectopic_palette[first_code]))
+                        painter.setFont(time_font)
+                        painter.drawText(tx, ECTOPIC_LABEL_BASELINE, txt)
             painter.restore()
 
         # --- Draw Auto-Detected Arrhythmia Labels ---
