@@ -4060,7 +4060,8 @@ class HolterFullDisclosureDialog(QDialog):
         is not measurable -- no P in AFib / Flutter / VFib / VT / SVT /
         Third-degree AV Block, no QRS / QT in VFib, fewer than 75% of the
         beats measured or their spread too wide, a noisy frame or one with
-        no heart signal (the same waveform on every lead) -- and the PR
+        no heart signal (the same waveform on every lead; QRS is still
+        shown there in a Ventricular Tachycardia segment) -- and the PR
         range in Mobitz I. Rhythms are the auto-marked segments in the frame
         (only once "Auto Arrhythmia Detection" has been clicked). PVC beats
         (ectopic_beats_detector 'V') are left out when >= 2 other beats

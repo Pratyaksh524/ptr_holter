@@ -97,6 +97,9 @@ NO_PR_RHYTHMS = (
     'ventricular tachycardia', 'supraventricular tachycardia', 'third-degree av block', 'asystole',
 )
 NO_QRS_RHYTHMS = ('ventricular fibrillation', 'asystole')
+# summarize(narrow_qrs_non_ecg=True): on a 'non_ecg' / 'test_signal' frame
+# with one of these rhythm segments, QRS is shown without the duty-cycle test.
+VT_QRS_RHYTHMS = ('ventricular tachycardia',)
 # PR changes beat to beat by definition: shown as a range.
 VARIABLE_PR_RHYTHMS = ('second-degree av block (mobitz i)',)
 
@@ -440,12 +443,22 @@ def summarize(beats: List[Dict[str, Any]], rhythms: Iterable[str] = (), status: 
     this; a test square wave (160 ms QRS at a 250 ms RR -- 64% duty
     cycle) and a triangle wave (QRS never resolved on any beat) both
     correctly stay '--' with this on. Off by default: only the on-screen
-    label asks for it."""
+    label asks for it.
+    In a Ventricular Tachycardia segment (VT_QRS_RHYTHMS) the duty-cycle
+    test is skipped -- QRS only, with the _robust_value checks: the
+    simulator's VT is the same waveform on I / V1 / V5 (0.99) and repeats
+    exactly, so its frames are 'test_signal' / 'non_ecg', and its wide QRS
+    is 67% of the RR (250 ms at 374 ms), as much as a square wave's -- it
+    read '--' on every VT frame (2026-11-12_13-54-02). The VT detector has
+    already judged those beats a rhythm; a test wave gets no VT segment."""
     out = {'pr_ms': None, 'qrs_ms': None, 'qt_ms': None, 'pr_range': None}
     labels = [str(r).lower() for r in rhythms]
     has = lambda names: any(any(n in lbl for n in names) for lbl in labels)
     if narrow_qrs_non_ecg and status in ('non_ecg', 'test_signal') and beats:
         if has(NO_QRS_RHYTHMS):
+            return out
+        if has(VT_QRS_RHYTHMS):
+            out['qrs_ms'] = _robust_value(beats, 'qrs_ms')
             return out
         duty = [
             float(b['qrs_ms']) / float(b['rr_ms'])

@@ -61,6 +61,9 @@ V V V V as a run instead of N N V N N V (trigeminy).
     Artifact, see _blocks_qrs), with fewer than
     MIN_SHAPE_LEADS usable leads, or (when not V) with no QRS bounds get
     'Q' (not classified). Everything else not V is 'N'.
+  - A narrow R peak < POST_V_MIN_RR_MS after a V is that PVC's T wave: it
+    is not returned, and the next beat's RR is measured from the V (when
+    the repeat test turns that V back to N, it is returned as 'Q').
   - PACs ('S'): a second pass over the N beats, _classify_pacs (early,
     abruptly, with the dominant QRS shape and a P stretch unlike the
     dominant beats'; not in AF / Flutter / AV block segments).
@@ -112,6 +115,7 @@ CLIP_FRACTION = 0.02
 SLOW_RUN_MIN_RR_MS = 600.0       # 100 bpm
 STEADY_RR_FRACTION = 0.10
 RESTART_GAP_SEC = 3.0
+POST_V_MIN_RR_MS = 300.0   # a narrow "beat" closer than this after a V is its T wave, not a beat
 PARTNER_CORR = 0.70
 PARTNER_MAX_COMPARE = 300
 PAC_PREMATURE_FRACTION = 0.85
@@ -875,6 +879,21 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
             p_template = None
         after_ectopic = prev_label == 'V'
         rr = (ts - prev_t) * 1000.0 if prev_t is not None else None
+        # Not a beat: a narrow "beat" < POST_V_MIN_RR_MS after a V is that
+        # PVC's own T wave (the ventricles have not recovered yet; its QRS
+        # alone is ~270 ms). It is dropped from the result (at the end, if
+        # that V is still V) and the next beat's RR is measured from the V.
+        # Seen: 250 ms after the last beat of a PVC run, QRS 100 ms, read V
+        # and made a 5-beat run 6 (2026-11-12_12-30-47, 87.65 s and
+        # 100.96 s). A wide one is kept: a VT faster than 200 bpm has RRs
+        # this short.
+        if (prev_label == 'V' and rr is not None and rr < POST_V_MIN_RR_MS
+                and not (qrs is not None and qrs >= WIDE_QRS_MS)):
+            out.append({'timestamp': round(ts, 3), 'label': 'Q', 'rr_ms': round(rr, 1),
+                        'qrs_ms': None if qrs is None else round(qrs, 1), '_not_beat': True})
+            corrs.append(None)
+            pcorrs.append(None)
+            continue
         prev_t = ts
         beat = {'timestamp': round(ts, 3), 'label': 'N',
                 'rr_ms': None if rr is None else round(rr, 1),
@@ -1071,4 +1090,12 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
             continue
         out[i]['label'] = 'N'
     _classify_pacs(out, corrs, segments, pcorrs)
-    return out
+    # T waves of a V (see the main loop) are dropped -- when that V is still
+    # V. One the repeat test put back to N was no PVC, so what followed it
+    # may be a real beat: it stays, unclassified ('Q').
+    result: List[Dict[str, Any]] = []
+    for b in out:
+        if b.pop('_not_beat', False) and result and result[-1]['label'] == 'V':
+            continue
+        result.append(b)
+    return result
