@@ -470,27 +470,48 @@ def summarize(beats: List[Dict[str, Any]], rhythms: Iterable[str] = (), status: 
 
 
 _CACHE_FILENAME = 'pqrst_cache.json'
-_CACHE_VERSION = 6   # 5: QT by the tangent method (_t_end); 6: QT above 250 bpm
+_frames_memory: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def _frames_cache_key(path: str) -> List[Any]:
+    """The recording file (size, modification time), the code the frames
+    depend on (this module and everything of the ecg package it imports --
+    cache_fingerprint.code_fingerprint follows the imports itself; the
+    hand-bumped _CACHE_VERSION it replaces missed every change to a
+    dependency) and the clinical configuration the run loaded. The code part
+    is '' when the sources cannot be read (a frozen build): the disk cache
+    is then not used."""
+    import os
+    from .cache_fingerprint import clinical_config_fingerprint, code_fingerprint
+    stat = os.stat(path)
+    code = code_fingerprint([os.path.abspath(__file__)])
+    return [os.path.abspath(path), stat.st_size, stat.st_mtime_ns, code, clinical_config_fingerprint()]
 
 
 def recording_frames(path: str) -> List[Dict[str, Any]]:
     """Every FRAME_SEC frame of the recording at `path`: {'start', 'end',
-    'status', 'beats': [[t, rr_ms, pr_ms, qrs_ms, qt_ms], ...]}. Cached next
-    to the recording (pqrst_cache.json), keyed by the file's size and
-    modification time."""
+    'status', 'beats': [[t, rr_ms, pr_ms, qrs_ms, qt_ms], ...]}. Cached in
+    memory and next to the recording (pqrst_cache.json), keyed by the file,
+    the code and the clinical configuration (_frames_cache_key)."""
     import json
     import os
+    import threading
     from .file_format import ECGHFileReader
-    stat = os.stat(path)
-    key = [_CACHE_VERSION, stat.st_size, stat.st_mtime_ns]
+    key = _frames_cache_key(path)
+    mem_key = json.dumps(key)
+    if mem_key in _frames_memory:
+        return _frames_memory[mem_key]
+    disk = bool(key[3])
     cache_path = os.path.join(os.path.dirname(os.path.abspath(path)), _CACHE_FILENAME)
-    try:
-        with open(cache_path, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
-        if saved.get('key') == key:
-            return saved['frames']
-    except (OSError, ValueError):
-        pass
+    if disk:
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
+            if isinstance(saved, dict) and saved.get('key') == key and isinstance(saved.get('frames'), list):
+                _frames_memory[mem_key] = saved['frames']
+                return saved['frames']
+        except (OSError, ValueError):
+            pass
     reader = ECGHFileReader(path)
     try:
         total = float(reader.duration_sec)
@@ -513,13 +534,21 @@ def recording_frames(path: str) -> List[Dict[str, Any]]:
             t = chunk_end
     finally:
         reader.close()
+    _frames_memory[mem_key] = frames
+    if not disk:
+        return frames
+    # a temp name of its own: the report and another process can save at once
+    tmp = f"{cache_path}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
-        tmp = cache_path + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump({'key': key, 'frames': frames}, f)
         os.replace(tmp, cache_path)
     except OSError as e:
         print(f"[PQRST] Could not save cache: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
     return frames
 
 

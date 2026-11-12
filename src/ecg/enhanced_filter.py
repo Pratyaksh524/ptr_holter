@@ -70,6 +70,23 @@ def make_notch(freq_hz: float, fs: float) -> Biquad:
     )
 
 
+def remove_mains(x, fs):
+    """Zero-phase 50 and 60 Hz notches (Q=25) on one lead. Recordings do not
+    store which mains frequency was in use, so both run; each removes only
+    ~2 Hz. Lives here, with make_notch, and not in panels/holter_widgets
+    (where it was _remove_mains): the QRS axis (holter/axis_detection) and the
+    Full Disclosure strip both use it, and the ischemia / axis cache is keyed
+    on this file's contents (holter/cache_fingerprint) -- a filter kept in a
+    UI module did not reach that key, so a changed notch left old axis
+    results in the cache. scipy's filtfilt, not this module's own."""
+    from scipy.signal import filtfilt as scipy_filtfilt
+    for mains_hz in (50.0, 60.0):
+        if mains_hz < fs / 2.0:
+            bq = make_notch(mains_hz, fs)
+            x = scipy_filtfilt(bq.b, bq.a, x)
+    return x
+
+
 def make_lowpass(cutoff_hz: float, fs: float) -> Biquad:
     wc = min(max(cutoff_hz / (fs / 2.0), 0.001), 0.999) * math.pi
     k = math.tan(wc / 2.0)

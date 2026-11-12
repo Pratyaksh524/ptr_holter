@@ -784,7 +784,7 @@ class _MainsNotchedPreprocessor:
     """SignalPreprocessor.process() (0.5-40 Hz band-pass + the config's one
     mains notch, notch_hz) followed by a notch at the other mains frequency,
     so 50 and 60 Hz are both removed -- as the Full Disclosure strip does
-    (holter_widgets._remove_mains). A recording does not store its mains
+    (enhanced_filter.remove_mains). A recording does not store its mains
     frequency, and one simulator recording switched 50 -> 60 Hz mid-way.
     Seen: 60 Hz mains (88% of Lead II's power) left in by the 50 Hz-only
     notch read as atrial activity -- Mobitz I called Atrial Fibrillation
@@ -995,6 +995,40 @@ def _detect_arrhythmias_uncached(
 
     all_r_peaks = sorted(all_r_peaks)
 
+    # Beats the PVC detector (ectopic_beats_detector) calls PVC -- in runs of
+    # at most SEGMENT_PVC_MAX_RUN; a longer run is VT / VFib, whose own rules
+    # judge it. The beat rules below that read rhythm from the beats -- Mobitz
+    # I, Sinus Arrhythmia, plain Tachycardia -- take every beat for a
+    # conducted sinus beat, and a PVC is not one: its "PR" is the previous T
+    # wave (no P; 288 ms beside a sinus 164), its early coupling and the pause
+    # after it read as a Wenckebach cycle (RR 602 against 750, then 896, PR
+    # 142 -> 162 -> 288), a late PVC and its pause as a rate that rises and
+    # falls, and five PVCs at 120 bpm as a Tachycardia. Seen: 2 Mobitz I + 1
+    # Sinus Arrhythmia on a ventricular trigeminy / bigeminy recording
+    # (2026-11-12_09-49-20), 2 Tachycardia on one with runs of PVCs
+    # (2026-11-12_11-19-27), 2 Sinus Arrhythmia on one with single PVCs
+    # (2026-11-06_15-18-05). Whole-recording pass only (a window-loop worker
+    # does not run those rules).
+    _pvc_arr = np.array([])
+    if _window_job is None:
+        try:
+            try:
+                from .ectopic_beats_detector import pvc_times_for_segments
+            except ImportError:
+                from ecg.holter.ectopic_beats_detector import pvc_times_for_segments
+            _pvc_arr = pvc_times_for_segments(raw_reader)
+        except Exception as e:
+            print(f"[Auto Arrhythmia Detect] PVC beats unavailable (rules run without them): {e}")
+
+    def _is_pvc(i):
+        """True when R peak all_r_peaks[i] is one of the PVC detector's beats
+        (within 150 ms: it times a beat at its own R peak)."""
+        if _pvc_arr.size == 0 or not (0 <= i < len(all_r_peaks)):
+            return False
+        t = all_r_peaks[i]
+        k = int(np.searchsorted(_pvc_arr, t))
+        return any(0 <= j < _pvc_arr.size and abs(_pvc_arr[j] - t) <= 0.15 for j in (k - 1, k))
+
     # Rate labels are sinus labels, so an RR pattern alone is not enough.
     # Measure every R-peak on the same best lead before rate segmentation and
     # use these beat-level measurements as a conduction gate below. A small
@@ -1042,7 +1076,7 @@ def _detect_arrhythmias_uncached(
         _make_notch = None
 
     # 50 and 60 Hz notches first, as the Full Disclosure strip does
-    # (holter_widgets._remove_mains): the 25 Hz low-pass below still passes
+    # (enhanced_filter.remove_mains): the 25 Hz low-pass below still passes
     # part of the mains, and with the simulator's mains on, that hid every
     # P wave -- seen: sinus 30 bpm, P on 10/10 beats before a 50 Hz stretch,
     # 0/10 inside it (10/10, PR 152-174 ms, with the notch), so Sinus
@@ -6296,7 +6330,10 @@ def _detect_arrhythmias_uncached(
     #      definition);
     #   3. gradually: no beat-to-beat change > 20% of the run's median RR
     #      and no RR outside 0.7-1.4x median -- a premature beat, a pause or
-    #      a missed / extra R-peak is not sinus arrhythmia;
+    #      a missed / extra R-peak is not sinus arrhythmia (a PVC in the run,
+    #      _is_pvc, makes it no run: its premature RR and the pause after it
+    #      passed this test at 19.7% of the median, and the sinus gate's 75%
+    #      let the two beats without a P through);
     #   4. phasic: >= 3 beat-to-beat changes of >= 40 ms, both lengthening
     #      and shortening -- the rate rises and falls. One rate step (seen:
     #      a test recording going 60 -> 70 bpm, RR 1000 -> 856 ms once, flat
@@ -6321,6 +6358,8 @@ def _detect_arrhythmias_uncached(
             rr = np.diff(np.asarray(all_r_peaks[i:j + 1], dtype=float)) * 1000.0
             med = float(np.median(rr))
             if med <= 0:
+                continue
+            if any(_is_pvc(q) for q in range(i, j + 1)):
                 continue
             if float(rr.max() - rr.min()) < _SA_MIN_RANGE_MS:
                 continue
@@ -6484,6 +6523,8 @@ def _detect_arrhythmias_uncached(
     #   80 ms over >= 2 measured -- P and QRS unrelated); and >= 2 waves
     #   per RR, >= 300 ms apart (more P than QRS, at an atrial rate below
     #   200/min -- Flutter's F waves are ~200 ms apart).
+    #   A PVC (_is_pvc) has no PR: it is left out of the PR list and a cycle
+    #   that holds one is not a cycle.
     # Sinus Bradycardia / Tachycardia / Arrhythmia are cut where they land.
     try:
         _rate_only = ('Sinus Bradycardia', 'Sinus Tachycardia', 'Sinus Arrhythmia', _AT_LABEL)
@@ -6532,7 +6573,7 @@ def _detect_arrhythmias_uncached(
                         _ns_pr[q] = float(b['pr_ms'])
 
         def _pr(i):
-            return _ns_pr.get(i)
+            return None if _is_pvc(i) else _ns_pr.get(i)
 
         new_av = []
 
@@ -6552,7 +6593,8 @@ def _detect_arrhythmias_uncached(
             if j < _n and _free(j) and _pr(j) is None:
                 j += 1
             ok = False
-            if len(prs) >= 3 and prs[-1] - prs[0] >= 60.0 and j < _n and (_free(j) or _free(j - 1)):
+            if (len(prs) >= 3 and prs[-1] - prs[0] >= 60.0 and j < _n and (_free(j) or _free(j - 1))
+                    and not any(_is_pvc(q) for q in range(i, j + 1))):
                 cyc_rr = [_rr(q) for q in range(i + 1, j)]
                 med = float(np.median(cyc_rr)) if cyc_rr else 0.0
                 p_after = _pr(j)
@@ -7005,7 +7047,10 @@ def _detect_arrhythmias_uncached(
     # sinus P/PR/QRS, so not Sinus Bradycardia / Tachycardia). Added last, on
     # beats outside every rhythm segment above, so it never shortens or
     # blocks another label (e.g. the Atrial Flutter 2:1 extension into
-    # uncovered time). See _plain_rate_segments.
+    # uncovered time). See _plain_rate_segments. A Tachycardia run is made of
+    # beats: an RR interval that touches a PVC (_is_pvc) does not count, so a
+    # run of PVCs -- 5 at 120 bpm, QRS 140, no P -- is no Tachycardia (the PVC
+    # detector names it). Bradycardia is left as it was.
     try:
         rhythm_spans = [
             (float(s['start_sec']), float(s['end_sec'])) for s in final_segments
@@ -7015,9 +7060,10 @@ def _detect_arrhythmias_uncached(
         final_segments.extend(_plain_rate_segments(
             plain_brady_peaks, lambda hr: _PLAIN_BRADY_HR[0] < hr < _PLAIN_BRADY_HR[1],
             2.5, 'Bradycardia', '#20B2AA', rhythm_spans, make_time_strs))
+        _tachy_blocked = rhythm_spans + [(float(t) - 0.05, float(t) + 0.05) for t in _pvc_arr]
         final_segments.extend(_plain_rate_segments(
             all_r_peaks, lambda hr: hr > _PLAIN_TACHY_HR,
-            1.0, 'Tachycardia', '#F08080', rhythm_spans, make_time_strs))
+            1.0, 'Tachycardia', '#F08080', _tachy_blocked, make_time_strs))
         final_segments.sort(key=lambda x: x['start_sec'])
     except Exception as e:
         print(f"[Auto Arrhythmia Detect] Bradycardia / Tachycardia check error: {e}")

@@ -72,16 +72,15 @@ except ImportError:
     scipy_filtfilt = None
 
 
-def _remove_mains(x, fs):
-    """Zero-phase 50 and 60 Hz notches (Q=25). Recordings do not store which
-    mains frequency was in use, so both run; each removes only ~2 Hz."""
-    if make_notch is None or scipy_filtfilt is None:
+try:
+    # Zero-phase 50 / 60 Hz notches for the strip. The filter itself is
+    # enhanced_filter.remove_mains (it was defined here): the QRS axis uses it
+    # too, and the ischemia / axis cache is keyed on the files it hashes,
+    # which a UI module is not part of.
+    from ...enhanced_filter import remove_mains as _remove_mains
+except ImportError:
+    def _remove_mains(x, fs):
         return x
-    for mains_hz in (50.0, 60.0):
-        if mains_hz < fs / 2.0:
-            bq = make_notch(mains_hz, fs)
-            x = scipy_filtfilt(bq.b, bq.a, x)
-    return x
 
 
 # Waveform colour (and lead I "A" mark) for the visible mains wiggle of an

@@ -4062,8 +4062,10 @@ class HolterFullDisclosureDialog(QDialog):
         beats measured or their spread too wide, a noisy frame or one with
         no heart signal (the same waveform on every lead) -- and the PR
         range in Mobitz I. Rhythms are the auto-marked segments in the frame
-        (only once "Auto Arrhythmia Detection" has been clicked). Called on
-        every scroll / window change. Display only."""
+        (only once "Auto Arrhythmia Detection" has been clicked). PVC beats
+        (ectopic_beats_detector 'V') are left out when >= 2 other beats
+        remain, so the values are the dominant beats'. Called on every
+        scroll / window change. Display only."""
         if not hasattr(self, 'lbl_pr_qrs'):
             return
         try:
@@ -4081,6 +4083,26 @@ class HolterFullDisclosureDialog(QDialog):
                     cache.clear()
                 cache[key] = (measure_beats(reader, start_sec, end_sec), frame_status(reader, start_sec, end_sec))
             beats, status = cache[key]
+            # PR / QRS / QT are the dominant (sinus) beats' intervals: a PVC
+            # has no PR (it does not start from a P wave -- the search then
+            # took the previous T for one, PR 290 ms beside 164), and its
+            # own QRS / QT (160 / 370 ms beside 90 / 338) are not the
+            # patient's conduction. With PVCs in the frame the beats' spread
+            # failed the display check and all three read '--' (ventricular
+            # trigeminy / bigeminy, 2026-11-12_09-49-20). The ectopic beats
+            # detector's V beats are left out when >= 2 other beats remain;
+            # a frame that is (nearly) all V -- a ventricular run -- keeps
+            # all its beats, as before.
+            v_times = self._ectopic_v_times()
+            if v_times is not None and v_times.size and beats:
+                def _is_v(t):
+                    k = int(np.searchsorted(v_times, t))
+                    # 150 ms: the detector times a beat at its QRS centre,
+                    # measure_beats at its R-peak (PVCs 70-120 ms apart)
+                    return any(0 <= j < v_times.size and abs(v_times[j] - t) <= 0.15 for j in (k - 1, k))
+                kept = [b for b in beats if not _is_v(float(b['t']))]
+                if len(kept) >= 2 and len(kept) < len(beats):
+                    beats = kept
 
             rhythms = []
             if getattr(self, '_auto_marking_visible', False):
@@ -4110,6 +4132,22 @@ class HolterFullDisclosureDialog(QDialog):
         except Exception as e:
             print(f"[Full Disclosure] PR/QRS/QT label error: {e}")
             self.lbl_pr_qrs.setText("PR: --   QRS: --   QT: --")
+
+    def _ectopic_v_times(self):
+        """Sorted times (s) of the ectopic beats detector's V beats for this
+        recording, or None while it has not run (the label is redrawn when
+        it is done, see _ectopic_window_badges). Read once per recording."""
+        path = getattr(getattr(self._engine, '_reader', None), 'path', None)
+        if not path:
+            return None
+        if getattr(self, '_ectopic_v_path', None) != path:
+            from .ectopic_beats_detector import get_cached_ectopic_beats
+            beats = get_cached_ectopic_beats(path)
+            if beats is None:
+                return None
+            self._ectopic_v_times_arr = np.array(sorted(float(b['timestamp']) for b in beats if b.get('label') == 'V'))
+            self._ectopic_v_path = path
+        return self._ectopic_v_times_arr
 
     def _ectopic_window_badges(self, start_sec: float, end_sec: float):
         """Beat badges (PVC / PAC patterns) inside [start_sec, end_sec], built
@@ -4251,12 +4289,16 @@ class HolterFullDisclosureDialog(QDialog):
             print(f"[Full Disclosure] Error updating auto rhythm label: {e}")
         
         # Beat badges (Single PVC, PVC/PAC Couplet / Triplet / Quadruplet /
-        # Run, Bigeminy..., AFib, Paced) describe the raw beat stream, so they are only
-        # shown before "Auto Arrhythmia Detection" is clicked. Once auto
-        # marking is on, this label comes only from the auto-detected
-        # segments above (and the Normal Sinus Rhythm fallback below).
-        if not arrhythmia_label and not getattr(self, '_auto_marking_visible', False) \
-                and lead_i_canvas and hasattr(lead_i_canvas, '_beat_annotations'):
+        # Run, Bigeminy..., AFib, Paced) describe the beat stream, not a
+        # rhythm segment, so they do not depend on "Auto Arrhythmia
+        # Detection" being clicked: the auto segments are for the other
+        # arrhythmias (the block above), and this label shows the PVC / PAC
+        # pattern whenever no segment is active in the window. It read
+        # "PVC Couplet" before the click and Normal Sinus Rhythm after it
+        # (2026-11-12_11-19-27). An active segment still takes the label, as
+        # before; the Normal Sinus Rhythm fallback below is for windows with
+        # neither.
+        if not arrhythmia_label and lead_i_canvas and hasattr(lead_i_canvas, '_beat_annotations'):
             # Get beats in current window
             window_beats = [b for b in lead_i_canvas._beat_annotations 
                            if start_sec <= b.get('timestamp', 0.0) <= end_sec]
@@ -4265,7 +4307,7 @@ class HolterFullDisclosureDialog(QDialog):
             # Generate badges for current window using the same logic as badge display
             try:
                 from ecg.holter.holter_summary_calc import get_template_beats_for_badges
-                # PVC patterns from ectopic_beats_detector (every beat of the
+                # PVC / PAC patterns from ectopic_beats_detector (every beat of the
                 # recording, classified from the signal); the live beat labels
                 # below only until it has run for this recording.
                 badges = self._ectopic_window_badges(start_sec, end_sec)

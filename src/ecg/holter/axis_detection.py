@@ -7,7 +7,7 @@ Independent of the auto arrhythmia detection. Run with the ischemia findings
 (ischemia_detection.compute_ischemia, same cache and background job). It
 reads the recording itself (ECGHFileReader.read_range, the raw 12 leads the
 Full Disclosure view shows) and filters every lead with _strip_filter:
-50 / 60 Hz notches (_remove_mains), 0.5 Hz DFT high-pass (zero-phase), 3-point
+50 / 60 Hz notches (enhanced_filter.remove_mains), 0.5 Hz DFT high-pass (zero-phase), 3-point
 median, one zero-phase 25 Hz Gaussian low-pass -- with 2 s of real
 neighbouring samples on each side, as the strip pads. The same filter as
 the Full Disclosure strip (panels/holter_widgets.ECGStripCanvas.set_data).
@@ -93,15 +93,10 @@ def _strip_filter(x: np.ndarray, fs: float) -> np.ndarray:
     the Full Disclosure strip. Was 35 Hz twice, the same response (two
     passes = one ~24.7 Hz pass)."""
     from ..ecg_filters import apply_dft_filter
-    from ..enhanced_filter import gaussian_lowpass
-    try:
-        from .panels.holter_widgets import _remove_mains
-    except Exception:  # pragma: no cover - holter_widgets needs Qt
-        _remove_mains = None
+    from ..enhanced_filter import gaussian_lowpass, remove_mains
     x = np.asarray(x, dtype=float)
     if x.size > 30:
-        if _remove_mains is not None:
-            x = np.asarray(_remove_mains(x, float(fs)), dtype=float)
+        x = np.asarray(remove_mains(x, float(fs)), dtype=float)
         x = np.asarray(apply_dft_filter(x, float(fs), "0.5"), dtype=float)
     if x.size >= 3:
         p = np.pad(x, (1, 1), mode='edge')

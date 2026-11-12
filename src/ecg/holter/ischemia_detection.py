@@ -767,32 +767,35 @@ _jobs: Dict[str, Any] = {}
 _code_hash: Optional[str] = None
 
 
-def _cache_key(path: str) -> Optional[str]:
-    """Recording file (path / size / mtime) + the code this result depends
-    on (this module, the filters, the R-peak detector), so it is recomputed
-    when either changes. Nothing from the arrhythmia detection."""
-    import hashlib
+def _code_fingerprint() -> str:
+    """Hash of the code this result depends on: this module, axis_detection
+    and everything of the ecg package they import, transitively (the
+    filters, the R-peak detector, the file reader, the theme constants --
+    cache_fingerprint.code_fingerprint follows the imports itself). Not the
+    arrhythmia detection or the UI. '' when the sources cannot be read (a
+    frozen build): the disk cache is then not used."""
     import os
     global _code_hash
+    if _code_hash is None:
+        from .cache_fingerprint import code_fingerprint
+        here = os.path.dirname(os.path.abspath(__file__))
+        _code_hash = code_fingerprint([os.path.join(here, 'ischemia_detection.py'),
+                                       os.path.join(here, 'axis_detection.py')])
+    return _code_hash
+
+
+def _cache_key(path: str) -> Optional[str]:
+    """Recording file (path / size / mtime) + the code this result depends
+    on (_code_fingerprint), so it is recomputed when either changes. Nothing
+    from the arrhythmia detection. Without a readable code fingerprint the key
+    says so ('nocode'): good for this process's memory cache, never written
+    to or read from disk (a saved result could be stale and nothing says so)."""
+    import os
     try:
         st = os.stat(path)
     except OSError:
         return None
-    if _code_hash is None:
-        here = os.path.dirname(os.path.abspath(__file__))
-        h = hashlib.sha1()
-        for f in (os.path.join(here, 'ischemia_detection.py'),
-                  os.path.join(here, 'axis_detection.py'),
-                  os.path.join(here, '..', 'ecg_filters.py'),
-                  os.path.join(here, '..', 'enhanced_filter.py'),
-                  os.path.join(here, '..', 'pan_tompkins.py')):
-            try:
-                with open(f, 'rb') as fh:
-                    h.update(fh.read())
-            except OSError:
-                pass
-        _code_hash = h.hexdigest()
-    return f"{os.path.abspath(path)}|{st.st_size}|{st.st_mtime_ns}|{_code_hash}"
+    return f"{os.path.abspath(path)}|{st.st_size}|{st.st_mtime_ns}|{_code_fingerprint() or 'nocode'}"
 
 
 def get_cached_ischemia(path: str) -> Optional[Dict[str, List[Dict[str, Any]]]]:
@@ -806,12 +809,14 @@ def get_cached_ischemia(path: str) -> Optional[Dict[str, List[Dict[str, Any]]]]:
         return None
     if key in _memory_cache:
         return copy.deepcopy(_memory_cache[key])
+    if not _code_fingerprint():
+        return None
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(path)), _CACHE_FILENAME), 'r', encoding='utf-8') as f:
             saved = json.load(f)
     except (OSError, ValueError):
         return None
-    if saved.get('key') != key or not isinstance(saved.get('result'), dict):
+    if not isinstance(saved, dict) or saved.get('key') != key or not isinstance(saved.get('result'), dict):
         return None
     _memory_cache[key] = saved['result']
     return copy.deepcopy(_memory_cache[key])
@@ -838,13 +843,21 @@ def compute_ischemia(path: str) -> Dict[str, List[Dict[str, Any]]]:
     key = _cache_key(path)
     if key is not None:
         _memory_cache[key] = result
+        if not _code_fingerprint():
+            return result
+        # a temp name of its own: the report and the UI can save at the same time
+        import threading
+        cache_path = os.path.join(os.path.dirname(os.path.abspath(path)), _CACHE_FILENAME)
+        tmp = f"{cache_path}.{os.getpid()}.{threading.get_ident()}.tmp"
         try:
-            cache_path = os.path.join(os.path.dirname(os.path.abspath(path)), _CACHE_FILENAME)
-            with open(cache_path + '.tmp', 'w', encoding='utf-8') as f:
+            with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump({'key': key, 'result': result}, f, default=float)
-            os.replace(cache_path + '.tmp', cache_path)
+            os.replace(tmp, cache_path)
         except OSError:
-            pass
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
     return result
 
 
