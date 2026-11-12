@@ -99,7 +99,14 @@ NO_PR_RHYTHMS = (
 NO_QRS_RHYTHMS = ('ventricular fibrillation', 'asystole')
 # summarize(narrow_qrs_non_ecg=True): on a 'non_ecg' / 'test_signal' frame
 # with one of these rhythm segments, QRS is shown without the duty-cycle test.
+# Matched as the whole label: 'ventricular tachycardia' is also inside
+# 'supraventricular tachycardia (svt)'.
 VT_QRS_RHYTHMS = ('ventricular tachycardia',)
+# A VT's QRS is wide by definition; a narrower value is not taken from this
+# rule (seen: 68 ms on a wide, large VT near the ADC rails,
+# 2026-11-04_17-31-21 at 300 s) -- the frame goes on to the duty-cycle test
+# as before.
+VT_QRS_MIN_MS = 120.0
 # PR changes beat to beat by definition: shown as a range.
 VARIABLE_PR_RHYTHMS = ('second-degree av block (mobitz i)',)
 
@@ -450,16 +457,20 @@ def summarize(beats: List[Dict[str, Any]], rhythms: Iterable[str] = (), status: 
     exactly, so its frames are 'test_signal' / 'non_ecg', and its wide QRS
     is 67% of the RR (250 ms at 374 ms), as much as a square wave's -- it
     read '--' on every VT frame (2026-11-12_13-54-02). The VT detector has
-    already judged those beats a rhythm; a test wave gets no VT segment."""
+    already judged those beats a rhythm; a test wave gets no VT segment.
+    A value under VT_QRS_MIN_MS (a VT's QRS is wide) is not shown by this
+    rule; the frame then goes through the duty-cycle test as before."""
     out = {'pr_ms': None, 'qrs_ms': None, 'qt_ms': None, 'pr_range': None}
     labels = [str(r).lower() for r in rhythms]
     has = lambda names: any(any(n in lbl for n in names) for lbl in labels)
     if narrow_qrs_non_ecg and status in ('non_ecg', 'test_signal') and beats:
         if has(NO_QRS_RHYTHMS):
             return out
-        if has(VT_QRS_RHYTHMS):
-            out['qrs_ms'] = _robust_value(beats, 'qrs_ms')
-            return out
+        if any(lbl in VT_QRS_RHYTHMS for lbl in labels):
+            qrs = _robust_value(beats, 'qrs_ms')
+            if qrs is not None and qrs >= VT_QRS_MIN_MS:
+                out['qrs_ms'] = qrs
+                return out
         duty = [
             float(b['qrs_ms']) / float(b['rr_ms'])
             for b in beats
