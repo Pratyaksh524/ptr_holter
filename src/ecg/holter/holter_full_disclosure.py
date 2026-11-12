@@ -4150,6 +4150,83 @@ class HolterFullDisclosureDialog(QDialog):
             self._ectopic_v_path = path
         return self._ectopic_v_times_arr
 
+    def _start_ectopic_detection(self, path: str):
+        """Run ectopic_beats_detector for `path` in the background (once at a
+        time); when it is done, the bottom label and the PVC / PAC beat
+        marks of the current window are redrawn."""
+        if getattr(self, '_ectopic_pending_path', None) == path:
+            return
+        from .ectopic_beats_detector import detect_ectopic_beats_async
+        self._ectopic_pending_path = path
+
+        def _done(_beats, p=path):
+            self._ectopic_pending_path = None
+            window = getattr(self, '_last_label_window', None)
+            if window and getattr(getattr(self._engine, '_reader', None), 'path', None) == p:
+                self._update_time_and_arrhythmia_labels(*window)
+                self._apply_ectopic_marks()
+
+        detect_ectopic_beats_async(path, _done)
+
+    # Coloured part of a PVC / PAC beat (_ectopic_mark_spans): from
+    # QRS/2 + ECTOPIC_MARK_PRE_SEC before the detector's beat time (its QRS
+    # centre) to QRS/2 + ECTOPIC_MARK_T_SEC after it (the T wave; a PVC's
+    # ran ~0.25 s past its QRS on the test recordings), never within
+    # ECTOPIC_MARK_GAP_SEC of the next / previous beat.
+    ECTOPIC_MARK_PRE_SEC = 0.02
+    ECTOPIC_MARK_T_SEC = 0.25
+    ECTOPIC_MARK_GAP_SEC = 0.10
+
+    def _ectopic_mark_spans(self):
+        """[(start_sec, end_sec, t, 'V' / 'S')] for every PVC / PAC beat
+        ectopic_beats_detector found in this recording -- the same beats as
+        the bottom label's PVC / PAC patterns, so independent of the "Auto
+        Arrhythmia Detection" button. None while the detector has not run
+        for this recording (it is then started). Built once per recording."""
+        path = getattr(getattr(self._engine, '_reader', None), 'path', None)
+        if not path:
+            return None
+        if getattr(self, '_ectopic_marks_path', None) != path:
+            from .ectopic_beats_detector import get_cached_ectopic_beats
+            beats = get_cached_ectopic_beats(path)
+            if beats is None:
+                self._start_ectopic_detection(path)
+                return None
+            beats = sorted(beats, key=lambda b: float(b.get('timestamp', 0.0)))
+            spans = []
+            for k, b in enumerate(beats):
+                code = b.get('label')
+                if code not in ('V', 'S'):
+                    continue
+                t = float(b['timestamp'])
+                half = (float(b['qrs_ms']) if b.get('qrs_ms') else 100.0) / 2000.0
+                start = t - half - self.ECTOPIC_MARK_PRE_SEC
+                end = t + half + self.ECTOPIC_MARK_T_SEC
+                if k > 0:
+                    start = max(start, float(beats[k - 1]['timestamp']) + self.ECTOPIC_MARK_GAP_SEC)
+                if k + 1 < len(beats):
+                    end = min(end, float(beats[k + 1]['timestamp']) - self.ECTOPIC_MARK_GAP_SEC)
+                if end > start:
+                    spans.append((start, end, t, code))
+            self._ectopic_mark_list = spans
+            self._ectopic_marks_path = path
+        return self._ectopic_mark_list
+
+    def _apply_ectopic_marks(self):
+        """Give every lead strip the PVC / PAC beats in its window
+        (ECGStripCanvas._ectopic_marks: coloured on all leads, "V" / "S" on
+        lead I) and repaint the strips whose set changed."""
+        spans = self._ectopic_mark_spans() or []
+        for c in getattr(self, '_canvases', []) or []:
+            c0 = float(getattr(c, '_start_sec', 0.0) or 0.0)
+            data = getattr(c, '_data', None)
+            n = 0 if data is None else len(data)
+            c1 = c0 + n / float(getattr(c, '_fs', 500) or 500)
+            marks = [m for m in spans if m[1] >= c0 and m[0] <= c1]
+            if marks != getattr(c, '_ectopic_marks', None):
+                c._ectopic_marks = marks
+                c.update()
+
     def _ectopic_window_badges(self, start_sec: float, end_sec: float):
         """Beat badges (PVC / PAC patterns) inside [start_sec, end_sec], built
         once over the whole recording from ectopic_beats_detector -- so a
@@ -4161,21 +4238,10 @@ class HolterFullDisclosureDialog(QDialog):
         if not path:
             return None
         if getattr(self, '_ectopic_badges_path', None) != path:
-            from .ectopic_beats_detector import (
-                detect_ectopic_beats_async, get_cached_ectopic_beats, pattern_beats,
-            )
+            from .ectopic_beats_detector import get_cached_ectopic_beats, pattern_beats
             beats = get_cached_ectopic_beats(path)
             if beats is None:
-                if getattr(self, '_ectopic_pending_path', None) != path:
-                    self._ectopic_pending_path = path
-
-                    def _done(_beats, p=path):
-                        self._ectopic_pending_path = None
-                        window = getattr(self, '_last_label_window', None)
-                        if window and getattr(getattr(self._engine, '_reader', None), 'path', None) == p:
-                            self._update_time_and_arrhythmia_labels(*window)
-
-                    detect_ectopic_beats_async(path, _done)
+                self._start_ectopic_detection(path)
                 return None
             from .holter_summary_calc import get_template_beats_for_badges
             self._ectopic_badges = get_template_beats_for_badges(
@@ -4793,6 +4859,11 @@ class HolterFullDisclosureDialog(QDialog):
         apply_artifact_wiggle_from_recording(
             self._canvases, getattr(self._engine, '_reader', None),
             getattr(self._engine, '_structured_events', []))
+        # PVC / PAC beats coloured, "V" / "S" on lead I (ectopic_beats_detector).
+        try:
+            self._apply_ectopic_marks()
+        except Exception as e:
+            print(f"[Full Disclosure] PVC / PAC beat marks: {e}")
 
         # Refresh the measurement header after the current waveform has been
         # installed on every canvas.  The status/header update runs earlier

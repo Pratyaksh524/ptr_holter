@@ -87,6 +87,17 @@ except ImportError:
 # auto-detected Artifact.
 AUTO_ARTIFACT_COLOR = "#F4A460"
 
+# PVC / PAC beats of ectopic_beats_detector (Full Disclosure sets them, see
+# ECGStripCanvas._ectopic_marks): the beat's QRS and T wave in this colour on
+# every lead, and its letter "V" / "S" above it on lead I. Red / blue, as
+# Holter systems mark ventricular / supraventricular ectopy; on the Graph
+# Mode paper (pink, red grid) the darker pair, so the red does not merge
+# with the grid. Not used by any segment band or other marking colour.
+ECTOPIC_MARK_COLORS = {
+    'dark': {'V': '#FF1744', 'S': '#2979FF'},
+    'graph': {'V': '#B71C1C', 'S': '#1565C0'},
+}
+
 
 def _visible_mains_wiggle(d, fs, start_sec, events):
     """Sample spans (start_idx, end_idx) of the displayed strip `d` where an
@@ -1287,6 +1298,9 @@ class ECGStripCanvas(QWidget):
         # Full Disclosure supplies the shared background, so draw_background
         # alone cannot tell whether the current theme is dark or graph.
         self._display_theme_mode = "dark"
+        # [(start_sec, end_sec, t, 'V' / 'S')] PVC / PAC beats to colour,
+        # set by Full Disclosure (_apply_ectopic_marks); empty elsewhere.
+        self._ectopic_marks = []
         self._gain = 1.0
         self._speed = 25
         self._inverted = False
@@ -2310,6 +2324,28 @@ class ECGStripCanvas(QWidget):
             except Exception as _exc:
                 pass   # Never crash paint — coloring is decorative
 
+        # PVC / PAC beats (ectopic_beats_detector, set by Full Disclosure):
+        # QRS + T wave in the ectopic colour. A beat the user labelled by hand
+        # (is_manual, within 150 ms -- the detector times a beat at its QRS
+        # centre) keeps the manual marking instead.
+        ectopic_marks = [] if self._disable_all_coloring else list(getattr(self, '_ectopic_marks', None) or [])
+        ectopic_palette = ECTOPIC_MARK_COLORS[
+            'graph' if 'graph' in (getattr(self, '_theme_mode', 'dark'), getattr(self, '_display_theme_mode', 'dark'))
+            else 'dark']
+        if ectopic_marks:
+            manual_ts = [float(b.get('timestamp', 0.0) or 0.0) for b in (getattr(self, '_beat_annotations', None) or [])
+                         if isinstance(b, dict) and b.get('is_manual', False)]
+            shown_marks = []
+            for m_start, m_end, m_t, m_code in ectopic_marks:
+                if m_code not in ectopic_palette or any(abs(m_t - mt) <= 0.15 for mt in manual_ts):
+                    continue
+                s_idx = max(0, int((m_start - self._start_sec) * self._fs))
+                e_idx = min(len(d) - 1, int((m_end - self._start_sec) * self._fs))
+                if s_idx < e_idx:
+                    colored_intervals.append((s_idx, e_idx, ectopic_palette[m_code]))
+                shown_marks.append((m_t, m_code))
+            ectopic_marks = shown_marks
+
         if not self._disable_all_coloring:
             for start_idx, end_idx in getattr(self, '_artifact_wiggle', []):
                 colored_intervals.append((start_idx, end_idx, AUTO_ARTIFACT_COLOR))
@@ -2383,6 +2419,24 @@ class ECGStripCanvas(QWidget):
             for start_idx, end_idx in groups:
                 mid = min((start_idx + end_idx) // 2, n - 1)
                 painter.drawText(int(xs[mid] - fm.horizontalAdvance("A") / 2), fm.ascent(), "A")
+            painter.restore()
+
+        # "V" / "S" above each coloured PVC / PAC beat, on lead I only (like
+        # the Artifact "A"), in the beat's colour.
+        if ectopic_marks and getattr(self, 'lead_name', '') == 'I':
+            painter.save()
+            mark_font = painter.font()
+            mark_font.setBold(True)
+            mark_font.setPointSize(10)
+            painter.setFont(mark_font)
+            fm = painter.fontMetrics()
+            strip_end = self._start_sec + n / float(self._fs or 500)
+            for m_t, m_code in ectopic_marks:
+                if not (self._start_sec <= m_t <= strip_end):
+                    continue
+                idx = min(max(int((m_t - self._start_sec) * self._fs), 0), n - 1)
+                painter.setPen(QColor(ectopic_palette[m_code]))
+                painter.drawText(int(xs[idx] - fm.horizontalAdvance(m_code) / 2), fm.ascent(), m_code)
             painter.restore()
 
         # --- Draw Auto-Detected Arrhythmia Labels ---
