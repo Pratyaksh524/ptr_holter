@@ -1,1 +1,0 @@
-"""dashboard widgets module"""

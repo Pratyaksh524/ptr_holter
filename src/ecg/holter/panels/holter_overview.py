@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import gc
 import json
@@ -41,11 +41,18 @@ from ..holter_helpers import (
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
     _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _card_style, _card_title_style, _overview_table_style,
 )
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas, HolterRRTrendCanvas, HRTrendCanvas
 
 # 4. HOLTER OVERVIEW PANEL
+from ..ischemia_detection import ST_DEPRESSION, ST_ELEVATION, T_INVERSION, format_st_summary
+from ..axis_detection import format_axis_events, format_axis_summary
+
+# rows whose value is several lines, sized to their wrapped text
+_MULTILINE_ROWS = ('T Inversion', 'ST Elevation', 'ST Depression', 'QRS Axis', 'Axis Deviation')
+
 class HolterOverviewPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -149,109 +156,171 @@ class HolterExpertReviewPanel(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
 
+        trend_card = QFrame()
+        trend_card.setObjectName("ovTrendCard")
+        trend_card.setStyleSheet(_card_style("QFrame#ovTrendCard"))
+        trend_l = QVBoxLayout(trend_card)
+        trend_l.setContentsMargins(6, 6, 6, 6)
         self._rr_trend_full = HolterRRTrendCanvas(title="RR Interval Trend (Full Recording)")
-        layout.addWidget(self._rr_trend_full)
+        trend_l.addWidget(self._rr_trend_full)
+        layout.addWidget(trend_card)
 
         body = QSplitter(Qt.Horizontal)
         body.setChildrenCollapsible(False)
-        body.setHandleWidth(1)
-        body.setStyleSheet(f"QSplitter{{background:{UI_BG};}} QSplitter::handle{{background:{UI_BORDER};}}")
+        body.setHandleWidth(6)
+        body.setStyleSheet(f"QSplitter{{background:{UI_BG};}} QSplitter::handle{{background:{UI_BG};}}")
 
         left = QFrame()
-        left.setStyleSheet(f"QFrame{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-radius:8px;}}")
+        left.setObjectName("ovLeftCard")
+        left.setStyleSheet(_card_style("QFrame#ovLeftCard"))
         left_l = QVBoxLayout(left)
         left_l.setContentsMargins(8, 8, 8, 8)
         left_l.setSpacing(8)
+        lorenz_ttl = QLabel("RR Scatter (Lorenz)")
+        lorenz_ttl.setStyleSheet(_card_title_style())
+        left_l.addWidget(lorenz_ttl)
         self._lorenz = LorenzCanvas()
         self._lorenz.setMinimumHeight(280)
         left_l.addWidget(self._lorenz, 2)
+        tmpl_ttl = QLabel("Templates")
+        tmpl_ttl.setStyleSheet(_card_title_style())
+        left_l.addWidget(tmpl_ttl)
         self._template_table = QTableWidget(0, 3)
         self._template_table.setHorizontalHeaderLabels(["Template", "Class", "Beats"])
         self._template_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._template_table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._template_table.verticalHeader().setVisible(False)
+        self._template_table.verticalHeader().setDefaultSectionSize(28)
         self._template_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._template_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._template_table.setAlternatingRowColors(True)
+        self._template_table.setShowGrid(False)
         self._template_table.setStyleSheet(_table_style())
         self._template_table.cellClicked.connect(self._on_template_clicked)
         left_l.addWidget(self._template_table, 1)
         body.addWidget(left)
 
-        #  "  "  Center: scrollable 12-lead ECG grid  "  " 
+        #  "  "  Center: scrollable 12-lead ECG grid  "  "
         center = QFrame()
-        center.setStyleSheet(f"QFrame{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:8px;}}")
+        center.setObjectName("ovCenterCard")
+        center.setStyleSheet(_card_style("QFrame#ovCenterCard"))
         center_l = QVBoxLayout(center)
-        center_l.setContentsMargins(4, 4, 4, 4)
-        center_l.setSpacing(0)
+        center_l.setContentsMargins(10, 8, 10, 10)
+        center_l.setSpacing(8)
 
-        # 12-lead header
-        hdr = QLabel("12-Lead ECG Overview")
-        hdr.setStyleSheet(f"color:{UI_TEXT};font-size:11px;font-weight:700;padding:4px 6px;border:none;")
-        center_l.addWidget(hdr)
+        # 12-lead header: title on the accent bar, what the strips show on the right.
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        hdr = QLabel("Overview")
+        hdr.setStyleSheet(_card_title_style())
+        head_hint = QLabel("Current replay frame  ·  rhythm strip: Lead II")
+        head_hint.setStyleSheet(f"color:{UI_MUTED};font-size:11px;background:transparent;border:none;")
+        head_hint.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        # May shrink (cut at the left edge) instead of widening the card.
+        head_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        head_hint.setMinimumWidth(0)
+        head.addWidget(hdr)
+        head.addWidget(head_hint, 1)
+        center_l.addLayout(head)
 
+        # The 12 leads, one row each, sharing the card's height; below their
+        # minimum height the list scrolls instead of squeezing.
         leads_scroll = QScrollArea()
         leads_scroll.setWidgetResizable(True)
         leads_scroll.setFrameShape(QFrame.NoFrame)
         leads_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         leads_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        leads_scroll.setStyleSheet(f"QScrollArea{{background:{COL_BLACK};border:none;}}")
+        leads_scroll.setStyleSheet(
+            f"QScrollArea{{background:transparent;border:none;}}"
+            f"QScrollArea > QWidget > QWidget{{background:transparent;}}"
+            f"QScrollBar:vertical{{background:{UI_PANEL};width:10px;margin:0;border:none;}}"
+            f"QScrollBar::handle:vertical{{background:{UI_BORDER};min-height:24px;border-radius:5px;margin:2px;}}"
+            f"QScrollBar::handle:vertical:hover{{background:#3A5378;}}"
+            f"QScrollBar::add-line,QScrollBar::sub-line{{width:0;height:0;}}")
         leads_container = QWidget()
-        leads_container.setStyleSheet(f"background:{COL_BLACK};")
+        leads_container.setStyleSheet("background:transparent;")
         leads_vbox = QVBoxLayout(leads_container)
-        leads_vbox.setContentsMargins(2, 2, 2, 2)
-        leads_vbox.setSpacing(2)
+        leads_vbox.setContentsMargins(0, 0, 4, 0)
+        leads_vbox.setSpacing(4)
+
+        def _lead_row(name, strip, object_name):
+            """One framed row: lead tag in a fixed gutter, strip filling the rest."""
+            row = QFrame()
+            row.setObjectName(object_name)
+            row.setStyleSheet(f"QFrame#{object_name}{{background:{COL_BLACK};border:1px solid {UI_BORDER};"
+                              f"border-radius:6px;}}")
+            row_l = QHBoxLayout(row)
+            row_l.setContentsMargins(4, 2, 4, 2)
+            row_l.setSpacing(6)
+            tag = QLabel(name)
+            tag.setFixedWidth(40)
+            tag.setAlignment(Qt.AlignCenter)
+            tag.setStyleSheet(f"color:{COL_GREEN};font-weight:800;font-size:11px;"
+                              f"background:rgba(11,18,32,200);border:1px solid {COL_GREEN_DRK};"
+                              f"border-radius:4px;padding:1px 0px;")
+            row_l.addWidget(tag, 0, Qt.AlignVCenter)
+            strip.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            row_l.addWidget(strip, 1)
+            return row
 
         self._lead_names_12 = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
         self._expert_lead_strips = {}  # lead_name -> ECGStripCanvas
         for lead in self._lead_names_12:
-            row_h = QHBoxLayout()
-            row_h.setContentsMargins(0, 0, 0, 0)
-            row_h.setSpacing(4)
-            lbl = QLabel(lead)
-            lbl.setFixedWidth(34)
-            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            lbl.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;")
             # Expert/Overview mode: disable ALL coloring (disable_all_coloring=True) - no arrhythmia colors, just green
             strip = ECGStripCanvas(height=60, color="#00FF00", pen_width=0.9, lead_name=lead, show_vertical_lines=False, show_annotations=False, disable_all_coloring=True)
             strip.set_gain(1.0)
+            strip.setMinimumHeight(36)
+            strip.setMaximumHeight(16777215)
             self._expert_lead_strips[lead] = strip
-            row_h.addWidget(lbl)
-            row_h.addWidget(strip, 1)
-            leads_vbox.addLayout(row_h)
+            leads_vbox.addWidget(_lead_row(lead, strip, "ovLeadRow"), 1)
 
         leads_scroll.setWidget(leads_container)
         center_l.addWidget(leads_scroll, 1)
 
         # Rhythm strip at bottom (Lead II) - also disable vertical lines and ALL coloring
-        rhythm_row = QHBoxLayout()
-        rhythm_row.setSpacing(4)
-        rlbl = QLabel("II")
-        rlbl.setFixedWidth(34)
-        rlbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        rlbl.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;")
+        rhythm_ttl = QLabel("Rhythm Strip")
+        rhythm_ttl.setStyleSheet(_card_title_style())
+        center_l.addWidget(rhythm_ttl)
         self._mini = ECGStripCanvas(height=40, color="#00AA00", pen_width=0.9, show_vertical_lines=False, show_annotations=False, disable_all_coloring=True)
-        rhythm_row.addWidget(rlbl)
-        rhythm_row.addWidget(self._mini, 1)
-        center_l.addLayout(rhythm_row)
+        self._mini.setMinimumHeight(44)
+        self._mini.setMaximumHeight(64)
+        center_l.addWidget(_lead_row("II", self._mini, "ovRhythmRow"))
 
         body.addWidget(center)
 
         right = QFrame()
-        right.setStyleSheet(f"QFrame{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-radius:8px;}}")
+        right.setObjectName("ovRightCard")
+        right.setStyleSheet(_card_style("QFrame#ovRightCard"))
         right_l = QVBoxLayout(right)
         right_l.setContentsMargins(8, 8, 8, 8)
-        right_l.setSpacing(6)
+        right_l.setSpacing(8)
         ttl = QLabel("Overview")
-        ttl.setStyleSheet(f"color:{UI_TEXT};font-weight:700;font-size:13px;padding:6px;background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};border-radius:6px;")
+        ttl.setStyleSheet(_card_title_style())
         right_l.addWidget(ttl)
+
+        # Overview Table matching reference workstation layout
         self._overview = QTableWidget(0, 2)
         self._overview.setHorizontalHeaderLabels(["Name", "Value"])
-        self._overview.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self._overview.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        # No horizontal scrolling: the Name column takes what it needs, Value
+        # takes the rest and its text (ST episodes) goes down, line by line.
+        self._overview.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self._overview.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._overview.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._overview.setWordWrap(True)
+        # refit one event later: the new column width is only in place after the resize is done
+        self._overview.horizontalHeader().sectionResized.connect(lambda *_: QTimer.singleShot(0, self._fit_st_rows))
         self._overview.verticalHeader().setVisible(False)
         self._overview.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._overview.setStyleSheet(_table_style())
+        self._overview.setSelectionMode(QAbstractItemView.NoSelection)
+        self._overview.setFocusPolicy(Qt.NoFocus)
+        self._overview.setShowGrid(False)
+        self._overview.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._overview.horizontalHeader().setFixedHeight(28)
+        self._overview.setStyleSheet(_overview_table_style())
+
         right_l.addWidget(self._overview, 1)
         body.addWidget(right)
-        body.setSizes([360, 760, 300])
+        body.setSizes([360, 760, 310])
         layout.addWidget(body, 1)
 
     def update_from_metrics(self, metrics_list: list, summary: dict):
@@ -355,17 +424,46 @@ class HolterExpertReviewPanel(QWidget):
             ("Pacing Min HR", "-"),
             ("Longest RR", f"{summary.get('longest_rr_ms', 0)/1000:.2f}s"),
             ("RRI (\u22652.0s)", f"{summary.get('pauses', 0)}"),
-            ("ST Elevation", "-"),
-            ("ST Depression", "-"),
+            ("T Inversion", format_st_summary(summary.get('t_episodes'), T_INVERSION, multiline=True)),
+            # ST: event list, Full Disclosure screen mm (average/max per lead)
+            ("ST Elevation", format_st_summary(summary.get('st_episodes'), ST_ELEVATION, multiline=True,
+                                               info=summary.get('st_info'))),
+            ("ST Depression", format_st_summary(summary.get('st_episodes'), ST_DEPRESSION, multiline=True,
+                                                info=summary.get('st_info'))),
+            # QRS axis: dominant / range / time outside Normal, and the deviation events
+            ("QRS Axis", format_axis_summary(summary.get('qrs_axis'), multiline=True)),
+            ("Axis Deviation", format_axis_events(summary.get('qrs_axis'), multiline=True)),
         ]
         self._overview.setRowCount(len(rows))
         for i, (k, v) in enumerate(rows):
+            self._overview.setRowHeight(i, max(24, 18 * (str(v).count("\n") + 1) + 8))
             ki = QTableWidgetItem(k)
             vi = QTableWidgetItem(v)
+            vi.setToolTip(v)
+            bg_col = QColor(UI_PANEL) if i % 2 == 0 else QColor(UI_PANEL_ALT)
+            ki.setBackground(bg_col)
+            vi.setBackground(bg_col)
             ki.setForeground(QColor(UI_MUTED))
             vi.setForeground(QColor(UI_TEXT))
             self._overview.setItem(i, 0, ki)
             self._overview.setItem(i, 1, vi)
+            if k in _MULTILINE_ROWS and "\n" in str(v):
+                # limb leads on one line, chest leads below; wrapped to the column
+                self._overview.resizeRowToContents(i)
+                self._overview.setRowHeight(i, max(self._overview.rowHeight(i), 24))
+
+    def _fit_st_rows(self, *_args):
+        """Size the ST Elevation / ST Depression rows to their wrapped text.
+        Called after the rows are filled and whenever a column is resized
+        (the Value column's width is only final once the table is laid out)."""
+        table = self._overview
+        for r in range(table.rowCount()):
+            name_item, value_item = table.item(r, 0), table.item(r, 1)
+            if name_item is None or value_item is None:
+                continue
+            if name_item.text() in _MULTILINE_ROWS and "\n" in value_item.text():
+                table.resizeRowToContents(r)
+                table.setRowHeight(r, max(table.rowHeight(r), 24))
 
     def set_replay_frame(self, data, beat_annotations=None, start_sec=0.0):
         if data is None or not isinstance(data, np.ndarray) or data.ndim != 2 or data.shape[1] == 0:

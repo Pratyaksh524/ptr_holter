@@ -6,14 +6,16 @@ def label_beat_sequences(beats: List[Dict[str, Any]]) -> None:
     """
     Analyzes a sequence of beats and tags ectopic beats with their rhythm context.
     
-    Detects:
+    Detects (PVC for V beats, PAC for S beats):
       1. Single PVC/PAC (N-N-N-V-N-N-N)
-      2. Couplets (N-N-V-V-N-N)
-      3. Bigeminy (N-V-N-V-N-V)
-      4. Trigeminy (N-N-V-N-N-V)
-      5. Quadrigeminy (N-N-N-V-N-N-N-V)
-      6. Runs (3+ consecutive: VT/SVT)
-      7. Atrial Fibrillation (irregular RR + no P)
+      2. Couplets (2 consecutive: N-N-V-V-N-N)
+      3. Triplets (3 consecutive)
+      4. Quadruplets (4 consecutive)
+      5. Runs (5+ consecutive: PVC Run / PAC Run)
+      6. Bigeminy (N-V-N-V-N-V)
+      7. Trigeminy (N-N-V-N-N-V)
+      8. Quadrigeminy (N-N-N-V-N-N-N-V)
+      9. Atrial Fibrillation (irregular RR + no P)
     """
     if not beats:
         return
@@ -47,15 +49,21 @@ def label_beat_sequences(beats: List[Dict[str, Any]]) -> None:
                 pattern = _classify_single_ectopic(codes, i, n, c)
             elif run_len == 2:
                 pattern = "PVC Couplet" if c == 'V' else "PAC Couplet"
-            elif run_len >= 3:
-                # VT/SVT Run
-                pattern = "VT Run" if c == 'V' else "SVT Run"
-                # Mark as critical if VT run
-                if c == 'V':
-                    for k in range(i, j):
-                        beats[k]['critical'] = True
+            elif run_len == 3:
+                pattern = "PVC Triplet" if c == 'V' else "PAC Triplet"
+            elif run_len == 4:
+                pattern = "PVC Quadruplet" if c == 'V' else "PAC Quadruplet"
             else:
-                pattern = "Ectopic"
+                # 5+ consecutive.  Was "VT Run" / "SVT Run" for 3+: the
+                # rule only counts consecutive V / S beat labels (no rate,
+                # no waveform), i.e. a PVC / PAC run.  The auto segment
+                # detector's "Ventricular Tachycardia" is a separate rhythm
+                # check on the waveform.
+                pattern = "PVC Run" if c == 'V' else "PAC Run"
+            # 3+ consecutive PVCs stay critical (red badge), as before
+            if c == 'V' and run_len >= 3:
+                for k in range(i, j):
+                    beats[k]['critical'] = True
                 
             # Apply pattern to all beats in run
             for k in range(i, j):
@@ -517,8 +525,10 @@ def _reclassify_beats_advanced(beats: List[Dict[str, Any]]) -> None:
       Narrow + premature + non-compensatory          -> S  (sinus-node reset)
       else                                           -> keep original label
 
-    Only auto-detected beats are reclassified; manual beats are left unchanged
-    (but their RR still updates the EMA when they are labelled N).
+    Only auto-detected beats are reclassified; manual beats and beats with
+    'fixed_label' (labelled from the signal by ectopic_beats_detector) are
+    left unchanged (but their RR still updates the EMA when they are
+    labelled N), and Stage 6 skips the 'fixed_label' ones too.
     """
     if len(beats) < 3:
         return
@@ -571,8 +581,10 @@ def _reclassify_beats_advanced(beats: List[Dict[str, Any]]) -> None:
         rr_i  = float(beat.get('rr_ms',  0.0) or 0.0)
         qrs_w = float(beat.get('qrs_ms', 0.0) or 0.0)
 
-        # For manual beats: skip reclassification but still update EMA
-        if beat.get('is_manual', False):
+        # For manual beats -- and beats already classified from the signal
+        # (ectopic_beats_detector, 'fixed_label') -- skip reclassification
+        # but still update EMA
+        if beat.get('is_manual', False) or beat.get('fixed_label', False):
             lbl  = str(beat.get('label', 'N')).upper()
             code = lbl.split('(')[1].split(')')[0] if ('(' in lbl and ')' in lbl) else lbl
             if code == 'N' and 300 < rr_i < 2000:
@@ -710,7 +722,7 @@ def _reclassify_beats_advanced(beats: List[Dict[str, Any]]) -> None:
     for i in range(1, n):
         beat = beats[i]
         code = beat.get('short_code', 'N')
-        if code == 'Q' or beat.get('is_artifact', False):
+        if code == 'Q' or beat.get('is_artifact', False) or beat.get('fixed_label', False):
             continue
             
         rr_i = float(beat.get('rr_ms', 0.0) or 0.0)
@@ -761,8 +773,8 @@ def get_template_beats_for_badges(beats: List[Dict[str, Any]], arrhythmias: List
     atrial fibrillation, and significant clinical events.
     
     Badge Display Logic:
-      - ALL V beats (PVCs) - Single PVCs, Couplets, Bigeminy, Trigeminy, Quadrigeminy, VT Runs
-      - ALL S beats (PACs/SVEs) - Single PACs, Couplets, Bigeminy, Trigeminy, Quadrigeminy, SVT Runs
+      - ALL V beats (PVCs) - Single PVCs, Couplets, Triplets, Quadruplets, PVC Runs, Bigeminy, Trigeminy, Quadrigeminy
+      - ALL S beats (PACs/SVEs) - Single PACs, Couplets, Triplets, Quadruplets, PAC Runs, Bigeminy, Trigeminy, Quadrigeminy
       - ALL AF beats - Atrial Fibrillation episodes
       - ALL P beats - Paced beats
       - Major rhythm events from arrhythmias (VFib, VTach, AFib, AFlutter)
@@ -904,8 +916,9 @@ def _get_badge_appearance(code: str, pattern: str, beat: Dict[str, Any]) -> tupl
     Returns: (color_hex, priority_level)
       priority: 0=normal, 1=minor, 2=moderate, 3=critical
     """
-    # CRITICAL: VT runs (3+ PVCs)
-    if ('VT Run' in pattern and code == 'V') or beat.get('critical', False):
+    # CRITICAL: 3+ consecutive PVCs (PVC Triplet / Quadruplet / Run; the
+    # 'critical' flag from label_beat_sequences)
+    if ('PVC Run' in pattern and code == 'V') or beat.get('critical', False):
         return '#FF0000', 3  # Bright red, highest priority
     
     # HIGH: PVC patterns
@@ -917,10 +930,10 @@ def _get_badge_appearance(code: str, pattern: str, beat: Dict[str, Any]) -> tupl
         else:  # Single PVC
             return '#FF6666', 1  # Light red, moderate priority
     
-    # MODERATE: SVT patterns
+    # MODERATE: PAC patterns
     if code == 'S':
-        if 'Run' in pattern:
-            return '#00CCFF', 2  # Bright cyan
+        if 'Run' in pattern or 'Triplet' in pattern or 'Quadruplet' in pattern:
+            return '#00CCFF', 2  # Bright cyan (3+ consecutive PACs, as before)
         elif 'Bigeminy' in pattern or 'Trigeminy' in pattern:
             return '#00FFFF', 2  # Cyan
         elif 'Couplet' in pattern:

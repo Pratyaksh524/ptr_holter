@@ -41,6 +41,7 @@ from ..holter_helpers import (
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
     _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _card_style,
 )
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas
@@ -51,7 +52,7 @@ class HolterHistogramPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(f"background:{COL_BG};")
+        self.setStyleSheet(f"background:{UI_BG};")
         self._metrics = []
         self._rank_mode = "rri"
         self._selected_point = None
@@ -75,17 +76,19 @@ class HolterHistogramPanel(QWidget):
 
         title_row = QHBoxLayout()
         self._title_label = QLabel("Histogram - RR Interval Distribution")
-        self._title_label.setStyleSheet(f"color:{COL_GREEN};font-size:14px;font-weight:bold;border:none;")
+        self._title_label.setStyleSheet(f"QLabel{{color:{UI_TEXT};font-size:14px;font-weight:bold;background:transparent;border:none;border-left:3px solid {UI_ACCENT};padding:2px 10px;}}")
         title_row.addWidget(self._title_label, 1)
         self._type_combo = QComboBox()
         self._type_combo.addItems(["RR Interval", "Heart Rate", "RRI Ratio"])
         self._type_combo.setStyleSheet(f"""
             QComboBox {{
-                background:{COL_DARK}; color:{COL_GREEN};
-                border:1px solid {COL_GREEN_DRK}; padding:4px; border-radius:4px;
+                background:{UI_PANEL_ALT}; color:{UI_TEXT};
+                border:1px solid {UI_BORDER}; padding:4px 8px; border-radius:6px;
             }}
+            QComboBox:hover {{ border:1px solid {UI_ACCENT}; }}
             QComboBox QAbstractItemView {{
-                background:{COL_DARK}; color:white; selection-background-color:{COL_GREEN_DRK};
+                background:{UI_PANEL}; color:{UI_TEXT}; border:1px solid {UI_BORDER};
+                selection-background-color:#1E3A5F; selection-color:{UI_TEXT}; outline:0;
             }}
         """)
         self._type_combo.currentTextChanged.connect(self._on_type_changed)
@@ -110,13 +113,14 @@ class HolterHistogramPanel(QWidget):
         layout.addWidget(self._hist_canvas, 1)
         self._selected_info = QLabel("Selected: none")
         self._selected_info.setStyleSheet(
-            f"color:{COL_WHITE};font-size:11px;font-weight:bold;border:none;padding:2px 0;"
+            f"color:{UI_MUTED};font-size:11px;font-weight:bold;border:none;background:transparent;padding:2px 2px;"
         )
         layout.addWidget(self._selected_info)
 
 
         stats_frame = QFrame()
-        stats_frame.setStyleSheet(f"QFrame{{background:{COL_BLACK};border:1px solid {COL_GREEN_DRK};border-radius:4px;}}")
+        stats_frame.setObjectName("hgStatsCard")
+        stats_frame.setStyleSheet(_card_style("QFrame#hgStatsCard"))
         stats_layout = QGridLayout(stats_frame)
         stats_layout.setContentsMargins(10, 6, 10, 6)
         self._hist_stats = {}
@@ -127,9 +131,9 @@ class HolterHistogramPanel(QWidget):
             col = i % 4
             row = i // 4
             l = QLabel(f"{lbl}:")
-            l.setStyleSheet(f"color:{COL_GREEN};font-size:11px;font-weight:bold;border:none;")
+            l.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:bold;border:none;background:transparent;")
             v = QLabel("?")
-            v.setStyleSheet(f"color:{COL_WHITE};font-size:13px;font-weight:bold;border:none;")
+            v.setStyleSheet(f"color:{UI_TEXT};font-size:13px;font-weight:bold;border:none;background:transparent;")
             stats_layout.addWidget(l, row*2, col)
             stats_layout.addWidget(v, row*2+1, col)
             self._hist_stats[key] = v

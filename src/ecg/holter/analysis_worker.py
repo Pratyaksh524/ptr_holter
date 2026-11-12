@@ -196,8 +196,12 @@ class HolterAnalysisWorker(threading.Thread):
 
         sqi_score = 1.0
         try:
-            if self._signal_quality is not None:
-                sqi_score = float(self._signal_quality.compute_sqi(best_signal))
+            # SQI of the raw lead: best_signal is already band-passed, and
+            # band-passing removes the very noise the SQI looks for.
+            if best_lead_name in lead_scores:
+                sqi_score = float(lead_scores[best_lead_name])
+            elif self._signal_quality is not None:
+                sqi_score = float(self._signal_quality.compute_sqi(lead_map.get(best_lead_name, lead_ii)))
             elif self._calc_sqi is not None:
                 sqi_score = float(self._calc_sqi(best_signal, np.array([], dtype=int), sampling_rate=float(fs)))
         except Exception:
@@ -528,7 +532,7 @@ class HolterAnalysisWorker(threading.Thread):
         providing clear visual indication of the VFib arrhythmia across all leads.
         """
         if len(r_peaks) == 0:
-            return {}, [], []
+            return {}, [], [], []
 
         # Check if VFib is detected - if so, suppress other arrhythmia classifications
         vfib_detected = False
@@ -656,12 +660,16 @@ class HolterAnalysisWorker(threading.Thread):
 
     @staticmethod
     def _label_beat(rr_prev_ms: float, rr_median_ms: float, qrs_width_ms: float) -> str:
-        if rr_prev_ms > 2000:
-            return 'Pause'
+        # Keep per-beat rate labels aligned with the beat-exact rate rules in
+        # auto_segment_arrthymia_detection.py.  Rate-based beats must be
+        # classified before the premature/QRS-width checks below; otherwise
+        # a slow or fast beat can be incorrectly marked as PVC/PAC.
         hr_prev = 60000.0 / max(rr_prev_ms, 1.0)
-        if hr_prev < 50:
+        if rr_prev_ms >= 4000.0:
+            return 'Pause'
+        if 15.0 <= hr_prev <= (60000.0 / 1050.0):
             return 'Brady'
-        if hr_prev > 130:
+        if hr_prev >= 100.0:
             return 'Tachy'
         # Classify as V (Ventricular) if wide QRS and premature
         if qrs_width_ms >= 120 and rr_prev_ms <= rr_median_ms * 0.95:

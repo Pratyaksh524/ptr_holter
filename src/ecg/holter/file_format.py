@@ -235,15 +235,15 @@ class ECGHFileReader:
         self._seek_to_second(start_sec)
         raw = self._f.read(n_frames * FRAME_SIZE)
         actual = len(raw) // FRAME_SIZE
-        out = np.zeros((self.n_leads, actual), dtype=np.float32)
+        if actual <= 0:
+            return np.zeros((self.n_leads, 0), dtype=np.float32)
 
-        for fi in range(actual):
-            offset = fi * FRAME_SIZE
-            for li in range(self.n_leads):
-                val = struct.unpack_from('>h', raw, offset + li * 2)[0]
-                out[li, fi] = float(val)
-
-        return out
+        # Each frame is 13 big-endian int16 values (12 lead samples + the
+        # frame index); decode the whole block at once instead of one
+        # struct.unpack_from call per sample.
+        frames = np.frombuffer(raw, dtype='>i2', count=actual * (FRAME_SIZE // 2))
+        frames = frames.reshape(actual, FRAME_SIZE // 2)
+        return np.ascontiguousarray(frames[:, :self.n_leads].T, dtype=np.float32)
 
     def iter_chunks(self, chunk_sec: float = 30.0):
         """Generator: yields (start_sec, data_array) for each chunk."""

@@ -26,14 +26,14 @@ def runtime_dir() -> Path:
     """
     Writable per-user directory for app runtime data.
 
-    Uses ECG_RUNTIME_DIR if set, otherwise LOCALAPPDATA\\Deckmount\\CardioX.
+    Uses ECG_RUNTIME_DIR if set, otherwise LOCALAPPDATA\\Deckmount\\Comprehensive.
     """
     base_dir = os.getenv("ECG_RUNTIME_DIR", "").strip()
     if base_dir:
         p = Path(base_dir).expanduser()
     else:
         local_appdata = os.getenv("LOCALAPPDATA") or str(Path.home())
-        p = Path(local_appdata) / "Deckmount" / "CardioX"
+        p = Path(local_appdata) / "Deckmount" / "Comprehensive"
     p.mkdir(parents=True, exist_ok=True)
     return p
 

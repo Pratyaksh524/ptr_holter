@@ -40,7 +40,7 @@ from ..holter_helpers import (
     UI_SUCCESS, UI_TEXT, UI_WARNING, _class_matches_filter, _find_latest_completed_session,
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
-    _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _style_active_btn, _style_btn, _style_filter_btn, _table_style, _template_filter_key,
 )
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas, HolterRRTrendCanvas, HRTrendCanvas
@@ -53,7 +53,7 @@ class HolterLorenzPanel(QWidget):
         super().__init__(parent)
         self.duration_sec = duration_sec
         self.replay_engine = replay_engine
-        self.setStyleSheet(f"background:{COL_BG};")
+        self.setStyleSheet(f"background:{UI_BG};")
         self._metrics_list = []
         self._all_beat_data = []  # Store (time, rr, beat_class, metric_ref) for beat selection
         self._current_replay_data = None  # Store current 12-lead frame for beat selection display
@@ -84,12 +84,18 @@ class HolterLorenzPanel(QWidget):
         self.lorenz_canvas.beats_selected.connect(self._on_beats_selected)
         self.lorenz_canvas.beats_reclassified.connect(self._on_beats_reclassified)
         self.lorenz_canvas.beats_deleted.connect(self._on_beats_deleted)
-        self.lorenz_canvas.setFixedHeight(350)
-        l_layout.addWidget(self.lorenz_canvas)
+        # Square-ish plot at the top of the column: up to as tall as the
+        # column is wide (see _fit_to_height), shrinking on short screens so
+        # the filter buttons below never overlap it.
+        self.lorenz_canvas.setMinimumSize(200, 160)
+        self.lorenz_canvas.setMaximumHeight(350)
+        self.lorenz_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        l_layout.addWidget(self.lorenz_canvas, 1)
 
         # Filter buttons matching the Template tab
         btn_row = QHBoxLayout()
         btn_row.setSpacing(4)
+        btn_row.setContentsMargins(0, 4, 0, 4)
         self._filter_btns = {}
         self._current_filter = "all"
         for key, lbl in [
@@ -106,11 +112,15 @@ class HolterLorenzPanel(QWidget):
             btn.setCheckable(True)
             btn.setChecked(key == "all")
             btn.setToolTip(f"Filter by {lbl}")
-            btn.setStyleSheet(_style_active_btn() if key == "all" else _style_btn())
+            btn.setFixedHeight(28)
+            btn.setStyleSheet(_style_filter_btn(active=(key == "all")))
             btn.clicked.connect(lambda checked=False, k=key: self._set_lorenz_filter(k))
             self._filter_btns[key] = btn
             btn_row.addWidget(btn)
         l_layout.addLayout(btn_row)
+        l_layout.addStretch(0)
+        self._lorenz_container = lorenz_container
+        lorenz_container.installEventFilter(self)  # splitter drags resize it alone
 
         # Internal state for view/display toggle helpers (used by right-click context menu)
         self._pixel_cycle = [2, 3, 5]
@@ -119,48 +129,83 @@ class HolterLorenzPanel(QWidget):
         mid_splitter.addWidget(lorenz_container)
         
         # Right side of mid splitter: 12-Lead ECG Grid (3 columns x 4 rows)
-        leads_container = QWidget()
-        leads_container.setStyleSheet(f"background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:6px;")
+        leads_container = QFrame()
+        leads_container.setObjectName("lzLeadsCard")
+        leads_container.setStyleSheet(f"QFrame#lzLeadsCard{{background:{UI_PANEL};border:1px solid {UI_BORDER};"
+                                      f"border-radius:8px;}}")
         leads_layout = QVBoxLayout(leads_container)
-        leads_layout.setContentsMargins(4, 4, 4, 4)
-        leads_layout.setSpacing(2)
-        
+        leads_layout.setContentsMargins(10, 8, 10, 10)
+        leads_layout.setSpacing(8)
+
+        # Header: title on an accent bar, and how the grid gets filled.
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        head_title = QLabel("12-LEAD ECG")
+        head_title.setStyleSheet(f"color:{UI_TEXT};font-size:12px;font-weight:800;letter-spacing:1px;"
+                                 f"background:transparent;border:none;border-left:3px solid {COL_GREEN};"
+                                 f"padding:2px 8px;")
+        head_hint = QLabel("Select points on the Lorenz plot to show those beats on all 12 leads")
+        head_hint.setStyleSheet(f"color:{UI_MUTED};font-size:11px;background:transparent;border:none;")
+        head_hint.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        # May shrink (cut at the left edge) instead of widening the grid.
+        head_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        head_hint.setMinimumWidth(0)
+        head.addWidget(head_title)
+        head.addWidget(head_hint, 1)
+        leads_layout.addLayout(head)
+
         # Create 12-lead grid: 4 rows x 3 columns
         grid_layout = QGridLayout()
-        grid_layout.setSpacing(10)
-        grid_layout.setContentsMargins(6, 6, 6, 6)
-        
+        grid_layout.setHorizontalSpacing(8)
+        grid_layout.setVerticalSpacing(8)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+
         self._lead_names = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
         self._lead_strips = {}  # Dictionary to store ECG strip canvases by lead name
-        
+
         for idx, lead_name in enumerate(self._lead_names):
             row = idx // 3  # 0-3 (4 rows)
             col = idx % 3   # 0-2 (3 columns)
-            
-            # Create a frame for each lead
+
+            # One cell per lead: the strip fills the whole cell (its trace
+            # height scales with the canvas height), lead name as a tag on it.
             lead_frame = QFrame()
-            lead_frame.setStyleSheet(f"background:{COL_BLACK};border:1px solid {COL_GREEN_DRK};border-radius:4px;")
+            lead_frame.setObjectName("lzLeadFrame")
+            lead_frame.setStyleSheet(f"QFrame#lzLeadFrame{{background:{COL_BLACK};border:1px solid {UI_BORDER};"
+                                     f"border-radius:6px;}}")
             lead_frame_layout = QVBoxLayout(lead_frame)
-            lead_frame_layout.setContentsMargins(2, 2, 2, 2)
-            lead_frame_layout.setSpacing(1)
-            
-            # Lead label
-            lead_label = QLabel(lead_name)
-            lead_label.setStyleSheet(f"color:{COL_GREEN};font-weight:bold;font-size:10px;border:none;")
-            lead_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            lead_frame_layout.addWidget(lead_label)
-            
+            lead_frame_layout.setContentsMargins(3, 3, 3, 3)
+            lead_frame_layout.setSpacing(0)
+
             # ECG strip canvas for this lead - with show_annotations=False to hide N labels and numbers
             strip = ECGStripCanvas(height=60, color=COL_GREEN, pen_width=0.8, lead_name=lead_name, show_vertical_lines=False, show_annotations=False)
             strip.set_gain(1.0)
+            strip.setMinimumHeight(44)
+            strip.setMaximumHeight(16777215)
+            strip.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             self._lead_strips[lead_name] = strip
             lead_frame_layout.addWidget(strip)
-            
+
+            # Lead label, drawn over the strip's top-left corner
+            lead_label = QLabel(lead_name, strip)
+            lead_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            lead_label.setStyleSheet(f"color:{COL_GREEN};font-weight:800;font-size:11px;"
+                                     f"background:rgba(11,18,32,200);border:1px solid {COL_GREEN_DRK};"
+                                     f"border-radius:4px;padding:1px 7px;")
+            lead_label.adjustSize()
+            lead_label.move(6, 5)
+            lead_label.raise_()
+
             grid_layout.addWidget(lead_frame, row, col)
-        
-        leads_layout.addLayout(grid_layout)
+
+        for r in range(4):
+            grid_layout.setRowStretch(r, 1)
+        for c in range(3):
+            grid_layout.setColumnStretch(c, 1)
+        leads_layout.addLayout(grid_layout, 1)
         mid_splitter.addWidget(leads_container)
 
+        lorenz_container.setMinimumWidth(300)
         lorenz_container.setMaximumWidth(450)
         mid_splitter.setSizes([400, 1200])
         mid_splitter.setStretchFactor(0, 0)
@@ -172,6 +217,34 @@ class HolterLorenzPanel(QWidget):
         self.ecg_canvas = ECGStripCanvas()
         self.ecg_canvas.setFixedHeight(90)
         layout.addWidget(self.ecg_canvas)
+
+    # Full heights of the top RR trend and the bottom strip on a tall
+    # screen, and how far they may shrink on a short one.
+    _RR_TREND_H = (70, 120)
+    _BOTTOM_STRIP_H = (56, 90)
+
+    def _fit_to_height(self):
+        """Share the height so nothing overlaps on short screens: the top
+        RR trend and the bottom strip give up height first (down to their
+        minimum), and the Lorenz plot is kept about square."""
+        h = self.height()
+        spare = max(0.0, min(1.0, (h - 560) / 240.0))   # 0 at <= 560 px, 1 at >= 800 px
+        lo, hi = self._RR_TREND_H
+        self.rr_trend_canvas.setFixedHeight(int(round(lo + (hi - lo) * spare)))
+        lo, hi = self._BOTTOM_STRIP_H
+        self.ecg_canvas.setFixedHeight(int(round(lo + (hi - lo) * spare)))
+        cont = getattr(self, '_lorenz_container', None)
+        if cont is not None:
+            self.lorenz_canvas.setMaximumHeight(max(160, min(450, cont.width() - 20)))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_to_height()
+
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, '_lorenz_container', None) and event.type() == QEvent.Resize:
+            self._fit_to_height()
+        return super().eventFilter(obj, event)
 
     def update_from_metrics(self, metrics_list, duration_sec=None):
         self._metrics_list = list(metrics_list or [])
@@ -233,7 +306,7 @@ class HolterLorenzPanel(QWidget):
         for k, btn in self._filter_btns.items():
             is_active = (k == key)
             btn.setChecked(is_active)
-            btn.setStyleSheet(_style_active_btn() if is_active else _style_btn())
+            btn.setStyleSheet(_style_filter_btn(active=is_active))
         self._apply_lorenz_filter()
 
     def _apply_lorenz_filter(self):

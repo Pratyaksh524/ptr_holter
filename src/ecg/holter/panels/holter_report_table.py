@@ -41,6 +41,7 @@ from ..holter_helpers import (
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
     _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _card_style, _card_title_style,
 )
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas
@@ -49,7 +50,7 @@ from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, Magni
 class HolterReportTablePanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(f"background:{COL_BG};")
+        self.setStyleSheet(f"background:{UI_BG};")
         self._build_ui()
 
     def _find_template_host(self):
@@ -63,12 +64,19 @@ class HolterReportTablePanel(QWidget):
             return window
         return None
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(0)
+        card = QFrame()
+        card.setObjectName("rtCard")
+        card.setStyleSheet(_card_style("QFrame#rtCard"))
+        outer.addWidget(card)
+        layout = QVBoxLayout(card)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setSpacing(8)
 
         title = QLabel("Hour-by-Hour Report Table")
-        title.setStyleSheet(f"color:{COL_GREEN};font-size:14px;font-weight:bold;border:none;")
+        title.setStyleSheet(_card_title_style())
         layout.addWidget(title)
 
         cols = ["Hour", "Beats", "HR Min", "HR Avg", "HR Max",
@@ -76,7 +84,10 @@ class HolterReportTablePanel(QWidget):
                 "SVE Iso.", "SVE Coup.", "SVE Total", "Pauses"]
         self._table = QTableWidget(0, len(cols))
         self._table.setHorizontalHeaderLabels(cols)
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._table.setAlternatingRowColors(True)
+        self._table.setShowGrid(False)
         self._table.setStyleSheet(_table_style())
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -114,8 +125,8 @@ class HolterReportTablePanel(QWidget):
             is_total = (i == len(rows) - 1)
             for j, val in enumerate(row):
                 item = QTableWidgetItem(val)
-                item.setForeground(QColor(COL_GREEN if j == 0 or is_total else COL_WHITE))
+                item.setForeground(QColor(UI_SUCCESS if j == 0 or is_total else UI_TEXT))
                 if is_total:
-                    item.setBackground(QColor(COL_GREEN_DRK))
+                    item.setBackground(QColor("#1E3A5F"))
                 self._table.setItem(i, j, item)
 

@@ -260,7 +260,10 @@ class AddEventDialog(QDialog):
         self.chest_from_combo.addItems(self.LEADS)
         self.chest_from_combo.setCurrentText("I")
         
-        swap_btn = QPushButton(" ")
+        swap_btn = QPushButton("⇄")   # swap arrows
+        swap_btn.setObjectName("swapBtn")
+        swap_btn.setToolTip("Swap leads")
+        swap_btn.setCursor(Qt.PointingHandCursor)
         swap_btn.setFixedSize(30, 26)
         
         self.chest_to_combo = QComboBox()
@@ -310,175 +313,154 @@ class AddEventDialog(QDialog):
         swap_btn.clicked.connect(self._on_swap_leads)
     
     def _apply_styles(self):
-        """Apply consistent styling to the dialog."""
+        """Apply consistent styling to the dialog (same navy palette as the main window)."""
+        bg, panel, panel_alt, border = "#0B1220", "#0F1A2E", "#13213A", "#243552"
+        text, muted, accent, accent_hover = "#E6EDF7", "#9AAECB", "#2F80ED", "#4B96FA"
+        field = "#0B1322"
         self.setStyleSheet(f"""
             QDialog {{
-                background: #0B1220;
-                color: #E5E7EB;
+                background: {bg};
+                color: {text};
             }}
             QLabel {{
-                color: #E5E7EB;
+                color: {text};
                 font-size: 12px;
+                background: transparent;
             }}
             QLineEdit, QComboBox, QDateTimeEdit, QSpinBox {{
-                background: #0C1320;
-                color: #FFFFFF;
-                border: 1px solid #1a6b3f;
-                border-radius: 4px;
+                background: {field};
+                color: {text};
+                border: 1px solid {border};
+                border-radius: 6px;
                 padding: 6px 8px;
                 font-size: 13px;
                 font-weight: 700;
+                selection-background-color: #1E3A5F;
             }}
-            QLineEdit:focus, QComboBox:focus, QDateTimeEdit:focus, QSpinBox:focus {{
-                border-color: #28E37B;
-                background: #0F1825;
-                color: #FFFFFF;
+            QLineEdit:hover, QComboBox:hover, QDateTimeEdit:hover, QSpinBox:hover {{
+                border-color: #3A5378;
             }}
-            QLineEdit::placeholder {{
-                color: #6B7280;
-            }}
-            QComboBox {{
-                background: #0C1320;
-                color: #FFFFFF;
-                border: 1px solid #1a6b3f;
-                border-radius: 4px;
-                padding: 6px 8px;
-                font-size: 13px;
-                font-weight: 700;
-                selection-background-color: #1a6b3f;
-            }}
-            QComboBox:focus {{
-                border-color: #28E37B;
-                background: #0F1825;
-            }}
-            QComboBox::drop-down {{
-                border: none;
-                width: 20px;
-                subcontrol-origin: padding;
-                subcontrol-position: top right;
-            }}
-            QComboBox::down-arrow {{
-                image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 5px solid #28E37B;
-                margin-right: 6px;
+            QLineEdit:focus, QComboBox:focus, QDateTimeEdit:focus, QSpinBox:focus, QComboBox:on {{
+                border-color: {accent};
+                background: {panel};
             }}
             QComboBox QAbstractItemView {{
-                background: #0C1320;
-                color: #FFFFFF;
-                selection-background-color: #1a6b3f;
+                background: {panel};
+                color: {text};
+                selection-background-color: {accent};
                 selection-color: #FFFFFF;
-                border: 1px solid #1a6b3f;
+                border: 1px solid {border};
                 outline: 0;
                 padding: 4px;
             }}
             QComboBox QAbstractItemView::item {{
                 padding: 6px 8px;
                 min-height: 20px;
-                border-radius: 3px;
-                color: #FFFFFF;
-                background: #0C1320;
+                color: {text};
                 font-weight: 700;
             }}
-            QComboBox QAbstractItemView::item:hover {{
-                background: #152235;
-                color: #FFFFFF;
-            }}
-            QComboBox QAbstractItemView::item:selected {{
-                background: #1a6b3f;
-                color: #FFFFFF;
-            }}
             QPushButton {{
-                background: #0C1320;
-                color: #28E37B;
-                border: 1px solid #1a6b3f;
-                border-radius: 4px;
+                background: {panel_alt};
+                color: {text};
+                border: 1px solid {border};
+                border-radius: 6px;
                 padding: 8px 16px;
                 font-size: 12px;
-                font-weight: 600;
+                font-weight: 700;
                 min-height: 26px;
             }}
             QPushButton:hover {{
-                background: #1a6b3f;
-                color: #FFFFFF;
-                border-color: #28E37B;
+                background: #1A2C49;
+                border-color: {accent};
             }}
             QPushButton:pressed {{
-                background: #28E37B;
-                color: #0C1320;
+                background: {panel};
+                border-color: {accent_hover};
+            }}
+            QPushButton#primaryBtn {{
+                background: {accent};
+                border-color: #5EA4FF;
+                color: #FFFFFF;
+            }}
+            QPushButton#primaryBtn:hover {{
+                background: {accent_hover};
+            }}
+            QPushButton#swapBtn {{
+                padding: 0px;
+                min-height: 0px;
+                font-size: 14px;
             }}
             QGroupBox {{
-                color: #E5E7EB;
-                border: 1px solid #1e3a52;
-                border-radius: 6px;
+                color: {text};
+                border: 1px solid {border};
+                border-radius: 8px;
                 margin-top: 16px;
                 padding-top: 20px;
-                font-weight: 600;
+                font-weight: 700;
                 font-size: 12px;
-                background: transparent;
+                background: {panel};
             }}
             QGroupBox::title {{
                 subcontrol-origin: margin;
                 subcontrol-position: top left;
-                padding: 0 8px;
-                color: #28E37B;
+                left: 8px;
+                padding: 0 6px;
+                color: {text};
                 font-weight: 700;
             }}
             QRadioButton, QCheckBox {{
-                color: #E5E7EB;
+                color: {text};
                 spacing: 8px;
                 font-size: 12px;
                 background: transparent;
             }}
-            QRadioButton::indicator {{
-                width: 16px;
-                height: 16px;
-                border: 2px solid #1e3a52;
-                border-radius: 9px;
-                background: #0C1320;
+            QRadioButton:disabled, QCheckBox:disabled {{
+                color: {muted};
             }}
-            QRadioButton::indicator:hover {{
-                border-color: #28E37B;
+            QRadioButton::indicator {{
+                width: 14px;
+                height: 14px;
+                border: 2px solid #3A5378;
+                border-radius: 9px;
+                background: {field};
+            }}
+            QRadioButton::indicator:hover, QCheckBox::indicator:hover {{
+                border-color: {accent};
             }}
             QRadioButton::indicator:checked {{
-                background: #28E37B;
-                border-color: #28E37B;
+                background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
+                    stop:0 {accent_hover}, stop:0.45 {accent_hover}, stop:0.55 {field}, stop:1 {field});
+                border-color: {accent};
             }}
             QCheckBox::indicator {{
-                width: 16px;
-                height: 16px;
-                border: 2px solid #1e3a52;
-                border-radius: 3px;
-                background: #0C1320;
-            }}
-            QCheckBox::indicator:hover {{
-                border-color: #28E37B;
+                width: 14px;
+                height: 14px;
+                border: 2px solid #3A5378;
+                border-radius: 4px;
+                background: {field};
             }}
             QCheckBox::indicator:checked {{
-                background: #28E37B;
-                border-color: #28E37B;
-            }}
-            QCheckBox::indicator:checked::after {{
-                content: " ";
-                color: #0C1320;
-                font-weight: bold;
+                background: {accent};
+                border-color: {accent};
             }}
             QToolButton {{
-                background: #0C1320;
-                color: #E5E7EB;
-                border: 1px solid #1e3a52;
-                border-radius: 3px;
+                background: {panel_alt};
+                color: {text};
+                border: 1px solid {border};
+                border-radius: 4px;
                 padding: 4px 8px;
             }}
             QToolButton:hover {{
-                background: #152235;
-                border-color: #28E37B;
-            }}
-            QToolButton:pressed {{
-                background: #1a6b3f;
+                background: #1A2C49;
+                border-color: {accent};
             }}
         """)
+        # Add Event is the main action of this dialog
+        self.btn_add.setObjectName("primaryBtn")
+        self.btn_add.setDefault(True)
+        for btn in (self.btn_add, self.btn_cancel, self.btn_instant, self.btn_export,
+                    self.btn_default, self.btn_prev, self.btn_next):
+            btn.setCursor(Qt.PointingHandCursor)
     
     def _on_channel_mode_changed(self):
         """Update channel selections based on mode."""

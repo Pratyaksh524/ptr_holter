@@ -41,6 +41,7 @@ from ..holter_helpers import (
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
     _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _card_style, _card_title_style,
 )
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas
@@ -51,7 +52,7 @@ class HolterEventsPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(f"background:{COL_BG};")
+        self.setStyleSheet(f"background:{UI_BG};")
         self._events = []
         self._session_dir = ""
         self._selected_payload = {}
@@ -74,28 +75,37 @@ class HolterEventsPanel(QWidget):
 
         # Left: event list + stats
         left = QWidget()
+        left.setObjectName("evLeftCard")
+        left.setAttribute(Qt.WA_StyledBackground, True)
+        left.setStyleSheet(_card_style("QWidget#evLeftCard"))
         left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setContentsMargins(10, 10, 10, 10)
+        left_layout.setSpacing(8)
 
         ev_title = QLabel("Events")
-        ev_title.setStyleSheet(f"color:#07111F;font-size:13px;font-weight:bold;background:qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #28E37B, stop:1 #89F7C5);padding:6px 10px;border-radius:6px;")
+        ev_title.setStyleSheet(_card_title_style())
         left_layout.addWidget(ev_title)
 
         cols = ["Event name", "Start Time", "Chan.", "Print Len.", "Source", "Conf."]
         self._ev_table = QTableWidget(0, len(cols))
         self._ev_table.setHorizontalHeaderLabels(cols)
         self._ev_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._ev_table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._ev_table.setAlternatingRowColors(True)
+        self._ev_table.setShowGrid(False)
+        self._ev_table.setCursor(Qt.PointingHandCursor)
         self._ev_table.setStyleSheet(
             _table_style() +
-            """
-            QTableWidget::item:selected {
-                background-color: rgba(66, 153, 225, 70);
-                color: #F3F7FB;
-                border: 1px solid rgba(255, 255, 255, 90);
-            }
-            QTableWidget::item:selected:active {
-                background-color: rgba(66, 153, 225, 110);
-            }
+            f"""
+            QTableWidget::item:selected {{
+                background-color: #1E3A5F;
+                color: {UI_TEXT};
+                border-top: 1px solid {UI_ACCENT};
+                border-bottom: 1px solid {UI_ACCENT};
+            }}
+            QTableWidget::item:selected:active {{
+                background-color: #1E4470;
+            }}
             """
         )
         self._ev_table.verticalHeader().setVisible(False)
@@ -107,10 +117,12 @@ class HolterEventsPanel(QWidget):
 
         # Stats below table
         stats_frame = QFrame()
-        stats_frame.setStyleSheet(f"QFrame{{background:{COL_DARK};border:1px solid {COL_GREEN_DRK};border-radius:6px;}}")
+        stats_frame.setObjectName("evStatsCard")
+        stats_frame.setStyleSheet(f"QFrame#evStatsCard{{background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};border-radius:6px;}}")
         sf_layout = QGridLayout(stats_frame)
-        sf_layout.setContentsMargins(8, 6, 8, 6)
-        sf_layout.setSpacing(6)
+        sf_layout.setContentsMargins(12, 8, 12, 8)
+        sf_layout.setHorizontalSpacing(16)
+        sf_layout.setVerticalSpacing(2)
         self._stat_labels = {}
         for i, (key, label) in enumerate([
             ("hr_max","HR Max"),("hr_min","HR Min"),("hr_smax","Sinus Max HR"),
@@ -118,9 +130,9 @@ class HolterEventsPanel(QWidget):
         ]):
             row, col = divmod(i, 2)
             l = QLabel(f"{label}:")
-            l.setStyleSheet(f"color:{COL_WHITE};font-size:10px;font-weight:bold;border:none;")
+            l.setStyleSheet(f"color:{UI_MUTED};font-size:10px;font-weight:bold;border:none;background:transparent;")
             v = QLabel("-")
-            v.setStyleSheet(f"color:{COL_GREEN};font-size:12px;font-weight:bold;border:none;")
+            v.setStyleSheet(f"color:{UI_TEXT};font-size:12px;font-weight:bold;border:none;background:transparent;padding-bottom:4px;")
             sf_layout.addWidget(l, row * 2, col)
             sf_layout.addWidget(v, row * 2 + 1, col)
             self._stat_labels[key] = v
@@ -129,9 +141,15 @@ class HolterEventsPanel(QWidget):
 
         # Right: navigation
         nav = QWidget()
+        nav.setObjectName("evNavCard")
+        nav.setAttribute(Qt.WA_StyledBackground, True)
+        nav.setStyleSheet(_card_style("QWidget#evNavCard"))
         nav_layout = QVBoxLayout(nav)
-        nav_layout.setContentsMargins(0, 0, 0, 0)
-        nav_layout.setSpacing(6)
+        nav_layout.setContentsMargins(10, 10, 10, 10)
+        nav_layout.setSpacing(8)
+        nav_ttl = QLabel("Navigate")
+        nav_ttl.setStyleSheet(_card_title_style())
+        nav_layout.addWidget(nav_ttl)
         for label in ["Prev Event", "Next Event", "Remove All", "Remove"]:
             btn = QPushButton(label)
             btn.setStyleSheet(_style_btn())

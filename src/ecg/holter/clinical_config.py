@@ -72,8 +72,8 @@ class ClinicalConfig:
     signal_flatline_std: float = 0.05
     signal_saturation_mv: float = 4.5
     signal_saturation_ratio: float = 0.01
-    signal_baseline_wander_ratio: float = 0.30
-    signal_hf_noise_ratio: float = 0.40
+    signal_baseline_wander_ratio: float = 2.0
+    signal_hf_noise_ratio: float = 0.05
     signal_regularity_cv: float = 0.8
 
     tachy_threshold_bpm: float = 100.0
@@ -84,9 +84,9 @@ class ClinicalConfig:
     bandpass_high_hz: float = 40.0
     notch_hz: float = 50.0
 
-    qrs_validator_min_width_ms: float = 40.0
+    qrs_validator_min_width_ms: float = 25.0
     qrs_validator_max_width_ms: float = 200.0
-    qrs_validator_min_amplitude: float = 0.08
+    qrs_validator_min_amplitude: float = 0.04
 
     template_similarity_threshold: float = 0.90
     qrs_detection_window_ms: float = 150.0
@@ -116,8 +116,8 @@ class ClinicalConfig:
         signal_flatline_std = _as_float(quality.get("flatline_std", signal.get("flatline_std")), 0.05)
         signal_saturation_mv = _as_float(quality.get("saturation_mv", signal.get("saturation_mv")), 4.5)
         signal_saturation_ratio = _as_float(quality.get("saturation_ratio", signal.get("saturation_ratio")), 0.01)
-        signal_baseline_wander_ratio = _as_float(quality.get("baseline_wander_ratio", signal.get("baseline_wander_ratio")), 0.30)
-        signal_hf_noise_ratio = _as_float(quality.get("hf_noise_ratio", signal.get("hf_noise_ratio")), 0.40)
+        signal_baseline_wander_ratio = _as_float(quality.get("baseline_wander_ratio", signal.get("baseline_wander_ratio")), 2.0)
+        signal_hf_noise_ratio = _as_float(quality.get("hf_noise_ratio", signal.get("hf_noise_ratio")), 0.05)
         signal_regularity_cv = _as_float(quality.get("regularity_cv", signal.get("regularity_cv")), 0.8)
 
         tachy_threshold_bpm = _as_float(arrhythmia.get("tachy_threshold_bpm", data.get("tachy_threshold_bpm")), 100.0)
@@ -128,9 +128,9 @@ class ClinicalConfig:
         bandpass_high_hz = _as_float(signal.get("bandpass_high_hz", data.get("bandpass_high_hz")), 40.0)
         notch_hz = _as_float(signal.get("notch_hz", data.get("notch_hz")), 50.0)
 
-        qrs_validator_min_width_ms = _as_float(qrs_validator.get("min_width_ms", data.get("qrs_validator_min_width_ms")), 40.0)
+        qrs_validator_min_width_ms = _as_float(qrs_validator.get("min_width_ms", data.get("qrs_validator_min_width_ms")), 25.0)
         qrs_validator_max_width_ms = _as_float(qrs_validator.get("max_width_ms", data.get("qrs_validator_max_width_ms")), 200.0)
-        qrs_validator_min_amplitude = _as_float(qrs_validator.get("min_amplitude", data.get("qrs_validator_min_amplitude")), 0.08)
+        qrs_validator_min_amplitude = _as_float(qrs_validator.get("min_amplitude", data.get("qrs_validator_min_amplitude")), 0.04)
 
         template_similarity_threshold = _as_float(
             data.get("template_similarity_threshold"),

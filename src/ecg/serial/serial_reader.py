@@ -1036,6 +1036,26 @@ class DeviceStartWorker(QThread):
                 except Exception:
                     pass
 
+            # Auto-scan with this app's own reader still holding a port (Stop
+            # stops the stream but keeps the port open): the scan probe can't
+            # open that port again -- Windows answers "Access is denied" (seen:
+            # COM4 denied on the second Connect & Start, device not found).
+            # Use that port first; reader.start() reopens it itself.
+            from ecg.serial.serial_reader import GlobalHardwareManager
+            reused_port = False
+            if scan_needed and SERIAL_AVAILABLE:
+                existing = GlobalHardwareManager().reader
+                existing_port = getattr(getattr(existing, "ser", None), "port", None)
+                try:
+                    present = [p.device for p in serial.tools.list_ports.comports()]
+                except Exception:
+                    present = []
+                if existing_port and existing_port in present:
+                    print(f" [Worker] Reusing this app's open port {existing_port}")
+                    port = existing_port
+                    scan_needed = False
+                    reused_port = True
+
             port_to_use = port
             if scan_needed:
                 print(" [Worker] Scanning ports for ECG device…")
@@ -1058,7 +1078,6 @@ class DeviceStartWorker(QThread):
             self._port_to_use = port_to_use
 
             # ── Get / create the shared reader ────────────────────────────
-            from ecg.serial.serial_reader import GlobalHardwareManager
             reader = GlobalHardwareManager().get_reader(port_to_use, baud_int)
             if reader is None:
                 self.connected.emit(False, port_to_use, "Failed to create serial reader")
@@ -1072,8 +1091,11 @@ class DeviceStartWorker(QThread):
                 # Only retry if a configured port failed for the stale/disconnected
                 # device cases we want to recover from. Keep every other scenario
                 # unchanged so we do not alter normal COM-port handling.
-                if scan_needed or not self._should_retry_with_scan(start_exc):
+                if scan_needed or not (reused_port or self._should_retry_with_scan(start_exc)):
                     raise
+                if reused_port:
+                    # Release our own handle first, or the scan is denied it.
+                    GlobalHardwareManager().close_reader()
                 print(" [Worker] Retrying with full auto-scan across all serial ports…")
 
                 scan_result = SerialStreamReader.scan_and_detect_port(

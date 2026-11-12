@@ -40,25 +40,266 @@ from ..holter_helpers import (
     UI_SUCCESS, UI_TEXT, UI_WARNING, _class_matches_filter, _find_latest_completed_session,
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
-    _show_message_box, _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _show_message_box, _style_active_btn, _style_btn, _style_filter_btn, _table_style, _template_filter_key,
 )
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas
+
+
+# ---------------------------------------------------------------------------
+# Template cards from the recorded beats + the auto segment detection.
+#
+# One card per beat label.  The live beat labels (metrics.jsonl all_beats /
+# template_summary, analysis_worker._label_beat) are N / S / V / Tachy /
+# Brady / Pause only: they come from rate and QRS width and never say AF.
+# The AF, AFL and Unidentified cards therefore come from the auto segment
+# detection (auto_segment_arrthymia_detection.detect_arrhythmias, the same
+# result the "Auto Arrhythmia Detection" button shows; it is used here
+# whether or not the button was pressed):
+#   * every recorded beat inside an Atrial Fibrillation / Atrial Flutter /
+#     Unidentified segment is taken out of its own label's card (where
+#     segments overlap, AF / AFL wins over Unidentified),
+#   * the AF / AFL / Unidentified card counts the R peaks of those segments,
+#     found on Lead II with Pan-Tompkins (the recorded beat list does not
+#     cover every beat, e.g. 61 of 752 beats on 2026-11-04_09-33-24).
+#     Unidentified is signal with no readable P / QRS / T, so its "beats"
+#     are whatever Pan-Tompkins picks there; the card is shown even with
+#     none, so the stretch can still be looked at.
+# The card's beat (first_timestamp: the 12-lead view and the seek on click)
+# is the label's first recorded beat outside those segments; for N it is first
+# looked for where no auto segment touches its view window (else a beat from
+# the first stretch with no segment), so the N card shows a sinus beat.
+# ---------------------------------------------------------------------------
+_SEGMENT_CARD_KINDS = {'Atrial Fibrillation': 'AF', 'Atrial Flutter': 'AFL',
+                       'Unidentified': 'Unidentified'}
+_SEGMENT_CARDS = ('AF', 'AFL', 'Unidentified')
+_TEMPLATE_VIEW_PRE_SEC = 0.60    # _update_detail_grid shows first_timestamp
+_TEMPLATE_VIEW_POST_SEC = 0.90   # -0.60 s .. +0.90 s
+_R_PEAK_PIECE_SEC = 60.0         # Lead II is read in pieces of this length
+_R_PEAK_PAD_SEC = 1.0            # overlap so peaks at a piece edge are found
+_NSR_SEARCH_MAX_SEC = 60.0       # signal searched per gap for a sinus beat
+
+
+def _segment_spans(segments):
+    """(card spans as (start, end, 'AF'|'AFL'|'Unidentified'), every span as
+    (start, end)) from detect_arrhythmias() segments; empty lists for None."""
+    af_spans, all_spans = [], []
+    for seg in segments or []:
+        try:
+            s, e = float(seg['start_sec']), float(seg['end_sec'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if e <= s:
+            continue
+        all_spans.append((s, e))
+        kind = _SEGMENT_CARD_KINDS.get(str(seg.get('label', '')))
+        if kind:
+            af_spans.append((s, e, kind))
+    af_spans.sort()
+    all_spans.sort()
+    return af_spans, all_spans
+
+
+def _span_kind(ts, af_spans):
+    """'AF' / 'AFL' / 'Unidentified' when ts is inside such a span (AF / AFL
+    first where they overlap), else None."""
+    found = None
+    for s, e, kind in af_spans:
+        if s <= ts < e:
+            if kind != 'Unidentified':
+                return kind
+            found = kind
+    return found
+
+
+def _view_clear_of_spans(ts, spans):
+    """True when the beat's whole 12-lead view window touches no span (a
+    beat just past a segment's end, e.g. 4 ms after an SVT, is not sinus)."""
+    a, b = ts - _TEMPLATE_VIEW_PRE_SEC, ts + _TEMPLATE_VIEW_POST_SEC
+    return not any(s < b and a < e for s, e in spans)
+
+
+def _lead_ii_r_peaks(reader, start, end):
+    """R peak times (s) between start and end on Lead II (Pan-Tompkins),
+    reading the signal in _R_PEAK_PIECE_SEC pieces."""
+    from ...pan_tompkins import pan_tompkins
+    fs = float(reader.fs)
+    names = list(getattr(reader, 'lead_names', []) or [])
+    lead = names.index('II') if 'II' in names else min(1, max(len(names) - 1, 0))
+    duration = float(getattr(reader, 'duration_sec', end) or end)
+    peaks = []
+    t = float(start)
+    while t < end:
+        t_end = min(t + _R_PEAK_PIECE_SEC, end)
+        a, b = max(0.0, t - _R_PEAK_PAD_SEC), min(duration, t_end + _R_PEAK_PAD_SEC)
+        data = reader.read_range(a, b)
+        if isinstance(data, np.ndarray) and data.ndim == 2 and data.shape[0] > lead and data.shape[1] > int(0.5 * fs):
+            for p in pan_tompkins(np.asarray(data[lead], dtype=float), fs=fs):
+                ts = a + float(p) / fs
+                if t <= ts < t_end:
+                    peaks.append(round(ts, 3))
+        t = t_end
+    return peaks
+
+
+def _viewable_beat(peaks, start, end):
+    """First peak whose whole 12-lead view window lies inside [start, end),
+    else the first peak, else None."""
+    for ts in peaks:
+        if ts - _TEMPLATE_VIEW_PRE_SEC >= start and ts + _TEMPLATE_VIEW_POST_SEC <= end:
+            return ts
+    return peaks[0] if peaks else None
+
+
+def _sinus_beat_from_signal(reader, all_spans):
+    """A beat from the first stretch with no auto segment at all (the
+    detector found nothing there), for an N card whose recorded N beats all
+    sit inside auto segments.  None when there is no such stretch."""
+    duration = float(getattr(reader, 'duration_sec', 0.0) or 0.0)
+    gaps, t = [], 0.0
+    for s, e in sorted(all_spans):
+        if s > t:
+            gaps.append((t, s))
+        t = max(t, e)
+    if duration > t:
+        gaps.append((t, duration))
+    min_len = _TEMPLATE_VIEW_PRE_SEC + _TEMPLATE_VIEW_POST_SEC + 1.0
+    for s, e in gaps:
+        if e - s < min_len:
+            continue
+        e = min(e, s + _NSR_SEARCH_MAX_SEC)
+        ts = _viewable_beat(_lead_ii_r_peaks(reader, s, e), s, e)
+        if ts is not None:
+            return ts
+    return None
+
+
+def _build_template_rows(metrics_list, segments=None, reader=None):
+    """Template card rows (one per beat label, plus AF / AFL / Unidentified) from the
+    metrics chunks and the auto segment detection; see the note above.
+    Without segments or a reader the cards are the recorded labels only."""
+    af_spans, all_spans = _segment_spans(segments)
+    if reader is None:
+        af_spans = []          # segment beats cannot be counted: leave them
+    items = {}
+    for metric in metrics_list or []:
+        beats = [b for b in (metric.get('all_beats') or []) if isinstance(b, dict)]
+        # Recorded beats inside AF / AFL / Unidentified leave their label's
+        # card (counts per label per chunk match template_summary exactly).
+        moved = {}
+        for b in beats:
+            if _span_kind(float(b.get('timestamp', 0.0) or 0.0), af_spans):
+                lbl = str(b.get('label', 'N') or 'N')
+                moved[lbl] = moved.get(lbl, 0) + 1
+        for row in (metric.get('template_summary') or []):
+            label = str(row.get('label', 'N') or 'N').strip() or 'N'
+            count = int(row.get('count', 0) or 0)
+            take = min(count, moved.get(label, 0))
+            moved[label] = moved.get(label, 0) - take
+            count -= take
+            if count <= 0:
+                continue
+            item = items.setdefault(label, {
+                'label': label, 'count': 0, 'rr': [], 'qrs': [],
+                'first_timestamp': None, '_sinus_ts': None,
+            })
+            item['count'] += count
+            item['rr'].append(float(row.get('avg_rr_ms', 0.0) or 0.0))
+            item['qrs'].append(float(row.get('avg_qrs_ms', 0.0) or 0.0))
+            # fallback until a beat of this label is seen below
+            if item['first_timestamp'] is None:
+                item['first_timestamp'] = float(row.get('first_timestamp', metric.get('t', 0.0)) or 0.0)
+        for b in beats:
+            label = str(b.get('label', 'N') or 'N').strip() or 'N'
+            item = items.get(label)
+            ts = float(b.get('timestamp', 0.0) or 0.0)
+            if item is None or _span_kind(ts, af_spans):
+                continue
+            if item.get('_seen') is None or ts < item['_seen']:
+                item['_seen'] = ts
+            if _view_clear_of_spans(ts, all_spans) and (item['_sinus_ts'] is None or ts < item['_sinus_ts']):
+                item['_sinus_ts'] = ts
+
+    for label, item in items.items():
+        if item.get('_seen') is not None:
+            item['first_timestamp'] = item['_seen']
+        if label == 'N' and all_spans:
+            sinus = item['_sinus_ts']
+            if sinus is None and reader is not None:
+                sinus = _sinus_beat_from_signal(reader, all_spans)
+            if sinus is not None:
+                item['first_timestamp'] = sinus
+
+    for kind in _SEGMENT_CARDS:
+        spans = [(s, e) for s, e, k in af_spans if k == kind]
+        peaks, rr, view_ts = [], [], None
+        for s, e in spans:
+            # an Unidentified peak inside an overlapping AF / AFL span is
+            # counted on that card only
+            p = [ts for ts in _lead_ii_r_peaks(reader, s, e) if _span_kind(ts, af_spans) == kind]
+            if view_ts is None:
+                view_ts = _viewable_beat(p, s, e)
+            rr.extend(float(v) * 1000.0 for v in np.diff(p))
+            peaks.extend(p)
+        if peaks or (spans and kind == 'Unidentified'):
+            if view_ts is None:      # Unidentified with no peak: its start
+                view_ts = spans[0][0] + _TEMPLATE_VIEW_PRE_SEC
+            items[kind] = {
+                'label': kind, 'count': len(peaks), 'rr': rr, 'qrs': [],
+                'first_timestamp': view_ts,
+            }
+
+    rows = sorted(items.values(), key=lambda it: it['count'], reverse=True)
+    out = []
+    for i, it in enumerate(rows, start=1):
+        out.append({
+            'template_key': it['label'],
+            'template_id': f'T{i}',
+            'label': it['label'],
+            'count': it['count'],
+            'rr': it['rr'],
+            'qrs': it['qrs'],
+            'first_timestamp': float(it['first_timestamp'] or 0.0),
+            'viewed': True,
+            'ambiguous': False,
+            'inserted': False,
+            'demix': False,
+            'auto_update': False,
+        })
+    return out
 
 # 8. HOLTER TEMPLATE PANEL (template gallery)
 class _TemplateMetricCard(QFrame):
     def __init__(self, title: str, value: str = "", accent: str = COL_GREEN, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(f"QFrame{{background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #1B2433, stop:1 #111827);border:1px solid {UI_BORDER};border-radius:10px;}}")
+        self.setObjectName("tpMetricCard")
+        self.setStyleSheet(f"QFrame#tpMetricCard{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-left:3px solid {UI_ACCENT};border-radius:8px;}}")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(2)
         lbl = QLabel(title)
-        lbl.setStyleSheet(f"color:{UI_MUTED};font-size:10px;font-weight:700;border:none;")
+        lbl.setStyleSheet(f"color:{UI_MUTED};font-size:10px;font-weight:700;border:none;background:transparent;")
         self.value = QLabel(value)
-        self.value.setStyleSheet(f"color:{UI_TEXT};font-size:16px;font-weight:800;border:none;")
+        self.value.setStyleSheet(f"color:{UI_TEXT};font-size:16px;font-weight:800;border:none;background:transparent;")
         layout.addWidget(lbl)
         layout.addWidget(self.value)
+
+class _LeadTagLabel(QLabel):
+    """Header text of one lead cell in the Template view. Callers
+    set plain "II  Tachy"; it is shown as the lead name in bold white and
+    the template class in the accent colour."""
+
+    def setText(self, text):
+        from html import escape
+        parts = str(text or "").split(None, 1)
+        lead = escape(parts[0]) if parts else ""
+        cls = escape(parts[1].strip()) if len(parts) > 1 else ""
+        html = f"<span style='color:{COL_WHITE};font-weight:800;'>{lead}</span>"
+        if cls:
+            html += (f"&nbsp;&nbsp;<span style='color:{UI_MUTED};'>•</span>&nbsp;&nbsp;"
+                     f"<span style='color:{UI_ACCENT_HOVER};font-weight:700;'>{cls}</span>")
+        super().setText(html)
+
 
 class TemplateCardWidget(QFrame):
     clicked = pyqtSignal(object, object)  # (card, event)
@@ -102,7 +343,7 @@ class TemplateCardWidget(QFrame):
                 border-radius: 14px;
             }}
             QLineEdit, QComboBox {{
-                background: #0C1320;
+                background: {ui_bg};
                 color: {ui_text};
                 border: 1px solid {border};
                 border-radius: 7px;
@@ -110,10 +351,10 @@ class TemplateCardWidget(QFrame):
                 font-size: 11px;
             }}
             QComboBox QAbstractItemView {{
-                background: #0B1220;
+                background: {ui_panel};
                 color: {ui_text};
-                selection-background-color: {ui_accent};
-                selection-color: #07111F;
+                selection-background-color: #1E3A5F;
+                selection-color: {ui_text};
                 border: 1px solid {border};
                 outline: 0;
             }}
@@ -123,6 +364,7 @@ class TemplateCardWidget(QFrame):
             }}
             QComboBox::drop-down {{ border: none; width: 16px; }}
             QLineEdit:focus, QComboBox:focus {{ border-color: {ui_accent}; }}
+            QLabel {{ background: transparent; }}
         """
 
         layout = QVBoxLayout(self)
@@ -135,12 +377,13 @@ class TemplateCardWidget(QFrame):
         self.id_edit.setFixedWidth(70)
         self.id_edit.setPlaceholderText("T ID")
         self.class_combo = QComboBox()
-        # Updated options: N, S, V, P, AF, X, Other, Unconfirmed
-        self.class_combo.addItems(["N", "S", "V", "P", "AF", "X", "Other", "Unconfirmed"])
-        self.class_combo.setFixedWidth(95)  # Increased width for "Unconfirmed"
+        # Options: N, S, V, P, AF, X, Other, Unidentified (was Unconfirmed;
+        # Unidentified = the auto detector's no-readable-signal stretches)
+        self.class_combo.addItems(["N", "S", "V", "P", "AF", "X", "Other", "Unidentified"])
+        self.class_combo.setFixedWidth(95)  # wide enough for "Unidentified"
         self.count_pill = QLabel("0 beats")
         self.count_pill.setAlignment(Qt.AlignCenter)
-        self.count_pill.setStyleSheet(f"color:{UI_TEXT};font-size:11px;font-weight:800;background:#152235;border:1px solid {self._accent};border-radius:10px;padding:4px 8px;")
+        self.count_pill.setStyleSheet(f"color:{UI_TEXT};font-size:11px;font-weight:800;background:{UI_PANEL_ALT};border:1px solid {self._accent};border-radius:10px;padding:4px 8px;")
         header.addWidget(self.id_edit)
         header.addWidget(self.class_combo)
         header.addStretch()
@@ -164,7 +407,7 @@ class TemplateCardWidget(QFrame):
             badge.setToolTip(tooltip)
             badge.setAlignment(Qt.AlignCenter)
             badge.setVisible(False)
-            badge.setStyleSheet(f"color:{UI_TEXT};font-size:10px;font-weight:800;background:#17243A;border:1px solid {UI_BORDER};border-radius:8px;padding:2px 6px;")
+            badge.setStyleSheet(f"color:{UI_TEXT};font-size:10px;font-weight:800;background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};border-radius:8px;padding:2px 6px;")
             self.badge_labels[key] = badge
             badge_row.addWidget(badge)
         self.setToolTip("It means that all the beat forms under the template are similar in the template")
@@ -178,24 +421,24 @@ class TemplateCardWidget(QFrame):
         bottom = QHBoxLayout()
         bottom.setSpacing(6)
         self.template_no = QLabel("#T1")
-        self.template_no.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:700;border:none;")
+        self.template_no.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:700;border:none;background:transparent;")
         self.view_toggle = QToolButton()
         self.view_toggle.setCheckable(True)
         self.view_toggle.setChecked(True)
         self.view_toggle.setText("\u25c9")
-        self.view_toggle.setToolTip("Viewed / unconfirmed")
+        self.view_toggle.setToolTip("Viewed / not viewed")
         self.view_toggle.setFixedSize(26, 26)
         self.view_toggle.setStyleSheet(f"""
             QToolButton {{
                 border: 1px solid {UI_BORDER};
                 border-radius: 13px;
                 color: {UI_TEXT};
-                background: #0C1320;
+                background: {UI_BG};
                 font-weight: 900;
             }}
             QToolButton:hover {{
                 border-color: {UI_ACCENT_HOVER};
-                background: #11203A;
+                background: {UI_PANEL_ALT};
             }}
             QToolButton:checked {{
                 background: {UI_SUCCESS};
@@ -278,14 +521,14 @@ class TemplateCardWidget(QFrame):
     def _apply_styles(self):
         if self._selected:
             border = UI_ACCENT_HOVER
-            bg_top = "#18263C"
-            bg_bottom = "#101B2B"
+            bg_top = "#1A2C49"
+            bg_bottom = UI_PANEL_ALT
         else:
-            border = "#6EB4FF" if self._hovered else self._accent
-            bg_top = "#141F31" if self._hovered else "#121C2D"
-            bg_bottom = "#101827" if self._hovered else "#0D1521"
-        self.setStyleSheet(self._card_style.format(border=border, bg_top=bg_top, bg_bottom=bg_bottom, ui_text=UI_TEXT, ui_accent=UI_ACCENT))
-        self.count_pill.setStyleSheet(f"color:{UI_TEXT};font-size:11px;font-weight:800;background:#152235;border:1px solid {border};border-radius:10px;padding:4px 8px;")
+            border = UI_ACCENT_HOVER if self._hovered else self._accent
+            bg_top = UI_PANEL_ALT if self._hovered else UI_PANEL
+            bg_bottom = UI_PANEL if self._hovered else UI_CARD
+        self.setStyleSheet(self._card_style.format(border=border, bg_top=bg_top, bg_bottom=bg_bottom, ui_text=UI_TEXT, ui_accent=UI_ACCENT, ui_bg=UI_BG, ui_panel=UI_PANEL))
+        self.count_pill.setStyleSheet(f"color:{UI_TEXT};font-size:11px;font-weight:800;background:{UI_PANEL_ALT};border:1px solid {border};border-radius:10px;padding:4px 8px;")
         self.thumb.setStyleSheet(f"background:{COL_BLACK};border:1px solid {border};border-radius:10px;")
 
     def set_accent(self, accent: str):
@@ -340,7 +583,7 @@ class TemplateCardWidget(QFrame):
             elif key == "demix":
                 badge.setStyleSheet(f"color:{UI_TEXT};font-size:10px;font-weight:900;background:#122C46;border:1px solid #2D9CDB;border-radius:8px;padding:2px 6px;")
             elif key == "auto_update":
-                badge.setStyleSheet(f"color:{UI_TEXT};font-size:10px;font-weight:900;background:#1F2030;border:1px solid {UI_MUTED};border-radius:8px;padding:2px 6px;")
+                badge.setStyleSheet(f"color:{UI_TEXT};font-size:10px;font-weight:900;background:{UI_PANEL_ALT};border:1px solid {UI_MUTED};border-radius:8px;padding:2px 6px;")
         self.badge_container.setVisible(any_badge)
 
         self.view_toggle.blockSignals(True)
@@ -362,7 +605,7 @@ class HolterBeatTemplatePanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(f"background:{COL_BG};")
+        self.setStyleSheet(f"background:{UI_BG};")
         self._template_rows = []
         self._current_filter = "all"
         self._selected_template_key = ""
@@ -370,6 +613,9 @@ class HolterBeatTemplatePanel(QWidget):
         self._card_widgets = []
         self._waveform_cache = {}
         self._replay_engine = None
+        self._last_metrics = []
+        self._last_summary = {}
+        self._segments_pending_path = None
         self._build_ui()
 
     def _find_template_host(self):
@@ -388,7 +634,7 @@ class HolterBeatTemplatePanel(QWidget):
         layout.setSpacing(8)
 
         title = QLabel("Template System")
-        title.setStyleSheet(f"color:#07111F;font-size:13px;font-weight:bold;background:qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #28E37B, stop:1 #89F7C5);padding:7px 12px;border-radius:8px;")
+        title.setStyleSheet(f"QLabel{{color:{UI_TEXT};font-size:13px;font-weight:bold;background:transparent;border:none;border-left:3px solid {UI_ACCENT};padding:4px 10px;}}")
         layout.addWidget(title)
 
         stats = QGridLayout()
@@ -397,19 +643,20 @@ class HolterBeatTemplatePanel(QWidget):
         self._stat_cards = {
             "total": _TemplateMetricCard("Total beats", "0", COL_TEXT),
             "templates": _TemplateMetricCard("Templates", "0", COL_TEXT),
-            "unconfirmed": _TemplateMetricCard("Unconfirmed", "0", UI_WARNING),
+            # beats on the Unidentified card(s) (was "Unconfirmed": cards not viewed)
+            "unidentified": _TemplateMetricCard("Unidentified", "0", UI_WARNING),
             "beat_distribution": _TemplateMetricCard("Beat distribution", "N: 0", UI_TEXT),
         }
         stats.addWidget(self._stat_cards["total"], 0, 0)
         stats.addWidget(self._stat_cards["templates"], 0, 1)
-        stats.addWidget(self._stat_cards["unconfirmed"], 0, 2)
+        stats.addWidget(self._stat_cards["unidentified"], 0, 2)
         stats.addWidget(self._stat_cards["beat_distribution"], 0, 3)
         layout.addLayout(stats)
 
         filter_row = QHBoxLayout()
         filter_row.setSpacing(8)
         filter_lbl = QLabel("Filter")
-        filter_lbl.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:700;border:none;")
+        filter_lbl.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:700;border:none;background:transparent;")
         filter_row.addWidget(filter_lbl)
         self._filter_buttons = {}
         for key, text in [
@@ -421,7 +668,9 @@ class HolterBeatTemplatePanel(QWidget):
             ("AF", "AF"),
             ("X", "X"),
             ("Other", "Other"),
-            ("unconfirmed", "Unconfirmed"),
+            # was "Unconfirmed" (cards marked not viewed); now the cards of
+            # the auto detector's Unidentified segments (see _build_template_rows)
+            ("unidentified", "Unidentified"),
         ]:
             btn = QPushButton(text)
             btn.setCheckable(True)
@@ -435,9 +684,10 @@ class HolterBeatTemplatePanel(QWidget):
                 "AF": "Show atrial fibrillation/flutter templates",
                 "X": "Show artifact templates",
                 "Other": "Show uncategorized templates",
-                "unconfirmed": "Show templates not yet confirmed",
+                "unidentified": "Show the Unidentified template (signal with no readable P / QRS / T)",
             }.get(key, text))
-            btn.setStyleSheet(_style_btn() if key != "all" else _style_active_btn())
+            btn.setFixedHeight(28)
+            btn.setStyleSheet(_style_filter_btn(active=(key == "all")))
             btn.clicked.connect(lambda checked=False, k=key: self._set_filter(k))
             self._filter_buttons[key] = btn
             filter_row.addWidget(btn)
@@ -449,9 +699,9 @@ class HolterBeatTemplatePanel(QWidget):
         self._scroll.setFrameShape(QFrame.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._scroll.setStyleSheet(f"QScrollArea{{background:{COL_BG};border:none;}}")
+        self._scroll.setStyleSheet(f"QScrollArea{{background:{UI_BG};border:none;}}")
         self._cards_host = QWidget()
-        self._cards_host.setStyleSheet(f"background:{COL_BG};")
+        self._cards_host.setStyleSheet(f"background:{UI_BG};")
         self._cards_layout = QGridLayout(self._cards_host)
         self._cards_layout.setContentsMargins(0, 0, 0, 0)
         self._cards_layout.setSpacing(7)
@@ -461,28 +711,57 @@ class HolterBeatTemplatePanel(QWidget):
         self._splitter = QSplitter(Qt.Horizontal)
         self._splitter.addWidget(self._scroll)
 
-        self._detail_grid_host = QWidget()
-        self._detail_grid_host.setStyleSheet(f"background:{COL_BLACK};border-left:1px solid {COL_GREEN_DRK};")
-        self._detail_layout = QGridLayout(self._detail_grid_host)
-        self._detail_layout.setContentsMargins(4, 4, 4, 4)
-        self._detail_layout.setSpacing(4)
+        # 12-lead view of the selected template, in the same card style as
+        # the metric cards / template cards above it.
+        self._detail_grid_host = QFrame()
+        self._detail_grid_host.setObjectName("tpDetailCard")
+        self._detail_grid_host.setStyleSheet(
+            f"QFrame#tpDetailCard{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-radius:10px;}}")
+        detail_outer = QVBoxLayout(self._detail_grid_host)
+        detail_outer.setContentsMargins(10, 8, 10, 10)
+        detail_outer.setSpacing(8)
+
+        detail_head = QHBoxLayout()
+        detail_head.setSpacing(10)
+        detail_title = QLabel("Template View")
+        detail_title.setStyleSheet(f"QLabel{{color:{UI_TEXT};font-size:13px;font-weight:bold;background:transparent;"
+                                   f"border:none;border-left:3px solid {UI_ACCENT};padding:4px 10px;}}")
+        detail_hint = QLabel("Click a template card to see its beat on all 12 leads")
+        detail_hint.setStyleSheet(f"color:{UI_MUTED};font-size:11px;background:transparent;border:none;")
+        detail_hint.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        detail_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)  # never widens the panel
+        detail_head.addWidget(detail_title)
+        detail_head.addWidget(detail_hint, 1)
+        detail_outer.addLayout(detail_head)
+
+        self._detail_layout = QGridLayout()
+        self._detail_layout.setContentsMargins(0, 0, 0, 0)
+        self._detail_layout.setHorizontalSpacing(8)
+        self._detail_layout.setVerticalSpacing(8)
+        detail_outer.addLayout(self._detail_layout, 1)
         self._detail_canvases = []
         lead_names_12 = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
         for i in range(12):
             lead_name = lead_names_12[i]
             frame = QFrame()
-            frame.setStyleSheet(f"QFrame{{background:{COL_BLACK};border:1px solid {COL_GREEN_DRK};}}")
+            frame.setObjectName("tpLeadFrame")
+            frame.setStyleSheet(f"QFrame#tpLeadFrame{{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                                f"stop:0 {UI_PANEL_ALT}, stop:1 {UI_CARD});border:1px solid {UI_BORDER};"
+                                f"border-radius:10px;}}")
             flayout = QVBoxLayout(frame)
-            flayout.setContentsMargins(2, 2, 2, 2)
-            flayout.setSpacing(0)
+            flayout.setContentsMargins(6, 4, 6, 6)
+            flayout.setSpacing(4)
 
             info = QWidget()
-            info.setFixedHeight(16)
+            info.setFixedHeight(20)
+            info.setStyleSheet("background:transparent;border:none;")
             info_layout = QHBoxLayout(info)
             info_layout.setContentsMargins(2, 0, 2, 0)
             info_layout.setSpacing(4)
-            lbl_type = QLabel(lead_name)
-            lbl_type.setStyleSheet(f"color:{COL_WHITE};font-weight:bold;font-size:10px;border:none;background:transparent;")
+            lbl_type = _LeadTagLabel()
+            lbl_type.setTextFormat(Qt.RichText)
+            lbl_type.setStyleSheet("font-size:11px;border:none;background:transparent;")
+            lbl_type.setText(lead_name)
             info_layout.addWidget(lbl_type)
             info_layout.addStretch()
             flayout.addWidget(info)
@@ -490,57 +769,78 @@ class HolterBeatTemplatePanel(QWidget):
             canvas = ECGStripCanvas(height=60, color=COL_GREEN, pen_width=1.0, lead_name=lead_name, show_vertical_lines=False, show_annotations=True, show_rr_numbers=False, disable_all_coloring=False)
             canvas.set_paper_speed(25)
             canvas.set_gain(1.5)
+            # Fill the cell: the trace height scales with the canvas height.
+            canvas.setMinimumHeight(44)
+            canvas.setMaximumHeight(16777215)
+            canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             flayout.addWidget(canvas, 1)
 
             self._detail_layout.addWidget(frame, i // 3, i % 3)
             self._detail_canvases.append({"frame": frame, "canvas": canvas, "type": lbl_type, "lead_name": lead_name})
+        for r in range(4):
+            self._detail_layout.setRowStretch(r, 1)
+        for c in range(3):
+            self._detail_layout.setColumnStretch(c, 1)
 
+        # Cards column wide enough for one whole card (320 px) + scrollbar.
+        self._scroll.setMinimumWidth(340)
         self._splitter.addWidget(self._detail_grid_host)
-        self._splitter.setSizes([220, 780])
+        self._splitter.setSizes([360, 1000])
+        self._splitter.setStretchFactor(0, 0)
+        self._splitter.setStretchFactor(1, 1)
+        self._splitter.setChildrenCollapsible(False)
         layout.addWidget(self._splitter, 1)
 
     def update_from_metrics(self, metrics_list: list, summary: dict):
-        class_totals = dict(summary.get('beat_class_totals', {}) or {})
-        if not class_totals:
-            for metric in metrics_list or []:
-                for cls, count in (metric.get('beat_class_counts', {}) or {}).items():
-                    class_totals[cls] = class_totals.get(cls, 0) + int(count or 0)
-        total_beats = int(summary.get("total_beats", 0) or sum(class_totals.values()) or 0)
-        template_map = {}
-        for metric in metrics_list or []:
-            for row in (metric.get('template_summary', []) or []):
-                tkey = str(row.get('template_key') or row.get('template_id') or row.get('label') or 'T')
-                item = template_map.setdefault(tkey, {
-                    'template_key': tkey,
-                    'template_id': row.get('template_id', 'T'),
-                    'label': row.get('label', 'N'),
-                    'count': 0,
-                    'rr': [],
-                    'qrs': [],
-                    'first_timestamp': float(row.get('first_timestamp', metric.get('t', 0.0)) or 0.0),
-                    'viewed': bool(row.get('viewed', True)),
-                    'ambiguous': bool(row.get('ambiguous', False)),
-                    'inserted': bool(row.get('inserted', False)),
-                    'demix': bool(row.get('demix', False)),
-                    'auto_update': bool(row.get('auto_update', False)),
-                })
-                item['count'] += int(row.get('count', 0) or 0)
-                item['rr'].append(float(row.get('avg_rr_ms', 0.0) or 0.0))
-                item['qrs'].append(float(row.get('avg_qrs_ms', 0.0) or 0.0))
-                item['first_timestamp'] = min(item['first_timestamp'], float(row.get('first_timestamp', item['first_timestamp']) or item['first_timestamp']))
-        self._template_rows = sorted(template_map.values(), key=lambda x: x['count'], reverse=True)
-
-        unconfirmed = sum(1 for row in self._template_rows if not row.get("viewed", True))
-        self._stat_cards["total"].value.setText(f"{total_beats:,}")
-        self._stat_cards["templates"].value.setText(str(len(self._template_rows)))
-        self._stat_cards["unconfirmed"].value.setText(str(unconfirmed))
-        dist_parts = []
-        for key in ("N", "V", "S", "F", "Q"):
-            if int(class_totals.get(key, 0) or 0) > 0:
-                dist_parts.append(f"{key}: {int(class_totals.get(key, 0)):,}")
-        self._stat_cards["beat_distribution"].value.setText("  ".join(dist_parts) if dist_parts else "No beat classes")
+        """Build the cards: one per beat label plus AF / AFL / Unidentified (see
+        _build_template_rows).  The chunks' own template ids (C01, C02 ...)
+        restart in every chunk, so they are not used to join chunks: joined
+        by id, chunk 1's N, V and Tachy clusters all became one card.
+        The auto segments come from the detection cache; when the detection
+        has not run yet it is started in the background and the cards are
+        rebuilt when it is done (independent of the Auto Arrhythmia
+        Detection button)."""
+        self._last_metrics = metrics_list
+        self._last_summary = summary
+        engine = self._get_replay_engine()
+        reader = getattr(engine, "_reader", None) if engine is not None else None
+        segments = self._auto_segments(reader)
+        try:
+            self._template_rows = _build_template_rows(metrics_list, segments, reader)
+        except Exception as e:
+            print(f"[Template] AF / AFL / Unidentified cards unavailable: {e}")
+            self._template_rows = _build_template_rows(metrics_list, None, None)
+        self._waveform_cache.clear()      # a card's beat may have moved
         self._refresh_stats()
         self._render_cards()
+
+    def _auto_segments(self, reader):
+        """detect_arrhythmias() segments for the recording, or None while the
+        detection is still running (it then rebuilds the cards when done)."""
+        path = getattr(reader, "path", None) if reader is not None else None
+        if not path:
+            return None
+        try:
+            from ..auto_segment_arrthymia_detection import detect_arrhythmias_async, get_cached_detection
+        except Exception as e:
+            print(f"[Template] Auto segment detection unavailable: {e}")
+            return None
+        cached = get_cached_detection(path)
+        if cached is not None:
+            return cached
+        if getattr(self, "_segments_pending_path", None) != path:
+            self._segments_pending_path = path
+
+            def _on_ready(_segments, p=path):
+                if self._segments_pending_path != p:
+                    return
+                self._segments_pending_path = None
+                eng = self._get_replay_engine()
+                if getattr(getattr(eng, "_reader", None), "path", None) == p:
+                    self.update_from_metrics(self._last_metrics, self._last_summary)
+
+            detect_arrhythmias_async(path, _on_ready)
+        return None
 
     def set_replay_engine(self, engine):
         self._replay_engine = engine
@@ -558,8 +858,10 @@ class HolterBeatTemplatePanel(QWidget):
             
             if self._current_filter == "all":
                 filtered.append(row)
-            elif self._current_filter == "unconfirmed" and not row.get("viewed", True):
+            elif self._current_filter == "unidentified" and label == "Unidentified":
                 filtered.append(row)
+            elif label == "Unidentified":
+                continue        # only under All and Unidentified, not Other
             elif self._current_filter == "AF" and code in {"AF", "F", "Q"}:
                 filtered.append(row)
             elif self._current_filter == "Other" and code == "Other":
@@ -570,16 +872,17 @@ class HolterBeatTemplatePanel(QWidget):
 
     def _refresh_stats(self):
         total_beats = sum(int(row.get("count", 0) or 0) for row in self._template_rows)
-        unconfirmed = sum(1 for row in self._template_rows if not row.get("viewed", True))
+        unidentified = sum(int(row.get("count", 0) or 0) for row in self._template_rows
+                           if str(row.get("label", "")).strip() == "Unidentified")
         label_totals = {}
         for row in self._template_rows:
             label = str(row.get("label", "N") or "N").strip() or "N"
             label_totals[label] = label_totals.get(label, 0) + int(row.get("count", 0) or 0)
         self._stat_cards["total"].value.setText(f"{int(total_beats):,}")
         self._stat_cards["templates"].value.setText(str(len(self._template_rows)))
-        self._stat_cards["unconfirmed"].value.setText(str(unconfirmed))
+        self._stat_cards["unidentified"].value.setText(f"{int(unidentified):,}")
 
-        preferred = ["N", "S", "V", "P", "AF", "X", "Unconfirmed"]
+        preferred = ["N", "S", "V", "P", "AF", "X", "Unidentified"]
         dist_parts = []
         for key in preferred:
             value = int(label_totals.pop(key, 0) or 0)
@@ -618,9 +921,19 @@ class HolterBeatTemplatePanel(QWidget):
             self._selected_template_key = self._selected_template_keys[0]
         else:
             self._selected_template_key = ""
-            
-        if self._selected_template_key:
+
+        # The 12-lead view follows a card that is on screen.  With no card
+        # (a filter with no templates, e.g. AF before any AF beat) it is
+        # cleared instead of keeping the previous filter's template.
+        if visible:
             self._update_detail_grid(self._selected_template_key)
+        elif not self._card_widgets:
+            self._clear_detail_grid()
+
+    def _clear_detail_grid(self):
+        for item in getattr(self, "_detail_canvases", []):
+            item["canvas"].set_data([], [])
+            item["type"].setText(item["lead_name"])
 
     def _row_for_key(self, template_key: str):
         template_key = str(template_key or "")
@@ -688,8 +1001,9 @@ class HolterBeatTemplatePanel(QWidget):
         try:
             self._current_filter = key
             for k, btn in self._filter_buttons.items():
-                btn.setChecked(k == key)
-                btn.setStyleSheet(_style_active_btn() if k == key else _style_btn())
+                is_active = (k == key)
+                btn.setChecked(is_active)
+                btn.setStyleSheet(_style_filter_btn(active=is_active))
             self._refresh_stats()
             self._render_cards()
         except Exception as e:
@@ -721,11 +1035,7 @@ class HolterBeatTemplatePanel(QWidget):
             if row is None:
                 return
             row["label"] = str(text or "N").strip() or "N"
-            
-            if text == "Unconfirmed":
-                row["viewed"] = False
-            else:
-                row["viewed"] = True  # Mark as viewed for other classifications
+            row["viewed"] = True  # choosing a class marks the card viewed
             
             self._refresh_stats()
             # Defer card rendering to avoid destroying card during signal
@@ -769,22 +1079,22 @@ class HolterBeatTemplatePanel(QWidget):
         box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
         box.setDefaultButton(QMessageBox.No)
         box.setStyleSheet(f"""
-            QMessageBox {{ background: {COL_BLACK}; }}
-            QMessageBox QLabel {{ color: {COL_WHITE}; font-size: 12px; }}
+            QMessageBox {{ background: {UI_PANEL}; }}
+            QMessageBox QLabel {{ color: {UI_TEXT}; font-size: 12px; background: transparent; }}
             QMessageBox QPushButton {{
-                background: #1B2740;
-                color: {COL_WHITE};
+                background: {UI_PANEL_ALT};
+                color: {UI_TEXT};
                 border: 1px solid {UI_BORDER};
                 border-radius: 6px;
                 padding: 6px 14px;
                 min-width: 64px;
             }}
             QMessageBox QPushButton:hover {{
-                background: #243552;
+                background: #1A2C49;
                 border-color: {UI_ACCENT};
             }}
             QMessageBox QPushButton:pressed {{
-                background: #132033;
+                background: {UI_PANEL_ALT};
             }}
         """)
         return box.exec_() == QMessageBox.Yes
@@ -937,9 +1247,9 @@ class HolterBeatTemplatePanel(QWidget):
             self._set_selected_keys([card_key])
         target_keys = list(self._selected_template_keys) or [card_key]
         menu = QMenu(self)
-        menu.setStyleSheet(f"QMenu {{ background: #0B1220; color: {UI_TEXT}; border: 1px solid {UI_BORDER}; padding: 6px; }} QMenu::item {{ padding: 6px 20px 6px 18px; border-radius: 4px; }} QMenu::item:selected {{ background: {UI_ACCENT}; color: #07111F; }} QMenu::separator {{ height: 1px; background: {UI_BORDER}; margin: 6px 4px; }}")
+        menu.setStyleSheet(f"QMenu {{ background: {UI_PANEL}; color: {UI_TEXT}; border: 1px solid {UI_BORDER}; padding: 6px; }} QMenu::item {{ padding: 6px 20px 6px 18px; border-radius: 4px; }} QMenu::item:selected {{ background: #1E3A5F; color: {UI_TEXT}; }} QMenu::separator {{ height: 1px; background: {UI_BORDER}; margin: 6px 4px; }}")
         prop_menu = menu.addMenu("Template properties")
-        # Updated options: N, S, V, P, AF, X, Other, Unconfirmed
+        # Options: N, S, V, P, AF, X, Other, Unidentified (was Unconfirmed)
         for title, code in [
             ("Normal (N)", "N"),
             ("Atrial Premature (S)", "S"),
@@ -948,7 +1258,7 @@ class HolterBeatTemplatePanel(QWidget):
             ("Atrial Fibrillation (AF)", "AF"),
             ("Artifact (X)", "X"),
             ("Other", "Other"),
-            ("Unconfirmed", "Unconfirmed")
+            ("Unidentified", "Unidentified")
         ]:
             action = prop_menu.addAction(title)
             action.triggered.connect(lambda checked=False, c=code: self._apply_template_label(target_keys, c))

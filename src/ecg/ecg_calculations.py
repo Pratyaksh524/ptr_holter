@@ -506,17 +506,21 @@ def detect_qrs_end_adaptive(data, r_peak, windows):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 5 — detectPWavesImproved
-# Aggressive adaptive P-wave detection, especially for tachycardia
+# Robust P-wave detection with amplitude validation and onset detection
 # ══════════════════════════════════════════════════════════════════════════════
 
 def detectPWavesImproved(data: np.ndarray, r_peaks: np.ndarray,
                           windows: AdaptiveWindows, heart_rate: int,
-                          qrs_starts: List[int], fs: float) -> List[int]:
+                          qrs_starts: List[int], fs: float) -> List[Tuple[int, int]]:
     """
-    Detect P-wave peaks for each beat using HR-adaptive search windows.
+    Detect P-wave peaks and onsets for each beat using HR-adaptive search windows.
 
-    Searches in the expected PR interval window before each QRS onset.
-    Especially tuned for tachycardia (>150 BPM) where P-waves are compressed.
+    FIX: Now returns (p_peak, p_onset) tuples instead of just peak index.
+    FIX: Added amplitude validation — P-wave must be 3-70% of R amplitude to
+         reject T-wave spillover, baseline drift noise, and missing P-waves.
+    FIX: Supports both positive (normal) and negative (inverted) P-waves.
+    FIX: P-onset is found by backtracking from peak to where signal crosses
+         the local isoelectric baseline (clinical PR standard requires onset).
 
     Args:
         data:       Bandpass-filtered ECG signal.
@@ -527,22 +531,22 @@ def detectPWavesImproved(data: np.ndarray, r_peaks: np.ndarray,
         fs:         Sampling rate in Hz.
 
     Returns:
-        List of P-wave peak indices (one per beat, -1 if not found).
+        List of (p_peak_idx, p_onset_idx) tuples. Both are -1 if not found.
     """
-    p_peaks = []
+    p_results = []   # list of (peak, onset) tuples
 
     for i, (r_idx, qrs_start) in enumerate(zip(r_peaks, qrs_starts)):
         try:
-            # Search window: minPtoQRS..maxPtoQRS samples before QRS onset
+            # ── Search window: minPtoQRS..maxPtoQRS samples before QRS onset ──
             p_search_end   = qrs_start - windows.minPtoQRS
             p_search_start = max(0, qrs_start - windows.maxPtoQRS)
 
             if p_search_end <= p_search_start or p_search_end <= 0:
-                p_peaks.append(-1)
+                p_results.append((-1, -1))
                 continue
 
             # At high HR, restrict search to avoid the T-wave of the previous beat.
-            # Smoothly taper the window from 150 BPM (100% window) to 200 BPM (40% window).
+            # Taper from 150 BPM (100% window) to 200 BPM (40% window).
             if heart_rate >= 200:
                 window_len = p_search_end - p_search_start
                 p_search_start = max(p_search_start,
@@ -554,69 +558,154 @@ def detectPWavesImproved(data: np.ndarray, r_peaks: np.ndarray,
                                      p_search_end - int(window_len * pct))
 
             p_seg = data[p_search_start:p_search_end]
-            if len(p_seg) == 0:
-                p_peaks.append(-1)
+            if len(p_seg) < 3:
+                p_results.append((-1, -1))
                 continue
 
-            # Always find the positive peak (standard P-wave). 
-            # Using np.abs at high HR was causing it to latch onto the negative Q-wave / QRS-onset!
-            p_rel = np.argmax(p_seg)
+            # ── Local isoelectric baseline (20ms before search window) ──────
+            bl_start = max(0, p_search_start - int(0.020 * fs))
+            bl_end   = max(bl_start + 1, p_search_start)
+            baseline  = float(np.mean(data[bl_start:bl_end])) if bl_end > bl_start else 0.0
 
-            p_peak = p_search_start + p_rel
-            p_peaks.append(p_peak)
+            # ── R amplitude for amplitude gating ─────────────────────────────
+            r_amp = abs(float(data[int(r_idx)]) - baseline)
+            if r_amp < 1e-6:
+                r_amp = float(np.max(np.abs(p_seg))) * 5.0 + 1e-6
+
+            # HR-adaptive amplitude limits:
+            # At normal HR P-wave is 5-50% of R; at high HR allow down to 3%
+            min_p_amp_frac = 0.03 if heart_rate > 150 else 0.05
+            max_p_amp_frac = 0.70
+            min_p_amp = min_p_amp_frac * r_amp
+            max_p_amp = max_p_amp_frac * r_amp
+
+            # ── Find peak (positive or negative — whichever is larger) ───────
+            pos_idx = int(np.argmax(p_seg))
+            neg_idx = int(np.argmin(p_seg))
+            pos_amp = float(p_seg[pos_idx]) - baseline
+            neg_amp = baseline - float(p_seg[neg_idx])
+
+            # Choose polarity with larger deflection
+            if pos_amp >= neg_amp:
+                p_peak_rel = pos_idx
+                p_amp_val  = pos_amp
+            else:
+                p_peak_rel = neg_idx
+                p_amp_val  = neg_amp
+
+            # ── Amplitude gate: reject if outside physiological P-wave range ─
+            if p_amp_val < min_p_amp or p_amp_val > max_p_amp:
+                p_results.append((-1, -1))
+                continue
+
+            p_peak = p_search_start + p_peak_rel
+
+            # ── P-onset: backtrack from peak to isoelectric baseline ─────────
+            # Threshold: 15% of P-wave amplitude above baseline
+            onset_threshold = max(0.15 * p_amp_val, 0.02 * r_amp)
+            p_onset = p_search_start   # default to search window start
+            for j in range(p_peak, p_search_start - 1, -1):
+                deflection = abs(float(data[j]) - baseline)
+                if deflection < onset_threshold:
+                    p_onset = j
+                    break
+
+            p_results.append((p_peak, p_onset))
 
         except Exception:
-            p_peaks.append(-1)
+            p_results.append((-1, -1))
 
-    return p_peaks
+    return p_results
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 6 — calculatePRIntervalsImproved
-# P-onset → QRS-onset
+# P-onset → QRS-onset  (clinical PR standard)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def calculatePRIntervalsImproved(signal: np.ndarray, p_waves: List[int],
-                                  r_peaks: np.ndarray, fs: float,
+def calculatePRIntervalsImproved(signal: np.ndarray,
+                                  p_waves: List[Tuple[int, int]],
+                                  r_peaks: np.ndarray,
+                                  fs: float,
                                   heart_rate: int) -> List[float]:
     """
-    Measure PR interval (ms) as P-peak → R-peak for each beat.
+    Measure PR interval (ms) as P-onset → QRS-onset for each beat.
+
+    FIX: Changed from P-peak → R-peak to P-onset → QRS-onset.
+         Clinical PR interval is defined as the time from the beginning of
+         the P-wave (P-onset) to the beginning of the QRS complex (Q-onset).
+         The old P-peak → R-peak measurement added ~20-40ms extra.
 
     Args:
         signal:     Bandpass-filtered ECG signal.
-        p_waves:    P-wave peak indices (from detectPWavesImproved).
+        p_waves:    (p_peak, p_onset) tuples from detectPWavesImproved.
         r_peaks:    R-peak indices.
         fs:         Sampling rate in Hz.
         heart_rate: Current HR in BPM.
 
     Returns:
-        List of PR intervals in ms (one per beat, 0.0 if not found).
+        List of PR intervals in ms (valid values only, 0.0 if not found).
     """
     pr_intervals = []
 
-    # HR-adaptive minimum PR to allow 70ms at high HR
-    pr_min_limit = 50 if heart_rate > 150 else 80
+    # HR-adaptive PR floor: short PRs are physiological at high heart rates
+    pr_min_limit = (
+        40 if heart_rate > 200 else
+        50 if heart_rate > 150 else
+        60 if heart_rate > 120 else
+        80
+    )
+    # HR-adaptive PR ceiling: longer RR allows longer PR
+    pr_max_limit = (
+        160 if heart_rate > 150 else
+        200 if heart_rate > 100 else
+        220 if heart_rate > 60 else
+        280
+    )
 
-    for p_wave in p_waves:
+    # Use windows to get QRS starts per beat
+    windows = None  # will compute per-beat QRS onset from r_peaks if needed
+
+    for idx, p_info in enumerate(p_waves):
         try:
-            if p_wave < 0:
+            # Accept both old (int) and new ((peak, onset)) format for safety
+            if isinstance(p_info, (tuple, list)) and len(p_info) == 2:
+                p_peak, p_onset = int(p_info[0]), int(p_info[1])
+            else:
+                p_peak = int(p_info)
+                p_onset = p_peak   # fallback: treat peak as onset
+
+            if p_peak < 0 or p_onset < 0:
                 continue
-            # Find the first R-peak that comes AFTER this P-wave
-            # Kotlin: rPeaks.find { it > pWave }
+
+            # Find the nearest R-peak AFTER this P-wave peak
             r_after = None
             for rp in r_peaks:
-                if rp > p_wave:
+                if rp > p_peak:
                     r_after = int(rp)
                     break
             if r_after is None:
                 continue
 
-            # Kotlin: ((rPeak - pWave) * 1000 / samplingRate).toInt()
-            pr_ms = int((r_after - p_wave) * 1000 / fs)
+            # QRS onset: scan backwards from R to find Q-onset
+            # Simple threshold: 7% of R amplitude before QRS region
+            qrs_search_start = max(0, r_after - int(0.10 * fs))  # 100ms before R
+            baseline_ref_start = max(0, qrs_search_start - int(0.03 * fs))
+            baseline_ref = float(np.mean(signal[baseline_ref_start:qrs_search_start]))
+            r_amp_local = abs(float(signal[r_after]) - baseline_ref)
+            qrs_threshold = max(r_amp_local * 0.07, abs(baseline_ref) * 0.10)
 
-            # PR ceiling: 200ms (>200ms = 1° AVB territory; reject as outlier)
-            if pr_min_limit <= pr_ms <= 200:
-                pr_intervals.append(pr_ms)
+            qrs_onset = qrs_search_start  # default
+            for j in range(qrs_search_start, r_after):
+                if abs(float(signal[j]) - baseline_ref) > qrs_threshold:
+                    qrs_onset = j
+                    break
+
+            # PR = P-onset to QRS-onset (clinical standard)
+            pr_ms = (qrs_onset - p_onset) / fs * 1000.0
+
+            if pr_min_limit <= pr_ms <= pr_max_limit:
+                pr_intervals.append(float(pr_ms))
 
         except Exception:
             continue
