@@ -89,14 +89,17 @@ def _wrap(deg):
 
 def _strip_filter(x: np.ndarray, fs: float) -> np.ndarray:
     """One lead, already padded with real neighbouring samples: mains
-    removal, 0.5 Hz high-pass, 3-point median, one 25 Hz Gaussian pass, as
+    removal, baseline wander removed (two_stage_median_baseline_filter),
+    0.5 Hz high-pass, 3-point median, one 25 Hz Gaussian pass, as
     the Full Disclosure strip. Was 35 Hz twice, the same response (two
     passes = one ~24.7 Hz pass)."""
     from ..ecg_filters import apply_dft_filter
     from ..enhanced_filter import gaussian_lowpass, remove_mains
+    from .two_stage_median_baseline_filter import remove_baseline_wander_r
     x = np.asarray(x, dtype=float)
     if x.size > 30:
         x = np.asarray(remove_mains(x, float(fs)), dtype=float)
+        x = remove_baseline_wander_r(x, float(fs))   # baseline wander out, beats masked
         x = np.asarray(apply_dft_filter(x, float(fs), "0.5"), dtype=float)
     if x.size >= 3:
         p = np.pad(x, (1, 1), mode='edge')

@@ -1303,6 +1303,12 @@ class ECGStripCanvas(QWidget):
         # [(start_sec, end_sec, t, 'V' / 'S')] PVC / PAC beats to colour,
         # set by Full Disclosure (_apply_ectopic_marks); empty elsewhere.
         self._ectopic_marks = []
+        # Baseline wander removal (two_stage_median_baseline_filter) ahead of
+        # the 0.5 Hz high-pass: on/off, and the wide-beat spans (sec) the
+        # baseline is bridged across. Full Disclosure turns it on for every
+        # strip before set_data(); off elsewhere.
+        self._baseline_filter_on = False
+        self._baseline_mask_spans_sec = []
         self._gain = 1.0
         self._speed = 25
         self._inverted = False
@@ -1465,9 +1471,29 @@ class ECGStripCanvas(QWidget):
                     # filters the live trace), and the 25 Hz Gaussian
                     # below still passes ~13% of 50 Hz.
                     padded = _remove_mains(padded, fs)
+                    # Baseline wander removal (on in Full Disclosure): the
+                    # two-stage median baseline is taken out here, before
+                    # the 0.5 Hz high-pass, which then runs as it always has.
+                    # The Artifact wiggle (_visible_mains_wiggle, below) is
+                    # judged on the strip WITHOUT this step, so the "A" marks
+                    # stay where they were before the filter was added.
+                    padded_no_bw = padded
+                    if getattr(self, '_baseline_filter_on', False):
+                        try:
+                            from ...holter.two_stage_median_baseline_filter import remove_baseline_wander
+                            pad_start_sec = start_sec - lead_in / fs
+                            spans = [(int((a - pad_start_sec) * fs), int((b - pad_start_sec) * fs))
+                                     for a, b in (getattr(self, '_baseline_mask_spans_sec', None) or [])]
+                            padded = remove_baseline_wander(padded, fs, spans)
+                        except Exception:
+                            padded = padded_no_bw
                     if apply_dft_filter is not None:
                         padded = np.asarray(apply_dft_filter(padded, fs, "0.5"), dtype=float)
+                        if padded_no_bw is not padded and getattr(self, '_baseline_filter_on', False):
+                            padded_no_bw = np.asarray(apply_dft_filter(padded_no_bw, fs, "0.5"), dtype=float)
                     display_input = np.asarray(padded, dtype=float)[lead_in:lead_in + raw_data.size]
+                    self._wiggle_input = (np.asarray(padded_no_bw, dtype=float)[lead_in:lead_in + raw_data.size] + float(np.median(raw_data))
+                                          if getattr(self, '_baseline_filter_on', False) else None)
                     # Keep the strip's own level: the high-pass removes the
                     # DC offset too, and the vertical placement below works
                     # from the signal's median.
@@ -1505,10 +1531,19 @@ class ECGStripCanvas(QWidget):
         self._structured_events = structured_events or []
         self._start_sec = start_sec
         try:
+            wig_src = getattr(self, '_wiggle_input', None)
+            if wig_src is None or wig_src.size != self._data.size:
+                wig_src = np.asarray(self._data, dtype=float)
+            else:
+                # same median / Gaussian steps as the displayed data
+                if gaussian_lowpass is not None and wig_src.size >= 3:
+                    pw = np.pad(wig_src, (1, 1), mode="edge")
+                    wig_src = gaussian_lowpass(np.median(np.stack((pw[:-2], pw[1:-1], pw[2:]), axis=0), axis=0), 25.0, self._fs)
             self._artifact_wiggle = _visible_mains_wiggle(
-                np.asarray(self._data, dtype=float), float(self._fs or 500), start_sec, self._structured_events)
+                wig_src, float(self._fs or 500), start_sec, self._structured_events)
         except Exception:
             self._artifact_wiggle = []
+        self._wiggle_input = None
         self._rr_intervals = self._calculate_rr_intervals() if beat_annotations else []
         self.update()
 

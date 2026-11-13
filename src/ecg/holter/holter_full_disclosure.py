@@ -4150,6 +4150,16 @@ class HolterFullDisclosureDialog(QDialog):
             self._ectopic_v_path = path
         return self._ectopic_v_times_arr
 
+    def _baseline_mask_spans(self):
+        """Wide-beat (PVC / VT) spans, sec, the strip's baseline wander
+        removal (two_stage_median_baseline_filter) bridges across: the
+        ectopic detector's V beats, QRS + T (same spans as the red marks),
+        or [] while it has not run."""
+        try:
+            return [(a, b) for a, b, t, code in (self._ectopic_mark_spans() or []) if code == 'V']
+        except Exception:
+            return []
+
     def _start_ectopic_detection(self, path: str):
         """Run ectopic_beats_detector for `path` in the background (once at a
         time); when it is done, the bottom label and the PVC / PAC beat
@@ -4827,8 +4837,15 @@ class HolterFullDisclosureDialog(QDialog):
                 self._beat_time_source = None
             self._beat_time_source_reader = self._reader
 
+        # Baseline wander removal on every strip (ECGStripCanvas.set_data;
+        # two_stage_median_baseline_filter), always on here like the 0.5 Hz
+        # high-pass, with the PVC / VT beats bridged across.
+        bw_on = True
+        bw_mask = self._baseline_mask_spans()
         # Optimization: Process data in parallel using numpy vectorization
         for i, c in enumerate(self._canvases):
+            c._baseline_filter_on = bw_on
+            c._baseline_mask_spans_sec = bw_mask
             c._asystole_spans = asystole_spans
             c._vfib_label_spans = getattr(self, '_vfib_label_spans', [])
             c._beat_time_source = getattr(self, '_beat_time_source', None)
