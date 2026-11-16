@@ -366,8 +366,17 @@ alongside the rhythm label, never instead of it.
 17. **Unidentified, first pass**: 10 s `frame_status` frames that aren't
     `ok` define "zones"; inside a zone, beat-interval `span_status` is
     checked (1 s filled steps where RR > 1.5 s); any non-`ok` span, minus
-    time any *other* rhythm already owns (`own_rhythm` — `_rate_labels`
-    and layer labels excluded), becomes Unidentified. Includes the VFib
+    time any *other* rhythm already owns (`own_rhythm` —
+    `_cut_by_unreadable`, i.e. the sinus rate labels, Atrial Tachycardia
+    and SVT, and layer labels excluded), becomes Unidentified and is cut
+    out of those labels. SVT is in that list because it is a regular
+    narrow-QRS rhythm: an unreadable stretch inside it is muscle noise /
+    mains / a test signal, not the rhythm. Muscle noise is one of the
+    unreadable reasons: `ecg/p_reliability.py` `muscle_noise_spans` (2 s
+    blocks where the 65-150 Hz power share is ≥ 2% on Lead II, I and V5 and
+    Lead II's >40 Hz std is ≥ 2% of the 10 s ECG peak-to-peak, runs of
+    ≥ 4 s), read on the raw samples. A P wave cannot be read in it, whatever
+    the SQI of the 10 s frame says. Includes the VFib
     test-signal trim: a VFib segment whose own beat-snapped pieces read
     `test_signal` gets those pieces cut out and relabelled Unidentified
     (≥ 2 s pieces only).

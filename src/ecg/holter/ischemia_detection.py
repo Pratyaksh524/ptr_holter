@@ -159,15 +159,19 @@ _T_NOT_JUDGED = {'limb': ('aVR',), 'chest': ('V1',)}   # inverted T is normal th
 
 
 def _fd_filter(x: np.ndarray, fs: float) -> np.ndarray:
-    """One lead: 0.5 Hz DFT high-pass (zero-phase, mirrored 2 s padding),
+    """One lead: baseline wander removed (two_stage_median_baseline_filter,
+    beats masked), 0.5 Hz DFT high-pass (zero-phase, mirrored 2 s padding),
     3-point median, one 25 Hz Gaussian low-pass (zero-phase, no ringing at
     the J point). As the Full Disclosure strip (ECGStripCanvas.set_data)
     but without its mains removal. Was 35 Hz twice, which is the same
     filter (two passes = one ~24.7 Hz pass)."""
     from ..ecg_filters import apply_dft_filter
     from ..enhanced_filter import gaussian_lowpass
+    from .two_stage_median_baseline_filter import remove_baseline_wander_r
     x = np.asarray(x, dtype=float)
     if x.size > 30:
+        # baseline wander out first (beats masked), see that module
+        x = remove_baseline_wander_r(x, fs)
         pad = int(min(x.size - 1, 2.0 * fs))
         mirrored = np.pad(x, (pad, pad), mode='reflect')
         x = np.asarray(apply_dft_filter(mirrored, float(fs), "0.5"), dtype=float)[pad:pad + x.size]

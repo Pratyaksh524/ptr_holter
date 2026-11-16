@@ -312,6 +312,14 @@ def measure_beats(reader, start_sec: float, end_sec: float) -> List[Dict[str, An
         return []
     data = np.asarray(data, dtype=float)
 
+    # Beats first: they mask the QRS + T when the baseline wander is taken
+    # out of every lead (two_stage_median_baseline_filter) ahead of the
+    # filters below -- the 0.5 Hz high-pass left ~1 mV of a 5-8 mV wander
+    # and QT read 2-8 ms long, PR +-10 ms (2026-11-12_16-19-27).
+    from .two_stage_median_baseline_filter import remove_baseline_wander_r
+    beats = _beat_samples(data, lead_names, fs)
+    data = np.vstack([remove_baseline_wander_r(lead, fs, beats) for lead in data])
+
     lead_ii = data[lead_names.index('II')]
     for notch in (make_notch(50.0, fs), make_notch(60.0, fs)):
         lead_ii = filtfilt(notch.b, notch.a, lead_ii)
@@ -331,7 +339,6 @@ def measure_beats(reader, start_sec: float, end_sec: float) -> List[Dict[str, An
     qrs_idx = [lead_names.index(n) for n in QRS_LEADS if n in lead_names]
     t_idx = [lead_names.index(n) for n in T_LEADS if n in lead_names]
 
-    beats = _beat_samples(data, lead_names, fs)
     out = []
     for k, r in enumerate(beats):
         t = p0 + r / fs

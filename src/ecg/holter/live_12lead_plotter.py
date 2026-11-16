@@ -242,6 +242,14 @@ class Live12LeadPlotter(QWidget):
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.timeout.connect(self._update_elapsed)
 
+        # System clock left of the elapsed timer, so the trace can be read
+        # against real (wall-clock) time while it records. Always running;
+        # checked every 200 ms, the text changes once a second.
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self._update_clock)
+        self._clock_timer.start(200)
+        self._update_clock()
+
     # ---- elapsed timer (runs from Connect & Start to Stop) -------------------
 
     def start_elapsed_timer(self):
@@ -255,6 +263,11 @@ class Live12LeadPlotter(QWidget):
             self._update_elapsed()
         self._elapsed_timer.stop()
         self._elapsed_t0 = None
+
+    def _update_clock(self):
+        text = "System Time: " + time.strftime("%H:%M:%S")
+        if self._clock_label.text() != text:
+            self._clock_label.setText(text)
 
     def _update_elapsed(self):
         if self._elapsed_t0 is None:
@@ -340,6 +353,10 @@ class Live12LeadPlotter(QWidget):
             bar.addSpacing(12)
         bar.addWidget(self._filter_chk)
         bar.addStretch(1)
+        self._clock_label = QLabel("System Time: --:--:--")
+        self._clock_label.setStyleSheet("font-weight:bold;")
+        bar.addWidget(self._clock_label)
+        bar.addSpacing(16)
         self._elapsed_label = QLabel("00:00")
         self._elapsed_label.setStyleSheet("font-weight:bold;")
         bar.addWidget(self._elapsed_label)

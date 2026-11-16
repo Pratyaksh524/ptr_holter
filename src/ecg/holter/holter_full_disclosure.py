@@ -736,6 +736,18 @@ class HolterFullDisclosureDialog(QDialog):
         except Exception as e:
             print(f"[Full Disclosure] Asystole detection unavailable: {e}")
 
+        # Lead-off spans (lead_off_detection.py): which electrodes were off
+        # when, for the bottom-bar "Lead off: ..." label. Display only --
+        # like Asystole above it never feeds any detector or marking.
+        self._lead_off_spans = []
+        try:
+            reader_path_lo = getattr(getattr(self._engine, '_reader', None), 'path', None)
+            if reader_path_lo:
+                from .lead_off_detection import detect_lead_off_spans_async
+                detect_lead_off_spans_async(reader_path_lo, self._on_lead_off_spans_ready)
+        except Exception as e:
+            print(f"[Full Disclosure] Lead-off scan unavailable: {e}")
+
         # VFib stretches, only to hide lead I's RR / HR numbers there (the
         # intervals Pan-Tompkins measures across VFib are noise). Taken from
         # the same background detector the "Auto Arrhythmia Detection"
@@ -843,6 +855,27 @@ class HolterFullDisclosureDialog(QDialog):
         self._event_index_dirty = True
         self._update_canvases(self._current_start)
         self._refresh_segment_overlay()
+
+    def _on_lead_off_spans_ready(self, spans):
+        """Background lead-off scan finished: refresh the "Lead off" label."""
+        self._lead_off_spans = spans or []
+        try:
+            self._update_lead_off_label(self._current_start, self._current_start + self._window_sec)
+        except Exception as e:
+            print(f"[Full Disclosure] Error refreshing Lead off label: {e}")
+
+    def _update_lead_off_label(self, start_sec: float, end_sec: float):
+        """"Lead off: <leads>" for the leads off anywhere in the visible
+        window [start_sec, end_sec); empty when none is."""
+        lbl = getattr(self, 'lbl_lead_off', None)
+        if lbl is None:
+            return
+        from .lead_off_detection import leads_off_in, lead_off_text
+        order = list(getattr(getattr(self._engine, '_reader', None), 'lead_names', None) or [])
+        if not order:
+            order = sorted({s['lead'] for s in getattr(self, '_lead_off_spans', []) or []})
+        leads = leads_off_in(getattr(self, '_lead_off_spans', []), start_sec, end_sec, order)
+        lbl.setText(lead_off_text(leads, order))
 
     def _on_asystole_segments_ready(self, segments):
         """Background Asystole scan finished (see the Asystole block in
@@ -1566,10 +1599,18 @@ class HolterFullDisclosureDialog(QDialog):
         self.btn_display_mode.clicked.connect(_show_display_mode_menu)
         bot_layout.addWidget(self.btn_display_mode)
 
+        # Lead-off indicator left of the Arrhythmia label: the leads whose
+        # electrode was off anywhere in the visible window ("Lead off: V4",
+        # "Lead off: All leads"), empty when every lead is connected. Filled
+        # by _update_lead_off_label from the background lead-off scan
+        # (lead_off_detection.py).
+        self.lbl_lead_off = QLabel("")
+        self.lbl_lead_off.setStyleSheet("color: #ffb347; font-weight: bold; font-size: 12px; padding-right: 12px;")
         # Arrhythmia indicator left of Recording label
         self.lbl_arrhythmia = QLabel("")
         self.lbl_arrhythmia.setStyleSheet("color: #ff6b6b; font-weight: bold; font-size: 12px;")
         bot_layout.addStretch()
+        bot_layout.addWidget(self.lbl_lead_off)
         bot_layout.addWidget(self.lbl_arrhythmia)
         
         # Total Recorded Time (right after arrhythmia label)
@@ -4150,6 +4191,16 @@ class HolterFullDisclosureDialog(QDialog):
             self._ectopic_v_path = path
         return self._ectopic_v_times_arr
 
+    def _baseline_mask_spans(self):
+        """Wide-beat (PVC / VT) spans, sec, the strip's baseline wander
+        removal (two_stage_median_baseline_filter) bridges across: the
+        ectopic detector's V beats, QRS + T (same spans as the red marks),
+        or [] while it has not run."""
+        try:
+            return [(a, b) for a, b, t, code in (self._ectopic_mark_spans() or []) if code == 'V']
+        except Exception:
+            return []
+
     def _start_ectopic_detection(self, path: str):
         """Run ectopic_beats_detector for `path` in the background (once at a
         time); when it is done, the bottom label and the PVC / PAC beat
@@ -4528,6 +4579,10 @@ class HolterFullDisclosureDialog(QDialog):
             print(f"[Full Disclosure] Error updating Asystole label: {e}")
 
         self.lbl_arrhythmia.setText(arrhythmia_label)
+        try:
+            self._update_lead_off_label(start_sec, end_sec)
+        except Exception as e:
+            print(f"[Full Disclosure] Error updating Lead off label: {e}")
 
     def _update_canvases(self, start_sec: float, update_extras: bool = True):
         eff_dur = self._engine.duration_sec
@@ -4827,8 +4882,15 @@ class HolterFullDisclosureDialog(QDialog):
                 self._beat_time_source = None
             self._beat_time_source_reader = self._reader
 
+        # Baseline wander removal on every strip (ECGStripCanvas.set_data;
+        # two_stage_median_baseline_filter), always on here like the 0.5 Hz
+        # high-pass, with the PVC / VT beats bridged across.
+        bw_on = True
+        bw_mask = self._baseline_mask_spans()
         # Optimization: Process data in parallel using numpy vectorization
         for i, c in enumerate(self._canvases):
+            c._baseline_filter_on = bw_on
+            c._baseline_mask_spans_sec = bw_mask
             c._asystole_spans = asystole_spans
             c._vfib_label_spans = getattr(self, '_vfib_label_spans', [])
             c._beat_time_source = getattr(self, '_beat_time_source', None)

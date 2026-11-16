@@ -372,6 +372,13 @@ def _qrs_bounds(signal: np.ndarray, r_idx: int, fs: float) -> Tuple[int, int, fl
     return int(q_onset), int(j_point), baseline, bool(q_resolved and j_resolved)
 
 
+# _detect_p_wave(strict_selection=True): a candidate this soon after a
+# candidate of the opposite sign at least this many times as prominent is
+# that wave's own undershoot, not a P.
+P_UNDERSHOOT_MS = 100.0
+P_UNDERSHOOT_RATIO = 2.0
+
+
 def _detect_p_wave(
     signal: np.ndarray,
     r_idx: int,
@@ -425,10 +432,25 @@ def _detect_p_wave(
     window = signal[p_start:p_end]
     # FIX: Scale-adaptive prominence threshold.
     # 0.04 was in mV; for ADC-count signals (Holter recorded data) the ptp
-    # of the P-wave search window is in hundreds of counts, so 18% of that
+    # of the P-wave search window is in hundreds of counts, so 12% of that
     # is already large enough. The max(0.04, ...) floor only applies for
     # signals already in mV scale. This one-liner handles both correctly.
-    window_ptp = float(np.ptp(window))
+    #
+    # Strict search with prev_rr_ms: the ptp is read only from 80 ms after
+    # the previous R on (_SINUS_P_SKIP_PREV_QRS_MS in the auto segment
+    # detector, the same 80 ms). Above 125 bpm (RR < 480 ms) the previous
+    # beat's QRS falls inside R-400 ms and its height set the threshold:
+    # 160 bpm sinus, window ptp 1266-1538 -> threshold 152-184 against a P
+    # prominence of 156-162, so the P counted on 22-62% of beats and the
+    # previous T wave (R-208 ms) was taken instead -- PR 96 / 222 beat to
+    # beat, the Sinus Tachycardia PR check failed, plain Tachycardia
+    # (2026-11-13_12-30-24, 12:51:08-12:52:14; 2026-11-13_18-05-35,
+    # 18:09:25-18:13:09). At RR >= 480 ms the read starts at the window's
+    # own start, as before.
+    _ptp_from = 0
+    if strict_selection and prev_rr_ms is not None:
+        _ptp_from = max(0, (r_idx - _ms_to_samples(prev_rr_ms - 80.0, fs)) - p_start)
+    window_ptp = float(np.ptp(window[_ptp_from:])) if window[_ptp_from:].size > 1 else float(np.ptp(window))
     prominence = max(0.04, 0.12 * window_ptp) if window_ptp > 0.05 else 0.04
 
     if strict_selection:
@@ -450,7 +472,40 @@ def _detect_p_wave(
         ]
         if not candidates:
             return result
-        peak_rel = max(peak for peak, _ in candidates)
+        # The candidate closest to the QRS that is tall enough for a P
+        # (>= 3% of R, the same floor applied below), not the closest one
+        # outright: a tiny bump between the P and the QRS -- 1 mm at R-64 ms
+        # beside a 7.8 mm P at R-168 ms (2026-11-12_18-15-12, 18:16:03), or
+        # a 25-35 ADC dip at R-116 ms on a 40 bpm sinus run
+        # (2026-11-12_16-19-27) -- used to be chosen and then rejected as
+        # "too small", or kept with a wrong PR and polarity, so the beat
+        # lost its sinus P and the Sinus Bradycardia broke into pieces.
+        # Candidates the floor rejects are skipped; the P wave is still the
+        # closest qualifying one, so the preceding T wave is not taken.
+        # Skipped too: a candidate within P_UNDERSHOOT_MS after a candidate
+        # of the opposite sign at least P_UNDERSHOOT_RATIO times as
+        # prominent -- that is the bigger wave's own return below / above
+        # the baseline (the 25-35 ADC dip 50 ms after a 150 ADC P on the
+        # 40 bpm run above, chosen as a negative "P" on 29 of 98 beats, PR
+        # off by > 25 ms, polarity flipped: no Sinus Bradycardia). A T wave
+        # followed by a P of the same sign is not affected.
+        _p_base = float(np.median(window))
+        _r_amp = abs(float(signal[r_idx]) - _p_base)
+        _floor = max(0.04, 0.03 * (_r_amp if _r_amp >= 1e-6 else 1.0))
+        _under = _ms_to_samples(P_UNDERSHOOT_MS, fs)
+        peak_rel = None
+        for cand_peak, cand_prom in sorted(candidates, key=lambda c: -c[0]):
+            amp = float(window[cand_peak]) - _p_base
+            if abs(amp) < _floor:
+                continue
+            if any(0 < cand_peak - o_peak <= _under and o_prom >= P_UNDERSHOOT_RATIO * cand_prom
+                   and (float(window[o_peak]) - _p_base) * amp < 0
+                   for o_peak, o_prom in candidates):
+                continue
+            peak_rel = cand_peak
+            break
+        if peak_rel is None:
+            return result
     else:
         # Preserve the detector's established P-wave behavior for rhythm
         # classification. The strict candidate selection above is a display

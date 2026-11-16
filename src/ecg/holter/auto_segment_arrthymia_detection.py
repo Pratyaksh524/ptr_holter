@@ -910,6 +910,26 @@ def _detect_arrhythmias_uncached(
         from ecg.holter.mains_cancel import MainsCancelledReader
     reader = MainsCancelledReader(raw_reader)
 
+    # TODO(conduction-lead-fallback): where Lead II is unusable for P waves (a
+    # P as tall as the QRS), the reads that take Lead II as the conduction /
+    # beat lead (_lead_reader.read_range below) get Lead I in the Lead II row;
+    # Lead II stays everywhere else, and every other rule (Artifact, flat
+    # line, VFib gap ...) reads `reader` exactly as before. Separate,
+    # removable condition: see conduction_lead_fallback.py for why, how, and
+    # when to drop it. In a window-loop worker only that worker's own range is
+    # scanned (the blocks sit on a fixed grid, so the result is the same).
+    _lead_reader = reader
+    try:
+        from .conduction_lead_fallback import wrap_reader as _lead_ii_fallback
+        if _window_job is None:
+            _lead_reader = _lead_ii_fallback(reader)
+        else:
+            _lead_reader = _lead_ii_fallback(
+                reader, max(0.0, _window_job[0] * _PARALLEL_WINDOW_STEP_SEC - 30.0),
+                _window_job[1] * _PARALLEL_WINDOW_STEP_SEC + 30.0)
+    except Exception:
+        _lead_reader = reader
+
     # Long recording: the window loop below starts now in worker processes
     # and runs alongside the whole-recording pass (see _PARALLEL_* above).
     _parallel_window_handle = None
@@ -972,7 +992,7 @@ def _detect_arrhythmias_uncached(
         t_end = min(t_cursor + chunk_len_sec, total_duration)
         pad_start = max(0.0, t_cursor - chunk_pad_sec)
         pad_end = min(total_duration, t_end + chunk_pad_sec)
-        chunk_data = reader.read_range(pad_start, pad_end)
+        chunk_data = _lead_reader.read_range(pad_start, pad_end)   # conduction-lead-fallback
         if chunk_data is not None and best_lead_idx < chunk_data.shape[0]:
             lead_sig = np.asarray(chunk_data[best_lead_idx], dtype=float)
             if len(lead_sig) > 50:
@@ -1100,6 +1120,18 @@ def _detect_arrhythmias_uncached(
         return x
 
     def _sinus_gate_filter(x):
+        """Conduction-lead signal for the sinus P / PR checks: baseline wander
+        removed (two_stage_median_baseline_filter, beats masked) ahead of
+        _mains_dft_filter and _gate_filter. The 0.5 Hz high-pass left ~1 mV
+        of a 5-8 mV simulator wander, and the P wave on its slope was missed
+        -- Sinus Tachycardia read plain Tachycardia 16:28:47-16:29:19
+        (2026-11-12_16-19-27). The window rules' signal (_mains_dft_filter at
+        the VFib / AF chain) is not changed."""
+        try:
+            from .two_stage_median_baseline_filter import remove_baseline_wander_r
+            x = remove_baseline_wander_r(np.asarray(x, dtype=float), float(fs))
+        except Exception:
+            pass
         return _gate_filter(_mains_dft_filter(x))
     # Lead II is the preferred conduction lead: it is the most reliable lead
     # for visible P waves and PR intervals in these recordings. R-peaks still
@@ -1116,7 +1148,7 @@ def _detect_arrhythmias_uncached(
             total_duration,
             max(metric_start + metric_chunk_sec, all_r_peaks[metric_cursor] + metric_pad_sec),
         )
-        metric_data = reader.read_range(metric_start, metric_end)
+        metric_data = _lead_reader.read_range(metric_start, metric_end)   # conduction-lead-fallback
         if metric_data is None or conduction_lead_idx >= metric_data.shape[0]:
             metric_cursor += 1
             continue
@@ -1202,7 +1234,7 @@ def _detect_arrhythmias_uncached(
     # segments: the plain Bradycardia/Tachycardia pass further below reuses
     # it as its own Bradycardia candidate beat list.
     _sinus_rate_result, brady_r_peaks = _sinus_rate_segments(
-        reader, fs, best_lead_idx, conduction_lead_idx, total_duration,
+        _lead_reader, fs, best_lead_idx, conduction_lead_idx, total_duration,   # conduction-lead-fallback
         all_r_peaks, all_rr_ms, sinus_gate_metrics, _sinus_gate_filter, make_time_strs,
         tachy_min_rr_ms=340.0 if _svt_age_hr is None else 60000.0 / _svt_age_hr,
     )
@@ -3211,7 +3243,7 @@ def _detect_arrhythmias_uncached(
         try:
             pad_start = max(0.0, current_time - morph_pad_sec)
             pad_end = min(total_duration, window_end + morph_pad_sec)
-            padded_array = reader.read_range(pad_start, pad_end)
+            padded_array = _lead_reader.read_range(pad_start, pad_end)   # conduction-lead-fallback
             if padded_array is not None and padded_array.shape[1] > 0:
                 # The unpadded core slice, for the signal-quality gate below,
                 # which wants exactly this window's own samples -- sliced
@@ -5055,7 +5087,7 @@ def _detect_arrhythmias_uncached(
             post = 0.06
             seg_start = max(0.0, earlier[0] - pre - 0.5)
             seg_end = min(total_duration, ref[-1] + post + 0.5)
-            sig = reader.read_range(seg_start, seg_end)
+            sig = _lead_reader.read_range(seg_start, seg_end)   # conduction-lead-fallback
             if sig is None or conduction_lead_idx >= sig.shape[0]:
                 return None
             lead_sig = np.asarray(sig[conduction_lead_idx], dtype=float)
@@ -5577,7 +5609,7 @@ def _detect_arrhythmias_uncached(
             ref_hi = region['end_sec']
             read_lo = max(0.0, ref_lo - 1.0)
             read_hi = min(total_duration, limit_sec + 1.5)
-        sig = reader.read_range(read_lo, read_hi)
+        sig = _lead_reader.read_range(read_lo, read_hi)   # conduction-lead-fallback
         if sig is None or conduction_lead_idx >= sig.shape[0]:
             return None
         x = np.asarray(sig[conduction_lead_idx], dtype=float)
@@ -6560,7 +6592,7 @@ def _detect_arrhythmias_uncached(
             _c += len(chunk)
             r0 = max(0.0, t_lo - 1.5)
             r1 = min(total_duration, all_r_peaks[chunk[-1]] + 1.0)
-            sig = reader.read_range(r0, r1)
+            sig = _lead_reader.read_range(r0, r1)   # conduction-lead-fallback
             if sig is None or conduction_lead_idx >= sig.shape[0] or sig.shape[1] < int(fs):
                 continue
             xs = _sinus_gate_filter(np.asarray(sig[conduction_lead_idx], dtype=float))
@@ -6622,7 +6654,7 @@ def _detect_arrhythmias_uncached(
             """(waves between the T wave after beat j-1 and beat j's QRS,
             P-peak-to-R time in ms of beats j-2, j-1, j -- None where no P)."""
             t0, t1 = all_r_peaks[j - 2] - 0.5, all_r_peaks[j] + 0.5
-            sig = reader.read_range(max(0.0, t0), min(total_duration, t1))
+            sig = _lead_reader.read_range(max(0.0, t0), min(total_duration, t1))   # conduction-lead-fallback
             if sig is None or conduction_lead_idx >= sig.shape[0]:
                 return 0, [None] * 3
             x = np.asarray(sig[conduction_lead_idx], dtype=float)
@@ -6732,7 +6764,7 @@ def _detect_arrhythmias_uncached(
             if sum(1 for v in prs if abs(v - med_pr) <= 20.0) >= 0.5 * len(prs):
                 return False
             t0, t1 = all_r_peaks[run[0]] - 0.5, all_r_peaks[run[-1]] + 0.5
-            sig = reader.read_range(max(0.0, t0), min(total_duration, t1))
+            sig = _lead_reader.read_range(max(0.0, t0), min(total_duration, t1))   # conduction-lead-fallback
             if sig is None or conduction_lead_idx >= sig.shape[0]:
                 return False
             x = np.asarray(sig[conduction_lead_idx], dtype=float)
@@ -6836,8 +6868,9 @@ def _detect_arrhythmias_uncached(
     # Unidentified: stretches with no heart signal that P / QRS / T can be
     # read from (pqrst_measure.frame_status): a simulator test signal (the
     # same waveform on every lead -- seen: triangle / pulse trains read as
-    # Tachycardia 1276-1287 s, a square wave read as VFib 2005-2020 s) or
-    # Lead II too noisy. Judged RR interval by RR interval
+    # Tachycardia 1276-1287 s, a square wave read as VFib 2005-2020 s), Lead
+    # II too noisy, or muscle noise (p_reliability.muscle_noise_spans: 65-150 Hz power on
+    # every lead, however far under the SQI limit). Judged RR interval by RR interval
     # (pqrst_measure.span_status, 2 s of signal around each; 1 s steps where
     # no beat is found), so the stretch starts and ends on a beat -- was 10 s
     # frames, which took in the normal beats before a test signal. Only
@@ -6846,8 +6879,15 @@ def _detect_arrhythmias_uncached(
     # VFib rule fires on a square wave's steps); a stretch inside any other
     # rhythm label (VFib, AFib, an AV block ... -- the simulator's VFib is
     # the same on every lead too) keeps that label. Rate labels (Sinus
-    # Bradycardia / Tachycardia / Arrhythmia) are cut out of it, and plain
-    # Bradycardia / Tachycardia below never start in it.
+    # Bradycardia / Tachycardia / Arrhythmia, Atrial Tachycardia) and SVT are
+    # cut out of it, and plain Bradycardia / Tachycardia below never start in
+    # it. SVT is a regular narrow-QRS rhythm, so an unreadable stretch inside
+    # it is noise, not the rhythm: over all 168 test recordings the SVT
+    # seconds read 'noise' / 'non_ecg' / 'test_signal' were muscle noise
+    # (65-150 Hz share 6-12%, clean SVT 0.1%), 50 / 60 Hz mains or a test
+    # signal -- seen: muscle noise at 200 bpm kept as SVT, 18:13:55-18:14:13
+    # (2026-11-13_18-05-35), while the same noise at 120 bpm was cut from
+    # Sinus Tachycardia.
     def _cut_spans(spans, blockers):
         """`spans` minus `blockers`, pieces of >= 2 s."""
         out = []
@@ -6871,6 +6911,8 @@ def _detect_arrhythmias_uncached(
     try:
         from .pqrst_measure import frame_status, span_status, FRAME_SEC, UNIDENTIFIED, UNIDENTIFIED_COLOR
         _rate_labels = ('Sinus Bradycardia', 'Sinus Tachycardia', 'Sinus Arrhythmia', _AT_LABEL)
+        # Labels the unreadable stretches are cut out of (see the comment above).
+        _cut_by_unreadable = _rate_labels + ('Supraventricular Tachycardia (SVT)',)
         zones = []
         f0 = 0.0
         while f0 < total_duration:
@@ -6906,6 +6948,28 @@ def _detect_arrhythmias_uncached(
                     else:
                         test_spans.append([a, b])
         unreadable_spans = [(a, b) for a, b in unreadable_spans if b - a >= 2.0]
+        # Muscle noise (ecg.p_reliability.muscle_noise_spans): a P wave cannot
+        # be read there, whether or not a whole 10 s frame read 'noise' (an
+        # episode under the SQI limit on each frame never made a zone above).
+        # Read on raw_reader, like the mains Artifact layer: `reader` here is the
+        # mains-cancelled reader and the 65-150 Hz share is measured on the
+        # raw samples (on `reader` the share read differently: spans in quiet
+        # stretches, edges moved).
+        try:
+            from ecg.p_reliability import muscle_noise_spans as _muscle_noise_spans
+            _muscle_spans = _muscle_noise_spans(raw_reader, fs, total_duration)
+        except Exception as e:
+            print(f"[Auto Arrhythmia Detect] Muscle noise check error: {e}")
+            _muscle_spans = []
+        if _muscle_spans:
+            _all_unread = sorted([float(x), float(y)] for x, y in list(unreadable_spans) + _muscle_spans)
+            _joined = []
+            for x, y in _all_unread:
+                if _joined and x <= _joined[-1][1] + 1e-6:
+                    _joined[-1][1] = max(_joined[-1][1], y)
+                else:
+                    _joined.append([x, y])
+            unreadable_spans = [(x, y) for x, y in _joined if y - x >= 2.0]
 
         def _test_overlap(seg):
             s0, s1 = float(seg['start_sec']), float(seg['end_sec'])
@@ -6998,13 +7062,13 @@ def _detect_arrhythmias_uncached(
 
         own_rhythm = [
             (float(s['start_sec']), float(s['end_sec'])) for s in final_segments
-            if s['label'] not in _rate_labels and not _is_layer_label(s['label'])
+            if s['label'] not in _cut_by_unreadable and not _is_layer_label(s['label'])
         ]
         unidentified = _cut_spans(unreadable_spans, own_rhythm)
         if unidentified:
             kept = []
             for seg in final_segments:
-                if seg['label'] not in _rate_labels:
+                if seg['label'] not in _cut_by_unreadable:
                     kept.append(seg)
                     continue
                 pieces = [(float(seg['start_sec']), float(seg['end_sec']))]
