@@ -1929,6 +1929,39 @@ def _detect_arrhythmias_uncached(
         n_deciding = n_sinus + atrial.count('fibrillatory')
         return n_deciding >= _BEAT_MIN_DECIDING and n_sinus >= _BEAT_SINUS_MAJORITY * n_deciding
 
+    # AFib's RR intervals are random: no interval repeats the one a few beats
+    # before it. A window whose RR series repeats as a cycle (every RR within
+    # _RR_CYCLE_TOL of the RR _RR_CYCLE_MAX_LAG or fewer beats earlier, on
+    # all but ~15% of the comparisons) is grouped beating -- Mobitz I's
+    # Wenckebach cycle, bigeminy, a fixed 3:2 / 4:3 block -- never AFib.
+    # Seen: 2026-11-16_14-01-13, 14:02:12 - 14:02:25, Mobitz I (5:4, RR 818 /
+    # 1190 / 810 / 930 ms repeating) under muscle noise: the noise hid the P
+    # waves, so the P-train veto above and the sinus-beat veto both had
+    # nothing to read, the RR still looked irregular, and 13 s read AFib.
+    # Applied to AFib only (Flutter's RR is regular / fixed-conduction).
+    _RR_CYCLE_MAX_LAG = 6
+    _RR_CYCLE_MIN_COMPARISONS = 4
+    _RR_CYCLE_MATCH_SHARE = 0.85
+    _RR_CYCLE_TOL = 0.04
+    _RR_CYCLE_TOL_MIN_MS = 30.0
+
+    def _rr_repeats_as_cycle(r_peaks, fs_):
+        """True when the window's RR series repeats with some period of
+        2.._RR_CYCLE_MAX_LAG beats (see the comment above)."""
+        peaks = np.sort(np.asarray(r_peaks, dtype=float))
+        if peaks.size < _RR_CYCLE_MIN_COMPARISONS + 3:
+            return False
+        rr = np.diff(peaks) * 1000.0 / float(fs_)
+        for lag in range(2, _RR_CYCLE_MAX_LAG + 1):
+            a, b = rr[:-lag], rr[lag:]
+            if a.size < _RR_CYCLE_MIN_COMPARISONS:
+                break
+            tol = np.maximum(_RR_CYCLE_TOL_MIN_MS, _RR_CYCLE_TOL * a)
+            if int(np.sum(np.abs(a - b) <= tol)) >= max(_RR_CYCLE_MIN_COMPARISONS,
+                                                        int(np.ceil(_RR_CYCLE_MATCH_SHARE * a.size))):
+                return True
+        return False
+
     # VFib needs a fibrillating stretch somewhere in a slow window: a 2 s
     # piece (1 s steps) where, on the median of the 12 leads, the signal sits
     # still for < _VFIB_STILL_SHARE of the time. VFib is one unbroken wave
@@ -3403,6 +3436,8 @@ def _detect_arrhythmias_uncached(
                             # waves at <= 200/min is neither. Mobitz I's grouped
                             # beating plus its changing PR otherwise reads as
                             # "irregular RR, no consistent PR" = AFib.
+                            # (That needs readable P waves; under noise the
+                            # RR-cycle veto below covers it.)
                             if atrial_label and av_ctx is not None and av_ctx['atrial_regular_for_afib_veto'] \
                                     and av_ctx['qrs_resolved_majority']:
                                 atrial_label = None
@@ -3410,6 +3445,11 @@ def _detect_arrhythmias_uncached(
                             # fibrillatory / flutter pattern, not a sinus P
                             # (_atrial_beats_mostly_sinus, beat by beat).
                             if atrial_label and _atrial_beats_mostly_sinus(padded_array, core_r_peaks, fs):
+                                atrial_label = None
+                            # AFib's RR is random: an RR series that repeats as
+                            # a cycle is grouped beating (_rr_repeats_as_cycle),
+                            # e.g. Mobitz I under noise that hides its P waves.
+                            if atrial_label == 'Atrial Fibrillation'                                     and _rr_repeats_as_cycle(core_r_peaks, fs):
                                 atrial_label = None
                             # Flutter waves must be locked to the QRS on most
                             # leads (_flutter_waves_locked), not artifact.

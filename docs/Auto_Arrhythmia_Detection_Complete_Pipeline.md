@@ -262,6 +262,15 @@ normal sinus territory); otherwise its peaks are counted
   Mobitz I's grouped beating from reading as AFib); and
   `_atrial_beats_mostly_sinus` (beat-by-beat, all 12 leads) can veto a
   call that's really plain sinus on a lead the window rule didn't check.
+  A third veto, AFib only: `_rr_repeats_as_cycle` — AFib's RR is random,
+  so a window whose RR series repeats as a cycle (every RR within 4%
+  / 30 ms of the RR 2–6 beats earlier, on ≥ 85% of ≥ 4 comparisons) is
+  grouped beating (Mobitz I's Wenckebach cycle, bigeminy, fixed 3:2 / 4:3
+  block), not AFib. It needs no P wave, so it holds where noise hides them
+  (2026-11-16_14-01-13, 14:02:12–14:02:25: Mobitz I under muscle noise read
+  AFib). Measured: 178 of 179 simulator recordings unchanged, MIT-BIH
+  unchanged, INCART 4 records lost only AFib stretches of sinus rhythm or
+  PVC bigeminy (I18, I35, I51, I53).
   Flutter additionally needs `_flutter_waves_locked` (the sawtooth is
   genuinely phase-locked to the QRS on most leads, not coincidental
   artifact).
