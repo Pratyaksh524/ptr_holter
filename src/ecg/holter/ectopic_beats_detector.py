@@ -40,7 +40,8 @@ V V V V as a run instead of N N V N N V (trigeminy).
     LATE_MIN_PARTNERS other V beats of the recording match its shape (>=
     LATE_PARTNER_CORR); a late PVC with fewer is dropped.
     Not V: a wide beat at the normal rate with the sinus P (bundle branch
-    block), a wide beat with the dominant beat's shape.
+    block), a wide beat with the dominant beat's shape, and any beat inside
+    an auto Atrial Flutter segment (NO_PVC_SEGMENTS).
   - A PVC repeats: a V whose shape matches no other V of the recording
     (beyond its own neighbours) >= PARTNER_CORR goes back to N -- noise
     that makes a normal beat "different" does not repeat, a ventricular
@@ -148,6 +149,22 @@ NORMAL_RR_MIN_FRACTION = 0.88    # RRs used for the running normal RR
 NORMAL_RR_MAX_FRACTION = 1.30
 
 NO_QRS_SEGMENTS = ('Ventricular Fibrillation', 'Asystole', 'Artifact', 'Unidentified')
+# Where no PVC is looked for. Flutter is atrial-rate bound and regular, so a
+# beat is never "premature" in it: after a rate step (100 -> 150 bpm,
+# 2026-11-16_12-09-16 at 12:11:41) every beat is premature against the running
+# normal RR, the shape of a conducted flutter beat matches the dominant beat
+# at 0.78-0.85 (limit 0.80: the F waves fall in its window) and its QRS reads
+# 112-118 ms even when normal, so premature + a shape just under the limit +
+# "wide" read V: 10 V in a 150 bpm flutter, 8 of them on the noise after an
+# Artifact, 2 on clean beats (12:12:05).
+# Atrial Fibrillation is deliberately NOT here: cardiologists annotated 495
+# (MIT-BIH) and 226 (INCART) PVCs inside the auto AF / Flutter segments of the
+# first 5 min of those records and this module found 380 and 196 of them (false
+# V 32 and 1) -- a PVC does occur in AF, and the V beats of the simulator's AF
+# recordings look like them (shape similarity median 0.63 vs 0.56, QRS 166 vs
+# 168 ms, RR / normal RR 0.66 vs 0.63), so no limit here removes the one and
+# not the other. Flutter in those records is 15 s and holds no V.
+NO_PVC_SEGMENTS = ('Atrial Flutter',)
 MAINS_ARTIFACT_KINDS = ('50 Hz', '60 Hz')   # 'artifact_kind' of the segment detector's mains Artifact
 
 _DEBUG = False
@@ -212,7 +229,7 @@ def _spans_signature(segments) -> str:
     """Hash of the auto segments this module reads (label, span and, for an
     Artifact, its kind: a mains one does not block beats, it only keeps them
     out of the template)."""
-    used = set(NO_QRS_SEGMENTS) | set(NO_PAC_SEGMENTS) | {'Ventricular Tachycardia'}
+    used = set(NO_QRS_SEGMENTS) | set(NO_PAC_SEGMENTS) | set(NO_PVC_SEGMENTS) | {'Ventricular Tachycardia'}
     spans = sorted((str(x.get('label', '')), round(float(x['start_sec']), 3), round(float(x['end_sec']), 3),
                     str(x.get('artifact_kind') or ''))
                    for x in (segments or [])
@@ -892,6 +909,13 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
     def in_mains(ts):
         return any(s_ <= ts < e_ for s_, e_ in mains_spans)
 
+    no_pvc_spans = [(float(x['start_sec']), float(x['end_sec'])) for x in (segments or [])
+                    if str(x.get('label', '')) in NO_PVC_SEGMENTS
+                    and x.get('start_sec') is not None and x.get('end_sec') is not None]
+
+    def no_pvc(ts):
+        return any(s_ <= ts < e_ for s_, e_ in no_pvc_spans)
+
     template, ref_rr = None, []
 
     out = []
@@ -971,7 +995,7 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
         # the dominant beat's and a wide QRS -- or a shape so unlike it that
         # a QRS measured under WIDE_QRS_MS (>= MIN_PVC_QRS_MS) does not
         # matter (seen: INCART PVCs measured 108-118 ms, similarity 0.0-0.4).
-        if (premature or run_on) and (very_different or (different and wide)):
+        if (premature or run_on) and (very_different or (different and wide)) and not no_pvc(ts):
             beat['label'] = 'V'
             prev_label = 'V'
             pending = []
@@ -1058,7 +1082,7 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
     late_idx = set()
     for k in range(1, len(out) - 1):
         b = out[k]
-        if b['label'] != 'N' or corrs[k] is None or pcorrs[k] is None or b['qrs_ms'] is None:
+        if b['label'] != 'N' or corrs[k] is None or pcorrs[k] is None or b['qrs_ms'] is None or no_pvc(feats[k][0]):
             continue
         if not (corrs[k] < VERY_DIFFERENT_CORR and b['qrs_ms'] >= WIDE_QRS_MS and pcorrs[k] < LATE_PVC_P_MAX):
             continue

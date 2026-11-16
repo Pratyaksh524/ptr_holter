@@ -376,7 +376,10 @@ alongside the rhythm label, never instead of it.
     blocks where the 65-150 Hz power share is ≥ 2% on Lead II, I and V5 and
     Lead II's >40 Hz std is ≥ 2% of the 10 s ECG peak-to-peak, runs of
     ≥ 4 s), read on the raw samples. A P wave cannot be read in it, whatever
-    the SQI of the 10 s frame says. Includes the VFib
+    the SQI of the 10 s frame says. Atrial Flutter, the AV blocks (1st
+    degree, Mobitz I / II, 3rd degree) and the bundle branch blocks yield to
+    these muscle spans too (and only to them, not to the other unreadable
+    reasons); Atrial Fibrillation, VFib and VT do not. Includes the VFib
     test-signal trim: a VFib segment whose own beat-snapped pieces read
     `test_signal` gets those pieces cut out and relabelled Unidentified
     (≥ 2 s pieces only).

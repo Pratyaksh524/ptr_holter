@@ -7065,14 +7065,52 @@ def _detect_arrhythmias_uncached(
             if s['label'] not in _cut_by_unreadable and not _is_layer_label(s['label'])
         ]
         unidentified = _cut_spans(unreadable_spans, own_rhythm)
-        if unidentified:
+        # Muscle noise (_muscle_spans) is cut out of these labels as well, and
+        # only muscle noise, not the other unreadable reasons (frame noise /
+        # test signal), through which they keep their stretch, like the other
+        # morphology labels: Atrial Flutter, the AV blocks (1st degree, Mobitz
+        # I / II, 3rd degree) and the bundle branch blocks. They are read off
+        # the P wave / QRS shape beat by beat and a P wave is buried by that
+        # noise (P height over its noise 4-5, 18-57 on a clean stretch). Atrial
+        # Fibrillation, VFib and VT are not in the list: AF's PVCs and its
+        # irregular RR are read on that signal (495 / 226 annotated PVCs inside
+        # the AF segments of MIT-BIH / INCART), VFib and VT are no rhythm to
+        # read a P wave from. The part of the muscle spans inside one of these
+        # labels is its cut. Seen: muscle noise 12:11:40-12:11:48 inside a 150
+        # bpm Atrial Flutter (2026-11-16_12-09-16) read as Flutter beats (and
+        # PVCs); Third-degree AV Block kept over 16 s of it
+        # (2026-11-03_19-30-06, 19:34:10-19:34:26).
+        # The bundle branch blocks are layer labels (drawn next to the
+        # rhythm): cut here like the rest, nothing else cuts them.
+        _muscle_cut_labels = ('Atrial Flutter', 'First-degree AV Block', 'Second-degree AV Block (Mobitz I)',
+                              'Second-degree AV Block (Mobitz II)', 'Third-degree AV Block',
+                              'Complete Right Bundle Branch Block', 'Complete Left Bundle Branch Block',
+                              'Incomplete Right Bundle Branch Block', 'Incomplete Left Bundle Branch Block')
+        flutter_cut = []
+        _fl_spans = [(float(x['start_sec']), float(x['end_sec'])) for x in final_segments
+                     if x['label'] in _muscle_cut_labels]
+        if _muscle_spans and _fl_spans:
+            _own_m = [(float(x['start_sec']), float(x['end_sec'])) for x in final_segments
+                      if x['label'] not in _cut_by_unreadable and x['label'] not in _muscle_cut_labels
+                      and not _is_layer_label(x['label'])]
+            for u0, u1 in _cut_spans([tuple(m) for m in _muscle_spans], _own_m):
+                for f0, f1 in _fl_spans:
+                    c0, c1 = max(u0, f0), min(u1, f1)
+                    if c1 - c0 >= 1.0:
+                        flutter_cut.append((c0, c1))
+            flutter_cut.sort()
+        if unidentified or flutter_cut:
             kept = []
             for seg in final_segments:
-                if seg['label'] not in _cut_by_unreadable:
+                if seg['label'] in _cut_by_unreadable:
+                    cuts = unidentified
+                elif seg['label'] in _muscle_cut_labels and flutter_cut:
+                    cuts = flutter_cut
+                else:
                     kept.append(seg)
                     continue
                 pieces = [(float(seg['start_sec']), float(seg['end_sec']))]
-                for u0, u1 in unidentified:
+                for u0, u1 in cuts:
                     nxt = []
                     for p0, p1 in pieces:
                         if u1 <= p0 or u0 >= p1:
@@ -7092,7 +7130,15 @@ def _detect_arrhythmias_uncached(
                         piece['start_time_str'], piece['end_time_str'] = make_time_strs(p0, p1)
                     kept.append(piece)
             final_segments = kept
-            for u0, u1 in unidentified:
+            _unid_all = unidentified
+            if flutter_cut:
+                _unid_all = []
+                for u0, u1 in sorted(list(unidentified) + flutter_cut):
+                    if _unid_all and u0 <= _unid_all[-1][1] + 1e-6:
+                        _unid_all[-1] = (_unid_all[-1][0], max(_unid_all[-1][1], u1))
+                    else:
+                        _unid_all.append((u0, u1))
+            for u0, u1 in _unid_all:
                 s_str, e_str = make_time_strs(u0, u1)
                 final_segments.append({
                     'start_sec': u0,
