@@ -432,10 +432,25 @@ def _detect_p_wave(
     window = signal[p_start:p_end]
     # FIX: Scale-adaptive prominence threshold.
     # 0.04 was in mV; for ADC-count signals (Holter recorded data) the ptp
-    # of the P-wave search window is in hundreds of counts, so 18% of that
+    # of the P-wave search window is in hundreds of counts, so 12% of that
     # is already large enough. The max(0.04, ...) floor only applies for
     # signals already in mV scale. This one-liner handles both correctly.
-    window_ptp = float(np.ptp(window))
+    #
+    # Strict search with prev_rr_ms: the ptp is read only from 80 ms after
+    # the previous R on (_SINUS_P_SKIP_PREV_QRS_MS in the auto segment
+    # detector, the same 80 ms). Above 125 bpm (RR < 480 ms) the previous
+    # beat's QRS falls inside R-400 ms and its height set the threshold:
+    # 160 bpm sinus, window ptp 1266-1538 -> threshold 152-184 against a P
+    # prominence of 156-162, so the P counted on 22-62% of beats and the
+    # previous T wave (R-208 ms) was taken instead -- PR 96 / 222 beat to
+    # beat, the Sinus Tachycardia PR check failed, plain Tachycardia
+    # (2026-11-13_12-30-24, 12:51:08-12:52:14; 2026-11-13_18-05-35,
+    # 18:09:25-18:13:09). At RR >= 480 ms the read starts at the window's
+    # own start, as before.
+    _ptp_from = 0
+    if strict_selection and prev_rr_ms is not None:
+        _ptp_from = max(0, (r_idx - _ms_to_samples(prev_rr_ms - 80.0, fs)) - p_start)
+    window_ptp = float(np.ptp(window[_ptp_from:])) if window[_ptp_from:].size > 1 else float(np.ptp(window))
     prominence = max(0.04, 0.12 * window_ptp) if window_ptp > 0.05 else 0.04
 
     if strict_selection:

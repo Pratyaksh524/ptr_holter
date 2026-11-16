@@ -6868,8 +6868,9 @@ def _detect_arrhythmias_uncached(
     # Unidentified: stretches with no heart signal that P / QRS / T can be
     # read from (pqrst_measure.frame_status): a simulator test signal (the
     # same waveform on every lead -- seen: triangle / pulse trains read as
-    # Tachycardia 1276-1287 s, a square wave read as VFib 2005-2020 s) or
-    # Lead II too noisy. Judged RR interval by RR interval
+    # Tachycardia 1276-1287 s, a square wave read as VFib 2005-2020 s), Lead
+    # II too noisy, or muscle noise (p_reliability.muscle_noise_spans: 65-150 Hz power on
+    # every lead, however far under the SQI limit). Judged RR interval by RR interval
     # (pqrst_measure.span_status, 2 s of signal around each; 1 s steps where
     # no beat is found), so the stretch starts and ends on a beat -- was 10 s
     # frames, which took in the normal beats before a test signal. Only
@@ -6878,8 +6879,15 @@ def _detect_arrhythmias_uncached(
     # VFib rule fires on a square wave's steps); a stretch inside any other
     # rhythm label (VFib, AFib, an AV block ... -- the simulator's VFib is
     # the same on every lead too) keeps that label. Rate labels (Sinus
-    # Bradycardia / Tachycardia / Arrhythmia) are cut out of it, and plain
-    # Bradycardia / Tachycardia below never start in it.
+    # Bradycardia / Tachycardia / Arrhythmia, Atrial Tachycardia) and SVT are
+    # cut out of it, and plain Bradycardia / Tachycardia below never start in
+    # it. SVT is a regular narrow-QRS rhythm, so an unreadable stretch inside
+    # it is noise, not the rhythm: over all 168 test recordings the SVT
+    # seconds read 'noise' / 'non_ecg' / 'test_signal' were muscle noise
+    # (65-150 Hz share 6-12%, clean SVT 0.1%), 50 / 60 Hz mains or a test
+    # signal -- seen: muscle noise at 200 bpm kept as SVT, 18:13:55-18:14:13
+    # (2026-11-13_18-05-35), while the same noise at 120 bpm was cut from
+    # Sinus Tachycardia.
     def _cut_spans(spans, blockers):
         """`spans` minus `blockers`, pieces of >= 2 s."""
         out = []
@@ -6903,6 +6911,8 @@ def _detect_arrhythmias_uncached(
     try:
         from .pqrst_measure import frame_status, span_status, FRAME_SEC, UNIDENTIFIED, UNIDENTIFIED_COLOR
         _rate_labels = ('Sinus Bradycardia', 'Sinus Tachycardia', 'Sinus Arrhythmia', _AT_LABEL)
+        # Labels the unreadable stretches are cut out of (see the comment above).
+        _cut_by_unreadable = _rate_labels + ('Supraventricular Tachycardia (SVT)',)
         zones = []
         f0 = 0.0
         while f0 < total_duration:
@@ -6938,6 +6948,28 @@ def _detect_arrhythmias_uncached(
                     else:
                         test_spans.append([a, b])
         unreadable_spans = [(a, b) for a, b in unreadable_spans if b - a >= 2.0]
+        # Muscle noise (ecg.p_reliability.muscle_noise_spans): a P wave cannot
+        # be read there, whether or not a whole 10 s frame read 'noise' (an
+        # episode under the SQI limit on each frame never made a zone above).
+        # Read on raw_reader, like the mains Artifact layer: `reader` here is the
+        # mains-cancelled reader and the 65-150 Hz share is measured on the
+        # raw samples (on `reader` the share read differently: spans in quiet
+        # stretches, edges moved).
+        try:
+            from ecg.p_reliability import muscle_noise_spans as _muscle_noise_spans
+            _muscle_spans = _muscle_noise_spans(raw_reader, fs, total_duration)
+        except Exception as e:
+            print(f"[Auto Arrhythmia Detect] Muscle noise check error: {e}")
+            _muscle_spans = []
+        if _muscle_spans:
+            _all_unread = sorted([float(x), float(y)] for x, y in list(unreadable_spans) + _muscle_spans)
+            _joined = []
+            for x, y in _all_unread:
+                if _joined and x <= _joined[-1][1] + 1e-6:
+                    _joined[-1][1] = max(_joined[-1][1], y)
+                else:
+                    _joined.append([x, y])
+            unreadable_spans = [(x, y) for x, y in _joined if y - x >= 2.0]
 
         def _test_overlap(seg):
             s0, s1 = float(seg['start_sec']), float(seg['end_sec'])
@@ -7030,13 +7062,13 @@ def _detect_arrhythmias_uncached(
 
         own_rhythm = [
             (float(s['start_sec']), float(s['end_sec'])) for s in final_segments
-            if s['label'] not in _rate_labels and not _is_layer_label(s['label'])
+            if s['label'] not in _cut_by_unreadable and not _is_layer_label(s['label'])
         ]
         unidentified = _cut_spans(unreadable_spans, own_rhythm)
         if unidentified:
             kept = []
             for seg in final_segments:
-                if seg['label'] not in _rate_labels:
+                if seg['label'] not in _cut_by_unreadable:
                     kept.append(seg)
                     continue
                 pieces = [(float(seg['start_sec']), float(seg['end_sec']))]
