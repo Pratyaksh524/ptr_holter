@@ -4353,7 +4353,21 @@ def _detect_arrhythmias_uncached(
         # Only when no other morphological region follows within a window
         # (VT -> VFib keeps its own handling) and only moving the end
         # earlier.
-        def _vt_run_last_beat_fwd(vt_region):
+        # The first break is the end of THAT run, not of everything after it:
+        # when the same VT comes back (>= _VT_RESUME_MIN_BEATS beats in a row
+        # with the same shape and RR as the template), each such run is
+        # returned in `resumed` and kept as its own VT segment. The window
+        # vote joins VT windows up to 2 windows apart into one region, so a
+        # stretch of noise inside a VT (a muscle burst on the lead read here)
+        # ended the region and threw the VT that followed away: seen
+        # 2026-11-16_15-35-15, VT 15:36:58 - 15:37:21 (muscle noise 15:37:21 -
+        # 15:37:33), then the same VT again, corr 1.00, RR 373 ms, to 15:37:56
+        # read Unidentified. A region whose later beats do NOT match the
+        # template (VFib after the VT, a changed rhythm) gives no run and is
+        # cut as before.
+        _VT_RESUME_MIN_BEATS = 5
+
+        def _vt_run_last_beat_fwd(vt_region, resumed=None):
             v_start, v_end = float(vt_region['start_sec']), float(vt_region['end_sec'])
             peaks = [p for p in _sorted_peaks if v_start - 0.05 <= p <= v_end + 0.05]
             ref = [p for p in peaks if p < min(v_end, v_start + window_size)]
@@ -4406,9 +4420,7 @@ def _detect_arrhythmias_uncached(
             if t_norm <= 0 or t_ptp <= 0:
                 return None
 
-            def _is_vt_beat(t, prev_t):
-                if abs((t - prev_t) - vt_rr) > 0.15 * vt_rr:
-                    return False
+            def _shape_matches(t):
                 x = _snip(t)
                 if x is None:
                     return False
@@ -4417,6 +4429,27 @@ def _detect_arrhythmias_uncached(
                     return False
                 return float(np.dot(x, template)) / (n * t_norm) >= 0.90
 
+            def _is_vt_beat(t, prev_t):
+                if abs((t - prev_t) - vt_rr) > 0.15 * vt_rr:
+                    return False
+                return _shape_matches(t)
+
+            def _resumed_runs(k0):
+                """Runs of >= _VT_RESUME_MIN_BEATS beats from cand[k0:] that
+                match the template and keep the VT's RR."""
+                runs, cur = [], []
+                for k in range(k0, len(cand)):
+                    ok = _shape_matches(cand[k])
+                    if ok and (not cur or abs((cand[k] - cur[-1]) - vt_rr) <= 0.15 * vt_rr):
+                        cur.append(cand[k])
+                        continue
+                    if len(cur) >= _VT_RESUME_MIN_BEATS:
+                        runs.append((cur[0], cur[-1]))
+                    cur = [cand[k]] if ok else []
+                if len(cur) >= _VT_RESUME_MIN_BEATS:
+                    runs.append((cur[0], cur[-1]))
+                return runs
+
             last, misses = cand[0] if cand else None, 0
             for k in range(1, len(cand)):
                 if _is_vt_beat(cand[k], cand[k - 1]):
@@ -4424,19 +4457,29 @@ def _detect_arrhythmias_uncached(
                 else:
                     misses += 1
                     if misses >= 2:
+                        if resumed is not None:
+                            resumed.extend(_resumed_runs(k - 1))
                         return last
             return None
 
+        _vt_resumed_regions = []
         for idx, region in enumerate(merged_morph):
             if region['label'] != 'Ventricular Tachycardia':
                 continue
             try:
                 if not (idx + 1 < len(merged_morph)
                         and float(merged_morph[idx + 1]['start_sec']) - float(region['end_sec']) <= window_size):
-                    vt_end = _vt_run_last_beat_fwd(region)
+                    _resumed = []
+                    vt_end = _vt_run_last_beat_fwd(region, _resumed)
                     if vt_end is not None and float(region['start_sec']) + 1.0 < vt_end < float(region['end_sec']) - 0.05:
                         region['end_sec'] = vt_end
                         _, region['end_time_str'] = make_time_strs(region['start_sec'], vt_end)
+                        for _r0, _r1 in _resumed:
+                            if _r0 > vt_end:
+                                _piece = dict(region)
+                                _piece['start_sec'], _piece['end_sec'] = float(_r0), float(_r1)
+                                _piece['start_time_str'], _piece['end_time_str'] = make_time_strs(_r0, _r1)
+                                _vt_resumed_regions.append(_piece)
                 # Never into another morphological label: the walk stops at
                 # the end of the region before (VFib, AFib, a block, ...), so
                 # no other rhythm's segment is shortened by this.
@@ -4456,6 +4499,9 @@ def _detect_arrhythmias_uncached(
                         merged_morph[idx + 1]['_flatline_gap_before'] = True
             except Exception as e:
                 print(f"[Auto Arrhythmia Detect] VT start refine error: {e}")
+        if _vt_resumed_regions:
+            merged_morph.extend(_vt_resumed_regions)
+            merged_morph.sort(key=lambda r: float(r['start_sec']))
 
         # Beat-exact edges for Atrial Fibrillation / Atrial Flutter where they
         # border normal rhythm (no other morphological region within one

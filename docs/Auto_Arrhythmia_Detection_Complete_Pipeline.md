@@ -227,6 +227,20 @@ this exact order — the first one that fires wins the window)
 - The drawn segment's **start** is trimmed to `_ventricular_tachycardia_core_start`
   (same stable-core search, applied again) so onset-transition beats
   aren't included.
+- The **end** is cut beat by beat (`_vt_run_last_beat_fwd`: shape corr ≥ 0.90
+  against the VT's own template, size 0.5–2×, RR within 15%; two misses in
+  a row end the run). The region the window vote joins can hold a break
+  (noise on the lead read) and the same VT after it: every later run of
+  ≥ 5 beats that matches the template again is kept as its own VT piece
+  instead of being thrown away with the break (2026-11-16_15-35-15: VT
+  15:36:58 – 15:37:21, muscle noise to 15:37:33, same VT to 15:37:56).
+  A later stretch that does not match (VFib after the VT) is still cut.
+- **PVC / PAC marks:** beats inside an auto VT segment are not marked V or S
+  by `ectopic_beats_detector` (`NO_PVC_SEGMENTS`, `NO_PAC_SEGMENTS`): VT is a
+  rhythm of its own, so it no longer reads "PVC Run". Measured: V inside VT
+  segments 0 on all 22 simulator recordings with a VT; MIT-BIH PVC Se
+  74.7 → 74.4%, +P 88.5 → 91.7% (34 false V gone, 3 real V in record 207's
+  VT lost); INCART unchanged.
 
 ### 6.2 Ventricular Fibrillation — `_is_vfib_window`
 Fires only when **all** of: the window's own chaos test passes, **and**

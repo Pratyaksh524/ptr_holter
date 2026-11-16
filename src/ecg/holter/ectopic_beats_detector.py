@@ -41,7 +41,7 @@ V V V V as a run instead of N N V N N V (trigeminy).
     LATE_PARTNER_CORR); a late PVC with fewer is dropped.
     Not V: a wide beat at the normal rate with the sinus P (bundle branch
     block), a wide beat with the dominant beat's shape, and any beat inside
-    an auto Atrial Flutter segment (NO_PVC_SEGMENTS).
+    an auto Atrial Flutter or Ventricular Tachycardia segment (NO_PVC_SEGMENTS).
   - A PVC repeats: a V whose shape matches no other V of the recording
     (beyond its own neighbours) >= PARTNER_CORR goes back to N -- noise
     that makes a normal beat "different" does not repeat, a ventricular
@@ -136,11 +136,12 @@ P_POST_SEC = 0.06
 # the old normal RR and its P stretch differs from the old rate's, so the
 # whole new rhythm read as one S run: 14-24 S per Sinus Tachycardia / SVT
 # segment of the simulator recordings), and first-degree AV block has a PR so
-# long the P stretch is not where the P test looks.
+# long the P stretch is not where the P test looks. A ventricular tachycardia
+# is no run of PACs either (2026-10-20_12-26-09: 2 S on its beats).
 NO_PAC_SEGMENTS = ('Atrial Fibrillation', 'Atrial Flutter', 'Second-degree AV Block (Mobitz I)',
                    'Second-degree AV Block (Mobitz II)', 'Second-degree AV Block (2:1)', 'Third-degree AV Block',
                    'First-degree AV Block', 'Sinus Tachycardia', 'Sinus Bradycardia', 'Tachycardia', 'Bradycardia',
-                   'Supraventricular Tachycardia (SVT)')
+                   'Supraventricular Tachycardia (SVT)', 'Ventricular Tachycardia')
 PAC_SEGMENT_MARGIN_SEC = 1.0   # a rate step's first beat comes just before its segment
 SHAPE_PRE_SEC = 0.10
 SHAPE_POST_SEC = 0.16
@@ -164,7 +165,12 @@ NO_QRS_SEGMENTS = ('Ventricular Fibrillation', 'Asystole', 'Artifact', 'Unidenti
 # recordings look like them (shape similarity median 0.63 vs 0.56, QRS 166 vs
 # 168 ms, RR / normal RR 0.66 vs 0.63), so no limit here removes the one and
 # not the other. Flutter in those records is 15 s and holds no V.
-NO_PVC_SEGMENTS = ('Atrial Flutter',)
+# Ventricular Tachycardia is a rhythm of its own, not a run of PVCs: its beats
+# are premature against the running normal RR and unlike the dominant shape,
+# so every one read V and the run read "PVC Run" (2026-11-16_15-35-15,
+# 160 bpm wide-complex VT, 22 V at 15:36:58 - 15:37:06). Beats inside an auto
+# Ventricular Tachycardia segment are not looked at for PVCs.
+NO_PVC_SEGMENTS = ('Atrial Flutter', 'Ventricular Tachycardia')
 MAINS_ARTIFACT_KINDS = ('50 Hz', '60 Hz')   # 'artifact_kind' of the segment detector's mains Artifact
 
 _DEBUG = False
