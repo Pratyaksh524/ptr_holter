@@ -386,6 +386,36 @@ alongside the rhythm label, never instead of it.
 16. **First-degree AV Block beat-by-beat** — fills in time no other label
     claims, same PR > 200 ms / 1:1-conducted idea as the window rule,
     beat by beat.
+    **Mobitz I / Mobitz II / Third-degree beat-by-beat** run right after it
+    in time no other rhythm label holds (Mobitz II: one pause at a time,
+    fixed P-peak-to-R PR before and after). **Mobitz II episode**
+    (`_MOBII_EPISODE_GAP_SEC` = 20 s): two Mobitz II spans (these pauses or
+    Mobitz II windows) at most 20 s apart are one episode when both hold a
+    real dropped beat (an RR ≥ 1.7× the median RR around it) and the time
+    between them is readable signal, holds no rhythm label but First-degree /
+    the rate-only labels / bundle branch blocks, and its conducted beats keep
+    the same fixed PR (≥ 3 beats, ≥ 70% within 20 ms of their median, median
+    within 20 ms of the pauses' PR). The gap is then Mobitz II and the
+    First-degree AV Block label there is cut out. Seen on
+    2026-11-16_18-15-18: pauses 18:18:49 and 19:04 with a fixed PR between
+    them read as First-degree 18:18:53–19:02; now one Mobitz II
+    18:18:49–19:18. A new PR or a longer silence is a new episode.
+    **First-degree next to Mobitz II:** a First-degree AV Block segment
+    within 20 s of a Mobitz II span (`_MOBII_EPISODE_GAP_SEC`) is that
+    episode's conducted beats, so whatever the PR reads that time is cut out
+    of the First-degree label (cut to beats, readable signal only). It is
+    NOT relabelled Mobitz II: Mobitz II stays where a pause confirms it (and
+    across a gap between two confirmed pauses, above). Seen on
+    2026-11-17_10-15-58: 12 s of First-degree right before a Mobitz II pause
+    and 9 s right after one.
+    **Third-degree run through the window label:** beats a Third-degree
+    window label already holds take part in the beat-by-beat Third-degree
+    run (PR measured, counted toward its ≥ 4 beats); only the free beats get
+    the label, joined to the window label. The window rule's first full 10 s
+    window starts several beats into the block, and the 1–3 free beats
+    before it used to read plain Bradycardia (seen: 2026-11-17_10-03-23,
+    Mobitz II then 30 bpm escape rhythm from 10:07:33; Bradycardia
+    10:07:32–40, now Third-degree from 10:07:35).
 17. **Unidentified, first pass**: 10 s `frame_status` frames that aren't
     `ok` define "zones"; inside a zone, beat-interval `span_status` is
     checked (1 s filled steps where RR > 1.5 s); any non-`ok` span, minus

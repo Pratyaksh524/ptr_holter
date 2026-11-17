@@ -2197,6 +2197,7 @@ def _detect_arrhythmias_uncached(
     # further apart than this is a real stretch of normal conduction between
     # two episodes and must not be bridged over.
     _AV_MERGE_GAP_SEC = 2.5
+    _MOBII_EPISODE_GAP_SEC = 20.0   # see 'Mobitz II episode' in the beat-by-beat AV step
 
     def _prepare_av_conduction_context(conduction_signal, qrs_peaks, core_r_peaks, fs):
         """Map every P wave in the window to the QRS it conducts to (or none).
@@ -6640,7 +6641,14 @@ def _detect_arrhythmias_uncached(
     #   median; the "PR" before each QRS scattered (std > 40 ms or range >
     #   80 ms over >= 2 measured -- P and QRS unrelated); and >= 2 waves
     #   per RR, >= 300 ms apart (more P than QRS, at an atrial rate below
-    #   200/min -- Flutter's F waves are ~200 ms apart).
+    #   200/min -- Flutter's F waves are ~200 ms apart). Beats a Third-degree
+    #   window label already holds count as members of the run (their PR is
+    #   measured too) and only the free beats get the label, joined to the
+    #   window label: its first full 10 s window starts several beats into
+    #   the block, and the 1-3 free beats before it were under the 4 the run
+    #   needs and read plain Bradycardia (seen: 2026-11-17_10-03-23, Mobitz II
+    #   ends 10:07:29, 30 bpm escape rhythm from 10:07:33, window label from
+    #   10:07:40 -- Bradycardia 10:07:32-40; now Third-degree from 10:07:35).
     #   A PVC (_is_pvc) has no PR: it is left out of the PR list and a cycle
     #   that holds one is not a cycle.
     # Sinus Bradycardia / Tachycardia / Arrhythmia are cut where they land.
@@ -6667,10 +6675,20 @@ def _detect_arrhythmias_uncached(
         # long PRs these blocks are made of -- seen: 356 ms at the end of a
         # Wenckebach cycle read as no PR), same filtering as the sinus gate,
         # measured only on beats no other label holds, 60 s at a time.
+        # Beats inside a Third-degree window label also take part in the
+        # beat-by-beat Third-degree run (PR measured, counted in the run):
+        # an episode's first beats before that label's first full 10 s window
+        # are otherwise 1-3 free beats, under the 4 the run needs.
+        _third_win = [(float(sg['start_sec']), float(sg['end_sec'])) for sg in final_segments
+                      if sg['label'] == _AV_THIRD]
+
+        def _in_third_win(i):
+            return any(s - 0.01 <= all_r_peaks[i] <= e + 0.01 for s, e in _third_win)
+
         _ns_pr = {}
         # free beats, plus the beat right after each (a Wenckebach cycle's
         # reset beat may be the first beat of the next segment)
-        _free_idx = [q for q in range(_n) if _free(q) or (q > 0 and _free(q - 1))]
+        _free_idx = [q for q in range(_n) if _free(q) or (q > 0 and _free(q - 1)) or _in_third_win(q)]
         _c = 0
         while _c < len(_free_idx):
             t_lo = all_r_peaks[_free_idx[_c]]
@@ -6834,11 +6852,184 @@ def _detect_arrhythmias_uncached(
             else:
                 new_av.append([_AV_MOBITZ_II, r0, r1])
 
+        # Mobitz II episode: the pauses above are found one at a time, so
+        # the conducted beats between two pauses of one episode are left to
+        # whatever else reads them -- and with a fixed PR over 200 ms they
+        # read as First-degree AV Block (seen on 2026-11-16_18-15-18: Mobitz
+        # II pause 18:18:49-18:18:53, First-degree 18:18:53-18:19:02, the next
+        # pause 18:19:04; the PR never changed and the AV block never stopped
+        # -- it just dropped a beat only now and then). Two Mobitz II spans
+        # no more than _MOBII_EPISODE_GAP_SEC apart are one episode when both
+        # spans hold a real dropped beat (an RR >= 1.7x the median RR around it
+        # -- a fixed PR is what any normal rhythm has, so it proves nothing by
+        # itself: MIT-BIH 220, normal beats only, has nine Mobitz II spans from
+        # the window rule and not one RR pause) and the
+        # time between them (a) is readable signal (frame_status 'ok', not
+        # noise), (b) holds no rhythm label but First-degree AV Block / the
+        # rate-only labels / bundle branch blocks (no Mobitz I, Third-degree,
+        # VT, AFib ...) and (c) its conducted beats keep the same fixed PR:
+        # P peak to R, >= 3 measured, >= 70% within 20 ms of their median, and
+        # that median within 20 ms of the pauses' own PR. A change of PR
+        # (new conduction) or a longer silence is a new episode.
+        _gap_ranges = []
+        try:
+            from .pqrst_measure import frame_status as _fs_gap
+
+            def _gap_readable(t0, t1):
+                t = t0
+                while t < t1 - 0.5:
+                    if _fs_gap(reader, t, min(t1, t + 10.0)) != 'ok':
+                        return False
+                    t += 10.0
+                return True
+
+            def _gap_fixed_pr(t0, t1):
+                """(PR list, P-peak-to-R in ms, of every beat in t0..t1 that has one)."""
+                idx = [q for q in range(_n) if t0 - 0.01 <= all_r_peaks[q] <= t1 + 0.01]
+                if len(idx) < 3:
+                    return None
+                a0, a1 = all_r_peaks[idx[0]] - 0.6, all_r_peaks[idx[-1]] + 0.2
+                sig = _lead_reader.read_range(max(0.0, a0), min(total_duration, a1))   # conduction-lead-fallback
+                if sig is None or conduction_lead_idx >= sig.shape[0]:
+                    return None
+                x = np.asarray(sig[conduction_lead_idx], dtype=float)
+                _b, _a = _butter(2, [0.5 / (float(fs) / 2.0), 30.0 / (float(fs) / 2.0)], btype='band')
+                x = _filtfilt(_b, _a, x)
+                base = max(0.0, a0)
+                out = []
+                for q in idx:
+                    if _is_pvc(q):
+                        continue
+                    i0 = int((all_r_peaks[q] - 0.35 - base) * fs)
+                    i1 = int((all_r_peaks[q] - 0.06 - base) * fs)
+                    if i0 < 0 or i1 > len(x) or i1 - i0 < int(0.1 * fs):
+                        continue
+                    seg = x[i0:i1]
+                    if np.ptp(seg) <= 0:
+                        continue
+                    pk, props = find_peaks(seg, prominence=0.3 * float(np.ptp(seg)), distance=int(0.3 * fs))
+                    if len(pk) == 0:
+                        continue
+                    best = pk[int(np.argmax(props['prominences']))]
+                    out.append((all_r_peaks[q] - (base + (i0 + best) / fs)) * 1000.0)
+                return out
+
+            _blocking = [
+                (float(sg['start_sec']), float(sg['end_sec']), sg['label']) for sg in final_segments
+                if sg['label'] not in _rate_only and sg['label'] != _AV_FIRST and not _is_layer_label(sg['label'])
+            ]
+            # the pauses found above plus the Mobitz II windows already labelled
+            _spans = sorted(
+                [(r[1], r[2]) for r in new_av if r[0] == _AV_MOBITZ_II]
+                + [(float(sg['start_sec']), float(sg['end_sec'])) for sg in final_segments
+                   if sg['label'] == _AV_MOBITZ_II],
+                key=lambda v: v[0])
+            _filled = []
+
+            def _has_dropped_beat(t0, t1):
+                """True if an RR inside t0..t1 is >= 1.7x the median RR of the
+                beats around it -- a QRS really missing (what a Mobitz II
+                pause is), not just a P the context decided was blocked."""
+                # the RRs that START inside the span: a window-rule span ends
+                # before the beat that closes the pause (seen: 3 s span, RRs
+                # 0.75 / 0.75, then the 2.25 s pause ending 0.75 s after it)
+                ii = [q for q in range(1, _n) if t0 - 0.01 <= all_r_peaks[q - 1] <= t1 + 0.01]
+                if not ii:
+                    return False
+                lo_q, hi_q = max(1, ii[0] - 6), min(_n - 1, ii[-1] + 6)
+                rrs = [_rr(q) for q in range(lo_q, hi_q + 1)]
+                med = float(np.median(rrs)) if rrs else 0.0
+                return med > 0 and any(_rr(q) >= 1.7 * med for q in ii)
+
+            for (a0, a1), (b0, b1) in zip(_spans, _spans[1:]):
+                g0, g1 = a1, b0
+                if not (0.0 < g1 - g0 <= _MOBII_EPISODE_GAP_SEC):
+                    continue
+                # both ends must be a real dropped beat (MIT-BIH 220, all
+                # normal beats, no RR pause anywhere, still has nine Mobitz II
+                # spans from the window rule: a fixed PR across the gap is
+                # what every normal rhythm has, so it can't be the only proof)
+                if not (_has_dropped_beat(a0, a1) and _has_dropped_beat(b0, b1)):
+                    continue
+                if any(l0 < g1 and l1 > g0 for l0, l1, _lab in _blocking):
+                    continue
+                if any(q[0] != _AV_MOBITZ_II and q[1] < g1 and q[2] > g0 for q in new_av):
+                    continue
+                if not _gap_readable(g0, g1):
+                    continue
+                gap_pr = _gap_fixed_pr(g0 - 0.01, g1 + 0.01)
+                edge_pr = (_gap_fixed_pr(a0 - 0.01, a1 + 0.01) or []) + (_gap_fixed_pr(b0 - 0.01, b1 + 0.01) or [])
+                if not gap_pr or len(gap_pr) < 3 or len(edge_pr) < 2:
+                    continue
+                med_gap = float(np.median(gap_pr))
+                if sum(1 for v in gap_pr if abs(v - med_gap) <= 20.0) < 0.7 * len(gap_pr):
+                    continue
+                if abs(med_gap - float(np.median(edge_pr))) > 20.0:
+                    continue
+                _filled.append((g0, g1))
+            # First-degree AV Block that sits within _MOBII_EPISODE_GAP_SEC of a
+            # Mobitz II span is that episode's conducted beats, not a rhythm of
+            # its own: a block that drops a beat now and then has the same
+            # long fixed PR on every beat in between, which is all the
+            # First-degree rule looks for (seen: 2026-11-17_10-15-58, 12 s of
+            # First-degree right before a Mobitz II pause, 9 s right after
+            # one). Whatever the PR reads, no First-degree label stays there.
+            # The time is only cut out of it, NOT relabelled: Mobitz II is
+            # labelled where a pause confirms it (and across a gap between two
+            # confirmed pauses, above), nothing else gets it. Cut back to
+            # beats, and only where the signal is readable.
+            _fd_fill = []
+            _beats_sorted = [float(x) for x in all_r_peaks]
+            for sg in final_segments:
+                if sg['label'] != _AV_FIRST:
+                    continue
+                f0, f1 = float(sg['start_sec']), float(sg['end_sec'])
+                for m0, m1 in _spans:
+                    p0, p1 = max(f0, m0 - _MOBII_EPISODE_GAP_SEC), min(f1, m1 + _MOBII_EPISODE_GAP_SEC)
+                    if p1 - p0 < 1.0:
+                        continue
+                    if p0 > f0:
+                        nxt = [t for t in _beats_sorted if t >= p0]
+                        p0 = nxt[0] if nxt else p0
+                    if p1 < f1:
+                        prv = [t for t in _beats_sorted if t <= p1]
+                        p1 = prv[-1] if prv else p1
+                    if p1 - p0 >= 1.0 and _gap_readable(p0, p1):
+                        _fd_fill.append((p0, p1))
+            for g0, g1 in _filled:
+                new_av.append([_AV_MOBITZ_II, g0, g1])
+            _gap_ranges = _filled + _fd_fill
+        except Exception as e:
+            print(f"[Auto Arrhythmia Detect] Mobitz II episode merge error: {e}")
+            _gap_ranges = []
+
         # Third-degree runs
         _mob = [(s, e) for _, s, e in new_av]
 
         def _free3(i):
-            return _free(i) and not any(s - 0.01 <= all_r_peaks[i] <= e + 0.01 for s, e in _mob)
+            # free, or already read as Third-degree by the window rule
+            return (_free(i) or _in_third_win(i)) and not any(
+                s - 0.01 <= all_r_peaks[i] <= e + 0.01 for s, e in _mob)
+
+        def _emit_third(run):
+            """Label the run's free beats Third-degree. A run can reach into
+            a Third-degree window label (those beats took part in the test but
+            already have the label): each stretch of free beats is emitted
+            on its own, reaching to the neighbouring window-label beat so the
+            two join up -- the window label can run through noise, which the
+            readable-signal check below would throw a whole run out for."""
+            k = 0
+            while k < len(run):
+                if not _free(run[k]):
+                    k += 1
+                    continue
+                k0 = k
+                while k + 1 < len(run) and _free(run[k + 1]):
+                    k += 1
+                s_q = run[k0 - 1] if k0 > 0 else run[k0]
+                e_q = run[k + 1] if k + 1 < len(run) else run[k]
+                new_av.append([_AV_THIRD, all_r_peaks[s_q], all_r_peaks[e_q]])
+                k += 1
 
         def _third_degree_run(run):
             prs = [_pr(q) for q in run if _pr(q) is not None]
@@ -6877,17 +7068,17 @@ def _detect_arrhythmias_uncached(
                 ok = abs(_rr(q) - med) <= 0.15 * med
                 if not ok and _free3(q) and _rr(q) > 1.0:
                     if len(run) >= 4 and _third_degree_run(run):
-                        new_av.append([_AV_THIRD, all_r_peaks[run[0]], all_r_peaks[run[-1]]])
+                        _emit_third(run)
                     run = [q]
                     continue
             if ok:
                 run.append(q)
                 continue
             if len(run) >= 4 and _third_degree_run(run):
-                new_av.append([_AV_THIRD, all_r_peaks[run[0]], all_r_peaks[run[-1]]])
+                _emit_third(run)
             run = []
         if len(run) >= 4 and _third_degree_run(run):
-            new_av.append([_AV_THIRD, all_r_peaks[run[0]], all_r_peaks[run[-1]]])
+            _emit_third(run)
 
         new_av = [r for r in new_av if r[2] - r[1] >= 2.0]
         # only on readable signal (pqrst_measure.frame_status 'ok' over
@@ -6906,14 +7097,20 @@ def _detect_arrhythmias_uncached(
             new_av = [r for r in new_av if _readable(r[1], r[2])]
         except Exception:
             new_av = []
-        if new_av:
+        if new_av or _gap_ranges:
             kept = []
             for seg in final_segments:
-                if seg['label'] not in _rate_only:
+                # First-degree AV Block is cut only by the time a Mobitz II
+                # episode spans between two of its pauses (_gap_ranges)
+                if seg['label'] == _AV_FIRST and _gap_ranges:
+                    _cutters = [(None, g0, g1) for g0, g1 in _gap_ranges]
+                elif seg['label'] in _rate_only:
+                    _cutters = new_av
+                else:
                     kept.append(seg)
                     continue
                 pieces = [(float(seg['start_sec']), float(seg['end_sec']))]
-                for _, r0, r1 in new_av:
+                for _, r0, r1 in _cutters:
                     nxt = []
                     for p0, p1 in pieces:
                         if r1 <= p0 or r0 >= p1:
@@ -6934,8 +7131,8 @@ def _detect_arrhythmias_uncached(
                     kept.append(piece)
             final_segments = kept
             for label, r0, r1 in new_av:
-                touching = next((s for s in final_segments if s['label'] == label and (
-                    abs(float(s['start_sec']) - r1) < 0.02 or abs(float(s['end_sec']) - r0) < 0.02)), None)
+                touching = next((s for s in final_segments if s['label'] == label
+                                 and float(s['start_sec']) - 0.02 <= r1 and float(s['end_sec']) + 0.02 >= r0), None)
                 if touching is not None:
                     touching['start_sec'] = min(float(touching['start_sec']), r0)
                     touching['end_sec'] = max(float(touching['end_sec']), r1)
@@ -6948,6 +7145,19 @@ def _detect_arrhythmias_uncached(
                     'start_time_str': s_str, 'end_time_str': e_str, 'detected_rhythm': label,
                 })
             final_segments.sort(key=lambda x: x['start_sec'])
+            if _gap_ranges:
+                # the episode's pieces (pauses, filled gaps) are one segment
+                _fin = []
+                for sg in final_segments:
+                    last = next((z for z in reversed(_fin) if z['label'] == _AV_MOBITZ_II), None)
+                    if (sg['label'] == _AV_MOBITZ_II and last is not None
+                            and abs(float(sg['start_sec']) - float(last['end_sec'])) < 0.05):
+                        last['end_sec'] = max(float(last['end_sec']), float(sg['end_sec']))
+                        last['start_time_str'], last['end_time_str'] = make_time_strs(
+                            float(last['start_sec']), float(last['end_sec']))
+                        continue
+                    _fin.append(sg)
+                final_segments = _fin
     except Exception as e:
         print(f"[Auto Arrhythmia Detect] Mobitz I / Third-degree beat check error: {e}")
 
