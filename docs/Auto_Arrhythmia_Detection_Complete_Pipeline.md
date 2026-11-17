@@ -242,6 +242,15 @@ this exact order — the first one that fires wins the window)
   74.7 → 74.4%, +P 88.5 → 91.7% (34 false V gone, 3 real V in record 207's
   VT lost); INCART unchanged.
 
+- **VT over a test signal with no QRS is dropped** (Unidentified pass): a
+  VT segment ≥ 50% 'test_signal' whose beats have a global QRS
+  (`pqrst_measure.measure_beats`) on < 25% of them. A 4 Hz triangle test
+  wave reads 240 bpm, regular, wide, one shape — VT to the window rule —
+  but has the same slope all along, so no QRS (2026-11-17_13-39-33,
+  13:59:58–14:00:18: 0 of 39). The simulator's real VT also reads
+  test_signal / non_ecg but its QRS is found (25–27 of 27 a frame, QRS
+  250 ms), so it stays.
+
 ### 6.2 Ventricular Fibrillation — `_is_vfib_window`
 Fires only when **all** of: the window's own chaos test passes, **and**
 no proven bundle-branch-block window covers it (P/PR/QRS-consistent wide
@@ -453,7 +462,7 @@ beside the true 238–258 on half the beats and every RBBB window failed
     the SQI of the 10 s frame says. Atrial Flutter, the AV blocks (1st
     degree, Mobitz I / II, 3rd degree) and the bundle branch blocks yield to
     these muscle spans too (and only to them, not to the other unreadable
-    reasons); Atrial Fibrillation, VFib and VT do not. Includes the VFib
+    reasons) -- Ventricular Tachycardia too (muscle noise inside a VT read as VT, 2026-11-17_13-39-33 14:03:03-15; the muscle part is Unidentified, the VT either side stays); Atrial Fibrillation and VFib do not. A muscle span's 2 s block needs the 65-150 Hz share >= 2% on two of Lead II / I / V5 and >= 1.5% on all three (was >= 2% on all three: a big QRS dilutes the share on its biggest lead, Lead I read 1.8-2.4% in that VT). Includes the VFib
     test-signal trim: a VFib segment whose own beat-snapped pieces read
     `test_signal` gets those pieces cut out and relabelled Unidentified
     (≥ 2 s pieces only).

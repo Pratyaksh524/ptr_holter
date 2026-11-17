@@ -7296,6 +7296,40 @@ def _detect_arrhythmias_uncached(
                     and _test_overlap(seg) >= 0.5 * (float(seg['end_sec']) - float(seg['start_sec'])))
         ]
 
+        # A Ventricular Tachycardia segment mostly over a test signal (>= 50%
+        # 'test_signal') is dropped when its beats have no QRS: the display's
+        # global QRS (pqrst_measure.measure_beats -- a burst of slope across
+        # the leads with quiet signal on both sides) is found on < 25% of
+        # them. A triangle wave has the same slope all the way up and all
+        # the way down, so no beat of it has a QRS; at 4 Hz it still reads
+        # 240 bpm, regular, wide and one shape -- the VT window rule's whole
+        # picture (seen: 2026-11-17_13-39-33, 13:59:58-14:00:18, QRS on 0 of
+        # 39 'beats'). The test-signal status alone can't drop a VT: the
+        # simulator's real VT is the same waveform on every lead and repeats
+        # exactly, so it reads 'test_signal' / 'non_ecg' too -- but its QRS
+        # is found (25-27 of 27 beats a frame on the same recording,
+        # 14:02:45-14:03:53, QRS 250 ms).
+        _VT_TEST_MIN_QRS_SHARE = 0.25
+
+        def _vt_without_qrs(seg):
+            s0, s1 = float(seg['start_sec']), float(seg['end_sec'])
+            if _test_overlap(seg) < 0.5 * (s1 - s0):
+                return False
+            try:
+                from .pqrst_measure import measure_beats as _pq_measure_beats
+                beats = _pq_measure_beats(reader, s0, s1)
+            except Exception:
+                return False
+            if len(beats) < 4:
+                return False
+            resolved = sum(1 for b in beats if b.get('qrs_ms') is not None)
+            return resolved < _VT_TEST_MIN_QRS_SHARE * len(beats)
+
+        final_segments = [
+            seg for seg in final_segments
+            if not (seg['label'] == 'Ventricular Tachycardia' and _vt_without_qrs(seg))
+        ]
+
         # A VFib segment that survives the drop above (< 50% test_signal)
         # can still have a test-signal (square / pulse-train) piece inside
         # it: the check above only flags a whole FRAME_SEC (10 s) frame, so
@@ -7387,17 +7421,21 @@ def _detect_arrhythmias_uncached(
         # I / II, 3rd degree) and the bundle branch blocks. They are read off
         # the P wave / QRS shape beat by beat and a P wave is buried by that
         # noise (P height over its noise 4-5, 18-57 on a clean stretch). Atrial
-        # Fibrillation, VFib and VT are not in the list: AF's PVCs and its
+        # Fibrillation and VFib are not in the list: AF's PVCs and its
         # irregular RR are read on that signal (495 / 226 annotated PVCs inside
-        # the AF segments of MIT-BIH / INCART), VFib and VT are no rhythm to
-        # read a P wave from. The part of the muscle spans inside one of these
+        # the AF segments of MIT-BIH / INCART), VFib is no rhythm to read a
+        # P wave from. Ventricular Tachycardia is: its beats are read off
+        # their QRS shape too, and muscle noise inside a VT was VT (seen:
+        # 2026-11-17_13-39-33, 14:03:03-15 inside VT 14:02:45-14:03:53) --
+        # the muscle part is Unidentified, the VT on either side stays. The part of the muscle spans inside one of these
         # labels is its cut. Seen: muscle noise 12:11:40-12:11:48 inside a 150
         # bpm Atrial Flutter (2026-11-16_12-09-16) read as Flutter beats (and
         # PVCs); Third-degree AV Block kept over 16 s of it
         # (2026-11-03_19-30-06, 19:34:10-19:34:26).
         # The bundle branch blocks are layer labels (drawn next to the
         # rhythm): cut here like the rest, nothing else cuts them.
-        _muscle_cut_labels = ('Atrial Flutter', 'First-degree AV Block', 'Second-degree AV Block (Mobitz I)',
+        _muscle_cut_labels = ('Atrial Flutter', 'Ventricular Tachycardia',
+                              'First-degree AV Block', 'Second-degree AV Block (Mobitz I)',
                               'Second-degree AV Block (Mobitz II)', 'Third-degree AV Block',
                               'Complete Right Bundle Branch Block', 'Complete Left Bundle Branch Block',
                               'Incomplete Right Bundle Branch Block', 'Incomplete Left Bundle Branch Block')
