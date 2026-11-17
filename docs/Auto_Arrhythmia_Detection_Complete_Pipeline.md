@@ -248,7 +248,17 @@ no proven bundle-branch-block window covers it (P/PR/QRS-consistent wide
 beats aren't VFib), **and** `_vfib_beats_organized` is false (no lead
 shows a mostly-organized QRS), **and** `_vfib_has_fibrillating_piece`
 finds an actually-fibrillating sub-piece inside the window (slow-window
-median RR > 600 ms is exempt from this extra check). A lone
+median RR > 600 ms is exempt from this extra check), **and**
+`_vfib_regular_train_under` is false: no regular beat train runs under the
+window on ≥ 2 of leads I / V1 / V6 (beats found on ≥ 2 of them within
+100 ms, ≥ 5 beats, ≥ 80% of RRs within 15% of the median, median RR
+≥ 400 ms, spanning ≥ 70% of the window, one QRS shape — median
+correlation ≥ 0.9 on ≥ 2 of those leads, 1–25 Hz). The window's own beat
+list takes extra "beats" from muscle noise on a steady rhythm (seen:
+2026-11-17_11-37-06, LBBB 80 bpm under 65–150 Hz muscle noise, 21
+'beats' for 13 real ones → VFib 11:38:26–36; now Unidentified, muscle).
+The simulator's VFib can run at a steady ~740 ms for a few waves but its
+waves are not alike (0.69–0.74), so it stays VFib. A lone
 coarse/few-beat VFib window is flagged for the neighbour-confirmation
 guard below (§7.1).
 
@@ -388,26 +398,26 @@ alongside the rhythm label, never instead of it.
     beat by beat.
     **Mobitz I / Mobitz II / Third-degree beat-by-beat** run right after it
     in time no other rhythm label holds (Mobitz II: one pause at a time,
-    fixed P-peak-to-R PR before and after). **Mobitz II episode**
-    (`_MOBII_EPISODE_GAP_SEC` = 20 s): two Mobitz II spans (these pauses or
-    Mobitz II windows) at most 20 s apart are one episode when both hold a
-    real dropped beat (an RR ≥ 1.7× the median RR around it) and the time
-    between them is readable signal, holds no rhythm label but First-degree /
-    the rate-only labels / bundle branch blocks, and its conducted beats keep
-    the same fixed PR (≥ 3 beats, ≥ 70% within 20 ms of their median, median
-    within 20 ms of the pauses' PR). The gap is then Mobitz II and the
-    First-degree AV Block label there is cut out. Seen on
-    2026-11-16_18-15-18: pauses 18:18:49 and 19:04 with a fixed PR between
-    them read as First-degree 18:18:53–19:02; now one Mobitz II
-    18:18:49–19:18. A new PR or a longer silence is a new episode.
-    **First-degree next to Mobitz II:** a First-degree AV Block segment
-    within 20 s of a Mobitz II span (`_MOBII_EPISODE_GAP_SEC`) is that
-    episode's conducted beats, so whatever the PR reads that time is cut out
-    of the First-degree label (cut to beats, readable signal only). It is
-    NOT relabelled Mobitz II: Mobitz II stays where a pause confirms it (and
-    across a gap between two confirmed pauses, above). Seen on
-    2026-11-17_10-15-58: 12 s of First-degree right before a Mobitz II pause
-    and 9 s right after one.
+    fixed P-peak-to-R PR before and after). Mobitz II is labelled only where
+    a pause confirms it. **First-degree next to Mobitz II:** a First-degree
+    AV Block segment within 20 s of a Mobitz II span
+    (`_FIRST_NEAR_MOBII_SEC`) is that block's conducted beats, so whatever
+    the PR reads that time is cut out of the First-degree label (cut to
+    beats, readable signal only). It is only cut, NOT relabelled Mobitz II,
+    and the cut time stays taken for the plain Bradycardia / Tachycardia
+    step (those are the block's own conducted beats, not a free rate run:
+    without this a Third-degree block's last slow beats next to a cut
+    First-degree read a 4.6 s plain Bradycardia, 2026-11-03_12-19-03).
+    Seen on 2026-11-17_10-15-58: 12 s of First-degree right before a Mobitz
+    II pause and 9 s right after one. (A Mobitz II episode merge that filled
+    the time between two pauses, 18 s of label for 2 pauses 15 s apart, was
+    tried and taken out.)
+    **Third-degree run, one early beat:** inside the beat-by-beat Third-degree
+    run a single early beat (RR ≤ 0.6× the run's median, next RR back within
+    15% of it) is stepped over instead of ending the run (seen:
+    2026-11-17_11-25-25, escape beats 2.0 / 2.1 / 2.0 s, one beat 0.75 s
+    after the last, then 2.0 s again: the run stopped at 3 beats and the 6 s
+    read plain Bradycardia; now Third-degree from 11:29:20).
     **Third-degree run through the window label:** beats a Third-degree
     window label already holds take part in the beat-by-beat Third-degree
     run (PR measured, counted toward its ≥ 4 beats); only the free beats get
