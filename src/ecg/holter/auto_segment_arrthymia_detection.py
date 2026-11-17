@@ -2260,6 +2260,7 @@ def _detect_arrhythmias_uncached(
     # two episodes and must not be bridged over.
     _AV_MERGE_GAP_SEC = 2.5
     _FIRST_NEAR_MOBII_SEC = 20.0   # First-degree within this of a Mobitz II span is cut (beat-by-beat AV step)
+    _M1_EARLY_FRACTION = 0.85      # a beat-by-beat Mobitz I cycle RR this far under the rhythm on both sides is an early beat
 
     def _prepare_av_conduction_context(conduction_signal, qrs_peaks, core_r_peaks, fs):
         """Map every P wave in the window to the QRS it conducts to (or none).
@@ -6738,6 +6739,9 @@ def _detect_arrhythmias_uncached(
     #   P lost in the T at the longest PR -- may close the run), then a pause
     #   of 1.3-2.0x the cycle's median RR (the blocked P), and the beat after
     #   it with a PR >= 60 ms shorter than the cycle's longest (the reset).
+    #   No RR of the cycle under _M1_EARLY_FRACTION x the rhythm before it
+    #   and after it (median of up to 4 RRs on each side): a conducted beat
+    #   is never early against the atrial rate, an ectopic one is.
     #   Back-to-back cycles make one segment.
     #   Mobitz II, one pause at a time: 3 beats at a steady RR (within 10%),
     #   then a pause of 2x (one blocked P) or 3x (two blocked P) that RR
@@ -6852,7 +6856,29 @@ def _detect_arrhythmias_uncached(
                 # no early beat inside the cycle: a premature beat and its
                 # compensatory pause (seen: RR 750, 750, 562, 936) is not a
                 # blocked P -- Wenckebach RRs stay close (810 / 930 / 820)
-                ok = (med > 0 and min(cyc_rr) >= 0.8 * max(cyc_rr)
+                # Nor early against the rhythm on both sides of the cycle:
+                # a conducted beat's RR is the P-P plus the PR's growth, so
+                # never under the atrial rate; an ectopic beat comes early
+                # and the rhythm goes on at its rate after the pause. The
+                # check above compares the cycle's RRs with each other
+                # only, and a PVC at 606 ms after a 728 ms RR (0.83) passed
+                # it -- its "PR" (284 ms, no P in front of it) the PR rise,
+                # its compensatory pause (892 ms) the blocked P (seen:
+                # 2026-11-17_13-39-33, 14:00:39 / 14:00:57 / 14:01:11, sinus
+                # 750 ms on both sides: 0.81; INCART I20 40.7 / 233 s, two
+                # PACs after 814 / 852 ms: 0.65 / 0.69; a healthy subject's
+                # sinus arrhythmia, 2026-10-29_16-36-56 742 s: 0.71; INCART
+                # I06 / I08, a PAC / a PVC: 0.75 / 0.50). Every simulator
+                # Wenckebach cycle reads >= 0.926 (RR 810 / 930 / 820, pause
+                # 1190, against 750 ms NSR or the cycle before), INCART I56
+                # 0.93, MIT-BIH 208 1.06. The shorter of the two sides is the
+                # reference: the rate may change at the block's start or end
+                # (I56 slows to ~1230 ms after it).
+                pre_rr = [_rr(q) for q in range(max(1, i - 3), i + 1)]
+                post_rr = [_rr(q) for q in range(j + 1, min(_n, j + 5))]
+                ref_rr = [float(np.median(x)) for x in (pre_rr, post_rr) if x]
+                early = bool(cyc_rr and ref_rr and min(cyc_rr) < _M1_EARLY_FRACTION * min(ref_rr))
+                ok = (med > 0 and min(cyc_rr) >= 0.8 * max(cyc_rr) and not early
                       and 1.3 * med <= _rr(j) <= 2.0 * med
                       and p_after is not None and p_after <= max(prs) - 60.0)
             if ok:

@@ -432,6 +432,21 @@ beside the true 238–258 on half the beats and every RBBB window failed
     II pause and 9 s right after one. (A Mobitz II episode merge that filled
     the time between two pauses, 18 s of label for 2 pauses 15 s apart, was
     tried and taken out.)
+    **Mobitz I cycle, no early beat:** a beat-by-beat Wenckebach cycle
+    (≥ 3 beats with PR rising ≥ 60 ms, pause 1.3–2.0× the cycle's median RR,
+    PR reset ≥ 60 ms) is not taken when its shortest RR is under
+    `_M1_EARLY_FRACTION` (0.85) × the median of up to 4 RRs before it **and**
+    under 0.85 × the median of up to 4 RRs after it. A conducted beat's RR
+    is the P-P plus the PR's growth, never under the atrial rate; a PVC /
+    PAC comes early and the rhythm goes on after its pause. Its "PR" (a P
+    found in front of a beat that has none) made the PR rise and its
+    compensatory pause the "blocked P": 2026-11-17_13-39-33 at 14:00:39,
+    14:00:57 and 14:01:11 (PVC at 606 ms in 750 ms sinus, 0.81), INCART I20
+    40.7 / 233 s (two PACs, 0.65 / 0.69), a healthy subject's sinus
+    arrhythmia (2026-10-29_16-36-56 at 742 s, 0.71). The PVC detector's list
+    (`_is_pvc`) did not hold those PVCs, and it holds no PAC at all.
+    Unchanged: every simulator Wenckebach cycle (≥ 0.926), INCART I56
+    (0.93), MIT-BIH 208 (1.06).
     **Third-degree run, one early beat:** inside the beat-by-beat Third-degree
     run a single early beat (RR ≤ 0.6× the run's median, next RR back within
     15% of it) is stepped over instead of ending the run (seen:
