@@ -387,6 +387,57 @@ def _knot_baseline(x: np.ndarray, onsets: Sequence[Optional[int]], fs: float) ->
     return base
 
 
+def pr_segment_onsets(leads: np.ndarray, lead_names: Sequence[str], beats: Sequence[int],
+                      fs: float) -> Optional[List[Optional[int]]]:
+    """The global QRS onset (sample) of every beat, or None for a beat
+    where it can't be read -- the PR-segment anchors of _knot_baseline and
+    choose_p. None at > 120 bpm (median RR < KNOT_MIN_RR_MS) or with fewer
+    than 3 beats. ``leads``: every lead, band-passed (0.5-40 Hz + notches)."""
+    if len(beats) < 3 or float(np.median(np.diff(beats))) * 1000.0 / fs < KNOT_MIN_RR_MS:
+        return None
+    qrs_idx = [lead_names.index(n) for n in QRS_LEADS
+               if n in lead_names and lead_names.index(n) < leads.shape[0]]
+    onsets = []
+    for k, r in enumerate(beats):
+        prev_rr = (r - beats[k - 1]) * 1000.0 / fs if k > 0 else None
+        bnd = _global_qrs(leads, _quiet_qrs_leads(leads, qrs_idx, r, prev_rr, fs), r, fs)
+        onsets.append(bnd[0] if bnd else None)
+    return onsets
+
+
+def choose_p(lead_ii: np.ndarray, anchor: int, fs: float, prev_rr: Optional[float], collision: bool,
+             onset: Optional[int] = None, prev_t_end: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """measure_beat() of the beat at ``anchor`` with its P wave chosen as in
+    the module docstring: the strict search; the most prominent wave where
+    it finds none (RR >= RELAXED_P_MIN_RR_MS); and the most prominent wave
+    instead of a strict pick P_OVER_STRICT times smaller above the PR
+    segment (the level 20-4 ms before ``onset``, the beat's global QRS
+    onset), inside R-300 .. R-50 ms and after ``prev_t_end`` (the previous
+    beat's T end). Shared by the display (measure_beats) and the auto
+    detector's bundle branch block rules, so both read the same P."""
+    from ecg.arrhythmia_detector import measure_beat
+    m = measure_beat(lead_ii, anchor, fs, strict_pr=True, prev_rr_ms=prev_rr, p_collision_check=collision)
+    relaxed_ok = prev_rr is not None and prev_rr >= RELAXED_P_MIN_RR_MS
+    if (m is None or m.get('pr_ms') is None) and relaxed_ok:
+        relaxed = measure_beat(lead_ii, anchor, fs, strict_pr=False, prev_rr_ms=prev_rr,
+                               p_collision_check=collision)
+        if relaxed and relaxed.get('pr_ms') is not None:
+            m = relaxed
+    if (m and m.get('pr_ms') is not None and m.get('p_peak') is not None and onset is not None
+            and onset - int(0.02 * fs) >= 0 and relaxed_ok and prev_t_end is not None):
+        pq_level = float(np.median(lead_ii[onset - int(0.02 * fs):onset - int(0.004 * fs)]))
+        strict_h = abs(float(lead_ii[int(m['p_peak'])]) - pq_level)
+        relaxed = measure_beat(lead_ii, anchor, fs, strict_pr=False, prev_rr_ms=prev_rr,
+                               p_collision_check=collision)
+        if (relaxed and relaxed.get('pr_ms') is not None and relaxed.get('p_peak') is not None
+                and relaxed.get('p_onset') is not None
+                and abs(float(lead_ii[int(relaxed['p_peak'])]) - pq_level) >= P_OVER_STRICT * strict_h
+                and anchor - int(0.30 * fs) <= int(relaxed['p_peak']) <= anchor - int(0.05 * fs)
+                and int(relaxed['p_onset']) > prev_t_end + int(0.02 * fs)):
+            m = relaxed
+    return m
+
+
 def measure_beats(reader, start_sec: float, end_sec: float) -> List[Dict[str, Any]]:
     """Every beat whose time falls in [start_sec, end_sec), measured as in the
     module docstring. Each beat: 't' (s), 'rr_ms' (from the previous beat,
@@ -423,13 +474,9 @@ def measure_beats(reader, start_sec: float, end_sec: float) -> List[Dict[str, An
     qrs_idx = [lead_names.index(n) for n in QRS_LEADS if n in lead_names]
     onsets = None
     if len(beats) >= 3 and float(np.median(np.diff(beats))) * 1000.0 / fs >= KNOT_MIN_RR_MS:
-        raw_leads = np.vstack([filtfilt(notch_60.b, notch_60.a, np.asarray(preproc.process(lead), dtype=float))
-                               for lead in data])
-        onsets = []
-        for k, r in enumerate(beats):
-            prev_rr = (r - beats[k - 1]) * 1000.0 / fs if k > 0 else None
-            bnd = _global_qrs(raw_leads, _quiet_qrs_leads(raw_leads, qrs_idx, r, prev_rr, fs), r, fs)
-            onsets.append(bnd[0] if bnd else None)
+        onsets = pr_segment_onsets(
+            np.vstack([filtfilt(notch_60.b, notch_60.a, np.asarray(preproc.process(lead), dtype=float))
+                       for lead in data]), lead_names, beats, fs)
     medianed = np.vstack([remove_baseline_wander_r(lead, fs, beats) for lead in data])
     knotted = []
     for i, lead in enumerate(data):
@@ -472,32 +519,8 @@ def measure_beats(reader, start_sec: float, end_sec: float) -> List[Dict[str, An
             local = lead_ii[max(0, r - int(fs)):r + int(fs)]
             anchor = a_lo + int(np.argmax(np.abs(lead_ii[a_lo:a_hi] - np.median(local))))
             collision = prev_rr is None or prev_rr < COLLISION_RR_MS
-            m = measure_beat(lead_ii, anchor, fs, strict_pr=True, prev_rr_ms=prev_rr,
-                             p_collision_check=collision)
-            if m and m.get('pr_ms') is None and prev_rr is not None and prev_rr >= RELAXED_P_MIN_RR_MS:
-                relaxed = measure_beat(lead_ii, anchor, fs, strict_pr=False, prev_rr_ms=prev_rr,
-                                       p_collision_check=collision)
-                if relaxed and relaxed.get('pr_ms') is not None:
-                    m = relaxed
-            # The strict pick against the most prominent wave (see the module
-            # docstring): heights above the PR segment (the level just before
-            # the global QRS onset); far smaller than a wave the strict window
-            # also holds after the previous T -> that wave.
-            if (m and m.get('pr_ms') is not None and m.get('p_peak') is not None and bounds is not None
-                    and bounds[0] - int(0.02 * fs) >= 0 and prev_rr is not None
-                    and prev_rr >= RELAXED_P_MIN_RR_MS):
-                pq_level = float(np.median(lead_ii[bounds[0] - int(0.02 * fs):bounds[0] - int(0.004 * fs)]))
-                strict_h = abs(float(lead_ii[int(m['p_peak'])]) - pq_level)
-                relaxed = measure_beat(lead_ii, anchor, fs, strict_pr=False, prev_rr_ms=prev_rr,
-                                       p_collision_check=collision)
-                rel_h = (abs(float(lead_ii[int(relaxed['p_peak'])]) - pq_level)
-                         if relaxed and relaxed.get('pr_ms') is not None and relaxed.get('p_peak') is not None
-                         else None)
-                if (rel_h is not None and rel_h >= P_OVER_STRICT * strict_h
-                      and anchor - int(0.30 * fs) <= int(relaxed['p_peak']) <= anchor - int(0.05 * fs)
-                      and prev_t_end is not None and relaxed.get('p_onset') is not None
-                      and int(relaxed['p_onset']) > prev_t_end + int(0.02 * fs)):
-                    m = relaxed
+            m = choose_p(lead_ii, anchor, fs, prev_rr, collision,
+                         bounds[0] if bounds is not None else None, prev_t_end)
             if m and m.get('pr_ms') is not None:
                 beat['pr_ms'] = float(m['pr_ms'])
                 beat['p_present'] = True

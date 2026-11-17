@@ -329,6 +329,17 @@ window *before* the chain above, but only as a **veto input** (a proven
 conducted BBB window vetoes a VFib call there) and as its own separate
 beat-level pass (§7's bundle-branch-block section) — it is drawn
 alongside the rhythm label, never instead of it.
+Its P / PR (the PR-consistency check both the window rule and the
+beat-level pass need) is read the way the display reads it:
+Lead II with the PR-segment spline baseline taken out
+(`pqrst_measure._knot_baseline` through every beat's global QRS onset, at
+≤ 120 bpm) and the P chosen by `pqrst_measure.choose_p` (the most
+prominent wave instead of a strict pick 2.5× smaller, after the previous
+beat's T end — estimated there as QRS onset + 0.46 s × √RR). With only the
+0.5–40 Hz band-pass a 7 mV / s respiration wander left PR at 74–166 ms
+beside the true 238–258 on half the beats and every RBBB window failed
+(2026-11-17_12-10-06, 12:10:41–12:11:06; 2026-11-17_10-15-58,
+10:20:28–53).
 
 ---
 

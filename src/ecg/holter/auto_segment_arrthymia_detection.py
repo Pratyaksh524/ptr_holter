@@ -2966,10 +2966,33 @@ def _detect_arrhythmias_uncached(
         )
         return wide_s, broad_r
 
-    def _bundle_branch_block_beat_pr(lead_ii, r, prev_rr, fs_):
+    try:
+        from .pqrst_measure import (choose_p as _pq_choose_p, pr_segment_onsets as _pq_onsets,
+                                    _knot_baseline as _pq_knot_baseline)
+    except ImportError:
+        from ecg.holter.pqrst_measure import (choose_p as _pq_choose_p, pr_segment_onsets as _pq_onsets,
+                                              _knot_baseline as _pq_knot_baseline)
+
+    def _bbb_wander_free_ii(leads, lead_ii, beats, fs_):
+        """(Lead II with the PR-segment spline baseline taken out, every
+        beat's global QRS onset or None) -- pqrst_measure's wander removal
+        for the P / PR, at <= 120 bpm; elsewhere Lead II unchanged and no
+        onsets. The 0.5-40 Hz band-pass alone left a 7 mV / s respiration
+        wander's slope under the P (see _bundle_branch_block_beat_pr)."""
+        try:
+            onsets = _pq_onsets(leads, list(lead_names)[:leads.shape[0]], list(beats), fs_)
+            if onsets is None:
+                return lead_ii, None
+            base = _pq_knot_baseline(lead_ii, onsets, fs_)
+            return (lead_ii if base is None else lead_ii - base), onsets
+        except Exception:
+            return lead_ii, None
+
+    def _bundle_branch_block_beat_pr(lead_ii, r, prev_rr, fs_, onset=None):
         """One beat's P / PR on Lead II for the bundle branch block rules:
         (has_p, pr_ms), or None when the beat can't be measured. See the
-        P / PR comments in _bundle_branch_block_window_beats."""
+        P / PR comments in _bundle_branch_block_window_beats. ``onset``: the
+        beat's global QRS onset (sample of lead_ii), for the P choice."""
         n = lead_ii.size
         half_sec = int(fs_)
         lo, hi = max(0, r - half_sec), min(n, r + half_sec)
@@ -2979,11 +3002,21 @@ def _detect_arrhythmias_uncached(
         if a_hi <= a_lo:
             return None
         anchor = a_lo + int(np.argmax(np.abs(seg_ii[a_lo:a_hi] - np.median(seg_ii))))
-        b = measure_beat(seg_ii, anchor, fs_, strict_pr=True, prev_rr_ms=prev_rr)
-        if (b is None or b.get('pr_ms') is None) and prev_rr is not None and prev_rr >= 500.0:
-            b_relaxed = measure_beat(seg_ii, anchor, fs_, strict_pr=False, prev_rr_ms=prev_rr)
-            if b_relaxed is not None and b_relaxed.get('pr_ms') is not None:
-                b = b_relaxed
+        # The P is chosen as the display chooses it (pqrst_measure.choose_p):
+        # strict search, the most prominent wave where it finds none at
+        # RR >= 500 ms, and the most prominent wave instead of a strict pick
+        # 2.5x smaller -- the tall P's own undershoot under a respiration
+        # wander (seen: RBBB with Mobitz II, PR read 74-166 ms beside the
+        # true 238-258 on half the beats, every RBBB window from 12:10:41 to
+        # 12:11:06 failed the PR check, 2026-11-17_12-10-06). The previous
+        # beat's T end, which that wave must come after, is estimated: its
+        # QRS onset (R - 50 ms) plus a QT of 0.46 s x sqrt(RR).
+        prev_t_end = None
+        if prev_rr is not None:
+            prev_t_end = ((r - lo) - int(prev_rr / 1000.0 * fs_) - int(0.05 * fs_)
+                          + int(0.46 * np.sqrt(prev_rr / 1000.0) * fs_))
+        b = _pq_choose_p(seg_ii, anchor, fs_, prev_rr, True,
+                         (onset - lo) if onset is not None and lo <= onset < hi else None, prev_t_end)
         if b and b.get('p_present') and b.get('p_onset') is not None:
             return True, (float(b['pr_ms']) if b.get('pr_ms') is not None else None)
         return False, None
@@ -3124,10 +3157,12 @@ def _detect_arrhythmias_uncached(
         # a P. The PR-consistency check below still has to pass.
         # (Both searches: _bundle_branch_block_beat_pr.)
         lead_ii = np.asarray(padded_array[conduction_lead_idx], dtype=float)
+        lead_ii, _onsets = _bbb_wander_free_ii(padded_array, lead_ii, core, fs_)
         prs, with_p = [], 0
         for k, r in enumerate(core):
             prev_rr = (r - core[k - 1]) * 1000.0 / fs_ if k else None
-            beat_p = _bundle_branch_block_beat_pr(lead_ii, r, prev_rr, fs_)
+            beat_p = _bundle_branch_block_beat_pr(lead_ii, r, prev_rr, fs_,
+                                                  _onsets[k] if _onsets is not None else None)
             if beat_p is None:
                 continue
             has_p, pr = beat_p
@@ -5454,6 +5489,7 @@ def _detect_arrhythmias_uncached(
                     found.extend((int(p), li) for p in pan_tompkins(np.asarray(raw[li], dtype=float), fs=fs))
             found.sort()
             chunk_beats = []
+            all_heads = []   # every beat in the read (pad too): the spline's PR levels
             k = 0
             while k < len(found):
                 group = [found[k]]
@@ -5461,8 +5497,10 @@ def _detect_arrhythmias_uncached(
                     k += 1
                     group.append(found[k])
                 k += 1
-                if len({li for _, li in group}) >= 2 and t <= p0 + group[0][0] / fs < t_end:
-                    chunk_beats.append(group[0][0])
+                if len({li for _, li in group}) >= 2:
+                    all_heads.append(group[0][0])
+                    if t <= p0 + group[0][0] / fs < t_end:
+                        chunk_beats.append(group[0][0])
             filtered = raw
             if _atrial_preproc is not None:
                 try:
@@ -5492,6 +5530,11 @@ def _detect_arrhythmias_uncached(
                 pass
             lead_ii = np.asarray(filtered[conduction_lead_idx], dtype=float) \
                 if conduction_lead_idx < filtered.shape[0] else None
+            head_onsets = None
+            if lead_ii is not None:
+                # P / PR as the window rule reads it: the PR-segment spline
+                # baseline taken out of Lead II (_bbb_wander_free_ii)
+                lead_ii, head_onsets = _bbb_wander_free_ii(filtered, lead_ii, all_heads, fs)
             best = np.asarray(raw[best_lead_idx], dtype=float) if best_lead_idx < raw.shape[0] else None
             median_best = float(np.median(best)) if best is not None and best.size else 0.0
             for r in chunk_beats:
@@ -5499,7 +5542,9 @@ def _detect_arrhythmias_uncached(
                 prev_rr = (t_sec - beats[-1][0]) * 1000.0 if beats else None
                 label, pr, snippet = None, None, None
                 try:
-                    beat_p = _bundle_branch_block_beat_pr(lead_ii, r, prev_rr, fs) if lead_ii is not None else None
+                    onset = head_onsets[all_heads.index(r)] if head_onsets is not None and r in all_heads else None
+                    beat_p = _bundle_branch_block_beat_pr(lead_ii, r, prev_rr, fs, onset) \
+                        if lead_ii is not None else None
                     width_shape = _bundle_branch_block_beat_width_shape(filtered, r, fs)
                     if beat_p is not None and beat_p[0] and beat_p[1] is not None \
                             and width_shape is not None and width_shape[1] is not None:
