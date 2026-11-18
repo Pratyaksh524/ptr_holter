@@ -28,8 +28,15 @@ import numpy as np
 
 # Muscle noise (EMG): broadband power far above anything an ECG has at
 # 65-150 Hz, on every lead at once. A 2 s block counts when
-#   - on each of Lead II, I and V5 the 65-150 Hz share of the 1-150 Hz power
-#     (Welch, 100 / 120 Hz mains harmonics +-3 Hz left out) is >= 2%, and
+#   - the 65-150 Hz share of the 1-150 Hz power (Welch, 100 / 120 Hz mains
+#     harmonics +-3 Hz left out) is >= 2% on at least two of Lead II, I and
+#     V5 and >= 1.5% on all three (was: >= 2% on all three -- a big QRS
+#     fills the 1-150 Hz power and the same noise reads a smaller share on
+#     the lead where the QRS is largest: muscle noise inside a 160 bpm VT,
+#     2026-11-17_13-39-33 14:03:03-15, read II 3.0-3.6%, V5 5.1-6.7%, I
+#     1.8-2.4%, so the 2 s blocks passed and failed by turns and no 4 s run
+#     ever formed; over all recordings this finds 66 s more, 22 s of it
+#     that noise, the rest 2-12 s at the edges of spans already found), and
 #   - on Lead II the std above 40 Hz (SignalQuality's own high-pass, after
 #     the 50 / 60 Hz notches) is >= 2% of the ECG peak-to-peak (0.5-40 Hz) of
 #     the 10 s around the block.
@@ -47,6 +54,8 @@ import numpy as np
 _MUSCLE_BLOCK_SEC = 2.0
 _MUSCLE_RUN_BLOCKS = 2
 _MUSCLE_SHARE_MIN = 0.02
+_MUSCLE_SHARE_LEADS = 2          # leads at _MUSCLE_SHARE_MIN or more ...
+_MUSCLE_SHARE_FLOOR = 0.015      # ... and every lead at this or more
 _MUSCLE_HF_RATIO_MIN = 0.02
 _MUSCLE_CONTEXT_BLOCKS = 2
 _MUSCLE_CHUNK_SEC = 120.0
@@ -76,14 +85,18 @@ def muscle_noise_spans(reader, fs, total_duration):
         data = reader.read_range(r0, min(total_duration, t_end + pad))
         n_blk = 0 if data is None else data.shape[1] // blk
         if n_blk > 0 and data.shape[0] > max(idx):
-            share_ok = np.ones(n_blk, dtype=bool)
+            n_at_min = np.zeros(n_blk, dtype=int)
+            n_at_floor = np.zeros(n_blk, dtype=int)
             for i in idx:
                 x = np.asarray(data[i, :n_blk * blk], dtype=float).reshape(n_blk, blk)
                 x = x - x.mean(axis=1, keepdims=True)
                 f, pw = welch(x, fs=fs, nperseg=min(blk, 500), axis=-1)
                 band = (f >= 65.0) & (f <= 150.0) & ~((f >= 97.0) & (f <= 103.0)) & ~((f >= 117.0) & (f <= 123.0))
                 tot = pw[:, (f >= 1.0) & (f <= 150.0)].sum(axis=1)
-                share_ok &= (tot > 0) & (pw[:, band].sum(axis=1) >= _MUSCLE_SHARE_MIN * np.maximum(tot, 1e-30))
+                hf_pw = pw[:, band].sum(axis=1)
+                n_at_min += ((tot > 0) & (hf_pw >= _MUSCLE_SHARE_MIN * np.maximum(tot, 1e-30))).astype(int)
+                n_at_floor += ((tot > 0) & (hf_pw >= _MUSCLE_SHARE_FLOOR * np.maximum(tot, 1e-30))).astype(int)
+            share_ok = (n_at_min >= _MUSCLE_SHARE_LEADS) & (n_at_floor >= len(idx))
             y = np.asarray(data[idx[0], :n_blk * blk], dtype=float)[None, :]
             y = (y - np.median(y, axis=1, keepdims=True)) / ADC_COUNTS_PER_MV
             for b, a in sq._notches:

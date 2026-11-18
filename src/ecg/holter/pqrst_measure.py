@@ -9,6 +9,27 @@ Measured against the Fluke ProSim 8 reference table
   - Beats: Pan-Tompkins on leads I, V1 and V6; a beat counts when >= 2 of
     them find it within 100 ms. One lead alone drops beats where its QRS
     shrinks (seen: V5 halved on LBBB-shaped beats, 7.5 s with no beat).
+  - Mains (50 / 60 Hz) is first subtracted where it is present
+    (mains_cancel.MainsCancelledReader on the read window), before anything
+    else: the baseline medians below read the raw samples, and a 3.5 mV
+    mains bent them -- on LBBB beats QRS read 180-204 ms (true 158) and QT
+    564-616 ms (true 372) on a quarter of the beats (2026-11-17_11-37-06,
+    11:38:11-21 and 11:39:01-11). Where there is no mains the samples are
+    untouched.
+  - Baseline wander, for P / PR and QRS: at <= 120 bpm (median RR >= 500
+    ms) a cubic spline through every beat's PR-segment level (the 20-4 ms
+    before its global QRS onset) is subtracted from each lead; faster, the
+    two-stage median as before. The medians lean toward the QRS and T on a
+    steep slope: with a respiration wander of 7 mV / s the PR segment sat
+    0.25-0.5 mV off, PR read 70-80 or 204-220 ms (true 152) on a third of
+    the beats and LBBB QRS 180-186 (true 158) (2026-11-17_11-37-06,
+    11:37:46-58 and 11:38:46-11:39:04).
+  - Baseline wander, for the T wave (QT): the two-stage median, as before.
+    The spline there moved the T end on a human recording (a U wave and
+    noise near the PR levels; 2026-10-30_13-51-44, QT spread 13 -> 44 ms);
+    so under a steep wander a few T ends are still off (QT 560-640 on the
+    steepest beats of 2026-11-17_11-37-06, 11:38:56-11:39:04 -- shown as
+    '--' by the spread check).
   - P / PR: Lead II, 50/60 Hz notch + 0.5 Hz DFT high-pass + 25 Hz low-pass,
     measure_beat(strict_pr=True) at Lead II's own dominant QRS deflection
     (40 ms before to 100 ms after the beat). Without the high-pass a 0.36 Hz
@@ -17,7 +38,16 @@ Measured against the Fluke ProSim 8 reference table
     (>= 180 bpm): on a 150 bpm sinus run with a small R it rejected the
     real P on every beat. Where the strict search finds no PR and RR >= 500
     ms, the non-strict search (most prominent wave) is used, as the bundle
-    branch block rule does.
+    branch block rule does -- and also where the most prominent wave is
+    >= 2.5x the strict pick's height above the PR segment (the level just
+    before the global QRS onset), inside the strict search's own window
+    (R-300 .. R-50 ms) and after the previous beat's T end: the strict pick
+    is then the tall P's own undershoot or the PR segment itself (seen: PR
+    70 beside 152 on RBBB beats, PR 132-164 beside 240 on Mobitz II beats,
+    both under respiration wander, 2026-11-17_11-37-06 / 12-10-06). Was
+    also: any strict pick within 3% of R of that level -> the most
+    prominent wave; on INCART I13 (human) that dropped real P waves next to
+    the QRS and PR went from 160 shown to '--' in 7 of 10 frames.
   - QRS: global, across leads I, II, aVL, V1, V2, V5, V6 (0.5-40 Hz +
     notch): from where their combined slope first rises above 10% of its
     peak to where it stays under 10% for 16 ms (20% when a discordant ST-T
@@ -290,6 +320,124 @@ def _t_end(x: np.ndarray, onset: int, offset: int, r: int, next_rr_ms: float, fs
     return end
 
 
+class _WindowReader:
+    """The samples already read, as a reader (seconds from their start) --
+    so MainsCancelledReader finds and subtracts the mains of this window
+    alone, not by scanning the whole recording on every call."""
+
+    def __init__(self, data: np.ndarray, fs: float, lead_names: Sequence[str]):
+        self._data = data
+        self.fs = fs
+        self.lead_names = list(lead_names)
+        self.duration_sec = data.shape[1] / fs
+
+    def read_range(self, start_sec: float, end_sec: float) -> np.ndarray:
+        a = max(0, int(start_sec * self.fs))
+        b = min(self._data.shape[1], int(end_sec * self.fs))
+        return self._data[:, a:max(a, b)]
+
+
+def _mains_subtracted(data: np.ndarray, fs: float, lead_names: Sequence[str]) -> np.ndarray:
+    """data with 50 / 60 Hz subtracted where it is present (see the module
+    docstring); unchanged where it is not."""
+    try:
+        from .mains_cancel import MainsCancelledReader
+    except ImportError:
+        from ecg.holter.mains_cancel import MainsCancelledReader
+    try:
+        wr = _WindowReader(data, fs, lead_names)
+        out = MainsCancelledReader(wr).read_range(0.0, wr.duration_sec)
+        if out is not None and out.shape == data.shape:
+            return np.asarray(out, dtype=float)
+    except Exception:
+        pass
+    return data
+
+
+# Baseline by a cubic spline through the PR-segment levels (see the module
+# docstring): at <= 120 bpm only; the level is the median of the samples
+# KNOT_FROM_MS .. KNOT_TO_MS before the beat's global QRS onset.
+KNOT_MIN_RR_MS = 500.0
+# measure_beats: the most prominent wave replaces the strict P pick when it is
+# this many times the pick's height above the PR segment (see the docstring).
+P_OVER_STRICT = 2.5
+KNOT_FROM_MS = 20.0
+KNOT_TO_MS = 4.0
+
+
+def _knot_baseline(x: np.ndarray, onsets: Sequence[Optional[int]], fs: float) -> Optional[np.ndarray]:
+    """Cubic spline through x's PR-segment level at every onset (held flat
+    before the first and after the last); None with fewer than 3 levels."""
+    from scipy.interpolate import CubicSpline
+    a, b = int(KNOT_FROM_MS / 1000.0 * fs), int(KNOT_TO_MS / 1000.0 * fs)
+    tk, vk = [], []
+    for o in onsets:
+        if o is None or o - a < 0 or o - b > x.size:
+            continue
+        t = float(o - (a + b) // 2)
+        if tk and t <= tk[-1]:
+            continue
+        tk.append(t)
+        vk.append(float(np.median(x[o - a:o - b])))
+    if len(tk) < 3:
+        return None
+    base = CubicSpline(np.asarray(tk), np.asarray(vk), bc_type='natural')(np.arange(x.size, dtype=float))
+    base[:int(tk[0])] = vk[0]
+    base[int(tk[-1]) + 1:] = vk[-1]
+    return base
+
+
+def pr_segment_onsets(leads: np.ndarray, lead_names: Sequence[str], beats: Sequence[int],
+                      fs: float) -> Optional[List[Optional[int]]]:
+    """The global QRS onset (sample) of every beat, or None for a beat
+    where it can't be read -- the PR-segment anchors of _knot_baseline and
+    choose_p. None at > 120 bpm (median RR < KNOT_MIN_RR_MS) or with fewer
+    than 3 beats. ``leads``: every lead, band-passed (0.5-40 Hz + notches)."""
+    if len(beats) < 3 or float(np.median(np.diff(beats))) * 1000.0 / fs < KNOT_MIN_RR_MS:
+        return None
+    qrs_idx = [lead_names.index(n) for n in QRS_LEADS
+               if n in lead_names and lead_names.index(n) < leads.shape[0]]
+    onsets = []
+    for k, r in enumerate(beats):
+        prev_rr = (r - beats[k - 1]) * 1000.0 / fs if k > 0 else None
+        bnd = _global_qrs(leads, _quiet_qrs_leads(leads, qrs_idx, r, prev_rr, fs), r, fs)
+        onsets.append(bnd[0] if bnd else None)
+    return onsets
+
+
+def choose_p(lead_ii: np.ndarray, anchor: int, fs: float, prev_rr: Optional[float], collision: bool,
+             onset: Optional[int] = None, prev_t_end: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """measure_beat() of the beat at ``anchor`` with its P wave chosen as in
+    the module docstring: the strict search; the most prominent wave where
+    it finds none (RR >= RELAXED_P_MIN_RR_MS); and the most prominent wave
+    instead of a strict pick P_OVER_STRICT times smaller above the PR
+    segment (the level 20-4 ms before ``onset``, the beat's global QRS
+    onset), inside R-300 .. R-50 ms and after ``prev_t_end`` (the previous
+    beat's T end). Shared by the display (measure_beats) and the auto
+    detector's bundle branch block rules, so both read the same P."""
+    from ecg.arrhythmia_detector import measure_beat
+    m = measure_beat(lead_ii, anchor, fs, strict_pr=True, prev_rr_ms=prev_rr, p_collision_check=collision)
+    relaxed_ok = prev_rr is not None and prev_rr >= RELAXED_P_MIN_RR_MS
+    if (m is None or m.get('pr_ms') is None) and relaxed_ok:
+        relaxed = measure_beat(lead_ii, anchor, fs, strict_pr=False, prev_rr_ms=prev_rr,
+                               p_collision_check=collision)
+        if relaxed and relaxed.get('pr_ms') is not None:
+            m = relaxed
+    if (m and m.get('pr_ms') is not None and m.get('p_peak') is not None and onset is not None
+            and onset - int(0.02 * fs) >= 0 and relaxed_ok and prev_t_end is not None):
+        pq_level = float(np.median(lead_ii[onset - int(0.02 * fs):onset - int(0.004 * fs)]))
+        strict_h = abs(float(lead_ii[int(m['p_peak'])]) - pq_level)
+        relaxed = measure_beat(lead_ii, anchor, fs, strict_pr=False, prev_rr_ms=prev_rr,
+                               p_collision_check=collision)
+        if (relaxed and relaxed.get('pr_ms') is not None and relaxed.get('p_peak') is not None
+                and relaxed.get('p_onset') is not None
+                and abs(float(lead_ii[int(relaxed['p_peak'])]) - pq_level) >= P_OVER_STRICT * strict_h
+                and anchor - int(0.30 * fs) <= int(relaxed['p_peak']) <= anchor - int(0.05 * fs)
+                and int(relaxed['p_onset']) > prev_t_end + int(0.02 * fs)):
+            m = relaxed
+    return m
+
+
 def measure_beats(reader, start_sec: float, end_sec: float) -> List[Dict[str, Any]]:
     """Every beat whose time falls in [start_sec, end_sec), measured as in the
     module docstring. Each beat: 't' (s), 'rr_ms' (from the previous beat,
@@ -310,15 +458,31 @@ def measure_beats(reader, start_sec: float, end_sec: float) -> List[Dict[str, An
     data = reader.read_range(p0, p1)
     if data is None or data.shape[1] < int(fs):
         return []
-    data = np.asarray(data, dtype=float)
+    data = _mains_subtracted(np.asarray(data, dtype=float), fs, lead_names)
 
     # Beats first: they mask the QRS + T when the baseline wander is taken
     # out of every lead (two_stage_median_baseline_filter) ahead of the
     # filters below -- the 0.5 Hz high-pass left ~1 mV of a 5-8 mV wander
-    # and QT read 2-8 ms long, PR +-10 ms (2026-11-12_16-19-27).
+    # and QT read 2-8 ms long, PR +-10 ms (2026-11-12_16-19-27). At <= 120
+    # bpm the PR-segment spline (_knot_baseline) is used instead for P / PR
+    # and QRS, lead by lead where it has >= 3 levels; the T wave (QT) is
+    # always measured on the medians (see the module docstring).
     from .two_stage_median_baseline_filter import remove_baseline_wander_r
     beats = _beat_samples(data, lead_names, fs)
-    data = np.vstack([remove_baseline_wander_r(lead, fs, beats) for lead in data])
+    preproc = SignalPreprocessor(fs=fs, config=HolterConfig.from_clinical_config())
+    notch_60 = make_notch(60.0, fs)
+    qrs_idx = [lead_names.index(n) for n in QRS_LEADS if n in lead_names]
+    onsets = None
+    if len(beats) >= 3 and float(np.median(np.diff(beats))) * 1000.0 / fs >= KNOT_MIN_RR_MS:
+        onsets = pr_segment_onsets(
+            np.vstack([filtfilt(notch_60.b, notch_60.a, np.asarray(preproc.process(lead), dtype=float))
+                       for lead in data]), lead_names, beats, fs)
+    medianed = np.vstack([remove_baseline_wander_r(lead, fs, beats) for lead in data])
+    knotted = []
+    for i, lead in enumerate(data):
+        base = _knot_baseline(lead, onsets, fs) if onsets is not None else None
+        knotted.append(medianed[i] if base is None else lead - base + float(np.median(lead)))
+    data = np.vstack(knotted)
 
     lead_ii = data[lead_names.index('II')]
     for notch in (make_notch(50.0, fs), make_notch(60.0, fs)):
@@ -332,14 +496,14 @@ def measure_beats(reader, start_sec: float, end_sec: float) -> List[Dict[str, An
     # above its 10% end level -- QRS read 114-154 ms (true 90) or not at
     # all, and QT with it. The detector's own use of the preprocessor is
     # unchanged.
-    preproc = SignalPreprocessor(fs=fs, config=HolterConfig.from_clinical_config())
-    notch_60 = make_notch(60.0, fs)
     leads = np.vstack([filtfilt(notch_60.b, notch_60.a, np.asarray(preproc.process(lead), dtype=float))
                        for lead in data])
-    qrs_idx = [lead_names.index(n) for n in QRS_LEADS if n in lead_names]
+    t_leads = np.vstack([filtfilt(notch_60.b, notch_60.a, np.asarray(preproc.process(lead), dtype=float))
+                         for lead in medianed])
     t_idx = [lead_names.index(n) for n in T_LEADS if n in lead_names]
 
     out = []
+    prev_t_end = None   # the previous measured beat's T end (sample), for the P choice
     for k, r in enumerate(beats):
         t = p0 + r / fs
         if not (start_sec <= t < end_sec):
@@ -348,24 +512,19 @@ def measure_beats(reader, start_sec: float, end_sec: float) -> List[Dict[str, An
         next_rr = (beats[k + 1] - r) * 1000.0 / fs if k + 1 < len(beats) else None
         beat = {'t': t, 'rr_ms': prev_rr, 'pr_ms': None, 'qrs_ms': None, 'qt_ms': None, 'p_present': False}
         m = None
+        bounds = _global_qrs(leads, _quiet_qrs_leads(leads, qrs_idx, r, prev_rr, fs), r, fs)
 
         a_lo, a_hi = max(0, r - int(0.04 * fs)), min(lead_ii.size, r + int(0.10 * fs))
         if a_hi > a_lo:
             local = lead_ii[max(0, r - int(fs)):r + int(fs)]
             anchor = a_lo + int(np.argmax(np.abs(lead_ii[a_lo:a_hi] - np.median(local))))
             collision = prev_rr is None or prev_rr < COLLISION_RR_MS
-            m = measure_beat(lead_ii, anchor, fs, strict_pr=True, prev_rr_ms=prev_rr,
-                             p_collision_check=collision)
-            if m and m.get('pr_ms') is None and prev_rr is not None and prev_rr >= RELAXED_P_MIN_RR_MS:
-                relaxed = measure_beat(lead_ii, anchor, fs, strict_pr=False, prev_rr_ms=prev_rr,
-                                       p_collision_check=collision)
-                if relaxed and relaxed.get('pr_ms') is not None:
-                    m = relaxed
+            m = choose_p(lead_ii, anchor, fs, prev_rr, collision,
+                         bounds[0] if bounds is not None else None, prev_t_end)
             if m and m.get('pr_ms') is not None:
                 beat['pr_ms'] = float(m['pr_ms'])
                 beat['p_present'] = True
 
-        bounds = _global_qrs(leads, _quiet_qrs_leads(leads, qrs_idx, r, prev_rr, fs), r, fs)
         # Lead II's own QRS onset can't come before the earliest onset over
         # all leads: where it does, its search ran into the PR segment (seen:
         # 150 bpm, lead II R shrunk to ~200-390, onset 52 ms before the beat
@@ -381,9 +540,11 @@ def measure_beats(reader, start_sec: float, end_sec: float) -> List[Dict[str, An
             onset, offset = bounds
             beat['qrs_ms'] = (offset - onset) * 1000.0 / fs
             if next_rr is not None:
-                ends = [e for e in (_t_end(leads[i], onset, offset, r, next_rr, fs) for i in t_idx) if e is not None]
+                ends = [e for e in (_t_end(t_leads[i], onset, offset, r, next_rr, fs) for i in t_idx) if e is not None]
                 if ends:
                     beat['qt_ms'] = (max(ends) - onset) * 1000.0 / fs
+        prev_t_end = (bounds[0] + int(round(beat['qt_ms'] * fs / 1000.0))) if (
+            bounds is not None and beat['qt_ms'] is not None) else None
         out.append(beat)
     return out
 

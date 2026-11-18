@@ -40,18 +40,26 @@ V V V V as a run instead of N N V N N V (trigeminy).
     LATE_MIN_PARTNERS other V beats of the recording match its shape (>=
     LATE_PARTNER_CORR); a late PVC with fewer is dropped.
     Not V: a wide beat at the normal rate with the sinus P (bundle branch
-    block), a wide beat with the dominant beat's shape.
+    block), a wide beat with the dominant beat's shape, and any beat inside
+    an auto Atrial Flutter or Ventricular Tachycardia segment (NO_PVC_SEGMENTS).
   - A PVC repeats: a V whose shape matches no other V of the recording
     (beyond its own neighbours) >= PARTNER_CORR goes back to N -- noise
     that makes a normal beat "different" does not repeat, a ventricular
     focus does. The only V of a recording stays V when its shape is very
     different, its QRS wide, it came early against the beat before it too
-    and no sinus P wave comes before it (_lone_v_is_ectopic).
+    and no sinus P wave comes before it (_lone_v_is_ectopic). Only V beats
+    with >= MIN_SHAPE_LEADS usable leads in common count as compared; a V
+    nothing can be compared with (leads clipped at the ADC rail) gets the
+    same only-V test.
   - Template: started from the first beats (the narrow ones when there are
     enough, so a bigeminy start does not take the PVC for the template),
     moved only by N beats with similarity >= TEMPLATE_UPDATE_CORR, and
     replaced when TEMPLATE_SWITCH_BEATS beats in a row at the normal rate
-    share a new shape (a lasting change of conduction). The normal RR
+    share a new shape (a lasting change of conduction), or when
+    TEMPLATE_SWITCH_BEATS V beats in a row (Q beats between them do not
+    break the row) come at a steady RR under 100 bpm (a new rhythm, not
+    PVCs). The PVC test judges the shape centred on the QRS and on the R
+    peak, and takes the better match (f waves can move the QRS edges). The normal RR
     follows dominant-shape beats both faster and slower, except the pause
     after a PVC. Template and normal RR are learnt again after a gap >
     RESTART_GAP_SEC or a no-QRS segment (below), never from the beats of an
@@ -61,7 +69,9 @@ V V V V as a run instead of N N V N N V (trigeminy).
     Fibrillation, Asystole, Artifact, Unidentified -- not a mains 50 / 60 Hz
     Artifact, see _blocks_qrs), with fewer than
     MIN_SHAPE_LEADS usable leads, or (when not V) with no QRS bounds get
-    'Q' (not classified). Everything else not V is 'N'.
+    'Q' (not classified), and so does a spike: narrower than MIN_QRS_MS,
+    unlike the dominant beat, splitting one normal cycle in two (an
+    artifact, not a beat). Everything else not V is 'N'.
   - A narrow R peak < POST_V_MIN_RR_MS after a V is that PVC's T wave: it
     is not returned, and the next beat's RR is measured from the V (when
     the repeat test turns that V back to N, it is returned as 'Q').
@@ -94,6 +104,7 @@ CACHE_FILENAME = 'ectopic_beats_cache.json'
 PIECE_SEC = 60.0
 PAD_SEC = 3.0
 MIN_BEAT_GAP_SEC = 0.20
+LEAD_DEAD_FRACTION = 0.10      # a lead whose 60 s peak-to-peak falls under this x its first 30 s is off there
 SEARCHBACK_RR_RATIO = 1.6        # an RR this many times the local RR is searched
 SEARCHBACK_MIN_SLOPE = 0.35      # a QRS there: combined slope >= this x neighbours'
 LOCAL_RR_BEATS = 8
@@ -102,6 +113,8 @@ WIDE_QRS_MS = 110.0
 SHAPE_SAME_CORR = 0.80
 VERY_DIFFERENT_CORR = 0.50
 MIN_PVC_QRS_MS = 90.0
+MIN_QRS_MS = 60.0                # narrower than any QRS
+SPLIT_RR_FRACTION = 0.10         # this beat's RR + the next one's within this of the normal RR: it split one cycle
 RETRY_SHIFTS_SEC = (-0.05, 0.05, -0.10, 0.10)
 TEMPLATE_UPDATE_CORR = 0.90
 PREMATURE_FRACTION = 0.88
@@ -118,6 +131,8 @@ STEADY_RR_FRACTION = 0.10
 RESTART_GAP_SEC = 3.0
 POST_V_MIN_RR_MS = 300.0   # a narrow "beat" closer than this after a V is its T wave, not a beat
 PARTNER_CORR = 0.70
+UNIQUE_PVC_QRS_MS = 120.0        # a V with no partner kept on its own evidence: QRS this wide (LITFL "broad QRS >= 120 ms") ...
+FULL_PAUSE_FRACTION = 0.10       # ... and RR + next RR within this of twice the normal RR
 PARTNER_MAX_COMPARE = 300
 PAC_PREMATURE_FRACTION = 0.85
 PAC_ABRUPT_FRACTION = 0.85
@@ -125,6 +140,9 @@ PAC_RETURN_FRACTION = 1.10
 PAC_RUN_RR_FRACTION = 0.15
 P_PRE_SEC = 0.26
 P_DIFFERENT_MAX = 0.50
+P_READABLE_MIN = 0.60      # neighbours' median P-stretch similarity: the P wave is readable there
+P_CONTRAST_MIN = 0.30      # a PAC's P stretch is this much less like the dominant beats' than its neighbours' are
+P_LOCAL_BEATS = 6          # N beats on each side for the two tests above
 LATE_PVC_P_MAX = 0.50
 LATE_PARTNER_CORR = 0.90   # a late PVC must match at least LATE_MIN_PARTNERS other V beats this well
 LATE_MIN_PARTNERS = 5
@@ -135,11 +153,12 @@ P_POST_SEC = 0.06
 # the old normal RR and its P stretch differs from the old rate's, so the
 # whole new rhythm read as one S run: 14-24 S per Sinus Tachycardia / SVT
 # segment of the simulator recordings), and first-degree AV block has a PR so
-# long the P stretch is not where the P test looks.
+# long the P stretch is not where the P test looks. A ventricular tachycardia
+# is no run of PACs either (2026-10-20_12-26-09: 2 S on its beats).
 NO_PAC_SEGMENTS = ('Atrial Fibrillation', 'Atrial Flutter', 'Second-degree AV Block (Mobitz I)',
                    'Second-degree AV Block (Mobitz II)', 'Second-degree AV Block (2:1)', 'Third-degree AV Block',
                    'First-degree AV Block', 'Sinus Tachycardia', 'Sinus Bradycardia', 'Tachycardia', 'Bradycardia',
-                   'Supraventricular Tachycardia (SVT)')
+                   'Supraventricular Tachycardia (SVT)', 'Ventricular Tachycardia')
 PAC_SEGMENT_MARGIN_SEC = 1.0   # a rate step's first beat comes just before its segment
 SHAPE_PRE_SEC = 0.10
 SHAPE_POST_SEC = 0.16
@@ -148,6 +167,27 @@ NORMAL_RR_MIN_FRACTION = 0.88    # RRs used for the running normal RR
 NORMAL_RR_MAX_FRACTION = 1.30
 
 NO_QRS_SEGMENTS = ('Ventricular Fibrillation', 'Asystole', 'Artifact', 'Unidentified')
+# Where no PVC is looked for. Flutter is atrial-rate bound and regular, so a
+# beat is never "premature" in it: after a rate step (100 -> 150 bpm,
+# 2026-11-16_12-09-16 at 12:11:41) every beat is premature against the running
+# normal RR, the shape of a conducted flutter beat matches the dominant beat
+# at 0.78-0.85 (limit 0.80: the F waves fall in its window) and its QRS reads
+# 112-118 ms even when normal, so premature + a shape just under the limit +
+# "wide" read V: 10 V in a 150 bpm flutter, 8 of them on the noise after an
+# Artifact, 2 on clean beats (12:12:05).
+# Atrial Fibrillation is deliberately NOT here: cardiologists annotated 495
+# (MIT-BIH) and 226 (INCART) PVCs inside the auto AF / Flutter segments of the
+# first 5 min of those records and this module found 380 and 196 of them (false
+# V 32 and 1) -- a PVC does occur in AF, and the V beats of the simulator's AF
+# recordings look like them (shape similarity median 0.63 vs 0.56, QRS 166 vs
+# 168 ms, RR / normal RR 0.66 vs 0.63), so no limit here removes the one and
+# not the other. Flutter in those records is 15 s and holds no V.
+# Ventricular Tachycardia is a rhythm of its own, not a run of PVCs: its beats
+# are premature against the running normal RR and unlike the dominant shape,
+# so every one read V and the run read "PVC Run" (2026-11-16_15-35-15,
+# 160 bpm wide-complex VT, 22 V at 15:36:58 - 15:37:06). Beats inside an auto
+# Ventricular Tachycardia segment are not looked at for PVCs.
+NO_PVC_SEGMENTS = ('Atrial Flutter', 'Ventricular Tachycardia')
 MAINS_ARTIFACT_KINDS = ('50 Hz', '60 Hz')   # 'artifact_kind' of the segment detector's mains Artifact
 
 _DEBUG = False
@@ -212,7 +252,7 @@ def _spans_signature(segments) -> str:
     """Hash of the auto segments this module reads (label, span and, for an
     Artifact, its kind: a mains one does not block beats, it only keeps them
     out of the template)."""
-    used = set(NO_QRS_SEGMENTS) | set(NO_PAC_SEGMENTS) | {'Ventricular Tachycardia'}
+    used = set(NO_QRS_SEGMENTS) | set(NO_PAC_SEGMENTS) | set(NO_PVC_SEGMENTS) | {'Ventricular Tachycardia'}
     spans = sorted((str(x.get('label', '')), round(float(x['start_sec']), 3), round(float(x['end_sec']), 3),
                     str(x.get('artifact_kind') or ''))
                    for x in (segments or [])
@@ -423,7 +463,13 @@ def _recording_r_peaks(reader):
     """R peaks (s) of the whole recording: the auto segment detector's pass
     (best lead by amplitude in the first 30 s, Pan-Tompkins per 60 s piece
     with 3 s of context, shape-match beats kept where another lead agrees,
-    beats the best lead missed but the other leads all found)."""
+    beats the best lead missed but the other leads all found).
+    In a piece where that lead is off (peak-to-peak under
+    LEAD_DEAD_FRACTION x its first 30 s) the largest lead still alive there
+    is read instead. Seen: V4 chosen, then flat from 6 min to the end of an
+    87 min recording with lead II alive -- 361 beats found, now 5155
+    (2026-10-30_12-01-08); INCART I58 V4 at 9 counts for 3 min, I02 V6 at
+    144 (was 4091): 3 false PVCs fewer. Every other record unchanged."""
     from ecg.pan_tompkins import pan_tompkins
     from .auto_segment_arrthymia_detection import _keep_confirmed_shape_beats, _beats_missed_on_best_lead
     fs = float(reader.fs)
@@ -449,17 +495,24 @@ def _recording_r_peaks(reader):
         ps, pe = max(0.0, t - PAD_SEC), min(total, te + PAD_SEC)
         data = reader.read_range(ps, pe)
         if data is not None and best < data.shape[0] and data.shape[1] > 50:
-            sig = np.asarray(data[best], dtype=float)
+            b_, leads_ = best, leads
+            if float(np.ptp(data[best])) < LEAD_DEAD_FRACTION * best_ptp:
+                # the chosen lead is off in this piece: the largest one alive
+                alive = sorted(((float(np.ptp(data[i])), i) for i, _ in ranked if i < data.shape[0]), reverse=True)
+                alive = [i for p, i in alive if p >= LEAD_DEAD_FRACTION * best_ptp]
+                if alive:
+                    b_, leads_ = alive[0], alive[:3]
+            sig = np.asarray(data[b_], dtype=float)
             p_idx, p_plain = pan_tompkins(sig, fs=fs, split_shape_match=True)
             if len(p_idx) != len(p_plain):
                 p_idx = _keep_confirmed_shape_beats(p_idx, p_plain, [
                     pan_tompkins(np.asarray(data[li], dtype=float), fs=fs)
-                    for li in leads if li != best and li < data.shape[0]], fs)
+                    for li in leads_ if li != b_ and li < data.shape[0]], fs)
             for p in p_idx:
                 s = ps + float(p) / fs
                 if t <= s < te and (not peaks or s - peaks[-1] >= MIN_BEAT_GAP_SEC):
                     peaks.append(s)
-            peaks.extend(_beats_missed_on_best_lead(data, best, leads, peaks, ps, t, te, fs, pan_tompkins))
+            peaks.extend(_beats_missed_on_best_lead(data, b_, leads_, peaks, ps, t, te, fs, pan_tompkins))
         t += PIECE_SEC
     return sorted(peaks)
 
@@ -635,6 +688,25 @@ def _lone_v_is_ectopic(out, pcorrs, i) -> bool:
     return True
 
 
+def _full_pause(out, i) -> bool:
+    """Beat i is followed by a full compensatory pause (LITFL: a PVC is
+    "usually followed by a full compensatory pause"): its RR + the next
+    beat's within FULL_PAUSE_FRACTION of twice the RR of the N beats around
+    it (N after N, up to 8 each side, at least 3)."""
+    if i + 1 >= len(out):
+        return False
+    rr, nxt = out[i].get('rr_ms'), out[i + 1].get('rr_ms')
+    if rr is None or nxt is None:
+        return False
+    nb = [out[j]['rr_ms'] for j in range(max(1, i - 8), min(len(out), i + 9))
+          if j not in (i, i + 1) and out[j].get('label') == 'N' and out[j].get('rr_ms')
+          and out[j - 1].get('label') == 'N']
+    if len(nb) < 3:
+        return False
+    n = float(np.median(nb))
+    return abs(rr + nxt - 2.0 * n) <= FULL_PAUSE_FRACTION * 2.0 * n
+
+
 def _no_qrs_spans(segments):
     return sorted((float(s['start_sec']), float(s['end_sec'])) for s in (segments or [])
                   if _blocks_qrs(s)
@@ -655,14 +727,17 @@ def _classify_pacs(out: List[Dict[str, Any]], corrs: List[Optional[float]], segm
       - abruptly: RR <= PAC_ABRUPT_FRACTION x the RR before it (sinus
         arrhythmia speeds up gradually, a few % per beat);
       - and the rhythm resets after it (next RR >= PAC_RETURN_FRACTION x
-        its RR) or the next beat is premature too (a PAC couplet / run);
+        its RR, so there must be a next beat) or the next beat is premature
+        too (a PAC couplet / run);
       - and the stretch before its QRS where the P wave sits (_p_shape) is
         unlike the dominant beats' (similarity < P_DIFFERENT_MAX): a PAC's
         P comes early and from another place in the atria; a beat that is
         only early (sinus arrhythmia) has the sinus P. (The ProSim "Atrial
         PAC" keeps the sinus P, only earlier -- 2026-11-12_11-07-11, P
         similarity 0.92-0.99 -- so it is not a PAC by this test, on purpose:
-        a real PAC's P differs.)
+        a real PAC's P differs.) Judged only where the P wave is readable:
+        the N beats around it match the dominant P (median >=
+        P_READABLE_MIN) and this beat matches it by >= P_CONTRAST_MIN less.
     A beat right after an S that is still faster than the normal RR at the
     run's own rate continues the run. A run that holds a steady RR for
     TEMPLATE_SWITCH_BEATS beats is a new rhythm (a sudden rate change, e.g. a
@@ -721,7 +796,10 @@ def _classify_pacs(out: List[Dict[str, Any]], corrs: List[Optional[float]], segm
         if cand:
             premature = rr <= PAC_PREMATURE_FRACTION * normal
             abrupt = prev_rr is not None and prev_label not in ('V', 'S') and rr <= PAC_ABRUPT_FRACTION * prev_rr
-            resets = nxt is None or nxt >= PAC_RETURN_FRACTION * rr
+            # the reset must be seen: with no next beat (the recording's
+            # last) there is none -- the last beat, after a motion artifact,
+            # read PAC (2026-10-29_16-33-38 at 132.87 s)
+            resets = nxt is not None and nxt >= PAC_RETURN_FRACTION * rr
             next_early = nxt is not None and nxt <= PAC_PREMATURE_FRACTION * normal
             run_on = (prev_label == 'S' and run and rr <= RUN_CONTINUE_FRACTION * normal
                       and abs(rr - out[run[-1]]['rr_ms']) <= PAC_RUN_RR_FRACTION * out[run[-1]]['rr_ms'])
@@ -731,6 +809,25 @@ def _classify_pacs(out: List[Dict[str, Any]], corrs: List[Optional[float]], segm
             # early -- sinus arrhythmia, a rate change -- median 0.79).
             # INCART / MIT-BIH, with this: +P 50 -> 84% / 60 -> 80%.
             p_differs = bool(pcorrs) and pcorrs[k] is not None and pcorrs[k] < P_DIFFERENT_MAX
+            # ... and only where the P wave can be read at all: the N beats
+            # around it (P_LOCAL_BEATS each side) match the dominant P
+            # stretch (median >= P_READABLE_MIN) and this beat clearly less
+            # (by >= P_CONTRAST_MIN). Where noisy leads or the previous T
+            # wave fill the stretch, normal beats read "different" too and
+            # an unreadable P is no evidence of an ectopic one: strong sinus
+            # arrhythmia (beat-to-beat RR -30% / +50%) with muscle noise gave
+            # 13 S on a healthy subject (2026-10-29_16-36-56; its normal
+            # beats' own similarity under 0.50 for 15% of them). Annotated
+            # PACs had neighbours at median 0.95 (INCART) / 0.91 (MIT-BIH),
+            # false S 0.53 / 0.12. With it: INCART S false 71 -> 13, true
+            # 226 -> 216; MIT-BIH false 304 -> 9, true 34 -> 32; simulator /
+            # human recordings 19 false S fewer, no PAC lost; PVCs unchanged.
+            if p_differs:
+                near = [pcorrs[j] for j in range(max(0, k - P_LOCAL_BEATS), min(len(out), k + P_LOCAL_BEATS + 1))
+                        if j != k and out[j].get('label') == 'N' and pcorrs[j] is not None]
+                local_p = float(np.median(near)) if len(near) >= 3 else None
+                p_differs = (local_p is not None and local_p >= P_READABLE_MIN
+                             and local_p - pcorrs[k] >= P_CONTRAST_MIN)
             if run_on or (premature and abrupt and (resets or next_early) and p_differs):
                 b['label'] = 'S'
                 if not run_on:
@@ -801,7 +898,9 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
         pieces.append((ps, q, clip))
         piece_peaks = sorted(p for p in all_peaks if t <= p < te)
         for p in piece_peaks:
-            feats.append([p, None, len(pieces) - 1, int(round((p - ps) * fs))])
+            # [time, QRS ms, piece, shape centre (moved to the QRS centre
+            # below), R peak sample (kept: see v_corr in the main loop)]
+            feats.append([p, None, len(pieces) - 1, int(round((p - ps) * fs)), int(round((p - ps) * fs))])
         t += PIECE_SEC
     feats.sort(key=lambda f: f[0])
 
@@ -892,6 +991,13 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
     def in_mains(ts):
         return any(s_ <= ts < e_ for s_, e_ in mains_spans)
 
+    no_pvc_spans = [(float(x['start_sec']), float(x['end_sec'])) for x in (segments or [])
+                    if str(x.get('label', '')) in NO_PVC_SEGMENTS
+                    and x.get('start_sec') is not None and x.get('end_sec') is not None]
+
+    def no_pvc(ts):
+        return any(s_ <= ts < e_ for s_, e_ in no_pvc_spans)
+
     template, ref_rr = None, []
 
     out = []
@@ -900,14 +1006,21 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
     p_template = None
     v_cands: List[tuple] = []           # (index in out, shape, similarity, qrs) of each V
     pending: List[np.ndarray] = []     # new-shape beats at the normal rate, in a row
+    pending_first = 0                   # index in out of pending's first beat
     run: List[tuple] = []               # the current V run: (beat, rr, shape)
+    spikes: List[tuple] = []           # (index in out, normal RR) of N beats too narrow and unlike any beat
     prev_label = None
+    # The last beat whose shape was judged, 'V' or 'N' (a 'Q' beat -- shape
+    # or QRS not measurable -- is no evidence either way and leaves it).
+    # A V run (`run`, the slow-run test below) goes on over Q beats and
+    # ends at an N beat.
+    last_judged = None
     prev_t = None
     for k, f in enumerate(feats):
         ts, qrs = f[0], f[1]
         if restart_at[k] and not blocked(ts):
             template, ref_rr = start(k)
-            pending, run, prev_label = [], [], None
+            pending, run, prev_label, last_judged = [], [], None, None
             p_template = None
         after_ectopic = prev_label == 'V'
         rr = (ts - prev_t) * 1000.0 if prev_t is not None else None
@@ -936,6 +1049,7 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
         if blocked(ts) or template is None:
             beat['label'] = 'Q'
             prev_label = 'Q'
+            last_judged = None
             pending = []
             run = []
             continue
@@ -950,15 +1064,31 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
             beat['label'] = 'Q'
             prev_label = 'Q'
             pending = []
-            run = []
             continue
         normal_rr = float(np.median(ref_rr)) if len(ref_rr) >= 2 else None
         premature = rr is not None and normal_rr is not None and rr <= PREMATURE_FRACTION * normal_rr
         different = corr < SHAPE_SAME_CORR
+        # For the PVC test only: the shape also judged centred on the R peak,
+        # the better of the two. The shape window sits on the measured QRS
+        # centre, and where AF f waves move the QRS edges the window moves
+        # with them: a normal 88 ms beat read QRS 172 ms and similarity 0.10
+        # (0.99 on its R peak) -- premature in AF, "wide" and "different":
+        # V (2026-11-17_13-39-33, 13:50:35 / :40 / :42; the same in the
+        # simulator AF of 2026-10-10_12-21-19, 2026-10-20_12-26-09,
+        # 2026-10-30_16-03-13). A PVC is unlike the dominant beat however it
+        # is aligned. MIT-BIH false V 119 -> 99, true 867 -> 865 (207: its
+        # template there is the PVC itself); INCART false V 59 -> 49, true
+        # unchanged. Not for the PAC test or the template (similarity there
+        # as before): there it made 19 INCART normal beats PACs.
+        v_corr = corr
+        if f[4] != f[3]:
+            corr_r = _corr(shape_leads, f[4], template, fs, clip)
+            if not np.isnan(corr_r) and corr_r > corr:
+                v_corr = corr_r
         # a beat whose QRS cannot be bounded is no PVC evidence: on INCART
         # most such "beats" were noise / T waves Pan-Tompkins took (146 of
         # 321 false V had no annotated beat at all)
-        very_different = corr < VERY_DIFFERENT_CORR and qrs is not None and qrs >= MIN_PVC_QRS_MS
+        very_different = v_corr < VERY_DIFFERENT_CORR and qrs is not None and qrs >= MIN_PVC_QRS_MS
         wide = qrs is not None and qrs >= WIDE_QRS_MS
         run_on = (prev_label == 'V' and rr is not None and normal_rr is not None
                   and rr <= RUN_CONTINUE_FRACTION * normal_rr)
@@ -971,14 +1101,15 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
         # the dominant beat's and a wide QRS -- or a shape so unlike it that
         # a QRS measured under WIDE_QRS_MS (>= MIN_PVC_QRS_MS) does not
         # matter (seen: INCART PVCs measured 108-118 ms, similarity 0.0-0.4).
-        if (premature or run_on) and (very_different or (different and wide)):
+        if (premature or run_on) and (very_different or (v_corr < SHAPE_SAME_CORR and wide)) and not no_pvc(ts):
             beat['label'] = 'V'
             prev_label = 'V'
             pending = []
-            if not run_on:
+            if not run_on and last_judged != 'V':
                 run = []
+            last_judged = 'V'
             v_shape = _shape(shape_leads, f[3], fs, clip)
-            v_cands.append((len(out) - 1, v_shape, corr, qrs))
+            v_cands.append((len(out) - 1, v_shape, v_corr, qrs))
             run.append((beat, rr, v_shape))
             # A "run" slower than 100 bpm with a steady RR is a new rhythm,
             # not PVCs (a PVC run / VT is >= 100 bpm): the beats go back to
@@ -1001,15 +1132,25 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
                         template = _blend(template, _nanmean_rows(np.array(shapes_)), 1.0)
                     ref_rr = [float(x) for x in rrs][-LOCAL_RR_BEATS:]
                     prev_label = 'N'
+                    last_judged = 'N'
                     run = []
             continue
-        run = []
         if qrs is None:
             beat['label'] = 'Q'
             prev_label = 'Q'
             pending = []
             continue
+        # Only an N beat ends the V run: a Q beat broke it, and a rhythm
+        # change with clipped leads never reached TEMPLATE_SWITCH_BEATS V in
+        # a row (Third-degree block 30 bpm, then 80 bpm LBBB: V Q Q V Q Q V
+        # ..., the template stayed the narrow escape beat and 5 LBBB beats
+        # read V, 2026-11-17_13-39-33 14:10:40-14:10:54; now the 8th V
+        # turns the run into the new rhythm). MIT-BIH / INCART unchanged.
+        run = []
         prev_label = 'N'
+        last_judged = 'N'
+        if qrs < MIN_QRS_MS and v_corr < VERY_DIFFERENT_CORR:
+            spikes.append((len(out) - 1, normal_rr))
         # normal beat: running RR and template
         if rr is not None and (normal_rr is None or NORMAL_RR_MIN_FRACTION * normal_rr <= rr <= NORMAL_RR_MAX_FRACTION * normal_rr):
             ref_rr.append(rr)
@@ -1036,10 +1177,27 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
         elif different and not premature:
             if pending and not (_similarity(pending[-1], v) >= SHAPE_SAME_CORR):
                 pending = []
+            if not pending:
+                pending_first = len(out) - 1
             pending.append(v)
             if len(pending) >= TEMPLATE_SWITCH_BEATS:
                 template = _blend(template, _nanmean_rows(np.array(pending)), 1.0)
                 pending = []
+                # The beat right before the new shape's run, when V with that
+                # same shape, was the new rhythm's first beat, not a PVC: a
+                # rhythm (conduction) change often starts a little early and
+                # is premature and unlike the old template only against the
+                # old rhythm. Seen: RBBB -> LBBB at 162.3 s, first LBBB beat
+                # 648 ms after a 750 ms RR (2026-10-29_15-05-05).
+                kp = pending_first - 1
+                while kp >= 0 and out[kp].get('_not_beat'):
+                    kp -= 1
+                if kp >= 0 and out[kp]['label'] == 'V':
+                    vs = next((c[1] for c in reversed(v_cands) if c[0] == kp), None)
+                    if vs is not None and vs.shape == template.shape:
+                        sim_ = _similarity(vs, template)
+                        if not np.isnan(sim_) and sim_ >= SHAPE_SAME_CORR:
+                            out[kp]['label'] = 'N'
         elif not different:
             pending = []
 
@@ -1058,7 +1216,7 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
     late_idx = set()
     for k in range(1, len(out) - 1):
         b = out[k]
-        if b['label'] != 'N' or corrs[k] is None or pcorrs[k] is None or b['qrs_ms'] is None:
+        if b['label'] != 'N' or corrs[k] is None or pcorrs[k] is None or b['qrs_ms'] is None or no_pvc(feats[k][0]):
             continue
         if not (corrs[k] < VERY_DIFFERENT_CORR and b['qrs_ms'] >= WIDE_QRS_MS and pcorrs[k] < LATE_PVC_P_MAX):
             continue
@@ -1080,6 +1238,16 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
     # is the only one in the recording stays V only with clear evidence
     # (very different and wide, and _lone_v_is_ectopic). INCART, threshold
     # 0.7: true PVCs kept 2485 of 2559, false V 111 -> 58.
+    # Only V beats it can be compared with count as "others": two shapes
+    # with fewer than MIN_SHAPE_LEADS usable leads in common (the rest
+    # clipped at the ADC rail) give no similarity, which is no evidence that
+    # the shapes differ. Counted as compared, they made every PVC of a large
+    # simulator PVC train "unlike every other V" (I, II, V2 at the rail, 2
+    # leads left; 50 Hz on top) and 13 of 14 went back to N
+    # (2026-11-17_13-39-33, 14:00:59-14:01:45); a V nothing can be compared
+    # with is judged as the only V (the clear-evidence test), 11 of them
+    # stay V. MIT-BIH / INCART and every other simulator / human recording
+    # unchanged.
     live = [c for c in v_cands if out[c[0]]['label'] == 'V' and c[1] is not None]
     # Late PVCs first: one has no early coupling to vouch for it, so it stays
     # V only when several other V beats of the recording have its shape. A
@@ -1110,17 +1278,52 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
                 j, u = live[m][0], live[m][1]
                 if abs(j - i) <= 1 or u.shape != v.shape:
                     continue
-                others += 1
                 sim = _similarity(v, u)
-                if not np.isnan(sim) and sim > best:
+                if np.isnan(sim):
+                    continue          # < MIN_SHAPE_LEADS leads in common: not compared
+                others += 1
+                if sim > best:
                     best = sim
             if best >= PARTNER_CORR or others >= PARTNER_MAX_COMPARE:
                 break
         if best >= PARTNER_CORR:
             continue
-        if others == 0 and c < VERY_DIFFERENT_CORR and q is not None and q >= WIDE_QRS_MS                 and _lone_v_is_ectopic(out, pcorrs, i):
+        if others == 0 and c < VERY_DIFFERENT_CORR and q is not None and q >= WIDE_QRS_MS and _lone_v_is_ectopic(out, pcorrs, i):
+            continue
+        # A PVC whose focus fires once among other PVCs (multiform PVCs)
+        # has no partner either; it stays V on the full LITFL picture of
+        # its own: very different, QRS >= UNIQUE_PVC_QRS_MS, early against
+        # the beat before it with no sinus P (_lone_v_is_ectopic), a full
+        # compensatory pause (_full_pause), and the dominant rhythm right
+        # after it (the next beat N with the dominant shape -- a rhythm
+        # change's first beat is followed by more of its own shape: RBBB ->
+        # LBBB 2026-11-12_13-54-02 at 858.8 s, RBBB -> AF 2026-10-30_16-03-13
+        # at 1150.5 s). MIT-BIH true PVCs 865 -> 874 (false 99 -> 99),
+        # INCART 2497 -> 2523 (false 46 -> 48); simulator: two multiform
+        # PVCs (2026-11-12_11-19-27 at 11.0 / 14.1 s) and 3 more found, no
+        # false V.
+        if (c < VERY_DIFFERENT_CORR and q is not None and q >= UNIQUE_PVC_QRS_MS
+                and _lone_v_is_ectopic(out, pcorrs, i) and _full_pause(out, i)
+                and i + 1 < len(out) and out[i + 1].get('label') == 'N'
+                and corrs[i + 1] is not None and corrs[i + 1] >= SHAPE_SAME_CORR):
             continue
         out[i]['label'] = 'N'
+    # Not a beat: an N "beat" narrower than any QRS (< MIN_QRS_MS), unlike
+    # the dominant beat (< VERY_DIFFERENT_CORR), that splits one normal cycle
+    # in two (its RR + the next beat's = the normal RR, within
+    # SPLIT_RR_FRACTION) is a step / spike artifact Pan-Tompkins took. As N
+    # it made the next real beat "early": an electrode artifact 704 ms into
+    # a 1000 ms cycle (QRS 26 ms, similarity 0.06) and the sinus beat 294 ms
+    # after it read PAC (2026-10-30_12-01-08 at 160.35 s; 2026-11-16_14-56-18
+    # at 383.0 s). It is 'Q' (and _classify_pacs restarts after a Q). Over
+    # all recordings 10 such beats, every one a baseline step; MIT-BIH 1,
+    # INCART 0; no PVC or PAC count changed except those two false PACs.
+    for i, nrr in spikes:
+        if out[i]['label'] != 'N' or nrr is None or i + 1 >= len(out):
+            continue
+        r0, r1 = out[i].get('rr_ms'), out[i + 1].get('rr_ms')
+        if r0 is not None and r1 is not None and abs(r0 + r1 - nrr) <= SPLIT_RR_FRACTION * nrr:
+            out[i]['label'] = 'Q'
     _classify_pacs(out, corrs, segments, pcorrs)
     # T waves of a V (see the main loop) are dropped -- when that V is still
     # V. One the repeat test put back to N was no PVC, so what followed it

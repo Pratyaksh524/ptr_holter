@@ -65,6 +65,10 @@ from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, Magni
 #     Unidentified is signal with no readable P / QRS / T, so its "beats"
 #     are whatever Pan-Tompkins picks there; the card is shown even with
 #     none, so the stretch can still be looked at.
+# N is the card of sinus beats: a recorded N beat inside any auto segment
+# that is not a sinus rhythm (the AV blocks, bundle branch blocks, SVT, VT ...)
+# is not one. The live label is only rate + QRS width (an RBBB beat at a
+# steady rate is "N"), so it moves to the Other card (see _NSR_COMPATIBLE).
 # The card's beat (first_timestamp: the 12-lead view and the seek on click)
 # is the label's first recorded beat outside those segments; for N it is first
 # looked for where no auto segment touches its view window (else a beat from
@@ -73,6 +77,9 @@ from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, Magni
 _SEGMENT_CARD_KINDS = {'Atrial Fibrillation': 'AF', 'Atrial Flutter': 'AFL',
                        'Unidentified': 'Unidentified'}
 _SEGMENT_CARDS = ('AF', 'AFL', 'Unidentified')
+# Segments an N beat may sit in: the sinus rate labels, the rate-only labels and
+# Artifact (noise: the rhythm under it is unknown, so its beats stay as they are).
+_NSR_COMPATIBLE = ('Bradycardia', 'Tachycardia', 'Artifact')
 _TEMPLATE_VIEW_PRE_SEC = 0.60    # _update_detail_grid shows first_timestamp
 _TEMPLATE_VIEW_POST_SEC = 0.90   # -0.60 s .. +0.90 s
 _R_PEAK_PIECE_SEC = 60.0         # Lead II is read in pieces of this length
@@ -80,10 +87,16 @@ _R_PEAK_PAD_SEC = 1.0            # overlap so peaks at a piece edge are found
 _NSR_SEARCH_MAX_SEC = 60.0       # signal searched per gap for a sinus beat
 
 
+def _nsr_compatible(label):
+    label = str(label or '')
+    return label.startswith('Sinus ') or label in _NSR_COMPATIBLE
+
+
 def _segment_spans(segments):
     """(card spans as (start, end, 'AF'|'AFL'|'Unidentified'), every span as
+    (start, end), spans of every segment that is not a sinus rhythm as
     (start, end)) from detect_arrhythmias() segments; empty lists for None."""
-    af_spans, all_spans = [], []
+    af_spans, all_spans, non_nsr_spans = [], [], []
     for seg in segments or []:
         try:
             s, e = float(seg['start_sec']), float(seg['end_sec'])
@@ -95,9 +108,16 @@ def _segment_spans(segments):
         kind = _SEGMENT_CARD_KINDS.get(str(seg.get('label', '')))
         if kind:
             af_spans.append((s, e, kind))
+        elif not _nsr_compatible(seg.get('label')):
+            non_nsr_spans.append((s, e))
     af_spans.sort()
     all_spans.sort()
-    return af_spans, all_spans
+    non_nsr_spans.sort()
+    return af_spans, all_spans, non_nsr_spans
+
+
+def _in_spans(ts, spans):
+    return any(s <= ts < e for s, e in spans)
 
 
 def _span_kind(ts, af_spans):
@@ -178,7 +198,7 @@ def _build_template_rows(metrics_list, segments=None, reader=None):
     """Template card rows (one per beat label, plus AF / AFL / Unidentified) from the
     metrics chunks and the auto segment detection; see the note above.
     Without segments or a reader the cards are the recorded labels only."""
-    af_spans, all_spans = _segment_spans(segments)
+    af_spans, all_spans, non_nsr_spans = _segment_spans(segments)
     if reader is None:
         af_spans = []          # segment beats cannot be counted: leave them
     items = {}
@@ -191,12 +211,31 @@ def _build_template_rows(metrics_list, segments=None, reader=None):
             if _span_kind(float(b.get('timestamp', 0.0) or 0.0), af_spans):
                 lbl = str(b.get('label', 'N') or 'N')
                 moved[lbl] = moved.get(lbl, 0) + 1
+        # N beats outside AF / AFL / Unidentified but inside another non-sinus
+        # segment: counted on the Other card instead
+        not_sinus = [float(b.get('timestamp', 0.0) or 0.0) for b in beats
+                     if str(b.get('label', 'N') or 'N').strip() == 'N'
+                     and not _span_kind(float(b.get('timestamp', 0.0) or 0.0), af_spans)
+                     and _in_spans(float(b.get('timestamp', 0.0) or 0.0), non_nsr_spans)]
         for row in (metric.get('template_summary') or []):
             label = str(row.get('label', 'N') or 'N').strip() or 'N'
             count = int(row.get('count', 0) or 0)
             take = min(count, moved.get(label, 0))
             moved[label] = moved.get(label, 0) - take
             count -= take
+            if label == 'N' and not_sinus and count > 0:
+                to_other = min(count, len(not_sinus))
+                count -= to_other
+                del not_sinus[:to_other]
+                other = items.setdefault('Other', {
+                    'label': 'Other', 'count': 0, 'rr': [], 'qrs': [],
+                    'first_timestamp': None, '_sinus_ts': None,
+                })
+                other['count'] += to_other
+                other['rr'].append(float(row.get('avg_rr_ms', 0.0) or 0.0))
+                other['qrs'].append(float(row.get('avg_qrs_ms', 0.0) or 0.0))
+                if other['first_timestamp'] is None:
+                    other['first_timestamp'] = float(row.get('first_timestamp', metric.get('t', 0.0)) or 0.0)
             if count <= 0:
                 continue
             item = items.setdefault(label, {
@@ -211,8 +250,10 @@ def _build_template_rows(metrics_list, segments=None, reader=None):
                 item['first_timestamp'] = float(row.get('first_timestamp', metric.get('t', 0.0)) or 0.0)
         for b in beats:
             label = str(b.get('label', 'N') or 'N').strip() or 'N'
-            item = items.get(label)
             ts = float(b.get('timestamp', 0.0) or 0.0)
+            if label == 'N' and not _span_kind(ts, af_spans) and _in_spans(ts, non_nsr_spans):
+                label = 'Other'    # not a sinus beat (see the note above)
+            item = items.get(label)
             if item is None or _span_kind(ts, af_spans):
                 continue
             if item.get('_seen') is None or ts < item['_seen']:

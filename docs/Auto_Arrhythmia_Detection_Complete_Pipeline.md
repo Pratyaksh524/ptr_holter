@@ -227,6 +227,29 @@ this exact order — the first one that fires wins the window)
 - The drawn segment's **start** is trimmed to `_ventricular_tachycardia_core_start`
   (same stable-core search, applied again) so onset-transition beats
   aren't included.
+- The **end** is cut beat by beat (`_vt_run_last_beat_fwd`: shape corr ≥ 0.90
+  against the VT's own template, size 0.5–2×, RR within 15%; two misses in
+  a row end the run). The region the window vote joins can hold a break
+  (noise on the lead read) and the same VT after it: every later run of
+  ≥ 5 beats that matches the template again is kept as its own VT piece
+  instead of being thrown away with the break (2026-11-16_15-35-15: VT
+  15:36:58 – 15:37:21, muscle noise to 15:37:33, same VT to 15:37:56).
+  A later stretch that does not match (VFib after the VT) is still cut.
+- **PVC / PAC marks:** beats inside an auto VT segment are not marked V or S
+  by `ectopic_beats_detector` (`NO_PVC_SEGMENTS`, `NO_PAC_SEGMENTS`): VT is a
+  rhythm of its own, so it no longer reads "PVC Run". Measured: V inside VT
+  segments 0 on all 22 simulator recordings with a VT; MIT-BIH PVC Se
+  74.7 → 74.4%, +P 88.5 → 91.7% (34 false V gone, 3 real V in record 207's
+  VT lost); INCART unchanged.
+
+- **VT over a test signal with no QRS is dropped** (Unidentified pass): a
+  VT segment ≥ 50% 'test_signal' whose beats have a global QRS
+  (`pqrst_measure.measure_beats`) on < 25% of them. A 4 Hz triangle test
+  wave reads 240 bpm, regular, wide, one shape — VT to the window rule —
+  but has the same slope all along, so no QRS (2026-11-17_13-39-33,
+  13:59:58–14:00:18: 0 of 39). The simulator's real VT also reads
+  test_signal / non_ecg but its QRS is found (25–27 of 27 a frame, QRS
+  250 ms), so it stays.
 
 ### 6.2 Ventricular Fibrillation — `_is_vfib_window`
 Fires only when **all** of: the window's own chaos test passes, **and**
@@ -234,7 +257,17 @@ no proven bundle-branch-block window covers it (P/PR/QRS-consistent wide
 beats aren't VFib), **and** `_vfib_beats_organized` is false (no lead
 shows a mostly-organized QRS), **and** `_vfib_has_fibrillating_piece`
 finds an actually-fibrillating sub-piece inside the window (slow-window
-median RR > 600 ms is exempt from this extra check). A lone
+median RR > 600 ms is exempt from this extra check), **and**
+`_vfib_regular_train_under` is false: no regular beat train runs under the
+window on ≥ 2 of leads I / V1 / V6 (beats found on ≥ 2 of them within
+100 ms, ≥ 5 beats, ≥ 80% of RRs within 15% of the median, median RR
+≥ 400 ms, spanning ≥ 70% of the window, one QRS shape — median
+correlation ≥ 0.9 on ≥ 2 of those leads, 1–25 Hz). The window's own beat
+list takes extra "beats" from muscle noise on a steady rhythm (seen:
+2026-11-17_11-37-06, LBBB 80 bpm under 65–150 Hz muscle noise, 21
+'beats' for 13 real ones → VFib 11:38:26–36; now Unidentified, muscle).
+The simulator's VFib can run at a steady ~740 ms for a few waves but its
+waves are not alike (0.69–0.74), so it stays VFib. A lone
 coarse/few-beat VFib window is flagged for the neighbour-confirmation
 guard below (§7.1).
 
@@ -262,6 +295,40 @@ normal sinus territory); otherwise its peaks are counted
   Mobitz I's grouped beating from reading as AFib); and
   `_atrial_beats_mostly_sinus` (beat-by-beat, all 12 leads) can veto a
   call that's really plain sinus on a lead the window rule didn't check.
+  A third veto, AFib only: `_rr_repeats_as_cycle` — AFib's RR is random,
+  so a window whose RR series repeats as a cycle (every RR within 4%
+  / 30 ms of the RR 2–6 beats earlier, on ≥ 85% of ≥ 4 comparisons) is
+  grouped beating (Mobitz I's Wenckebach cycle, bigeminy, fixed 3:2 / 4:3
+  block), not AFib. It needs no P wave, so it holds where noise hides them
+  (2026-11-16_14-01-13, 14:02:12–14:02:25: Mobitz I under muscle noise read
+  AFib). Measured: 178 of 179 simulator recordings unchanged, MIT-BIH
+  unchanged, INCART 4 records lost only AFib stretches of sinus rhythm or
+  PVC bigeminy (I18, I35, I51, I53).
+  A fourth veto, AFib only: **irregularity that is only PVCs**. A beat of
+  another shape carries no evidence of the atrial rhythm (its RRs are its
+  own coupling interval and pause; it has no P of its own), yet sinus
+  rhythm with PVCs passed the RR test above on those short-long pairs, and
+  at 100+/min the sinus-beat veto has no diastole to judge (MIT 208 / 215 /
+  200). On the window's dominant beats only (QRS on II / V1 / V5, 1–25 Hz,
+  ±80 ms, correlation ≥ 0.80 with the window's median QRS):
+  `_rr_regular_without_ectopics` — ≥ 1 beat of another shape, ≥ 4 RRs
+  between two dominant beats, ≥ 80% of them within 10% of their median;
+  `_dominant_beats_fibrillatory` — the `_beat_by_beat_evidence` vote of the
+  dominant beats whose previous beat is dominant too (an ectopic's T wave
+  sits in the next diastole): ≥ 3 deciding, more than half fibrillatory.
+  AFib is vetoed when the first holds and the second does not. Measured on
+  every AF window of MIT-BIH / INCART (first 300 s): the RR check alone
+  vetoed 13 of 305 windows inside annotated AF (MIT 210, 221: AFib's
+  response looks regular over 10 dominant RRs now and then); with the P
+  check, 0 of 305, while 65 of 199 windows outside annotated AF went.
+  Seconds of AF label: MIT inside annotated AF 1435 → 1434, outside
+  748 → 423; INCART inside 90 → 90, outside 753 → 607.
+  2026-11-18_12-49-55 12:52:11–12:52:32 (PVCs under muscle noise, read
+  AFib) is now Unidentified. Opens up what the false AFib covered: MIT 208
+  shows plain Tachycardia and Atrial Tachycardia pieces instead (annotated
+  sinus 105–119/min with PVCs and fusion beats — the Atrial Tachycardia
+  pieces are false, open), INCART I57 a 3.7 s Mobitz II at 151.2–154.9 s on
+  steady RR 610–620 ms (false, Mobitz II rule, open).
   Flutter additionally needs `_flutter_waves_locked` (the sawtooth is
   genuinely phase-locked to the QRS on most leads, not coincidental
   artifact).
@@ -296,6 +363,17 @@ window *before* the chain above, but only as a **veto input** (a proven
 conducted BBB window vetoes a VFib call there) and as its own separate
 beat-level pass (§7's bundle-branch-block section) — it is drawn
 alongside the rhythm label, never instead of it.
+Its P / PR (the PR-consistency check both the window rule and the
+beat-level pass need) is read the way the display reads it:
+Lead II with the PR-segment spline baseline taken out
+(`pqrst_measure._knot_baseline` through every beat's global QRS onset, at
+≤ 120 bpm) and the P chosen by `pqrst_measure.choose_p` (the most
+prominent wave instead of a strict pick 2.5× smaller, after the previous
+beat's T end — estimated there as QRS onset + 0.46 s × √RR). With only the
+0.5–40 Hz band-pass a 7 mV / s respiration wander left PR at 74–166 ms
+beside the true 238–258 on half the beats and every RBBB window failed
+(2026-11-17_12-10-06, 12:10:41–12:11:06; 2026-11-17_10-15-58,
+10:20:28–53).
 
 ---
 
@@ -363,6 +441,94 @@ alongside the rhythm label, never instead of it.
 16. **First-degree AV Block beat-by-beat** — fills in time no other label
     claims, same PR > 200 ms / 1:1-conducted idea as the window rule,
     beat by beat.
+    **Mobitz I / Mobitz II / Third-degree beat-by-beat** run right after it
+    in time no other rhythm label holds (Mobitz II: one pause at a time,
+    fixed P-peak-to-R PR before and after). Mobitz II is labelled only where
+    a pause confirms it. **First-degree next to Mobitz II:** a First-degree
+    AV Block segment within 20 s of a Mobitz II span
+    (`_FIRST_NEAR_MOBII_SEC`) is that block's conducted beats, so whatever
+    the PR reads that time is cut out of the First-degree label (cut to
+    beats, readable signal only). It is only cut, NOT relabelled Mobitz II,
+    and the cut time stays taken for the plain Bradycardia / Tachycardia
+    step (those are the block's own conducted beats, not a free rate run:
+    without this a Third-degree block's last slow beats next to a cut
+    First-degree read a 4.6 s plain Bradycardia, 2026-11-03_12-19-03).
+    Seen on 2026-11-17_10-15-58: 12 s of First-degree right before a Mobitz
+    II pause and 9 s right after one. (A Mobitz II episode merge that filled
+    the time between two pauses, 18 s of label for 2 pauses 15 s apart, was
+    tried and taken out.)
+    **Mobitz I cycle, no early beat:** a beat-by-beat Wenckebach cycle
+    (≥ 3 beats with PR rising ≥ 60 ms, pause 1.3–2.0× the cycle's median RR,
+    PR reset ≥ 60 ms) is not taken when its shortest RR is under
+    `_M1_EARLY_FRACTION` (0.85) × the median of up to 4 RRs before it **and**
+    under 0.85 × the median of up to 4 RRs after it. A conducted beat's RR
+    is the P-P plus the PR's growth, never under the atrial rate; a PVC /
+    PAC comes early and the rhythm goes on after its pause. Its "PR" (a P
+    found in front of a beat that has none) made the PR rise and its
+    compensatory pause the "blocked P": 2026-11-17_13-39-33 at 14:00:39,
+    14:00:57 and 14:01:11 (PVC at 606 ms in 750 ms sinus, 0.81), INCART I20
+    40.7 / 233 s (two PACs, 0.65 / 0.69), a healthy subject's sinus
+    arrhythmia (2026-10-29_16-36-56 at 742 s, 0.71). The PVC detector's list
+    (`_is_pvc`) did not hold those PVCs (its repeat test now keeps the ones
+    at 14:00:59 and 14:01:13; 14:00:40 has every lead at the ADC rail and
+    reads Q), and it holds no PAC at all.
+    **PVC repeat test, leads clipped:** in `ectopic_beats_detector` a V that
+    can be compared with no other V (< 3 usable leads in common, the rest
+    at the ADC rail) is judged as the only V of the recording (very
+    different, wide, early against the beat before it, no sinus P), not
+    sent back to N as "unlike every other V". 2026-11-17_13-39-33: 11 PVCs
+    of the 14:00:59–14:01:45 train back to V, and 4 of them added to the
+    list `_is_pvc` reads. MIT-BIH / INCART and every other simulator /
+    human recording: no beat changed.
+    **PAC, P wave readable:** `_classify_pacs` takes a "P stretch unlike
+    the dominant beats'" as PAC evidence only where the P wave can be read:
+    the N beats around it (6 each side) match the dominant P at median
+    ≥ 0.60 and this beat matches it ≥ 0.30 less. Noisy leads or the
+    previous T wave make normal beats' P "different" too; with strong sinus
+    arrhythmia that gave 13 false PACs on a healthy subject
+    (2026-10-29_16-36-56). INCART false PAC 71 → 13 (true 226 → 216),
+    MIT-BIH 304 → 9 (true 34 → 32), simulator / human recordings 19 false
+    PACs fewer, none lost; PVCs and segments unchanged (`_is_pvc` reads V
+    only).
+    **Beat lead off:** `_recording_r_peaks` reads the lead chosen in the
+    first 30 s; in a 60 s piece where it is off (peak-to-peak < 10% of its
+    first 30 s) the largest lead alive there is read. An 87 min recording
+    whose V4 went flat after 6 min (lead II alive) had 361 beats, now 5155
+    (2026-10-30_12-01-08); INCART I02 / I58 had a lead off too.
+    **Spike, not a beat:** an N "beat" with QRS < 60 ms, unlike the dominant
+    beat (< 0.50), whose RR + the next beat's equal one normal RR (±10%) is
+    a baseline step / spike: 'Q'. As N it made the next sinus beat read
+    PAC. 10 such beats over all recordings, all artifacts.
+    **PAC reset must be seen:** the recording's last beat has no next RR,
+    so it is no longer taken as "reset after it".
+    **Multiform PVC:** a V that matches no other V (repeat test) stays V
+    on the full LITFL picture of its own: very different shape, QRS ≥ 120
+    ms, early against the beat before it, no sinus P, a full compensatory
+    pause (RR + next RR within 10% of 2 × the normal RR) and the dominant
+    rhythm right after it (a rhythm change's first beat is followed by
+    more of its own shape). MIT-BIH true PVCs 865 → 874 (false 99 → 99),
+    INCART 2497 → 2523 (false 46 → 48). Tried and not taken: normal RR
+    from dominant-shape beats only (MIT −24 true PVCs), a milder
+    prematurity limit for clearly ventricular beats (0.92 / 0.95: as many
+    false as true PVCs gained), aberrant PAC vs PVC by the P wave (our P
+    measures do not separate them), a P-P / PR timing PAC rule (INCART 180
+    PACs / 354 false vs 216 / 13 now).
+    Unchanged: every simulator Wenckebach cycle (≥ 0.926), INCART I56
+    (0.93), MIT-BIH 208 (1.06).
+    **Third-degree run, one early beat:** inside the beat-by-beat Third-degree
+    run a single early beat (RR ≤ 0.6× the run's median, next RR back within
+    15% of it) is stepped over instead of ending the run (seen:
+    2026-11-17_11-25-25, escape beats 2.0 / 2.1 / 2.0 s, one beat 0.75 s
+    after the last, then 2.0 s again: the run stopped at 3 beats and the 6 s
+    read plain Bradycardia; now Third-degree from 11:29:20).
+    **Third-degree run through the window label:** beats a Third-degree
+    window label already holds take part in the beat-by-beat Third-degree
+    run (PR measured, counted toward its ≥ 4 beats); only the free beats get
+    the label, joined to the window label. The window rule's first full 10 s
+    window starts several beats into the block, and the 1–3 free beats
+    before it used to read plain Bradycardia (seen: 2026-11-17_10-03-23,
+    Mobitz II then 30 bpm escape rhythm from 10:07:33; Bradycardia
+    10:07:32–40, now Third-degree from 10:07:35).
 17. **Unidentified, first pass**: 10 s `frame_status` frames that aren't
     `ok` define "zones"; inside a zone, beat-interval `span_status` is
     checked (1 s filled steps where RR > 1.5 s); any non-`ok` span, minus
@@ -376,14 +542,21 @@ alongside the rhythm label, never instead of it.
     blocks where the 65-150 Hz power share is ≥ 2% on Lead II, I and V5 and
     Lead II's >40 Hz std is ≥ 2% of the 10 s ECG peak-to-peak, runs of
     ≥ 4 s), read on the raw samples. A P wave cannot be read in it, whatever
-    the SQI of the 10 s frame says. Includes the VFib
+    the SQI of the 10 s frame says. Atrial Flutter, the AV blocks (1st
+    degree, Mobitz I / II, 3rd degree) and the bundle branch blocks yield to
+    these muscle spans too (and only to them, not to the other unreadable
+    reasons) -- Ventricular Tachycardia too (muscle noise inside a VT read as VT, 2026-11-17_13-39-33 14:03:03-15; the muscle part is Unidentified, the VT either side stays); Atrial Fibrillation and VFib do not. A muscle span's 2 s block needs the 65-150 Hz share >= 2% on two of Lead II / I / V5 and >= 1.5% on all three (was >= 2% on all three: a big QRS dilutes the share on its biggest lead, Lead I read 1.8-2.4% in that VT). Includes the VFib
     test-signal trim: a VFib segment whose own beat-snapped pieces read
     `test_signal` gets those pieces cut out and relabelled Unidentified
     (≥ 2 s pieces only).
 18. **Plain Bradycardia / Tachycardia fallback** — rate only (no P/PR/QRS
     requirement), on beats outside every other rhythm segment: HR < 59.4
     (`_PLAIN_BRADY_HR`) or HR > 100 (`_PLAIN_TACHY_HR`), minimum 2.5 s / 1 s
-    respectively.
+    respectively. Bradycardia needs ≥ 3 beats; Tachycardia ≥ 4 beats (3
+    fast RRs in a row, was 2): two fast RRs are a PAC couplet, a PVC and its
+    neighbour, a spurious beat or two quick beats of sinus arrhythmia, not a
+    rhythm. Every Tachycardia this removed was a 2-RR one (MIT-BIH 15,
+    INCART 31, simulator / human 10); longer runs kept.
 19. **Noise gate** (§2d) — the last thing that can remove a label.
 20. **Unidentified, second pass** — any unreadable stretch still left
     with no rhythm label after everything above.
@@ -404,6 +577,37 @@ output is merged in):
   onset can't read as one huge "slow beat" and get mislabelled
   Bradycardia), using the **missed-beat-recovered** peak list (§3,
   item 4), through the same gate.
+- **PVC beats are not sinus beats** (the PVC detector's list, `_is_pvc`):
+  - A PVC the R-peak pass missed (no R peak within `_PVC_SAME_BEAT_SEC`
+    0.15 s) is added to `all_r_peaks`, at the PVC detector's own R peak.
+    Missing, its coupling interval and pause read as one long RR (ventricular
+    bigeminy: ~2 cycles; 2026-11-18_12-49-55 12:59:44–47 read Bradycardia).
+  - Its `sinus_gate_metrics` entry is an `'_ectopic'` marker with no
+    measurements (the strict P search found the previous T wave in front of
+    it: MIT 233, "PR" 204 ms beside sinus 136). `_sinus_beat` is False on it,
+    `_sinus_conduction_gate` leaves it out of every count.
+  - `_append_sinus_rate_segments` steps over up to `_ECTOPIC_BRIDGE_MAX` (2)
+    of them in a row when a sinus beat follows; they don't count toward the
+    ≥ 3 sinus beats. 3 in a row (a VT salvo) ends the segment.
+  - `_rr_bridged_over_ectopics`: in the fast run (Sinus Tachycardia) and the
+    slow run (Sinus Bradycardia) the RRs that touch such a stretch read as
+    max / min of the sinus RRs on either side (two sinus beats on each side
+    needed), not as the coupling interval and the pause (> 630 ms at
+    100+/min, which ended the fast run at every PVC). Ventricular bigeminy
+    has no sinus-sinus RR between its PVCs and is left as it is.
+  - Seen before: Sinus Tachycardia on five-PVC runs (2026-11-18_12-49-55
+    13:00:15, 13:00:55); MIT 233 (sinus 107/min, a PVC every ~5 s) in pieces,
+    now one segment 87.7–115.1 s across three PVCs. Interpolated PVCs (INCART
+    I08 119.9–123.0 s, N–V–N inside one ~1000 ms sinus cycle) read on the
+    sinus RRs: Sinus Bradycardia, right.
+  - Measured (first 300 s / sim 192): simulator 187 of 192 unchanged (the
+    new recording's four misfires gone; others ≤ 1.5 s edge moves). MIT-BIH
+    and INCART Sinus Bradycardia / Tachycardia now run across PVCs (MIT 114,
+    233; INCART I05, I29, I30, I67). Side effects: an added PVC splits MIT
+    214's LBBB 200.3–208.1 s in two, MIT 210's AFib starts 1.7 s later; MIT
+    232 22.9–28.6 s and INCART I19 71.2–74.0 s read Bradycardia instead of
+    Sinus Bradycardia (fewer than 3 sinus beats once a beat the PVC detector
+    calls V is left out). GUARD unchanged.
 - Both go through `_suppress_sinus_rate_overlap` against the window
   loop's `merged_morph` once that's ready: a sinus-rate segment is
   trimmed (not just dropped) at the exact edge of any overlapping
