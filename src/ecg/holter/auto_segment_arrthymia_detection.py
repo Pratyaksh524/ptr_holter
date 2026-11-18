@@ -451,6 +451,7 @@ _asystole_async_jobs: Dict[str, Dict[str, Any]] = {}
 # Minimum sustained flatline duration to call it Asystole rather than a
 # brief dropout/artifact blip.
 _ASYSTOLE_MIN_SEC = 3.0
+_PVC_SAME_BEAT_SEC = 0.15   # a PVC-detector beat this close to an R peak is that beat (_is_pvc)
 
 
 def _asystole_disk_cache_path(path: str) -> str:
@@ -1040,14 +1041,27 @@ def _detect_arrhythmias_uncached(
         except Exception as e:
             print(f"[Auto Arrhythmia Detect] PVC beats unavailable (rules run without them): {e}")
 
+    # A PVC the PVC detector found but the R-peak pass above missed (no R
+    # peak within _PVC_SAME_BEAT_SEC) is added as a beat, so that every rule
+    # sees it and knows it for a PVC. Missing, its coupling interval and the
+    # pause after it read as one long RR: in ventricular bigeminy the
+    # sinus-to-sinus RR across the PVC is ~2 cycles, and 2026-11-18_12-49-55
+    # 12:59:44-12:59:47 read as Bradycardia (PVC at 589.71 s not among the
+    # R peaks). Its timestamp is the PVC detector's own R peak.
+    if _pvc_arr.size and all_r_peaks:
+        _pk = np.asarray(all_r_peaks, dtype=float)
+        _add = [float(t) for t in _pvc_arr if float(np.min(np.abs(_pk - t))) > _PVC_SAME_BEAT_SEC]
+        if _add:
+            all_r_peaks = sorted(list(all_r_peaks) + _add)
+
     def _is_pvc(i):
         """True when R peak all_r_peaks[i] is one of the PVC detector's beats
-        (within 150 ms: it times a beat at its own R peak)."""
+        (within _PVC_SAME_BEAT_SEC: it times a beat at its own R peak)."""
         if _pvc_arr.size == 0 or not (0 <= i < len(all_r_peaks)):
             return False
         t = all_r_peaks[i]
         k = int(np.searchsorted(_pvc_arr, t))
-        return any(0 <= j < _pvc_arr.size and abs(_pvc_arr[j] - t) <= 0.15 for j in (k - 1, k))
+        return any(0 <= j < _pvc_arr.size and abs(_pvc_arr[j] - t) <= _PVC_SAME_BEAT_SEC for j in (k - 1, k))
 
     # Rate labels are sinus labels, so an RR pattern alone is not enough.
     # Measure every R-peak on the same best lead before rate segmentation and
@@ -1192,6 +1206,18 @@ def _detect_arrhythmias_uncached(
                 if sinus_metric:
                     sinus_metric['_r_time_sec'] = peak_sec
             metric_cursor += 1
+
+    # A PVC is not a sinus beat: whatever P / PR the strict search found in
+    # front of it is the previous T wave (seen: MIT 233 102.10 s, "PR" 204 ms
+    # beside sinus 136). Its gate entry becomes an '_ectopic' marker with no
+    # measurements, which the sinus rules skip instead of reading as a failed
+    # sinus beat (_sinus_beat, _sinus_conduction_gate,
+    # _append_sinus_rate_segments, _rr_bridged_over_ectopics). Seen without
+    # the marker: five PVCs at 120/min (2026-11-18_12-49-55, 13:00:15 and
+    # 13:00:55) passed the gate and read as Sinus Tachycardia.
+    for _i in range(len(all_r_peaks)):
+        if _is_pvc(_i):
+            sinus_gate_metrics[_i] = {'_ectopic': True, '_r_time_sec': all_r_peaks[_i]}
 
     # Calculate beat-to-beat RR intervals
     all_rr_ms = []
@@ -1928,6 +1954,79 @@ def _detect_arrhythmias_uncached(
         n_sinus = atrial.count('sinus')
         n_deciding = n_sinus + atrial.count('fibrillatory')
         return n_deciding >= _BEAT_MIN_DECIDING and n_sinus >= _BEAT_SINUS_MAJORITY * n_deciding
+
+    # A beat of another shape (PVC) carries no evidence of the atrial rhythm:
+    # its RRs are its own coupling interval and pause, and it has no P wave
+    # of its own. Sinus rhythm with PVCs read as AFib through exactly those
+    # (MIT 208 / 215 / 200: sinus at 100-120/min, PVCs every few beats ->
+    # the RR test above saw the short-long pairs as irregular, and at that
+    # rate the sinus-beat veto has no diastole to judge). Two checks on the
+    # window's dominant beats only (QRS shape on leads II / V1 / V5, 1-25 Hz,
+    # +/-80 ms: correlation >= _ECT_SHAPE_SAME with the window's median QRS):
+    #   _rr_regular_without_ectopics -- the RRs between two dominant beats
+    #     are regular: >= _ECT_RR_REGULAR_SHARE within _ECT_RR_REGULAR_TOL of
+    #     their median (needs >= 1 beat of another shape and
+    #     >= _ECT_MIN_RR such RRs);
+    #   _dominant_beats_fibrillatory -- the sinus-beat evidence of the
+    #     dominant beats whose previous beat is dominant too (an ectopic
+    #     beat's T wave sits in the next beat's diastole), as in
+    #     _atrial_beats_mostly_sinus: >= _BEAT_MIN_DECIDING deciding beats,
+    #     more than half fibrillatory.
+    # AFib is vetoed when the first holds and the second does not. Measured
+    # on every AF window of MIT-BIH / INCART (first 300 s): the RR check alone
+    # vetoed 13 of 305 windows inside annotated AF (AFib's response looks
+    # regular over 10 dominant RRs now and then -- 210, 221); with the P
+    # check none, while 65 of 199 windows outside annotated AF went.
+    _ECT_SHAPE_SAME = 0.80
+    _ECT_RR_REGULAR_TOL = 0.10
+    _ECT_RR_REGULAR_SHARE = 0.80
+    _ECT_MIN_RR = 4
+
+    def _dominant_shape_flags(padded_array, r_peaks, fs_):
+        """Per beat of r_peaks: True -- dominant QRS shape, False -- another
+        shape, None -- too close to the window edge to judge."""
+        peaks = [int(p) for p in r_peaks]
+        rows = [lead_names.index(n) for n in ('II', 'V1', 'V5')
+                if n in lead_names and lead_names.index(n) < padded_array.shape[0]]
+        if not rows:
+            return [None] * len(peaks)
+        h = int(0.08 * fs_)
+        try:
+            _bb, _aa = _butter(2, [1.0 / (float(fs_) / 2.0), 25.0 / (float(fs_) / 2.0)], btype='band')
+            sig = [_filtfilt(_bb, _aa, np.asarray(padded_array[r], dtype=float)) for r in rows]
+        except Exception:
+            return [None] * len(peaks)
+        wins = {k: np.concatenate([s[p - h:p + h] for s in sig])
+                for k, p in enumerate(peaks) if p - h >= 0 and p + h <= len(sig[0])}
+        if len(wins) < 3:
+            return [None] * len(peaks)
+        tpl = np.median(np.array(list(wins.values())), axis=0)
+        if np.std(tpl) <= 0:
+            return [None] * len(peaks)
+        return [None if k not in wins else
+                bool(np.std(wins[k]) > 0 and np.corrcoef(wins[k], tpl)[0, 1] >= _ECT_SHAPE_SAME)
+                for k in range(len(peaks))]
+
+    def _rr_regular_without_ectopics(dom, r_peaks, fs_):
+        """True when the window has a beat of another shape and its RRs
+        between consecutive dominant beats are regular (comment above)."""
+        if len(r_peaks) < _ECT_MIN_RR + 2 or not any(d is False for d in dom):
+            return False
+        rr = [(float(r_peaks[k]) - float(r_peaks[k - 1])) * 1000.0 / float(fs_)
+              for k in range(1, len(r_peaks)) if dom[k] and dom[k - 1]]
+        if len(rr) < _ECT_MIN_RR:
+            return False
+        med = float(np.median(rr))
+        return med > 0 and float(np.mean(np.abs(np.array(rr) - med) <= _ECT_RR_REGULAR_TOL * med)) >= _ECT_RR_REGULAR_SHARE
+
+    def _dominant_beats_fibrillatory(dom, padded_array, r_peaks, fs_):
+        """True when most deciding dominant beats (previous beat dominant
+        too) show no sinus P on a quiet diastole (comment above)."""
+        atrial = _beat_by_beat_evidence(padded_array, r_peaks, fs_)['atrial']
+        votes = [atrial[k] for k in range(1, len(r_peaks)) if dom[k] and dom[k - 1]]
+        n_fib = votes.count('fibrillatory')
+        n_deciding = n_fib + votes.count('sinus')
+        return n_deciding >= _BEAT_MIN_DECIDING and n_fib > 0.5 * n_deciding
 
     # AFib's RR intervals are random: no interval repeats the one a few beats
     # before it. A window whose RR series repeats as a cycle (every RR within
@@ -3554,6 +3653,16 @@ def _detect_arrhythmias_uncached(
                             # e.g. Mobitz I under noise that hides its P waves.
                             if atrial_label == 'Atrial Fibrillation'                                     and _rr_repeats_as_cycle(core_r_peaks, fs):
                                 atrial_label = None
+                            # ... nor where its irregularity is only beats of
+                            # another shape (PVCs): the RRs between dominant beats
+                            # are regular and the dominant beats' P vote is not
+                            # fibrillatory (_rr_regular_without_ectopics,
+                            # _dominant_beats_fibrillatory).
+                            if atrial_label == 'Atrial Fibrillation':
+                                _dom = _dominant_shape_flags(padded_array, core_r_peaks, fs)
+                                if _rr_regular_without_ectopics(_dom, core_r_peaks, fs) \
+                                        and not _dominant_beats_fibrillatory(_dom, padded_array, core_r_peaks, fs):
+                                    atrial_label = None
                             # Flutter waves must be locked to the QRS on most
                             # leads (_flutter_waves_locked), not artifact.
                             if atrial_label == 'Atrial Flutter' \
@@ -7539,7 +7648,15 @@ def _detect_arrhythmias_uncached(
     # uncovered time). See _plain_rate_segments. A Tachycardia run is made of
     # beats: an RR interval that touches a PVC (_is_pvc) does not count, so a
     # run of PVCs -- 5 at 120 bpm, QRS 140, no P -- is no Tachycardia (the PVC
-    # detector names it). Bradycardia is left as it was.
+    # detector names it). A Tachycardia needs >= 3 fast RRs in a row (4
+    # beats; was 2): two fast RRs are a PAC couplet, a PVC and its
+    # neighbour, a spurious beat or two quick beats of sinus arrhythmia, not
+    # a rhythm (as Atrial Tachycardia's _AT_MIN_BEATS). Seen: INCART I20 PAC
+    # couplets (N A A) read Tachycardia 1.1 s at 5.1 / 40.7 / 80.4 / 233.0 s;
+    # a healthy subject's breathing, 2026-10-29_16-36-56, 9 labels. Over all
+    # data every Tachycardia taken out was a 2-RR one (MIT 15, INCART 31,
+    # simulator / human 10), longer runs kept (a 2-RR head or tail cut off).
+    # Bradycardia is left as it was.
     try:
         rhythm_spans = [
             (float(s['start_sec']), float(s['end_sec'])) for s in final_segments
@@ -7559,7 +7676,7 @@ def _detect_arrhythmias_uncached(
         _tachy_blocked = rhythm_spans + [(float(t) - 0.05, float(t) + 0.05) for t in _pvc_arr]
         final_segments.extend(_plain_rate_segments(
             all_r_peaks, lambda hr: hr > _PLAIN_TACHY_HR,
-            1.0, 'Tachycardia', '#F08080', _tachy_blocked, make_time_strs))
+            1.0, 'Tachycardia', '#F08080', _tachy_blocked, make_time_strs, min_beats=4))
         final_segments.sort(key=lambda x: x['start_sec'])
     except Exception as e:
         print(f"[Auto Arrhythmia Detect] Bradycardia / Tachycardia check error: {e}")
@@ -8156,12 +8273,52 @@ def _qrs_ok_for_sinus(b):
     return bool(b.get('qrs_bounds_resolved') or b.get('pr_ms') is not None)
 
 
+_ECTOPIC_BRIDGE_MAX = 2   # up to a couplet of ectopic beats sits inside a sinus run; 3 in a row is a VT salvo
+
+
+def _rr_bridged_over_ectopics(rr_ms, metrics, pick):
+    """The RR series as the Sinus Tachycardia / Bradycardia rate runs read it.
+    RR k joins beats k and k+1 of `metrics` (len(rr_ms) + 1 beats). An
+    ectopic beat (metrics flagged '_ectopic': a PVC) is not a sinus cycle:
+    its coupling interval and its pause say nothing about the sinus rate,
+    and its pause (> 630 ms at 100+/min) ended a Sinus Tachycardia run at
+    every PVC (MIT 233). For a stretch of <= _ECTOPIC_BRIDGE_MAX ectopic
+    beats with two sinus beats on each side, the RRs that touch it take
+    pick(sinus RR before, sinus RR after) -- max for the fast run, min for
+    the slow one, so the run goes on only when the sinus rate on both
+    sides qualifies. Anything else (ventricular bigeminy: no sinus-sinus RR
+    between the PVCs; a run of 3+) is left as it is."""
+    out = list(rr_ms)
+    n = len(rr_ms) + 1
+    if len(metrics) < n:
+        return out
+    ect = [bool(m and m.get('_ectopic')) for m in metrics[:n]]
+    i = 0
+    while i < n:
+        if not ect[i]:
+            i += 1
+            continue
+        a = i
+        while i < n and ect[i]:
+            i += 1
+        b = i - 1
+        if b - a + 1 <= _ECTOPIC_BRIDGE_MAX and a >= 2 and b + 2 < n \
+                and not (ect[a - 2] or ect[a - 1] or ect[b + 1] or ect[b + 2]):
+            v = pick(rr_ms[a - 2], rr_ms[b + 1])
+            for r in range(a - 1, b + 1):
+                out[r] = v
+    return out
+
+
 def _sinus_beat(b):
     """One beat's own sinus evidence: a P with onset/end, a QRS of 40-200
     ms (see _qrs_ok_for_sinus) and a measured PR --
-    _sinus_conduction_gate()'s per-beat "valid" test plus the PR it needs."""
+    _sinus_conduction_gate()'s per-beat "valid" test plus the PR it needs.
+    An '_ectopic' beat (a PVC) never is one; _append_sinus_rate_segments
+    steps over it instead of ending the segment there."""
     return bool(
         b
+        and not b.get('_ectopic')
         and b.get('p_present')
         and b.get('p_onset') is not None
         and b.get('p_end') is not None
@@ -8185,6 +8342,7 @@ def _sinus_conduction_gate(metrics, start_idx, end_idx):
     for Sinus Tachycardia and Sinus Arrhythmia, the Sinus Bradycardia rule's
     own (possibly missed-beat-recovered) list for Sinus Bradycardia. Every
     caller passes its own list explicitly; there is no default here.
+    Ectopic beats (flagged '_ectopic': PVCs) are left out of every count.
     """
     if start_idx is None or end_idx is None:
         return False
@@ -8192,7 +8350,7 @@ def _sinus_conduction_gate(metrics, start_idx, end_idx):
     right = min(len(metrics) - 1, int(end_idx))
     if right < left:
         return False
-    beats = [b for b in metrics[left:right + 1] if b]
+    beats = [b for b in metrics[left:right + 1] if b and not b.get('_ectopic')]
     if len(beats) < 3:
         return False
 
@@ -8309,9 +8467,15 @@ def _append_sinus_rate_segments(peaks, metrics, start_idx, end_idx, min_dur_sec,
     """Sinus Tachycardia / Bradycardia judged beat by beat inside one
     rate run (beats start_idx..end_idx of `peaks`): a beat that fails
     _sinus_beat() ends the current segment and the next passing beat
-    starts a new one. Each segment needs >= 3 beats, >= min_dur_sec and
-    _sinus_conduction_gate() on its own beats (PR / QRS / P-P / P shape
-    consistency). Was: the gate on the whole run at once, so one bad
+    starts a new one. An ectopic beat (metrics flagged '_ectopic': a PVC)
+    is neither: up to _ECTOPIC_BRIDGE_MAX of them in a row with a sinus
+    beat after them are stepped over, so the segment goes on across a PVC
+    (a PVC does not end the sinus rhythm under it; seen: MIT 233, sinus
+    107/min, a PVC every ~5 s, Sinus Tachycardia in pieces). They do not
+    count toward the >= 3 sinus beats either. Each segment needs >= 3
+    sinus beats, >= min_dur_sec and _sinus_conduction_gate() on its own
+    beats (PR / QRS / P-P / P shape consistency; ectopic beats left
+    out). Was: the gate on the whole run at once, so one bad
     stretch dropped the good one with it -- seen: Sinus Tachycardia 150
     bpm 100.1-148.6 s, 37 of 122 beats valid (92 needed) because P was
     rejected on every beat after 120 s, while 101-111 s alone had 21
@@ -8326,11 +8490,20 @@ def _append_sinus_rate_segments(peaks, metrics, start_idx, end_idx, min_dur_sec,
             k += 1
             continue
         seg_start = k
-        while k + 1 <= end_idx and _sinus_beat(metrics[k + 1]):
-            k += 1
+        while True:
+            if k + 1 <= end_idx and _sinus_beat(metrics[k + 1]):
+                k += 1
+                continue
+            j = k + 1
+            while j <= end_idx and metrics[j] and metrics[j].get('_ectopic') and j - k <= _ECTOPIC_BRIDGE_MAX:
+                j += 1
+            if j - k - 1 >= 1 and j - k - 1 <= _ECTOPIC_BRIDGE_MAX and j <= end_idx and _sinus_beat(metrics[j]):
+                k = j
+                continue
+            break
         seg_end = k
         k += 1
-        if seg_end - seg_start + 1 >= 3 \
+        if sum(1 for q in range(seg_start, seg_end + 1) if _sinus_beat(metrics[q])) >= 3 \
                 and peaks[seg_end] - peaks[seg_start] >= min_dur_sec \
                 and _sinus_conduction_gate(metrics, seg_start, seg_end):
             s_sec = peaks[seg_start]
@@ -8468,7 +8641,9 @@ def _sinus_rate_segments(reader, fs, best_lead_idx, conduction_lead_idx, total_d
             ranges.append((start, len(rr_ms)))
         return ranges
 
-    _tachy_ranges = _fast_ranges(all_rr_ms)
+    # The RRs around a PVC are read as the sinus RRs on either side of it
+    # (_rr_bridged_over_ectopics), not as its coupling interval and pause.
+    _tachy_ranges = _fast_ranges(_rr_bridged_over_ectopics(all_rr_ms, sinus_gate_metrics, max))
 
     # Missed-beat recovery for this Sinus Tachycardia rule, reactive
     # instead of a blanket pre-scan the way Sinus Bradycardia's below
@@ -8572,7 +8747,7 @@ def _sinus_rate_segments(reader, fs, best_lead_idx, conduction_lead_idx, total_d
             (tachy_r_peaks[k + 1] - tachy_r_peaks[k]) * 1000.0
             for k in range(len(tachy_r_peaks) - 1)
         ]
-        _tachy_ranges = _fast_ranges(tachy_rr_ms)
+        _tachy_ranges = _fast_ranges(_rr_bridged_over_ectopics(tachy_rr_ms, tachy_beat_metrics, max))
     else:
         tachy_r_peaks, tachy_beat_metrics = all_r_peaks, sinus_gate_metrics
 
@@ -8686,8 +8861,10 @@ def _sinus_rate_segments(reader, fs, best_lead_idx, conduction_lead_idx, total_d
     in_brady = False
     brady_start_idx = None
 
-    for i, rr in enumerate(brady_rr_ms):
-        next_rr = brady_rr_ms[i + 1] if i + 1 < len(brady_rr_ms) else None
+    # RRs around a PVC: as for the fast run above (_rr_bridged_over_ectopics).
+    _brady_run_rr = _rr_bridged_over_ectopics(brady_rr_ms, brady_beat_metrics, min)
+    for i, rr in enumerate(_brady_run_rr):
+        next_rr = _brady_run_rr[i + 1] if i + 1 < len(_brady_run_rr) else None
         is_slow = (
             (_BRADY_MIN_RR_MS <= rr <= _brady_max_rr_ms)
             or (
@@ -8715,12 +8892,13 @@ def _sinus_rate_segments(reader, fs, best_lead_idx, conduction_lead_idx, total_d
     return segments, brady_r_peaks
 
 
-def _plain_rate_segments(peaks, hr_ok, min_dur_sec, label, color, blocked_spans, make_time_strs):
+def _plain_rate_segments(peaks, hr_ok, min_dur_sec, label, color, blocked_spans, make_time_strs, min_beats=3):
     """Plain 'Bradycardia' / 'Tachycardia' segments, beat by beat: a beat
     joins the current segment while its RR gives hr_ok(60000 / RR) and the
     RR lies outside every blocked span (the other rhythm segments); the
-    first beat that fails ends the segment. Kept with >= 3 beats over
-    >= min_dur_sec, edges on the R peaks. Rate only -- no P/PR/QRS check:
+    first beat that fails ends the segment. Kept with >= min_beats beats
+    (min_beats - 1 RRs at the rate) over >= min_dur_sec, edges on the R
+    peaks. Rate only -- no P/PR/QRS check:
     a run with sinus evidence is already Sinus Bradycardia / Tachycardia
     and is among the blocked spans.
 
@@ -8762,7 +8940,7 @@ def _plain_rate_segments(peaks, hr_ok, min_dur_sec, label, color, blocked_spans,
             else:
                 break
         s_sec, e_sec = peaks[first], peaks[i + 1]
-        if i - first + 2 >= 3 and e_sec - s_sec >= min_dur_sec:
+        if i - first + 2 >= min_beats and e_sec - s_sec >= min_dur_sec:
             s_str, e_str = make_time_strs(s_sec, e_sec)
             segments.append({
                 'start_sec': s_sec,

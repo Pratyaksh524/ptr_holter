@@ -304,6 +304,31 @@ normal sinus territory); otherwise its peaks are counted
   AFib). Measured: 178 of 179 simulator recordings unchanged, MIT-BIH
   unchanged, INCART 4 records lost only AFib stretches of sinus rhythm or
   PVC bigeminy (I18, I35, I51, I53).
+  A fourth veto, AFib only: **irregularity that is only PVCs**. A beat of
+  another shape carries no evidence of the atrial rhythm (its RRs are its
+  own coupling interval and pause; it has no P of its own), yet sinus
+  rhythm with PVCs passed the RR test above on those short-long pairs, and
+  at 100+/min the sinus-beat veto has no diastole to judge (MIT 208 / 215 /
+  200). On the window's dominant beats only (QRS on II / V1 / V5, 1–25 Hz,
+  ±80 ms, correlation ≥ 0.80 with the window's median QRS):
+  `_rr_regular_without_ectopics` — ≥ 1 beat of another shape, ≥ 4 RRs
+  between two dominant beats, ≥ 80% of them within 10% of their median;
+  `_dominant_beats_fibrillatory` — the `_beat_by_beat_evidence` vote of the
+  dominant beats whose previous beat is dominant too (an ectopic's T wave
+  sits in the next diastole): ≥ 3 deciding, more than half fibrillatory.
+  AFib is vetoed when the first holds and the second does not. Measured on
+  every AF window of MIT-BIH / INCART (first 300 s): the RR check alone
+  vetoed 13 of 305 windows inside annotated AF (MIT 210, 221: AFib's
+  response looks regular over 10 dominant RRs now and then); with the P
+  check, 0 of 305, while 65 of 199 windows outside annotated AF went.
+  Seconds of AF label: MIT inside annotated AF 1435 → 1434, outside
+  748 → 423; INCART inside 90 → 90, outside 753 → 607.
+  2026-11-18_12-49-55 12:52:11–12:52:32 (PVCs under muscle noise, read
+  AFib) is now Unidentified. Opens up what the false AFib covered: MIT 208
+  shows plain Tachycardia and Atrial Tachycardia pieces instead (annotated
+  sinus 105–119/min with PVCs and fusion beats — the Atrial Tachycardia
+  pieces are false, open), INCART I57 a 3.7 s Mobitz II at 151.2–154.9 s on
+  steady RR 610–620 ms (false, Mobitz II rule, open).
   Flutter additionally needs `_flutter_waves_locked` (the sawtooth is
   genuinely phase-locked to the QRS on most leads, not coincidental
   artifact).
@@ -455,6 +480,39 @@ beside the true 238–258 on half the beats and every RBBB window failed
     of the 14:00:59–14:01:45 train back to V, and 4 of them added to the
     list `_is_pvc` reads. MIT-BIH / INCART and every other simulator /
     human recording: no beat changed.
+    **PAC, P wave readable:** `_classify_pacs` takes a "P stretch unlike
+    the dominant beats'" as PAC evidence only where the P wave can be read:
+    the N beats around it (6 each side) match the dominant P at median
+    ≥ 0.60 and this beat matches it ≥ 0.30 less. Noisy leads or the
+    previous T wave make normal beats' P "different" too; with strong sinus
+    arrhythmia that gave 13 false PACs on a healthy subject
+    (2026-10-29_16-36-56). INCART false PAC 71 → 13 (true 226 → 216),
+    MIT-BIH 304 → 9 (true 34 → 32), simulator / human recordings 19 false
+    PACs fewer, none lost; PVCs and segments unchanged (`_is_pvc` reads V
+    only).
+    **Beat lead off:** `_recording_r_peaks` reads the lead chosen in the
+    first 30 s; in a 60 s piece where it is off (peak-to-peak < 10% of its
+    first 30 s) the largest lead alive there is read. An 87 min recording
+    whose V4 went flat after 6 min (lead II alive) had 361 beats, now 5155
+    (2026-10-30_12-01-08); INCART I02 / I58 had a lead off too.
+    **Spike, not a beat:** an N "beat" with QRS < 60 ms, unlike the dominant
+    beat (< 0.50), whose RR + the next beat's equal one normal RR (±10%) is
+    a baseline step / spike: 'Q'. As N it made the next sinus beat read
+    PAC. 10 such beats over all recordings, all artifacts.
+    **PAC reset must be seen:** the recording's last beat has no next RR,
+    so it is no longer taken as "reset after it".
+    **Multiform PVC:** a V that matches no other V (repeat test) stays V
+    on the full LITFL picture of its own: very different shape, QRS ≥ 120
+    ms, early against the beat before it, no sinus P, a full compensatory
+    pause (RR + next RR within 10% of 2 × the normal RR) and the dominant
+    rhythm right after it (a rhythm change's first beat is followed by
+    more of its own shape). MIT-BIH true PVCs 865 → 874 (false 99 → 99),
+    INCART 2497 → 2523 (false 46 → 48). Tried and not taken: normal RR
+    from dominant-shape beats only (MIT −24 true PVCs), a milder
+    prematurity limit for clearly ventricular beats (0.92 / 0.95: as many
+    false as true PVCs gained), aberrant PAC vs PVC by the P wave (our P
+    measures do not separate them), a P-P / PR timing PAC rule (INCART 180
+    PACs / 354 false vs 216 / 13 now).
     Unchanged: every simulator Wenckebach cycle (≥ 0.926), INCART I56
     (0.93), MIT-BIH 208 (1.06).
     **Third-degree run, one early beat:** inside the beat-by-beat Third-degree
@@ -494,7 +552,11 @@ beside the true 238–258 on half the beats and every RBBB window failed
 18. **Plain Bradycardia / Tachycardia fallback** — rate only (no P/PR/QRS
     requirement), on beats outside every other rhythm segment: HR < 59.4
     (`_PLAIN_BRADY_HR`) or HR > 100 (`_PLAIN_TACHY_HR`), minimum 2.5 s / 1 s
-    respectively.
+    respectively. Bradycardia needs ≥ 3 beats; Tachycardia ≥ 4 beats (3
+    fast RRs in a row, was 2): two fast RRs are a PAC couplet, a PVC and its
+    neighbour, a spurious beat or two quick beats of sinus arrhythmia, not a
+    rhythm. Every Tachycardia this removed was a 2-RR one (MIT-BIH 15,
+    INCART 31, simulator / human 10); longer runs kept.
 19. **Noise gate** (§2d) — the last thing that can remove a label.
 20. **Unidentified, second pass** — any unreadable stretch still left
     with no rhythm label after everything above.
@@ -515,6 +577,37 @@ output is merged in):
   onset can't read as one huge "slow beat" and get mislabelled
   Bradycardia), using the **missed-beat-recovered** peak list (§3,
   item 4), through the same gate.
+- **PVC beats are not sinus beats** (the PVC detector's list, `_is_pvc`):
+  - A PVC the R-peak pass missed (no R peak within `_PVC_SAME_BEAT_SEC`
+    0.15 s) is added to `all_r_peaks`, at the PVC detector's own R peak.
+    Missing, its coupling interval and pause read as one long RR (ventricular
+    bigeminy: ~2 cycles; 2026-11-18_12-49-55 12:59:44–47 read Bradycardia).
+  - Its `sinus_gate_metrics` entry is an `'_ectopic'` marker with no
+    measurements (the strict P search found the previous T wave in front of
+    it: MIT 233, "PR" 204 ms beside sinus 136). `_sinus_beat` is False on it,
+    `_sinus_conduction_gate` leaves it out of every count.
+  - `_append_sinus_rate_segments` steps over up to `_ECTOPIC_BRIDGE_MAX` (2)
+    of them in a row when a sinus beat follows; they don't count toward the
+    ≥ 3 sinus beats. 3 in a row (a VT salvo) ends the segment.
+  - `_rr_bridged_over_ectopics`: in the fast run (Sinus Tachycardia) and the
+    slow run (Sinus Bradycardia) the RRs that touch such a stretch read as
+    max / min of the sinus RRs on either side (two sinus beats on each side
+    needed), not as the coupling interval and the pause (> 630 ms at
+    100+/min, which ended the fast run at every PVC). Ventricular bigeminy
+    has no sinus-sinus RR between its PVCs and is left as it is.
+  - Seen before: Sinus Tachycardia on five-PVC runs (2026-11-18_12-49-55
+    13:00:15, 13:00:55); MIT 233 (sinus 107/min, a PVC every ~5 s) in pieces,
+    now one segment 87.7–115.1 s across three PVCs. Interpolated PVCs (INCART
+    I08 119.9–123.0 s, N–V–N inside one ~1000 ms sinus cycle) read on the
+    sinus RRs: Sinus Bradycardia, right.
+  - Measured (first 300 s / sim 192): simulator 187 of 192 unchanged (the
+    new recording's four misfires gone; others ≤ 1.5 s edge moves). MIT-BIH
+    and INCART Sinus Bradycardia / Tachycardia now run across PVCs (MIT 114,
+    233; INCART I05, I29, I30, I67). Side effects: an added PVC splits MIT
+    214's LBBB 200.3–208.1 s in two, MIT 210's AFib starts 1.7 s later; MIT
+    232 22.9–28.6 s and INCART I19 71.2–74.0 s read Bradycardia instead of
+    Sinus Bradycardia (fewer than 3 sinus beats once a beat the PVC detector
+    calls V is left out). GUARD unchanged.
 - Both go through `_suppress_sinus_rate_overlap` against the window
   loop's `merged_morph` once that's ready: a sinus-rate segment is
   trimmed (not just dropped) at the exact edge of any overlapping
