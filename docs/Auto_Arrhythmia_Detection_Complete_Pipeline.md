@@ -444,7 +444,17 @@ beside the true 238–258 on half the beats and every RBBB window failed
     14:00:57 and 14:01:11 (PVC at 606 ms in 750 ms sinus, 0.81), INCART I20
     40.7 / 233 s (two PACs, 0.65 / 0.69), a healthy subject's sinus
     arrhythmia (2026-10-29_16-36-56 at 742 s, 0.71). The PVC detector's list
-    (`_is_pvc`) did not hold those PVCs, and it holds no PAC at all.
+    (`_is_pvc`) did not hold those PVCs (its repeat test now keeps the ones
+    at 14:00:59 and 14:01:13; 14:00:40 has every lead at the ADC rail and
+    reads Q), and it holds no PAC at all.
+    **PVC repeat test, leads clipped:** in `ectopic_beats_detector` a V that
+    can be compared with no other V (< 3 usable leads in common, the rest
+    at the ADC rail) is judged as the only V of the recording (very
+    different, wide, early against the beat before it, no sinus P), not
+    sent back to N as "unlike every other V". 2026-11-17_13-39-33: 11 PVCs
+    of the 14:00:59–14:01:45 train back to V, and 4 of them added to the
+    list `_is_pvc` reads. MIT-BIH / INCART and every other simulator /
+    human recording: no beat changed.
     Unchanged: every simulator Wenckebach cycle (≥ 0.926), INCART I56
     (0.93), MIT-BIH 208 (1.06).
     **Third-degree run, one early beat:** inside the beat-by-beat Third-degree

@@ -47,12 +47,19 @@ V V V V as a run instead of N N V N N V (trigeminy).
     that makes a normal beat "different" does not repeat, a ventricular
     focus does. The only V of a recording stays V when its shape is very
     different, its QRS wide, it came early against the beat before it too
-    and no sinus P wave comes before it (_lone_v_is_ectopic).
+    and no sinus P wave comes before it (_lone_v_is_ectopic). Only V beats
+    with >= MIN_SHAPE_LEADS usable leads in common count as compared; a V
+    nothing can be compared with (leads clipped at the ADC rail) gets the
+    same only-V test.
   - Template: started from the first beats (the narrow ones when there are
     enough, so a bigeminy start does not take the PVC for the template),
     moved only by N beats with similarity >= TEMPLATE_UPDATE_CORR, and
     replaced when TEMPLATE_SWITCH_BEATS beats in a row at the normal rate
-    share a new shape (a lasting change of conduction). The normal RR
+    share a new shape (a lasting change of conduction), or when
+    TEMPLATE_SWITCH_BEATS V beats in a row (Q beats between them do not
+    break the row) come at a steady RR under 100 bpm (a new rhythm, not
+    PVCs). The PVC test judges the shape centred on the QRS and on the R
+    peak, and takes the better match (f waves can move the QRS edges). The normal RR
     follows dominant-shape beats both faster and slower, except the pause
     after a PVC. Template and normal RR are learnt again after a gap >
     RESTART_GAP_SEC or a no-QRS segment (below), never from the beats of an
@@ -824,7 +831,9 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
         pieces.append((ps, q, clip))
         piece_peaks = sorted(p for p in all_peaks if t <= p < te)
         for p in piece_peaks:
-            feats.append([p, None, len(pieces) - 1, int(round((p - ps) * fs))])
+            # [time, QRS ms, piece, shape centre (moved to the QRS centre
+            # below), R peak sample (kept: see v_corr in the main loop)]
+            feats.append([p, None, len(pieces) - 1, int(round((p - ps) * fs)), int(round((p - ps) * fs))])
         t += PIECE_SEC
     feats.sort(key=lambda f: f[0])
 
@@ -930,14 +939,20 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
     p_template = None
     v_cands: List[tuple] = []           # (index in out, shape, similarity, qrs) of each V
     pending: List[np.ndarray] = []     # new-shape beats at the normal rate, in a row
+    pending_first = 0                   # index in out of pending's first beat
     run: List[tuple] = []               # the current V run: (beat, rr, shape)
     prev_label = None
+    # The last beat whose shape was judged, 'V' or 'N' (a 'Q' beat -- shape
+    # or QRS not measurable -- is no evidence either way and leaves it).
+    # A V run (`run`, the slow-run test below) goes on over Q beats and
+    # ends at an N beat.
+    last_judged = None
     prev_t = None
     for k, f in enumerate(feats):
         ts, qrs = f[0], f[1]
         if restart_at[k] and not blocked(ts):
             template, ref_rr = start(k)
-            pending, run, prev_label = [], [], None
+            pending, run, prev_label, last_judged = [], [], None, None
             p_template = None
         after_ectopic = prev_label == 'V'
         rr = (ts - prev_t) * 1000.0 if prev_t is not None else None
@@ -966,6 +981,7 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
         if blocked(ts) or template is None:
             beat['label'] = 'Q'
             prev_label = 'Q'
+            last_judged = None
             pending = []
             run = []
             continue
@@ -980,15 +996,31 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
             beat['label'] = 'Q'
             prev_label = 'Q'
             pending = []
-            run = []
             continue
         normal_rr = float(np.median(ref_rr)) if len(ref_rr) >= 2 else None
         premature = rr is not None and normal_rr is not None and rr <= PREMATURE_FRACTION * normal_rr
         different = corr < SHAPE_SAME_CORR
+        # For the PVC test only: the shape also judged centred on the R peak,
+        # the better of the two. The shape window sits on the measured QRS
+        # centre, and where AF f waves move the QRS edges the window moves
+        # with them: a normal 88 ms beat read QRS 172 ms and similarity 0.10
+        # (0.99 on its R peak) -- premature in AF, "wide" and "different":
+        # V (2026-11-17_13-39-33, 13:50:35 / :40 / :42; the same in the
+        # simulator AF of 2026-10-10_12-21-19, 2026-10-20_12-26-09,
+        # 2026-10-30_16-03-13). A PVC is unlike the dominant beat however it
+        # is aligned. MIT-BIH false V 119 -> 99, true 867 -> 865 (207: its
+        # template there is the PVC itself); INCART false V 59 -> 49, true
+        # unchanged. Not for the PAC test or the template (similarity there
+        # as before): there it made 19 INCART normal beats PACs.
+        v_corr = corr
+        if f[4] != f[3]:
+            corr_r = _corr(shape_leads, f[4], template, fs, clip)
+            if not np.isnan(corr_r) and corr_r > corr:
+                v_corr = corr_r
         # a beat whose QRS cannot be bounded is no PVC evidence: on INCART
         # most such "beats" were noise / T waves Pan-Tompkins took (146 of
         # 321 false V had no annotated beat at all)
-        very_different = corr < VERY_DIFFERENT_CORR and qrs is not None and qrs >= MIN_PVC_QRS_MS
+        very_different = v_corr < VERY_DIFFERENT_CORR and qrs is not None and qrs >= MIN_PVC_QRS_MS
         wide = qrs is not None and qrs >= WIDE_QRS_MS
         run_on = (prev_label == 'V' and rr is not None and normal_rr is not None
                   and rr <= RUN_CONTINUE_FRACTION * normal_rr)
@@ -1001,14 +1033,15 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
         # the dominant beat's and a wide QRS -- or a shape so unlike it that
         # a QRS measured under WIDE_QRS_MS (>= MIN_PVC_QRS_MS) does not
         # matter (seen: INCART PVCs measured 108-118 ms, similarity 0.0-0.4).
-        if (premature or run_on) and (very_different or (different and wide)) and not no_pvc(ts):
+        if (premature or run_on) and (very_different or (v_corr < SHAPE_SAME_CORR and wide)) and not no_pvc(ts):
             beat['label'] = 'V'
             prev_label = 'V'
             pending = []
-            if not run_on:
+            if not run_on and last_judged != 'V':
                 run = []
+            last_judged = 'V'
             v_shape = _shape(shape_leads, f[3], fs, clip)
-            v_cands.append((len(out) - 1, v_shape, corr, qrs))
+            v_cands.append((len(out) - 1, v_shape, v_corr, qrs))
             run.append((beat, rr, v_shape))
             # A "run" slower than 100 bpm with a steady RR is a new rhythm,
             # not PVCs (a PVC run / VT is >= 100 bpm): the beats go back to
@@ -1031,15 +1064,23 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
                         template = _blend(template, _nanmean_rows(np.array(shapes_)), 1.0)
                     ref_rr = [float(x) for x in rrs][-LOCAL_RR_BEATS:]
                     prev_label = 'N'
+                    last_judged = 'N'
                     run = []
             continue
-        run = []
         if qrs is None:
             beat['label'] = 'Q'
             prev_label = 'Q'
             pending = []
             continue
+        # Only an N beat ends the V run: a Q beat broke it, and a rhythm
+        # change with clipped leads never reached TEMPLATE_SWITCH_BEATS V in
+        # a row (Third-degree block 30 bpm, then 80 bpm LBBB: V Q Q V Q Q V
+        # ..., the template stayed the narrow escape beat and 5 LBBB beats
+        # read V, 2026-11-17_13-39-33 14:10:40-14:10:54; now the 8th V
+        # turns the run into the new rhythm). MIT-BIH / INCART unchanged.
+        run = []
         prev_label = 'N'
+        last_judged = 'N'
         # normal beat: running RR and template
         if rr is not None and (normal_rr is None or NORMAL_RR_MIN_FRACTION * normal_rr <= rr <= NORMAL_RR_MAX_FRACTION * normal_rr):
             ref_rr.append(rr)
@@ -1066,10 +1107,27 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
         elif different and not premature:
             if pending and not (_similarity(pending[-1], v) >= SHAPE_SAME_CORR):
                 pending = []
+            if not pending:
+                pending_first = len(out) - 1
             pending.append(v)
             if len(pending) >= TEMPLATE_SWITCH_BEATS:
                 template = _blend(template, _nanmean_rows(np.array(pending)), 1.0)
                 pending = []
+                # The beat right before the new shape's run, when V with that
+                # same shape, was the new rhythm's first beat, not a PVC: a
+                # rhythm (conduction) change often starts a little early and
+                # is premature and unlike the old template only against the
+                # old rhythm. Seen: RBBB -> LBBB at 162.3 s, first LBBB beat
+                # 648 ms after a 750 ms RR (2026-10-29_15-05-05).
+                kp = pending_first - 1
+                while kp >= 0 and out[kp].get('_not_beat'):
+                    kp -= 1
+                if kp >= 0 and out[kp]['label'] == 'V':
+                    vs = next((c[1] for c in reversed(v_cands) if c[0] == kp), None)
+                    if vs is not None and vs.shape == template.shape:
+                        sim_ = _similarity(vs, template)
+                        if not np.isnan(sim_) and sim_ >= SHAPE_SAME_CORR:
+                            out[kp]['label'] = 'N'
         elif not different:
             pending = []
 
@@ -1110,6 +1168,16 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
     # is the only one in the recording stays V only with clear evidence
     # (very different and wide, and _lone_v_is_ectopic). INCART, threshold
     # 0.7: true PVCs kept 2485 of 2559, false V 111 -> 58.
+    # Only V beats it can be compared with count as "others": two shapes
+    # with fewer than MIN_SHAPE_LEADS usable leads in common (the rest
+    # clipped at the ADC rail) give no similarity, which is no evidence that
+    # the shapes differ. Counted as compared, they made every PVC of a large
+    # simulator PVC train "unlike every other V" (I, II, V2 at the rail, 2
+    # leads left; 50 Hz on top) and 13 of 14 went back to N
+    # (2026-11-17_13-39-33, 14:00:59-14:01:45); a V nothing can be compared
+    # with is judged as the only V (the clear-evidence test), 11 of them
+    # stay V. MIT-BIH / INCART and every other simulator / human recording
+    # unchanged.
     live = [c for c in v_cands if out[c[0]]['label'] == 'V' and c[1] is not None]
     # Late PVCs first: one has no early coupling to vouch for it, so it stays
     # V only when several other V beats of the recording have its shape. A
@@ -1140,15 +1208,17 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
                 j, u = live[m][0], live[m][1]
                 if abs(j - i) <= 1 or u.shape != v.shape:
                     continue
-                others += 1
                 sim = _similarity(v, u)
-                if not np.isnan(sim) and sim > best:
+                if np.isnan(sim):
+                    continue          # < MIN_SHAPE_LEADS leads in common: not compared
+                others += 1
+                if sim > best:
                     best = sim
             if best >= PARTNER_CORR or others >= PARTNER_MAX_COMPARE:
                 break
         if best >= PARTNER_CORR:
             continue
-        if others == 0 and c < VERY_DIFFERENT_CORR and q is not None and q >= WIDE_QRS_MS                 and _lone_v_is_ectopic(out, pcorrs, i):
+        if others == 0 and c < VERY_DIFFERENT_CORR and q is not None and q >= WIDE_QRS_MS and _lone_v_is_ectopic(out, pcorrs, i):
             continue
         out[i]['label'] = 'N'
     _classify_pacs(out, corrs, segments, pcorrs)
