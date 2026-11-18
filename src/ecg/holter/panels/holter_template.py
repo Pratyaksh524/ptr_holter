@@ -70,13 +70,29 @@ from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, Magni
 # is not one. The live label is only rate + QRS width (an RBBB beat at a
 # steady rate is "N"), so it moves to the Other card (see _NSR_COMPATIBLE).
 # The card's beat (first_timestamp: the 12-lead view and the seek on click)
-# is the label's first recorded beat outside those segments; for N it is first
-# looked for where no auto segment touches its view window (else a beat from
-# the first stretch with no segment), so the N card shows a sinus beat.
+# is a beat ectopic_beats_detector found too (see _SAME_BEAT_SEC), whose
+# 12-lead view has no mains hum, muscle noise, baseline wander / step or
+# clipping (_view_badness, _cleanest_view): for N a detector N beat between
+# two N beats at a steady RR with no auto segment in its view window, for the
+# other live labels their live beats the detector has as N (clear of
+# Artifact / Unidentified first); AF / AFL likewise among their own beats.
+# Until the detector's beats are there, as before: the label's first recorded
+# beat outside those segments, for N first looked for where no auto segment
+# touches its view window (else a beat from the first stretch with no segment).
+# V (PVC) and S (PAC) come from ectopic_beats_detector, not from the live
+# labels, whenever the recording can be read (_ectopic_cards): the same beats
+# the strip marks V / S and the summary counts. The live V is any wide beat
+# and the live S any narrow early one -- seen (2026-11-17_13-39-33): the V
+# card's beat was a clipped, flat-topped complex at 14:00:38.67 where the
+# simulator switched rhythm under 50 Hz mains, a beat the PVC detector itself
+# leaves unclassified ('Q'), and 25 of the 71 live V beats were VT, 19
+# bundle branch block. The live V / S rows are then not used at all.
 # ---------------------------------------------------------------------------
 _SEGMENT_CARD_KINDS = {'Atrial Fibrillation': 'AF', 'Atrial Flutter': 'AFL',
                        'Unidentified': 'Unidentified'}
 _SEGMENT_CARDS = ('AF', 'AFL', 'Unidentified')
+_ECTOPIC_CARD_LABELS = ('V', 'S')            # PVC / PAC cards (_ectopic_cards)
+_NOISE_SEGMENT_LABELS = ('Artifact', 'Unidentified')
 # Segments an N beat may sit in: the sinus rate labels, the rate-only labels and
 # Artifact (noise: the rhythm under it is unknown, so its beats stay as they are).
 _NSR_COMPATIBLE = ('Bradycardia', 'Tachycardia', 'Artifact')
@@ -194,13 +210,306 @@ def _sinus_beat_from_signal(reader, all_spans):
     return None
 
 
-def _build_template_rows(metrics_list, segments=None, reader=None):
+def _noise_spans(segments):
+    """(start, end) of the Artifact / Unidentified auto segments."""
+    spans = []
+    for seg in segments or []:
+        try:
+            if str(seg.get('label', '')) in _NOISE_SEGMENT_LABELS:
+                spans.append((float(seg['start_sec']), float(seg['end_sec'])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return spans
+
+
+# A card's beat (the 12-lead view) is a beat ectopic_beats_detector found
+# too. The live beat list (metrics.jsonl all_beats) is the 5 s chunks' own
+# R-peak pass: it holds about a quarter of the beats and things that are not
+# beats -- seen (2026-11-17_13-39-33): the N card showed 75.90 s
+# (13:40:49.25), a baseline step (Lead II 2345 -> 1170 ADC in 0.2 s) with the
+# real QRSs 0.48 s either side; the PVC detector has those at 75.42 and
+# 76.42 s (N, QRS 90 ms, RR 1000 ms) and nothing at 75.90.
+_SAME_BEAT_SEC = 0.10        # a live beat this close to a detector beat is that beat
+_SINUS_RR_STEADY = 0.15      # N card: RR after the beat within this of the RR before it
+
+
+def _detector_n_index(ectopic_beats):
+    """(sorted times, labels) of the detector's beats."""
+    beats = sorted(ectopic_beats or [], key=lambda b: float(b.get('timestamp', 0.0) or 0.0))
+    return (np.asarray([float(b.get('timestamp', 0.0) or 0.0) for b in beats], dtype=float),
+            [str(b.get('label', '')) for b in beats])
+
+
+def _detector_beat(times, labels, ts, label='N'):
+    """The detector's own time of the beat at `ts` when the detector found
+    a beat there (within _SAME_BEAT_SEC) and labelled it `label`, else None."""
+    if times.size == 0:
+        return None
+    k = int(np.searchsorted(times, ts))
+    best = None
+    for j in (k - 1, k):
+        if 0 <= j < times.size and abs(times[j] - ts) <= _SAME_BEAT_SEC and labels[j] == label:
+            if best is None or abs(times[j] - ts) < abs(times[best] - ts):
+                best = j
+    return None if best is None else float(times[best])
+
+
+# The rate cards' view beats come from the detector's whole beat list by the
+# live label's own RR bounds (analysis_worker._label_beat), not only from
+# the card's live beats: those are a few (Brady: 14 on 2026-11-17_13-39-33)
+# and every one of them had baseline drift in view, so the Brady card showed
+# a baseline tilting across the view (148.88 s, 13:42:02); now 188.36 s
+# (13:42:41), inside the Sinus Bradycardia, clean.
+_RATE_PAUSE_MS = 4000.0      # RR >= this: Pause
+_RATE_BRADY_MS = 1050.0      # RR >= this: Brady
+_RATE_TACHY_MS = 600.0       # RR <= this: Tachy
+_RATE_CARD_LABELS = ('N', 'Brady', 'Tachy', 'Pause')
+
+
+def _rate_class(rr_ms):
+    """analysis_worker._label_beat's rate label for an RR (ms)."""
+    if rr_ms >= _RATE_PAUSE_MS:
+        return 'Pause'
+    if rr_ms >= _RATE_BRADY_MS:
+        return 'Brady'
+    if rr_ms <= _RATE_TACHY_MS:
+        return 'Tachy'
+    return 'N'
+
+
+def _rate_card_beats(label, times, labels, avoid_spans):
+    """View beats for a rate card (N / Brady / Tachy / Pause), in time order:
+    detector N beats whose RR before (and, but for Pause, the RR after, within
+    _SINUS_RR_STEADY of it) is of that rate, both neighbours N, view window
+    clear of `avoid_spans` (the segments that are not sinus rhythm, and noise)."""
+    out = []
+    for j in range(1, times.size - 1):
+        if labels[j - 1] != 'N' or labels[j] != 'N' or labels[j + 1] != 'N':
+            continue
+        before, after = times[j] - times[j - 1], times[j + 1] - times[j]
+        if before <= 0 or _rate_class(1000.0 * before) != label:
+            continue
+        if label != 'Pause' and (_rate_class(1000.0 * after) != label
+                                 or abs(after - before) > _SINUS_RR_STEADY * before):
+            continue
+        if _view_clear_of_spans(float(times[j]), avoid_spans):
+            out.append(float(times[j]))
+    return out
+
+
+def _other_card_beats(times, labels, segments, card_beats, avoid_spans):
+    """View beats for the Other card: detector N beats inside the segments
+    (not sinus rhythm) that hold the card's own beats (`card_beats`), the
+    rhythm with the most of them first (seen: 60 of the 79 on
+    2026-11-17_13-39-33 were LBBB; an SVT beat was shown, a rhythm none of
+    them came from), view window clear of `avoid_spans` (AF / AFL /
+    Unidentified / Artifact)."""
+    spans_of, hits = {}, {}
+    for seg in segments or []:
+        label = str(seg.get('label', ''))
+        if _nsr_compatible(label) or label in _SEGMENT_CARD_KINDS:
+            continue
+        try:
+            s, e = float(seg['start_sec']), float(seg['end_sec'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        n = sum(1 for ts in card_beats if s <= ts < e)
+        if n:
+            spans_of.setdefault(label, []).append((s, e))
+            hits[label] = hits.get(label, 0) + n
+    out = []
+    for label in sorted(hits, key=lambda k: -hits[k]):
+        spans = spans_of[label]
+        out.extend(float(t) for t, lbl in zip(times, labels)
+                   if lbl == 'N' and _in_spans(float(t), spans) and _view_clear_of_spans(float(t), avoid_spans)
+                   and float(t) not in out)
+    return out
+
+
+def _real_card_beats(candidates, times, labels, avoid_spans):
+    """For a live-label card (Tachy, Brady, Other ...): its live beats the
+    detector also has as N beats (at the detector's time), those whose view
+    window touches none of `avoid_spans` first."""
+    real = [t for t in (_detector_beat(times, labels, ts) for ts in sorted(candidates)) if t is not None]
+    return [t for t in real if _view_clear_of_spans(t, avoid_spans)] + \
+           [t for t in real if not _view_clear_of_spans(t, avoid_spans)]
+
+
+# The card's 12-lead view (-0.60 .. +0.90 s) is chosen on the signal itself
+# too: segments do not cover mains hum, baseline wander / respiration, steps
+# or clipping everywhere (seen, 2026-11-17_13-39-33: a 1000 ADC baseline step
+# at 75.90 s and 78.4 s inside no segment; 50 Hz at 53% of Lead II's power at
+# 30.45 s). _view_badness rates the window on the measured leads (I, II,
+# V1-V6; III / aVR / aVL / aVF are made from I and II), each against the
+# largest QRS (R +-60 ms) of the window, the worst lead counting:
+#   mains   -- 50 + 60 Hz (the part two notches take out), outside the QRSs;
+#   muscle  -- > 35 Hz after the notches, outside the QRSs;
+#   baseline -- the PR-segment level (R -90 .. -50 ms) of the detector's N
+#     beats from 1.2 s before to 1.5 s after the beat: its spread is
+#     wander, respiration or a step; with fewer than 2 such beats, the range
+#     of a 300 then 800 ms median filter (wide QRSs leak into it, so the N
+#     beats' PR level comes first);
+#   clipping -- samples at the ADC rail (a lead dead at the rail for > 90% of
+#     the window is left out: no other beat changes that).
+# Each over its limit below; badness = the largest ratio, <= 1 is clean.
+# Measured on known windows of 13-39-33: clean sinus beat 0.23, the baseline
+# steps 8.1 / 5.0, the mains stretch 9.1, the clipped 1265.33 s 8.1. The
+# baseline limit was 15% first: a view at 13% still showed the tilt. A card
+# takes its first clean candidate, else the least bad one read (at most
+# _VIEW_SCAN_MAX, ~4 ms each).
+_VIEW_LEADS = ('I', 'II', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6')
+_VIEW_MAINS_MAX = 0.02
+_VIEW_MUSCLE_MAX = 0.02
+_VIEW_BASELINE_MAX = 0.10
+_VIEW_CLIP_MAX = 10
+_VIEW_SCAN_MAX = 150
+_ADC_RAIL_LOW, _ADC_RAIL_HIGH = 1, 4094
+
+
+def _view_badness(reader, t, beat_times=None, n_times=None):
+    """Noise of the 12-lead view window around `t` (see the note above):
+    the largest of mains / muscle / baseline / clipping over its limit, or
+    None when the window cannot be read. beat_times / n_times: the detector's
+    beats and N beats (sorted s); without them Lead II Pan-Tompkins beats
+    mark the QRSs and the median-filter baseline is used."""
+    from scipy.signal import butter, filtfilt, iirnotch, medfilt
+    fs = float(reader.fs)
+    names = list(getattr(reader, 'lead_names', []) or [])
+    duration = float(getattr(reader, 'duration_sec', t + 2.0) or (t + 2.0))
+    a, b = max(0.0, t - 2.0), min(duration, t + 2.0)
+    try:
+        d = np.asarray(reader.read_range(a, b), dtype=float)
+    except Exception:
+        return None
+    if d.ndim != 2 or d.shape[1] < int(fs):
+        return None
+    w0 = max(0, int(round((t - _TEMPLATE_VIEW_PRE_SEC - a) * fs)))
+    w1 = min(d.shape[1], int(round((t + _TEMPLATE_VIEW_POST_SEC - a) * fs)))
+    k = int(round((t - a) * fs))
+    if beat_times is None:
+        from ...pan_tompkins import pan_tompkins
+        lead_ii = names.index('II') if 'II' in names else 0
+        peaks = [int(p) for p in pan_tompkins(d[lead_ii], fs=fs)]
+    else:
+        peaks = [int(round((bt - a) * fs)) for bt in beat_times if a <= bt < b]
+    outside_qrs = np.zeros(d.shape[1], bool)
+    outside_qrs[w0:w1] = True
+    qz = int(0.10 * fs)
+    for p in peaks + [k]:
+        outside_qrs[max(0, p - qz):p + qz] = False
+    pr_at = [int(round((bt - a) * fs)) for bt in (n_times or [])
+             if t - 1.2 <= bt <= t + 1.5 and bt - 0.09 >= a]
+    n50, d50 = iirnotch(50.0 / (fs / 2.0), 30.0)
+    n60, d60 = iirnotch(60.0 / (fs / 2.0), 30.0)
+    hb, ha = butter(2, 35.0 / (fs / 2.0), 'high')
+    step = max(1, int(round(fs / 50.0)))
+    per = []
+    for name in _VIEW_LEADS:
+        if name not in names or names.index(name) >= d.shape[0]:
+            continue
+        x = d[names.index(name)]
+        xw = x[w0:w1]
+        rail = (xw <= _ADC_RAIL_LOW) | (xw >= _ADC_RAIL_HIGH)
+        if xw.size == 0 or np.ptp(xw) < 20 or rail.mean() > 0.9:
+            continue
+        qrs = float(np.ptp(x[max(0, k - int(0.06 * fs)):k + int(0.06 * fs)]))
+        clean = filtfilt(n60, d60, filtfilt(n50, d50, x))
+        mains = float(np.sqrt(2.0 * np.mean((x - clean)[outside_qrs] ** 2))) if outside_qrs.any() else 0.0
+        muscle = float(np.sqrt(np.mean(filtfilt(hb, ha, clean)[outside_qrs] ** 2))) if outside_qrs.any() else 0.0
+        if len(pr_at) >= 2:
+            pr = [float(np.median(clean[p - int(0.09 * fs):p - int(0.05 * fs)])) for p in pr_at]
+            baseline = max(pr) - min(pr)
+        else:
+            base = medfilt(medfilt(clean[::step], int(0.3 * fs / step) | 1), int(0.8 * fs / step) | 1)
+            baseline = float(np.ptp(base[w0 // step:max(w0 // step + 1, w1 // step)]))
+        per.append((qrs, mains, muscle, baseline, int(rail.sum())))
+    if not per:
+        return None
+    ref = max(p[0] for p in per)
+    if ref <= 0:
+        return None
+    return max(max(p[1] for p in per) / ref / _VIEW_MAINS_MAX,
+               max(p[2] for p in per) / ref / _VIEW_MUSCLE_MAX,
+               max(p[3] for p in per) / ref / _VIEW_BASELINE_MAX,
+               max(p[4] for p in per) / _VIEW_CLIP_MAX)
+
+
+def _cleanest_view(reader, candidates, beat_times=None, n_times=None):
+    """The first of `candidates` (times, in preference order) whose view
+    window is clean (_view_badness <= 1), else the least bad one read, else
+    the first candidate; None without candidates. Of more than
+    _VIEW_SCAN_MAX candidates, _VIEW_SCAN_MAX spread evenly over the list
+    (kept in order) are read, so a clean stretch late in a long recording is
+    found too, not only the first minutes."""
+    if not candidates:
+        return None
+    if reader is None:
+        return candidates[0]
+    if len(candidates) > _VIEW_SCAN_MAX:
+        pick = np.linspace(0, len(candidates) - 1, _VIEW_SCAN_MAX).round().astype(int)
+        scan = [candidates[i] for i in sorted(set(pick.tolist()))]
+    else:
+        scan = list(candidates)
+    best, best_bad = None, None
+    for ts in scan:
+        bad = _view_badness(reader, ts, beat_times, n_times)
+        if bad is None:
+            continue
+        if bad <= 1.0:
+            return ts
+        if best_bad is None or bad < best_bad:
+            best, best_bad = ts, bad
+    return best if best is not None else candidates[0]
+
+
+def _ectopic_cards(ectopic_beats, segments, af_spans, all_spans, reader=None):
+    """V (PVC) and S (PAC) cards from ectopic_beats_detector's beats.
+
+    Count: the detector's V / S beats outside the AF / AFL / Unidentified
+    segments (a beat there is on that card, as for every other label). The
+    detector itself already leaves noise unclassified ('Q': Artifact other
+    than 50 / 60 Hz mains, Unidentified, VFib, clipped leads), and a beat in
+    a VT segment is not V. A PVC under mains hum stays a PVC, as on the
+    strip. RR / QRS: the detector's own per beat.
+    The card's beat: the first with a clean view window (_cleanest_view) of
+    those whose window touches no auto segment, then those whose window
+    touches no Artifact / Unidentified segment, then the rest."""
+    noise_spans = _noise_spans(segments)
+    det_times, det_labels = _detector_n_index(ectopic_beats)
+    n_times = [float(t) for t, lbl in zip(det_times, det_labels) if lbl == 'N']
+    items = {}
+    for label in _ECTOPIC_CARD_LABELS:
+        beats = sorted((b for b in ectopic_beats or []
+                        if b.get('label') == label
+                        and not _span_kind(float(b.get('timestamp', 0.0) or 0.0), af_spans)),
+                       key=lambda b: float(b.get('timestamp', 0.0) or 0.0))
+        if not beats:
+            continue
+        stamps = [float(b.get('timestamp', 0.0) or 0.0) for b in beats]
+        clear = [t for t in stamps if _view_clear_of_spans(t, all_spans)]
+        quiet = [t for t in stamps if t not in clear and _view_clear_of_spans(t, noise_spans)]
+        rest = [t for t in stamps if t not in clear and t not in quiet]
+        view = _cleanest_view(reader, clear + quiet + rest, list(det_times), n_times)
+        items[label] = {
+            'label': label, 'count': len(beats),
+            'rr': [float(b['rr_ms']) for b in beats if b.get('rr_ms')],
+            'qrs': [float(b['qrs_ms']) for b in beats if b.get('qrs_ms')],
+            'first_timestamp': view,
+        }
+    return items
+
+
+def _build_template_rows(metrics_list, segments=None, reader=None, ectopic_beats=None):
     """Template card rows (one per beat label, plus AF / AFL / Unidentified) from the
     metrics chunks and the auto segment detection; see the note above.
-    Without segments or a reader the cards are the recorded labels only."""
+    Without segments or a reader the cards are the recorded labels only.
+    With a reader the V / S cards are ectopic_beats_detector's (`ectopic_beats`,
+    _ectopic_cards) and the live V / S rows are left out; while that
+    detection is still running (`ectopic_beats` None) there are no V / S cards."""
     af_spans, all_spans, non_nsr_spans = _segment_spans(segments)
     if reader is None:
         af_spans = []          # segment beats cannot be counted: leave them
+    detector_ectopics = reader is not None
     items = {}
     for metric in metrics_list or []:
         beats = [b for b in (metric.get('all_beats') or []) if isinstance(b, dict)]
@@ -219,6 +528,8 @@ def _build_template_rows(metrics_list, segments=None, reader=None):
                      and _in_spans(float(b.get('timestamp', 0.0) or 0.0), non_nsr_spans)]
         for row in (metric.get('template_summary') or []):
             label = str(row.get('label', 'N') or 'N').strip() or 'N'
+            if detector_ectopics and label in _ECTOPIC_CARD_LABELS:
+                continue           # V / S come from ectopic_beats_detector
             count = int(row.get('count', 0) or 0)
             take = min(count, moved.get(label, 0))
             moved[label] = moved.get(label, 0) - take
@@ -256,12 +567,42 @@ def _build_template_rows(metrics_list, segments=None, reader=None):
             item = items.get(label)
             if item is None or _span_kind(ts, af_spans):
                 continue
+            item.setdefault('_cands', []).append(ts)
             if item.get('_seen') is None or ts < item['_seen']:
                 item['_seen'] = ts
             if _view_clear_of_spans(ts, all_spans) and (item['_sinus_ts'] is None or ts < item['_sinus_ts']):
                 item['_sinus_ts'] = ts
 
+    # The card's beat: a beat the PVC / PAC detector found too (see
+    # _SAME_BEAT_SEC above), with a clean 12-lead view (_cleanest_view): for
+    # N / Brady / Tachy / Pause a detector N beat of that rate in a steady
+    # run with only sinus rhythm in view (_rate_card_beats); for Other a
+    # detector N beat in the rhythm segments its own beats are in
+    # (_other_card_beats); then the card's own live beats the detector has
+    # as N. Without the detector's beats (still running, or no reader), as
+    # before: the first live beat.
+    det_times, det_labels = _detector_n_index(ectopic_beats)
+    n_times = [float(t) for t, lbl in zip(det_times, det_labels) if lbl == 'N']
+    noise_spans = _noise_spans(segments)
+    # segments a rate card's beat must not have in view: all but sinus rhythm
+    not_sinus_spans = sorted(non_nsr_spans + [(s, e) for s, e, _k in af_spans] + noise_spans)
     for label, item in items.items():
+        if det_times.size:
+            if label in _RATE_CARD_LABELS:
+                cands = _rate_card_beats(label, det_times, det_labels, not_sinus_spans)
+            elif label == 'Other':
+                cands = _other_card_beats(det_times, det_labels, segments, item.get('_cands', []),
+                                          [(s, e) for s, e, _k in af_spans] + noise_spans)
+            else:
+                cands = []
+            # the card's own live beats the detector has as N come after
+            own = _real_card_beats(item.get('_cands', []), det_times, det_labels,
+                                   all_spans if label == 'N' else noise_spans)
+            cands = cands + [t for t in own if t not in set(cands)]
+            beat = _cleanest_view(reader, cands, list(det_times), n_times)
+            if beat is not None:
+                item['first_timestamp'] = beat
+                continue
         if item.get('_seen') is not None:
             item['first_timestamp'] = item['_seen']
         if label == 'N' and all_spans:
@@ -271,17 +612,26 @@ def _build_template_rows(metrics_list, segments=None, reader=None):
             if sinus is not None:
                 item['first_timestamp'] = sinus
 
+    if detector_ectopics:
+        items.update(_ectopic_cards(ectopic_beats, segments, af_spans, all_spans, reader))
+
     for kind in _SEGMENT_CARDS:
         spans = [(s, e) for s, e, k in af_spans if k == kind]
         peaks, rr, view_ts = [], [], None
+        inside = []
         for s, e in spans:
             # an Unidentified peak inside an overlapping AF / AFL span is
             # counted on that card only
             p = [ts for ts in _lead_ii_r_peaks(reader, s, e) if _span_kind(ts, af_spans) == kind]
+            inside.extend(ts for ts in p if ts - _TEMPLATE_VIEW_PRE_SEC >= s and ts + _TEMPLATE_VIEW_POST_SEC <= e)
             if view_ts is None:
                 view_ts = _viewable_beat(p, s, e)
             rr.extend(float(v) * 1000.0 for v in np.diff(p))
             peaks.extend(p)
+        # AF / AFL: a beat whose whole view is inside the segment, with a
+        # clean view (_cleanest_view). Unidentified is the noise card: as is.
+        if kind != 'Unidentified' and inside:
+            view_ts = _cleanest_view(reader, inside, list(det_times) or None, n_times or None)
         if peaks or (spans and kind == 'Unidentified'):
             if view_ts is None:      # Unidentified with no peak: its start
                 view_ts = spans[0][0] + _TEMPLATE_VIEW_PRE_SEC
@@ -340,6 +690,16 @@ class _LeadTagLabel(QLabel):
             html += (f"&nbsp;&nbsp;<span style='color:{UI_MUTED};'>•</span>&nbsp;&nbsp;"
                      f"<span style='color:{UI_ACCENT_HOVER};font-weight:700;'>{cls}</span>")
         super().setText(html)
+
+
+class _NoWheelComboBox(QComboBox):
+    """The card's class box. A mouse wheel / trackpad scroll over it is
+    passed on to the card list (which scrolls) instead of changing the class:
+    scrolling the cards past it re-labelled the card under the pointer. The
+    class changes only from the list a click opens."""
+
+    def wheelEvent(self, event):
+        event.ignore()
 
 
 class TemplateCardWidget(QFrame):
@@ -417,7 +777,7 @@ class TemplateCardWidget(QFrame):
         self.id_edit = QLineEdit("T1")
         self.id_edit.setFixedWidth(70)
         self.id_edit.setPlaceholderText("T ID")
-        self.class_combo = QComboBox()
+        self.class_combo = _NoWheelComboBox()
         # Options: N, S, V, P, AF, X, Other, Unidentified (was Unconfirmed;
         # Unidentified = the auto detector's no-readable-signal stretches)
         self.class_combo.addItems(["N", "S", "V", "P", "AF", "X", "Other", "Unidentified"])
@@ -846,8 +1206,9 @@ class HolterBeatTemplatePanel(QWidget):
         engine = self._get_replay_engine()
         reader = getattr(engine, "_reader", None) if engine is not None else None
         segments = self._auto_segments(reader)
+        ectopic_beats = self._ectopic_beats(reader) if segments is not None else None
         try:
-            self._template_rows = _build_template_rows(metrics_list, segments, reader)
+            self._template_rows = _build_template_rows(metrics_list, segments, reader, ectopic_beats)
         except Exception as e:
             print(f"[Template] AF / AFL / Unidentified cards unavailable: {e}")
             self._template_rows = _build_template_rows(metrics_list, None, None)
@@ -881,6 +1242,41 @@ class HolterBeatTemplatePanel(QWidget):
                     self.update_from_metrics(self._last_metrics, self._last_summary)
 
             detect_arrhythmias_async(path, _on_ready)
+        return None
+
+    def _ectopic_beats(self, reader):
+        """ectopic_beats_detector's beats for the recording (the V / S cards),
+        or None while that detection is still running (it then rebuilds the
+        cards when done). A result delivered without a cache entry (the
+        detection failed) is kept for this recording, so the rebuild does not
+        start it again."""
+        path = getattr(reader, "path", None) if reader is not None else None
+        if not path:
+            return None
+        try:
+            from ..ectopic_beats_detector import detect_ectopic_beats_async, get_cached_ectopic_beats
+        except Exception as e:
+            print(f"[Template] PVC / PAC detection unavailable: {e}")
+            return None
+        cached = get_cached_ectopic_beats(path)
+        if cached is not None:
+            return cached
+        done = getattr(self, "_ectopic_result", None)
+        if done is not None and done[0] == path:
+            return done[1]
+        if getattr(self, "_ectopic_pending_path", None) != path:
+            self._ectopic_pending_path = path
+
+            def _on_ready(beats, p=path):
+                if self._ectopic_pending_path != p:
+                    return
+                self._ectopic_pending_path = None
+                self._ectopic_result = (p, list(beats or []))
+                eng = self._get_replay_engine()
+                if getattr(getattr(eng, "_reader", None), "path", None) == p:
+                    self.update_from_metrics(self._last_metrics, self._last_summary)
+
+            detect_ectopic_beats_async(path, _on_ready)
         return None
 
     def set_replay_engine(self, engine):
