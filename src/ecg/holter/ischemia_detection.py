@@ -776,8 +776,9 @@ def _code_fingerprint() -> str:
     and everything of the ecg package they import, transitively (the
     filters, the R-peak detector, the file reader, the theme constants --
     cache_fingerprint.code_fingerprint follows the imports itself). Not the
-    arrhythmia detection or the UI. '' when the sources cannot be read (a
-    frozen build): the disk cache is then not used."""
+    arrhythmia detection or the UI. In a frozen build (no sources) the
+    build's fingerprint (cache_fingerprint.frozen_build_fingerprint); '' when
+    neither can be read: the disk cache is then not used."""
     import os
     global _code_hash
     if _code_hash is None:

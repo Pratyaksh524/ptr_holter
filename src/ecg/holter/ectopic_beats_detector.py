@@ -212,9 +212,10 @@ _async_jobs: Dict[str, Any] = {}
 # with other ones.
 # ---------------------------------------------------------------------------
 def _code_fingerprint() -> str:
-    """Hash of the code the result depends on ('' when the sources cannot be
-    read, e.g. a frozen build: nothing then says a saved result is current,
-    so the disk cache is not used -- the memory cache still is)."""
+    """Hash of the code the result depends on (in a frozen build the hash of
+    the sources it was built from, shipped with it; '' when neither can be
+    read: nothing then says a saved result is current, so the disk cache is
+    not used -- the memory cache still is)."""
     from .auto_segment_arrthymia_detection import _code_fingerprint as seg_fp
     return seg_fp()
 
