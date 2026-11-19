@@ -670,9 +670,10 @@ def _frames_cache_key(path: str) -> List[Any]:
     depend on (this module and everything of the ecg package it imports --
     cache_fingerprint.code_fingerprint follows the imports itself; the
     hand-bumped _CACHE_VERSION it replaces missed every change to a
-    dependency) and the clinical configuration the run loaded. The code part
-    is '' when the sources cannot be read (a frozen build): the disk cache
-    is then not used."""
+    dependency) and the clinical configuration the run loaded. In a frozen
+    build (no sources) the code part is the build's fingerprint
+    (cache_fingerprint.frozen_build_fingerprint); it is '' only when neither
+    can be read, and the disk cache is then not used."""
     import os
     from .cache_fingerprint import clinical_config_fingerprint, code_fingerprint
     stat = os.stat(path)

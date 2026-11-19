@@ -4406,77 +4406,10 @@ class HolterFullDisclosureDialog(QDialog):
         except Exception as e:
             print(f"[Full Disclosure] Error updating auto rhythm label: {e}")
         
-        # Beat badges (Single PVC, PVC/PAC Couplet / Triplet / Quadruplet /
-        # Run, Bigeminy..., AFib, Paced) describe the beat stream, not a
-        # rhythm segment, so they do not depend on "Auto Arrhythmia
-        # Detection" being clicked: the auto segments are for the other
-        # arrhythmias (the block above), and this label shows the PVC / PAC
-        # pattern whenever no segment is active in the window. It read
-        # "PVC Couplet" before the click and Normal Sinus Rhythm after it
-        # (2026-11-12_11-19-27). An active segment still takes the label, as
-        # before; the Normal Sinus Rhythm fallback below is for windows with
-        # neither.
-        if not arrhythmia_label and lead_i_canvas and hasattr(lead_i_canvas, '_beat_annotations'):
-            # Get beats in current window
-            window_beats = [b for b in lead_i_canvas._beat_annotations 
-                           if start_sec <= b.get('timestamp', 0.0) <= end_sec]
-            window_events = []
-            
-            # Generate badges for current window using the same logic as badge display
-            try:
-                from ecg.holter.holter_summary_calc import get_template_beats_for_badges
-                # PVC / PAC patterns from ectopic_beats_detector (every beat of the
-                # recording, classified from the signal); the live beat labels
-                # below only until it has run for this recording.
-                badges = self._ectopic_window_badges(start_sec, end_sec)
-                if badges is None:
-                    badges = get_template_beats_for_badges(window_beats, window_events)
-                
-                # Filter badges to show V, S, AF, P beats
-                arrhythmia_badges = [b for b in badges if b.get('code') in ['V', 'S', 'AF', 'P']]
-                
-                if arrhythmia_badges:
-                    # Sort by timestamp and get the earliest arrhythmia
-                    arrhythmia_badges.sort(key=lambda x: x.get('timestamp', 0.0))
-                    earliest = arrhythmia_badges[0]
-                    
-                    badge_name = earliest.get('name', '')
-                    badge_ts = earliest.get('timestamp', 0.0)
-                    
-                    if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
-                        ts_real = datetime.fromtimestamp(self._engine._reader.start_time + badge_ts)
-                        arrhythmia_label = f"Arrhythmia: {badge_name} at {ts_real.strftime('%H:%M:%S')}"
-                    else:
-                        arrhythmia_label = f"Arrhythmia: {badge_name}"
-                elif window_beats:
-                    # For the remaining organized rhythm, use the visible
-                    # window's RR values and the current scroll position.
-                    window_rr = np.asarray(
-                        [float(b.get('rr_ms')) for b in window_beats
-                         if b.get('rr_ms') is not None],
-                        dtype=float,
-                    )
-                    normal_rr = bool(
-                        window_rr.size == 0
-                        or np.all((window_rr >= 600.0) & (window_rr <= 1000.0))
-                    )
-                    if normal_rr:
-                        if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
-                            # Use start_sec, not the first beat timestamp, so
-                            # the label follows every scroll/drag update.
-                            ts_real = datetime.fromtimestamp(
-                                self._engine._reader.start_time + start_sec
-                            )
-                            arrhythmia_label = f"Arrhythmia: Normal Sinus Rhythm at {ts_real.strftime('%H:%M:%S')}"
-                        else:
-                            arrhythmia_label = "Arrhythmia: Normal Sinus Rhythm"
-                        
-            except Exception as e:
-                print(f"[Full Disclosure] Error updating arrhythmia label from badges: {e}")
-
-        # At the first canvas refresh beat annotations may not yet be loaded.
-        # If no auto-arrhythmia is active, keep the status label populated with
-        # the current visible time instead of leaving it blank.
+        # No auto rhythm segment at the scroll position: the rhythm is Normal
+        # Sinus Rhythm at the scroll second (NSR is the display fallback, not
+        # stored as an auto event). PVC / PAC beats do not take its place --
+        # they are beats, not a rhythm -- see the PVC / PAC block below.
         if not arrhythmia_label:
             if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
                 current_time = datetime.fromtimestamp(
@@ -4527,6 +4460,52 @@ class HolterFullDisclosureDialog(QDialog):
                     break
         except Exception as e:
             print(f"[Full Disclosure] Error updating Bundle Branch Block label: {e}")
+
+        # PVC / PAC at the scroll second. A PVC / PAC is a beat at one time,
+        # and the rhythm under it goes on, so the label names it only when the
+        # scroll stops on the wall-clock second it falls in, next to the
+        # rhythm: "Normal Sinus Rhythm at 12:50:11 | Single PVC at 12:50:11"
+        # (the beat's pattern name: Single PVC, Couplet, Bigeminy, ...; also
+        # the AF / paced beat badges). Elsewhere the rhythm alone shows, with
+        # the scroll time; the strip marks every PVC / PAC beat on screen
+        # itself. Was: any PVC / PAC anywhere in the 10 s on screen took the
+        # whole label with that beat's time -- the time ran ahead of the
+        # scroll (12:50:06 read "Single PVC at 12:50:11") and, with a PVC
+        # every ~3 s, Normal Sinus Rhythm showed on 19 of 653 scroll seconds
+        # (2026-11-18_12-49-55, N beats at 80/min between the PVCs).
+        # Badges are built over the whole recording (ectopic_beats_detector),
+        # or over the beats on screen until that has run, so a pattern is
+        # not cut at the second's edge. Independent of the Auto Arrhythmia
+        # Detection button, as before.
+        try:
+            reader_start_pvc = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
+            if reader_start_pvc:
+                second_start = math.floor(reader_start_pvc + start_sec) - reader_start_pvc
+            else:
+                second_start = start_sec
+            second_end = second_start + 1.0
+            badges = self._ectopic_window_badges(start_sec, end_sec)
+            if badges is None and lead_i_canvas and hasattr(lead_i_canvas, '_beat_annotations'):
+                from ecg.holter.holter_summary_calc import get_template_beats_for_badges
+                window_beats = [b for b in lead_i_canvas._beat_annotations
+                                if start_sec <= b.get('timestamp', 0.0) <= end_sec]
+                badges = get_template_beats_for_badges(window_beats, [])
+            at_second = sorted(
+                (b for b in badges or []
+                 if b.get('code') in ('V', 'S', 'AF', 'P')
+                 and second_start <= float(b.get('timestamp', 0.0) or 0.0) < second_end),
+                key=lambda b: float(b.get('timestamp', 0.0) or 0.0))
+            if at_second and arrhythmia_label:
+                badge = at_second[0]
+                badge_name = badge.get('name', '')
+                if reader_start_pvc:
+                    badge_time = datetime.fromtimestamp(
+                        reader_start_pvc + float(badge.get('timestamp', 0.0) or 0.0)).strftime('%H:%M:%S')
+                    arrhythmia_label = f"{arrhythmia_label} | {badge_name} at {badge_time}"
+                else:
+                    arrhythmia_label = f"{arrhythmia_label} | {badge_name}"
+        except Exception as e:
+            print(f"[Full Disclosure] Error updating PVC / PAC label: {e}")
 
         # Auto-segment detection is still running in the background: don't
         # claim a rhythm (the fallbacks above would say Normal Sinus Rhythm).

@@ -18,21 +18,77 @@ Code is not the only input: the measurements read the clinical configuration
 not code -- clinical_config_fingerprint() hashes the values this process
 loaded, for a cache key to hold next to the code hash.
 
-'' means the code cannot be read (a frozen build has no .py files, or a file
-does not parse): there is then no way to tell whether a saved result is
-stale, and the caller must not use its disk cache (auto_segment_arrthymia_
-detection._code_fingerprint does the same).
+A frozen build (the PyInstaller exe) has no .py files to hash. Its code
+cannot change without a new build, so there the fingerprint is the hash of
+the ecg sources the build was made from (ecg_tree_fingerprint), which
+build_exe.py writes into the bundle as ecg/code_fingerprint.txt
+(frozen_build_fingerprint). Without that file the frozen app read '' and
+used no disk cache at all: closing and reopening it recomputed the auto
+segments, PVC / PAC beats, ischemia and PQRST of every recording opened.
+A new build has a new fingerprint, so its first opening of a recording
+recomputes once.
+
+'' means the code cannot be read (a file does not parse, or a frozen build
+without its fingerprint file): there is then no way to tell whether a saved
+result is stale, and the caller must not use its disk cache (auto_segment_
+arrthymia_detection._code_fingerprint does the same).
 """
 
 import ast
 import hashlib
 import json
 import os
+import sys
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 _ECG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # .../ecg
 _SRC_DIR = os.path.dirname(_ECG_DIR)                                      # holds the `ecg` package
 _memo: Dict[Tuple[str, ...], str] = {}
+BUILD_FINGERPRINT_FILENAME = 'code_fingerprint.txt'   # in the bundle's ecg/ (build_exe.py)
+_build_fingerprint: Optional[str] = None
+
+
+def ecg_tree_fingerprint(ecg_dir: str = _ECG_DIR) -> str:
+    """sha1 over every .py file of the ecg package -- its path relative to
+    `ecg_dir`, then its content, directories and files in sorted order,
+    __pycache__ left out; '' when there is none to read (a frozen build).
+    The auto segment and PVC / PAC caches key with it; build_exe.py runs it
+    on the sources and ships the value (frozen_build_fingerprint)."""
+    h = hashlib.sha1()
+    n_files = 0
+    for root, dirs, files in os.walk(ecg_dir):
+        dirs[:] = sorted(d for d in dirs if d != '__pycache__')
+        for name in sorted(files):
+            if not name.endswith('.py'):
+                continue
+            try:
+                with open(os.path.join(root, name), 'rb') as f:
+                    h.update(os.path.relpath(os.path.join(root, name), ecg_dir).encode('utf-8'))
+                    h.update(f.read())
+                n_files += 1
+            except OSError:
+                continue
+    return h.hexdigest() if n_files else ''
+
+
+def frozen_build_fingerprint() -> str:
+    """In a frozen build: the ecg sources' fingerprint the build was made
+    from (ecg/code_fingerprint.txt in the bundle, written by build_exe.py);
+    '' when not frozen or the file is not there. Read once per process."""
+    global _build_fingerprint
+    if _build_fingerprint is None:
+        _build_fingerprint = ''
+        if getattr(sys, 'frozen', False):
+            for d in (_ECG_DIR, os.path.join(getattr(sys, '_MEIPASS', '') or '', 'ecg')):
+                try:
+                    with open(os.path.join(d, BUILD_FINGERPRINT_FILENAME), 'r', encoding='utf-8') as f:
+                        value = f.read().strip()
+                except OSError:
+                    continue
+                if value:
+                    _build_fingerprint = value
+                    break
+    return _build_fingerprint
 
 
 def _norm(path: str) -> str:
@@ -115,8 +171,10 @@ def source_closure(entry_files: Iterable[str]) -> Optional[List[str]]:
 
 
 def code_fingerprint(entry_files: Iterable[str]) -> str:
-    """sha1 over the closure's relative paths and contents ('' when the code
-    cannot be read -- see the module note). Computed once per process."""
+    """sha1 over the closure's relative paths and contents; in a frozen build
+    (no sources) the build's fingerprint instead (frozen_build_fingerprint);
+    '' when neither can be read -- see the module note. Computed once per
+    process."""
     entries = tuple(sorted(_norm(p) for p in entry_files))
     if entries in _memo:
         return _memo[entries]
@@ -132,6 +190,8 @@ def code_fingerprint(entry_files: Iterable[str]) -> str:
             digest = h.hexdigest()
         except OSError:
             digest = ''
+    if not digest:
+        digest = frozen_build_fingerprint()
     _memo[entries] = digest
     return digest
 

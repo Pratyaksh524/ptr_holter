@@ -33,7 +33,6 @@ Pipeline:
 
 import bisect
 import copy
-import hashlib
 import json
 import os
 import numpy as np
@@ -72,26 +71,16 @@ _code_fingerprint_value: Optional[str] = None
 
 
 def _code_fingerprint() -> str:
+    """Hash of every .py file of the ecg package (cache_fingerprint.
+    ecg_tree_fingerprint). A frozen build has no .py files: there it is the
+    hash of the sources the build was made from, shipped with it
+    (cache_fingerprint.frozen_build_fingerprint), so a closed and reopened
+    exe reuses the saved result. '' when neither can be read: the disk cache
+    is then skipped, since nothing would say whether a saved result is stale."""
     global _code_fingerprint_value
     if _code_fingerprint_value is None:
-        ecg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        h = hashlib.sha1()
-        n_files = 0
-        for root, dirs, files in os.walk(ecg_dir):
-            dirs[:] = sorted(d for d in dirs if d != '__pycache__')
-            for name in sorted(files):
-                if not name.endswith('.py'):
-                    continue
-                try:
-                    with open(os.path.join(root, name), 'rb') as f:
-                        h.update(os.path.relpath(os.path.join(root, name), ecg_dir).encode('utf-8'))
-                        h.update(f.read())
-                    n_files += 1
-                except OSError:
-                    continue
-        # No readable sources (e.g. a frozen build): disk cache is skipped,
-        # since there's no way to tell whether a saved result is stale.
-        _code_fingerprint_value = h.hexdigest() if n_files else ''
+        from .cache_fingerprint import ecg_tree_fingerprint, frozen_build_fingerprint
+        _code_fingerprint_value = ecg_tree_fingerprint() or frozen_build_fingerprint()
     return _code_fingerprint_value
 
 
