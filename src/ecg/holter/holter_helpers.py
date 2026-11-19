@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import struct
 from datetime import datetime
 from typing import Optional
 
@@ -61,8 +63,33 @@ def _resolve_recordings_dir(session_dir: str = "") -> str:
     return preferred_dir
 
 
+def _recording_start_from_header(ecgh_path: str) -> Optional[float]:
+    """The recording's start time (epoch s) from its .ecgh header -- written
+    once, when the recording started (file_format.ECGHFileWriter: time.time()
+    at Start, header bytes 12-20) -- or None when the header cannot be read."""
+    try:
+        with open(ecgh_path, "rb") as f:
+            hdr = f.read(20)
+        if len(hdr) < 20 or hdr[:4] != b"ECGH":
+            return None
+        value = struct.unpack_from(">d", hdr, 12)[0]
+        return value if math.isfinite(value) and value > 0 else None
+    except Exception:
+        return None
+
+
 def _find_latest_completed_session(output_dir: str) -> str:
-    """Return the newest completed session directory, or empty string."""
+    """Return the newest completed session directory, or empty string.
+
+    Newest by the recording's own start time (_recording_start_from_header),
+    not by the .ecgh file's modification time: that changes whenever the file
+    is rewritten -- a git reset / checkout of a tracked recording, a copy or
+    a restore that does not keep the time -- and then an old recording opened
+    by default (seen: 2026-09-25_10-33-24, the one recording tracked in git,
+    rewritten by a git reset on 2026-11-19 09:52, opened before the
+    2026-11-16 ones). A new recording's start time is when Start was pressed,
+    so it is still the one opened. The modification time stays the fallback
+    for a file whose header cannot be read."""
     if not output_dir or not os.path.isdir(output_dir):
         return ""
 
@@ -75,10 +102,12 @@ def _find_latest_completed_session(output_dir: str) -> str:
                 continue
             if not os.path.exists(ecgh_path):
                 continue
-            try:
-                sort_key = os.path.getmtime(ecgh_path)
-            except Exception:
-                sort_key = os.path.getmtime(session_dir)
+            sort_key = _recording_start_from_header(ecgh_path)
+            if sort_key is None:
+                try:
+                    sort_key = os.path.getmtime(ecgh_path)
+                except Exception:
+                    sort_key = os.path.getmtime(session_dir)
             candidates.append((sort_key, session_dir))
     except Exception:
         return ""

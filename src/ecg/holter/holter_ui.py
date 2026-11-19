@@ -75,31 +75,11 @@ def _resolve_recordings_dir(session_dir: str = "") -> str:
 
 
 def _find_latest_completed_session(output_dir: str) -> str:
-    """Return the newest completed session directory, or empty string."""
-    if not output_dir or not os.path.isdir(output_dir):
-        return ""
-
-    candidates = []
-    try:
-        for name in os.listdir(output_dir):
-            session_dir = os.path.join(output_dir, name)
-            ecgh_path = os.path.join(session_dir, "recording.ecgh")
-            if not os.path.isdir(session_dir):
-                continue
-            if not os.path.exists(ecgh_path):
-                continue
-            try:
-                sort_key = os.path.getmtime(ecgh_path)
-            except Exception:
-                sort_key = os.path.getmtime(session_dir)
-            candidates.append((sort_key, session_dir))
-    except Exception:
-        return ""
-
-    if not candidates:
-        return ""
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
+    """Return the newest completed session directory, or empty string --
+    by the recording's own start time; see holter_helpers.
+    _find_latest_completed_session, which this calls (one rule for both)."""
+    from .holter_helpers import _find_latest_completed_session as _latest
+    return _latest(output_dir)
 
 
 def _normalize_patient_info(info: Optional[dict]) -> dict:
@@ -2766,15 +2746,72 @@ class HolterMainWindow(QDialog):
         worker.start()
 
     def _generate_report(self):
-        from PyQt5.QtWidgets import QProgressDialog
         from PyQt5.QtCore import QThread, pyqtSignal
-        
-        progress = QProgressDialog("Generating Comprehensive ECG Analysis Report. Please wait...", None, 0, 0, self)
-        progress.setWindowTitle("Please Wait")
+
+        # Progress dialog in the app's dark style (as the ECG Reanalysis one):
+        # the plain QProgressDialog drew in the light Windows style -- its
+        # stylesheet background did not apply -- so the white text sat on a
+        # light grey box and could not be read.
+        progress = QDialog(self, Qt.Dialog | Qt.FramelessWindowHint)
+        progress.setObjectName("reportProgress")
+        progress.setAttribute(Qt.WA_StyledBackground, True)
+        progress.setFixedSize(500, 172)
         progress.setWindowModality(Qt.WindowModal)
-        progress.setStyleSheet(f"QProgressDialog{{background:{COL_DARK};color:{COL_GREEN};}}"
-                               "QProgressDialog QLabel{color:#FFFFFF;}")
-        progress.setRange(0, 0)
+        progress.setStyleSheet("""
+            QDialog#reportProgress {
+                background: #0D1117;
+                border: 1px solid #00CC66;
+                border-radius: 12px;
+            }
+            QDialog#reportProgress QLabel { background: transparent; border: none; }
+            QDialog#reportProgress QProgressBar {
+                background: #161B22;
+                border: 1px solid #444444;
+                border-radius: 5px;
+            }
+            QDialog#reportProgress QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00CC66, stop:0.6 #00FF00, stop:1 #66FFB3);
+                border-radius: 5px;
+            }
+        """)
+        p_layout = QVBoxLayout(progress)
+        p_layout.setContentsMargins(28, 22, 28, 22)
+        p_layout.setSpacing(10)
+
+        p_header = QHBoxLayout()
+        p_dot = QLabel("●")
+        p_dot.setStyleSheet("color:#00FF00; font-size:13px;")
+        p_header.addWidget(p_dot)
+        p_title = QLabel("Generating Report")
+        p_title.setStyleSheet("color:#FFFFFF; font-size:14px; font-weight:bold; letter-spacing:1px;")
+        p_header.addWidget(p_title)
+        p_header.addStretch()
+        p_elapsed = QLabel("0 s")
+        p_elapsed.setStyleSheet("color:#00CC66; font-size:12px; font-weight:bold;")
+        p_header.addWidget(p_elapsed)
+        p_layout.addLayout(p_header)
+
+        p_message = QLabel("Generating Comprehensive ECG Analysis Report. Please wait...")
+        p_message.setStyleSheet("color:#FFFFFF; font-size:12px;")
+        p_layout.addWidget(p_message)
+
+        p_bar = QProgressBar()
+        p_bar.setRange(0, 0)            # busy: the report has no steps to count
+        p_bar.setTextVisible(False)
+        p_bar.setFixedHeight(10)
+        p_layout.addWidget(p_bar)
+
+        p_note = QLabel("This may take a few moments depending on recording length.")
+        p_note.setStyleSheet("color:#E6EDF3; font-size:10px;")
+        p_layout.addWidget(p_note)
+
+        # seconds since start, so the wait visibly moves on
+        p_started = time.monotonic()
+        p_timer = QTimer(progress)
+        p_timer.timeout.connect(lambda: p_elapsed.setText(f"{int(time.monotonic() - p_started)} s"))
+        p_timer.start(500)
+        progress.finished.connect(p_timer.stop)
         progress.show()
 
         class ReportWorker(QThread):

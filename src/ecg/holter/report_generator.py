@@ -937,6 +937,8 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         # VE / SVE patterns from ectopic_beats_detector (every beat, labelled
         # from the signal; computed here when not cached); the live labels
         # above only when the recording file cannot be read.
+        _grid_beats_from_detector = False
+        _grid_segments = []
         try:
             from .ectopic_beats_detector import detect_ectopic_beats, pattern_beats
             from .file_format import ECGHFileReader
@@ -945,6 +947,12 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
                 _rd = ECGHFileReader(_ecgh)
                 try:
                     _grid_beats = pattern_beats(detect_ectopic_beats(_rd), _grid_metrics)
+                    _grid_beats_from_detector = True
+                    # the auto segments that detection ran with (cached by it),
+                    # whether or not "Auto Arrhythmia Detection" was clicked:
+                    # the HR / RR below must leave noise out either way
+                    from .auto_segment_arrthymia_detection import get_cached_detection
+                    _grid_segments = get_cached_detection(_ecgh) or []
                 finally:
                     try:
                         _rd.close()
@@ -1085,12 +1093,86 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
                 pass
             return _grid_hms(sec)
 
-        # Longest RR Interval, with the real date/time it occurred at --
-        # found from whichever chunk's own "longest_rr" matches the overall
-        # summary value, same way max_hr_chunk/min_hr_chunk are found above.
-        _longest_rr_chunk = max(_grid_metrics, key=lambda m: float(m.get('longest_rr', 0) or 0), default={})
-        _longest_rr_ms = float(_longest_rr_chunk.get('longest_rr', 0) or 0) or float(summary.get('longest_rr_ms', 0) or 0)
-        _longest_rr_t = float(_longest_rr_chunk.get('t', 0.0) or 0.0)
+        # Longest RR Interval: the longest gap between two consecutive beats
+        # of the recording -- one of the RR numbers the Full Disclosure strip
+        # prints under each beat pair -- at the time of the beat it starts
+        # from. Taken from the PVC / PAC detector's beats above (every beat of
+        # the recording; on 2026-11-06_15-18-05 the same 134 beats and the
+        # same longest RR, 1000 ms from 15:18:06.81, as the Full Disclosure
+        # strip's own beat times). A gap that touches an Unidentified or a
+        # Ventricular Fibrillation stretch is left out: there is no QRS to
+        # read there (seen: 1.55 s from the last sinus beat to the first
+        # fibrillation wave at a VFib onset, 2026-10-05_17-14-16 17:15:57).
+        # Equal RRs (to the 10 ms shown) give the first one. Was: the live
+        # 5 s chunks' own longest RR at the chunk's start time -- a beat the
+        # live pass missed joined two RRs into "1.75s At 11-06 15:19:00", an
+        # RR the recording does not have, and the time was the chunk's, not
+        # the interval's. The live value stays the fallback when the
+        # detector could not run.
+        _longest_rr_ms, _longest_rr_t = 0.0, 0.0
+        if _grid_beats_from_detector and len(_grid_beats) >= 2:
+            # Unidentified / VFib stretches from the detection the beats came
+            # from, not only when "Auto Arrhythmia Detection" was clicked
+            # (_report_auto_segment_events is empty otherwise; seen: a 4.51 s
+            # "RR" across a noise stretch on 2026-10-29_16-36-56)
+            _no_qrs = []
+            for _e in (_grid_segments or _report_auto_segment_events):
+                if str(_e.get('label', '')) in ('Unidentified', 'Ventricular Fibrillation'):
+                    try:
+                        _no_qrs.append((float(_e.get('start_sec', 0.0) or 0.0), float(_e.get('end_sec', 0.0) or 0.0)))
+                    except (TypeError, ValueError):
+                        pass
+            _beat_ts = sorted(float(_b.get('timestamp', 0.0) or 0.0) for _b in _grid_beats)
+            _best_cs = 0
+            for _t0, _t1 in zip(_beat_ts, _beat_ts[1:]):
+                if _t1 <= _t0 or any(_s < _t1 and _t0 < _e for _s, _e in _no_qrs):
+                    continue
+                _cs = int(round((_t1 - _t0) * 100.0))      # 10 ms steps, as shown
+                if _cs > _best_cs:
+                    _best_cs, _longest_rr_ms, _longest_rr_t = _cs, (_t1 - _t0) * 1000.0, _t0
+        # Heart rate as Holter reports it clinically, from the same beats:
+        #   Min / Max -- the beat-to-beat HR (60000 / RR, the number the Full
+        #     Disclosure strip prints under a beat pair) of normal-to-normal
+        #     intervals only: both beats sinus ('N'). An interval that ends on
+        #     a PVC / PAC (its coupling, e.g. 114 bpm on 2026-11-06_15-18-05)
+        #     or starts on one (the pause after it) is not the heart rate, and
+        #     neither is one touching an Unidentified / VFib stretch. One
+        #     value each, at the first beat pair that has it (10 ms steps).
+        #   Avg -- every beat, ectopic ones too: intervals counted / time
+        #     they span (the readable time; Unidentified / VFib left out).
+        # Was: the live 5 s chunks' mean HR -- Max was a 5 s average (80, not
+        # the 107 the recording reaches), its time the start of the last
+        # tying chunk and as elapsed time ("00:01:35").
+        _report_hr = None
+        if _grid_beats_from_detector and len(_grid_beats) >= 3:
+            _beats_lab = sorted(((float(_b.get('timestamp', 0.0) or 0.0), str(_b.get('label', 'N')))
+                                 for _b in _grid_beats), key=lambda x: x[0])
+            _hr_min = _hr_max = None
+            _sum_rr = 0.0
+            _n_rr = 0
+            for (_t0, _l0), (_t1, _l1) in zip(_beats_lab, _beats_lab[1:]):
+                if _t1 <= _t0 or any(_s < _t1 and _t0 < _e for _s, _e in _no_qrs):
+                    continue
+                if _l0 == 'Q' or _l1 == 'Q':
+                    continue
+                _sum_rr += _t1 - _t0
+                _n_rr += 1
+                if _l0 != 'N' or _l1 != 'N':
+                    continue
+                _rr_cs = int(round((_t1 - _t0) * 100.0))
+                if _hr_min is None or _rr_cs > _hr_min[0]:
+                    _hr_min = (_rr_cs, 60.0 / (_t1 - _t0), _t0)
+                if _hr_max is None or _rr_cs < _hr_max[0]:
+                    _hr_max = (_rr_cs, 60.0 / (_t1 - _t0), _t0)
+            if _hr_min and _hr_max and _sum_rr > 0:
+                _report_hr = {'avg': 60.0 * _n_rr / _sum_rr,
+                              'min': _hr_min[1], 'min_t': _hr_min[2],
+                              'max': _hr_max[1], 'max_t': _hr_max[2]}
+
+        if _longest_rr_ms <= 0.0:
+            _longest_rr_chunk = max(_grid_metrics, key=lambda m: float(m.get('longest_rr', 0) or 0), default={})
+            _longest_rr_ms = float(_longest_rr_chunk.get('longest_rr', 0) or 0) or float(summary.get('longest_rr_ms', 0) or 0)
+            _longest_rr_t = float(_longest_rr_chunk.get('t', 0.0) or 0.0)
         _longest_rr_str = f"{_longest_rr_ms/1000:.2f}s At {_grid_wallclock(_longest_rr_t)}"
 
         # Brief Summary as prose, not a table cell -- the same numbers the
@@ -1124,10 +1206,19 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
             lines = "<br/>".join(f"<b>{k}:</b> {v}" for k, v in rows)
             return [Paragraph(title, grid_title_style), Paragraph(lines, grid_body_style)]
 
-        hr_panel = _grid_panel("Heart Rate (bpm)", [
-            ("Avg", f"{summary.get('avg_hr', 0):.0f}"),
-            ("Max", f"{summary.get('max_hr', 0):.0f} @ {summary.get('max_hr_time', '-')}"),
-            ("Min", f"{summary.get('min_hr', 0):.0f} @ {summary.get('min_hr_time', '-')}"),
+        if _report_hr:
+            _hr_rows = [
+                ("Avg", f"{_report_hr['avg']:.0f}"),
+                ("Max", f"{_report_hr['max']:.0f} @ {_grid_wallclock(_report_hr['max_t'])}"),
+                ("Min", f"{_report_hr['min']:.0f} @ {_grid_wallclock(_report_hr['min_t'])}"),
+            ]
+        else:
+            _hr_rows = [
+                ("Avg", f"{summary.get('avg_hr', 0):.0f}"),
+                ("Max", f"{summary.get('max_hr', 0):.0f} @ {summary.get('max_hr_time', '-')}"),
+                ("Min", f"{summary.get('min_hr', 0):.0f} @ {summary.get('min_hr_time', '-')}"),
+            ]
+        hr_panel = _grid_panel("Heart Rate (bpm)", _hr_rows + [
             ("Longest RR Interval", _longest_rr_str),
             ("Pause (&gt;2.0s)", str(summary.get('pauses', 0))),
         ])
@@ -1166,10 +1257,13 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
             ("rMSSD (ms)", f"{_hrv.get('rmssd', 0):.1f}" if _hrv else "-"),
             ("pNN50 (%)", f"{_hrv.get('pnn50', 0):.2f}" if _hrv else "-"),
             ("Triangular Index", f"{_hrv.get('triangular_index', 0):.2f}" if _hrv else "-"),
-            ("VLF", f"{_hrv.get('vlf', 0):.1f}" if _hrv else "-"),
-            ("LF", f"{_hrv.get('lf', 0):.1f}" if _hrv else "-"),
-            ("HF", f"{_hrv.get('hf', 0):.1f}" if _hrv else "-"),
-            ("LF/HF", f"{_hrv.get('lf_hf_ratio', 0):.2f}" if _hrv else "-"),
+            # 3 decimals, as the HRV Summary table on page 2: the band powers
+            # are small numbers (seconds^2, e.g. LF 0.022) and 1 decimal
+            # showed them as 0.0
+            ("VLF", f"{_hrv.get('vlf', 0):.3f}" if _hrv else "-"),
+            ("LF", f"{_hrv.get('lf', 0):.3f}" if _hrv else "-"),
+            ("HF", f"{_hrv.get('hf', 0):.3f}" if _hrv else "-"),
+            ("LF/HF", f"{_hrv.get('lf_hf_ratio', 0):.3f}" if _hrv else "-"),
         ])
         paced_panel = _grid_panel("Paced", [
             ("Total", str(_paced_total)),
@@ -1210,6 +1304,11 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     avg_hr = summary.get('avg_hr', 0)
     max_hr = summary.get('max_hr', 0)
     min_hr = summary.get('min_hr', 0)
+    # the recorded beats' HR (see _report_hr in the grid above), so the
+    # Clinical Impression and page 2 say what the Heart Rate panel says
+    _report_hr = locals().get('_report_hr')
+    if _report_hr:
+        avg_hr, max_hr, min_hr = _report_hr['avg'], _report_hr['max'], _report_hr['min']
 
     # -------------------------------------------------------------------------
     # Compute Arrhythmias (combining auto detection with exact manual markings)
@@ -1375,22 +1474,32 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     _snapshot_ve_total = int(locals().get('_ve_total', 0) or 0)
     _snapshot_sve_total = int(locals().get('_sve_total', 0) or 0)
     _snapshot_pct = lambda value, total: f"{100.0 * value / total:.1f}%" if total else "0.0%"
+
+    def _snapshot_row(name, patterns, total):
+        # Same counts as page 1's VE / SVE and Rhythm panels: Couplets,
+        # Triplets and Runs are episodes; Single, Bigeminy and Trigeminy
+        # (Quadrigeminy included) are ectopic beats.
+        return [name, f"{min_hr:.0f}", f"{avg_hr:.0f}", f"{max_hr:.0f}",
+                str(patterns.get('single', 0)), str(patterns.get('couplet', 0)),
+                str(patterns.get('triplet', 0)), str(patterns.get('run', 0)),
+                str(patterns.get('bigeminy', 0)), str(patterns.get('trigeminy', 0)),
+                str(total), _snapshot_pct(total, summary.get('total_beats', 0))]
+
     overview_data = [
-        ['Rhythm', 'Min HR', 'Avg HR', 'Max HR', 'Single', 'Couplets', 'Runs', 'Total', '%'],
-        ['VE', f"{min_hr:.0f}", f"{avg_hr:.0f}", f"{max_hr:.0f}",
-         str(_snapshot_ve.get('single', 0)), str(_snapshot_ve.get('couplet', 0)),
-         str(_snapshot_ve.get('run', 0)), str(_snapshot_ve_total),
-         _snapshot_pct(_snapshot_ve_total, summary.get('total_beats', 0))],
-        ['SVE', f"{min_hr:.0f}", f"{avg_hr:.0f}", f"{max_hr:.0f}",
-         str(_snapshot_sve.get('single', 0)), str(_snapshot_sve.get('couplet', 0)),
-         str(_snapshot_sve.get('run', 0)), str(_snapshot_sve_total),
-         _snapshot_pct(_snapshot_sve_total, summary.get('total_beats', 0))],
-        ['Pause (>2.0s)', '', '', '', '', '', '', str(summary.get('pauses', 0)), ''],
+        ['Rhythm', 'Min HR', 'Avg HR', 'Max HR', 'Single', 'Couplets', 'Triplets', 'Runs',
+         'Bigeminy', 'Trigeminy', 'Total', '%'],
+        _snapshot_row('VE', _snapshot_ve, _snapshot_ve_total),
+        _snapshot_row('SVE', _snapshot_sve, _snapshot_sve_total),
+        # the pause count sits under Total; the cells before it are merged
+        # (the merge used to take in the Total cell too, so the count never showed)
+        ['Pause (>2.0s)', '', '', '', '', '', '', '', '', '', str(summary.get('pauses', 0)), ''],
     ]
+    # widths from the header text at 7.2 pt bold + padding ("Trigeminy" 12.1 mm,
+    # "Pause (>2.0s)" 16.3 mm in the first column)
     overview_table = Table(
         overview_data,
-        colWidths=[27*mm, 18*mm, 18*mm, 18*mm, 18*mm,
-                   18*mm, 18*mm, 18*mm, 18*mm],
+        colWidths=[21*mm, 12.5*mm, 12.5*mm, 12.5*mm, 12*mm, 14.5*mm,
+                   13*mm, 11*mm, 15*mm, 15.5*mm, 11.5*mm, 12*mm],
         repeatRows=1,
     )
     overview_table.setStyle(TableStyle([
@@ -1404,7 +1513,7 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ('PADDING', (0, 0), (-1, -1), 4),
-        ('SPAN', (1, 3), (7, 3)),
+        ('SPAN', (1, 3), (9, 3)),
     ]))
     story.append(overview_table)
 
