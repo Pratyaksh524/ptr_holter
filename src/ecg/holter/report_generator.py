@@ -344,6 +344,109 @@ def first_confirmed_nsr_beat(reader, t_from: float, t_to: float):
         return False
 
 
+_FD_BEATS_CACHE = 'full_disclosure_beats_cache.json'
+
+
+def _full_disclosure_beat_times(session_dir: str) -> Optional[List[float]]:
+    """R-peak times (s) of the whole recording exactly as the Full Disclosure
+    strip finds them for its RR / HR numbers (panels.holter_widgets.
+    StableBeatTimes: fixed 10 s chunks, so the same beats whatever the
+    scroll). The report's Heart Rate figures come from these, so a Min /
+    Max / Avg on page 1 or in the hourly table is one the strip prints.
+
+    Saved next to the recording (full_disclosure_beats_cache.json), keyed
+    like the auto segment cache (file size / time, code fingerprint) plus the
+    clinical configuration: a 24 h recording takes about 2 min (12 ms per
+    10 s chunk), and a reopened report must not pay that again. None when the
+    recording cannot be read."""
+    ecgh = os.path.join(session_dir, 'recording.ecgh')
+    if not os.path.exists(ecgh):
+        return None
+    key = None
+    try:
+        from .auto_segment_arrthymia_detection import _cache_key, _code_fingerprint
+        from .cache_fingerprint import clinical_config_fingerprint
+        seg_key = _cache_key(ecgh)
+        if seg_key and _code_fingerprint():
+            key = f"fd_beats|{seg_key}|cfg={clinical_config_fingerprint()}"
+    except Exception:
+        key = None
+    cache_path = os.path.join(session_dir, _FD_BEATS_CACHE)
+    if key:
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
+            if saved.get('key') == key and isinstance(saved.get('beats'), list):
+                return [float(t) for t in saved['beats']]
+        except (OSError, ValueError, TypeError):
+            pass
+    try:
+        from .file_format import ECGHFileReader
+        from .panels.holter_widgets import StableBeatTimes
+        reader = ECGHFileReader(ecgh)
+        try:
+            beats = [float(t) for t in StableBeatTimes(reader).peaks_between(0.0, float(reader.duration_sec))]
+        finally:
+            try:
+                reader.close()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[HolterReport] Full Disclosure beat times unavailable: {e}")
+        return None
+    if key:
+        # a temp name of its own: a preview and a report build may both save
+        tmp = f"{cache_path}.{os.getpid()}.{_threading.get_ident()}.tmp"
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump({'key': key, 'beats': [round(t, 4) for t in beats]}, f)
+            os.replace(tmp, cache_path)
+        except (OSError, TypeError, ValueError) as e:
+            print(f"[HolterReport] Could not save Full Disclosure beat times: {e}")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return beats
+
+
+def _full_disclosure_hr_pairs(beat_times, skip_spans):
+    """(start s, end s, RR s) of every pair of consecutive Full Disclosure
+    beats whose HR the strip prints (60000 / RR ms under the pair), leaving
+    out the pairs that touch a span in `skip_spans` (start s, end s) -- the
+    strip hides its numbers inside VFib and Asystole; the report also leaves
+    out Unidentified (noise: no QRS to read)."""
+    pairs = []
+    for t0, t1 in zip(beat_times, beat_times[1:]):
+        if t1 <= t0 or any(s <= t1 and t0 <= e for s, e in skip_spans):
+            continue
+        pairs.append((t0, t1, t1 - t0))
+    return pairs
+
+
+def _hr_min_avg_max(pairs):
+    """Heart rate of the pairs from _full_disclosure_hr_pairs:
+    {'avg', 'min', 'min_t', 'max', 'max_t'} -- Min / Max the slowest /
+    fastest beat-to-beat HR (60 / RR, as the strip prints it), one value
+    each, at the first pair that has it (RRs equal to 10 ms count as equal,
+    the time is the pair's first beat); Avg the pairs counted / the time
+    they span. None without a pair."""
+    if not pairs:
+        return None
+    slow = fast = None
+    total = 0.0
+    for t0, _t1, rr in pairs:
+        total += rr
+        cs = int(round(rr * 100.0))
+        if slow is None or cs > slow[0]:
+            slow = (cs, rr, t0)
+        if fast is None or cs < fast[0]:
+            fast = (cs, rr, t0)
+    return {'avg': 60.0 * len(pairs) / total,
+            'min': 60.0 / slow[1], 'min_t': slow[2],
+            'max': 60.0 / fast[1], 'max_t': fast[2]}
+
+
 def _build_timeline_events(session_dir: str,
                            auto_segment_events=None,
                            metrics=None,
@@ -1130,44 +1233,50 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
                 _cs = int(round((_t1 - _t0) * 100.0))      # 10 ms steps, as shown
                 if _cs > _best_cs:
                     _best_cs, _longest_rr_ms, _longest_rr_t = _cs, (_t1 - _t0) * 1000.0, _t0
-        # Heart rate as Holter reports it clinically, from the same beats:
-        #   Min / Max -- the beat-to-beat HR (60000 / RR, the number the Full
-        #     Disclosure strip prints under a beat pair) of normal-to-normal
-        #     intervals only: both beats sinus ('N'). An interval that ends on
-        #     a PVC / PAC (its coupling, e.g. 114 bpm on 2026-11-06_15-18-05)
-        #     or starts on one (the pause after it) is not the heart rate, and
-        #     neither is one touching an Unidentified / VFib stretch. One
-        #     value each, at the first beat pair that has it (10 ms steps).
-        #   Avg -- every beat, ectopic ones too: intervals counted / time
-        #     they span (the readable time; Unidentified / VFib left out).
-        # Was: the live 5 s chunks' mean HR -- Max was a 5 s average (80, not
-        # the 107 the recording reaches), its time the start of the last
-        # tying chunk and as elapsed time ("00:01:35").
-        _report_hr = None
-        if _grid_beats_from_detector and len(_grid_beats) >= 3:
+        # Heart Rate panel (and the hourly table on page 2): the HR the Full
+        # Disclosure strip prints -- its own beats over the whole recording
+        # (_full_disclosure_beat_times), 60000 / RR under every beat pair.
+        #   Min / Max -- the slowest / fastest of those numbers, one value
+        #     each, at the first beat pair that has it (10 ms steps).
+        #   Avg -- the pairs counted / the time they span.
+        # Pairs the strip shows no number for (VFib, Asystole) are left out,
+        # and so is Unidentified (noise: no QRS to read).
+        # Was: the PVC / PAC detector's beats (N-N pairs) -- a beat it put in
+        # the wrong place gave "Max 294 @ 16:22:50" on 2026-11-12_16-19-27
+        # (it put beats at 16:22:51.11 / 51.51 and missed 16:22:51.31; the
+        # signal and the strip are a steady 150 there, the strip's highest is
+        # 201), a number the strip never shows. Before that: the live 5 s
+        # chunks' mean HR (a 5 s average, at the chunk's elapsed time).
+        _hr_skip_spans = []
+        for _e in (_grid_segments or _report_auto_segment_events):
+            if str(_e.get('label', '')) in ('Unidentified', 'Ventricular Fibrillation'):
+                try:
+                    _hr_skip_spans.append((float(_e.get('start_sec', 0.0) or 0.0), float(_e.get('end_sec', 0.0) or 0.0)))
+                except (TypeError, ValueError):
+                    pass
+        for _e in _load_asystole_events(session_dir):
+            try:
+                _hr_skip_spans.append((float(_e.get('start_sec', 0.0) or 0.0), float(_e.get('end_sec', 0.0) or 0.0)))
+            except (TypeError, ValueError):
+                pass
+        _fd_beat_times = _full_disclosure_beat_times(session_dir)
+        _fd_hr_pairs = _full_disclosure_hr_pairs(_fd_beat_times, _hr_skip_spans) if _fd_beat_times else []
+        _report_hr = _hr_min_avg_max(_fd_hr_pairs)
+        # HR of each PVC / PAC (60 / the RR that ends on it: the rate it came
+        # at), for the VE / SVE rows of the statistics overview -- from the
+        # PVC / PAC detector, the only source that says which beat is one
+        _ectopic_hr = None
+        if _grid_beats_from_detector and len(_grid_beats) >= 2:
             _beats_lab = sorted(((float(_b.get('timestamp', 0.0) or 0.0), str(_b.get('label', 'N')))
                                  for _b in _grid_beats), key=lambda x: x[0])
-            _hr_min = _hr_max = None
-            _sum_rr = 0.0
-            _n_rr = 0
+            _ectopic_hr = {'V': [], 'S': []}
             for (_t0, _l0), (_t1, _l1) in zip(_beats_lab, _beats_lab[1:]):
-                if _t1 <= _t0 or any(_s < _t1 and _t0 < _e for _s, _e in _no_qrs):
+                if _t1 <= _t0 or any(_s < _t1 and _t0 < _e for _s, _e in _hr_skip_spans):
                     continue
                 if _l0 == 'Q' or _l1 == 'Q':
                     continue
-                _sum_rr += _t1 - _t0
-                _n_rr += 1
-                if _l0 != 'N' or _l1 != 'N':
-                    continue
-                _rr_cs = int(round((_t1 - _t0) * 100.0))
-                if _hr_min is None or _rr_cs > _hr_min[0]:
-                    _hr_min = (_rr_cs, 60.0 / (_t1 - _t0), _t0)
-                if _hr_max is None or _rr_cs < _hr_max[0]:
-                    _hr_max = (_rr_cs, 60.0 / (_t1 - _t0), _t0)
-            if _hr_min and _hr_max and _sum_rr > 0:
-                _report_hr = {'avg': 60.0 * _n_rr / _sum_rr,
-                              'min': _hr_min[1], 'min_t': _hr_min[2],
-                              'max': _hr_max[1], 'max_t': _hr_max[2]}
+                if _l1 in _ectopic_hr:
+                    _ectopic_hr[_l1].append(60.0 / (_t1 - _t0))
 
         if _longest_rr_ms <= 0.0:
             _longest_rr_chunk = max(_grid_metrics, key=lambda m: float(m.get('longest_rr', 0) or 0), default={})
@@ -1304,8 +1413,8 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     avg_hr = summary.get('avg_hr', 0)
     max_hr = summary.get('max_hr', 0)
     min_hr = summary.get('min_hr', 0)
-    # the recorded beats' HR (see _report_hr in the grid above), so the
-    # Clinical Impression and page 2 say what the Heart Rate panel says
+    # the Full Disclosure strip's HR (see _report_hr in the grid above), so
+    # the Clinical Impression and page 2 say what the Heart Rate panel says
     _report_hr = locals().get('_report_hr')
     if _report_hr:
         avg_hr, max_hr, min_hr = _report_hr['avg'], _report_hr['max'], _report_hr['min']
@@ -1475,11 +1584,26 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     _snapshot_sve_total = int(locals().get('_sve_total', 0) or 0)
     _snapshot_pct = lambda value, total: f"{100.0 * value / total:.1f}%" if total else "0.0%"
 
+    # Min / Avg / Max HR of the row's own ectopic beats: each beat's rate is
+    # 60 / the RR that ends on it (PVCs for VE, PACs for SVE; from the PVC /
+    # PAC detector's beats, Unidentified / VFib / Asystole left out), "--"
+    # with none.
+    # Was: the whole recording's HR on both rows (the same 60 / 78 / 80).
+    _ectopic_hr = locals().get('_ectopic_hr')
+
+    def _row_hr(code):
+        if _ectopic_hr is None:
+            return f"{min_hr:.0f}", f"{avg_hr:.0f}", f"{max_hr:.0f}"
+        values = _ectopic_hr.get(code) or []
+        if not values:
+            return '--', '--', '--'
+        return f"{min(values):.0f}", f"{sum(values) / len(values):.0f}", f"{max(values):.0f}"
+
     def _snapshot_row(name, patterns, total):
         # Same counts as page 1's VE / SVE and Rhythm panels: Couplets,
         # Triplets and Runs are episodes; Single, Bigeminy and Trigeminy
         # (Quadrigeminy included) are ectopic beats.
-        return [name, f"{min_hr:.0f}", f"{avg_hr:.0f}", f"{max_hr:.0f}",
+        return [name, *_row_hr('V' if name == 'VE' else 'S'),
                 str(patterns.get('single', 0)), str(patterns.get('couplet', 0)),
                 str(patterns.get('triplet', 0)), str(patterns.get('run', 0)),
                 str(patterns.get('bigeminy', 0)), str(patterns.get('trigeminy', 0)),
@@ -1551,11 +1675,30 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         'Single', 'Couplets', 'Triplets', 'Runs', 'Total', '%', ''
     ]]
     _detail_hours = max(1, int(np.ceil(float(summary.get('duration_sec', 0) or 0) / 3600.0)))
+    # HR per hour: the Full Disclosure strip's beat pairs that start in the
+    # hour, worked out as page 1's Heart Rate panel (_hr_min_avg_max). Was:
+    # the live 5 s chunks' hr_min / hr_mean / hr_max -- a beat the live pass
+    # put in the wrong place gave "Max 303" on 2026-11-12_16-19-27, where
+    # the strip's highest is 201. The live values stay the fallback when
+    # the strip's beats could not be found.
+    _fd_hr_pairs = locals().get('_fd_hr_pairs') or []
+    _hour_hr = {}
+    if _fd_hr_pairs:
+        _pairs_by_hour = {}
+        for _pair in _fd_hr_pairs:
+            _pairs_by_hour.setdefault(int(_pair[0] // 3600), []).append(_pair)
+        _hour_hr = {_h: _hr_min_avg_max(_p) for _h, _p in _pairs_by_hour.items()}
     for _hour in range(_detail_hours):
         _row = _hourly_stats.get(_hour, {})
-        _mins = _row.get('hr_min', [])
-        _avgs = _row.get('hr_avg', [])
-        _maxs = _row.get('hr_max', [])
+        if _fd_hr_pairs:
+            _hh = _hour_hr.get(_hour)
+            _mins = [_hh['min']] if _hh else []
+            _avgs = [_hh['avg']] if _hh else []
+            _maxs = [_hh['max']] if _hh else []
+        else:
+            _mins = _row.get('hr_min', [])
+            _avgs = _row.get('hr_avg', [])
+            _maxs = _row.get('hr_max', [])
         _ve_count = int(_row.get('ve', 0) or 0)
         _sve_count = int(_row.get('sve', 0) or 0)
         _detail_rows.append([

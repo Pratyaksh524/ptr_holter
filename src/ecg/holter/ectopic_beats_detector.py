@@ -34,9 +34,11 @@ V V V V as a run instead of N N V N N V (trigeminy).
     bundle branch block after a slow rhythm), so its beats go back to N.
     A late PVC (not premature) is V when it is wide, its shape is very
     different (< VERY_DIFFERENT_CORR), no sinus P wave comes before it (P
-    stretch similarity < LATE_PVC_P_MAX) and the beats on both sides are N
+    stretch similarity < LATE_PVC_P_MAX), the beats on both sides are N
     with the dominant shape (a lone beat: a bundle branch block or paced run
-    starts with several such beats) -- and it must repeat: at least
+    starts with several such beats) and a pause follows it (the next RR >=
+    LATE_PVC_PAUSE_FRACTION x the normal RR: a beat neither early nor
+    followed by a pause did not break the rhythm) -- and it must repeat: at least
     LATE_MIN_PARTNERS other V beats of the recording match its shape (>=
     LATE_PARTNER_CORR); a late PVC with fewer is dropped.
     Not V: a wide beat at the normal rate with the sinus P (bundle branch
@@ -144,6 +146,7 @@ P_READABLE_MIN = 0.60      # neighbours' median P-stretch similarity: the P wave
 P_CONTRAST_MIN = 0.30      # a PAC's P stretch is this much less like the dominant beats' than its neighbours' are
 P_LOCAL_BEATS = 6          # N beats on each side for the two tests above
 LATE_PVC_P_MAX = 0.50
+LATE_PVC_PAUSE_FRACTION = 1.05   # a late PVC is followed by a pause: the next beat's RR >= this x the normal RR
 LATE_PARTNER_CORR = 0.90   # a late PVC must match at least LATE_MIN_PARTNERS other V beats this well
 LATE_MIN_PARTNERS = 5
 P_POST_SEC = 0.06
@@ -1004,6 +1007,7 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
     out = []
     corrs: List[Optional[float]] = []  # each beat's similarity to the template (None: not measured)
     pcorrs: List[Optional[float]] = []  # each beat's P-wave stretch vs the dominant beats' (None: not measured)
+    nrrs: List[Optional[float]] = []    # the normal RR (ms) each beat was judged against (None: not judged)
     p_template = None
     v_cands: List[tuple] = []           # (index in out, shape, similarity, qrs) of each V
     pending: List[np.ndarray] = []     # new-shape beats at the normal rate, in a row
@@ -1039,6 +1043,7 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
                         'qrs_ms': None if qrs is None else round(qrs, 1), '_not_beat': True})
             corrs.append(None)
             pcorrs.append(None)
+            nrrs.append(None)
             continue
         prev_t = ts
         beat = {'timestamp': round(ts, 3), 'label': 'N',
@@ -1047,6 +1052,7 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
         out.append(beat)
         corrs.append(None)
         pcorrs.append(None)
+        nrrs.append(None)
         if blocked(ts) or template is None:
             beat['label'] = 'Q'
             prev_label = 'Q'
@@ -1067,6 +1073,7 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
             pending = []
             continue
         normal_rr = float(np.median(ref_rr)) if len(ref_rr) >= 2 else None
+        nrrs[-1] = normal_rr
         premature = rr is not None and normal_rr is not None and rr <= PREMATURE_FRACTION * normal_rr
         different = corr < SHAPE_SAME_CORR
         # For the PVC test only: the shape also judged centred on the R peak,
@@ -1214,12 +1221,26 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
     # candidates were 23 true in 76 on INCART (16 in 40 on MIT-BIH): a late
     # PVC must repeat, see the repeat test below (>= LATE_MIN_PARTNERS other V
     # beats at similarity >= LATE_PARTNER_CORR: INCART 11 true in 11).
+    # And it is followed by a pause (the next beat's RR >= LATE_PVC_PAUSE_
+    # FRACTION x the normal RR): a PVC breaks the rhythm -- it comes early or,
+    # when it does not, the next beat comes late (the sinus beat it blocked
+    # is not conducted). A beat neither early nor followed by a pause is the
+    # rhythm's own beat, whatever its shape read. First 5 min of MIT-BIH /
+    # INCART: the 21 true late PVCs had a next RR of 1.00-1.76 x normal
+    # (all but one >= 1.05), the 13 false ones (MIT 232, aberrant PACs and
+    # RBBB beats after long pauses) 0.94-1.88 (10 under 1.05) -> MIT true
+    # 10 -> 10, false 13 -> 3; INCART true 11 -> 10, false 0. Seen without
+    # it: 7 "late PVCs" in a regular tachycardia, RR 400 ms before and after
+    # each (2026-11-12_16-19-27, 16:22:53.91 - 16:23:43.65).
     late_idx = set()
     for k in range(1, len(out) - 1):
         b = out[k]
         if b['label'] != 'N' or corrs[k] is None or pcorrs[k] is None or b['qrs_ms'] is None or no_pvc(feats[k][0]):
             continue
         if not (corrs[k] < VERY_DIFFERENT_CORR and b['qrs_ms'] >= WIDE_QRS_MS and pcorrs[k] < LATE_PVC_P_MAX):
+            continue
+        next_rr = out[k + 1].get('rr_ms')
+        if nrrs[k] is None or next_rr is None or next_rr < LATE_PVC_PAUSE_FRACTION * nrrs[k]:
             continue
         if not all(out[j]['label'] == 'N' and corrs[j] is not None and corrs[j] >= SHAPE_SAME_CORR
                    for j in (k - 1, k + 1)):
