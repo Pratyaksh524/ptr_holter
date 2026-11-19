@@ -1066,6 +1066,10 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         _grid_beats.sort(key=lambda b: float(b.get('timestamp', 0.0) or 0.0))
         label_beat_sequences(_grid_beats)
 
+        # The whole-recording detector is the same beat source used by Full
+        # Disclosure, so use its count as the report denominator.
+        _report_total_beats = len(_grid_beats)
+
         # Couplet (2) / Triplet (3) / Quadruplet (4) / Run (5+ consecutive,
         # label_beat_sequences) are counted once per episode, on its first
         # beat -- was once per beat, so one 18-beat run read "VT run: 18".
@@ -1582,6 +1586,7 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     _snapshot_sve = locals().get('_sve_patterns', {'single': 0, 'couplet': 0, 'run': 0})
     _snapshot_ve_total = int(locals().get('_ve_total', 0) or 0)
     _snapshot_sve_total = int(locals().get('_sve_total', 0) or 0)
+    _report_total_beats = int(locals().get('_report_total_beats', summary.get('total_beats', 0)) or 0)
     _snapshot_pct = lambda value, total: f"{100.0 * value / total:.1f}%" if total else "0.0%"
 
     # Min / Avg / Max HR of the row's own ectopic beats: each beat's rate is
@@ -1607,7 +1612,7 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
                 str(patterns.get('single', 0)), str(patterns.get('couplet', 0)),
                 str(patterns.get('triplet', 0)), str(patterns.get('run', 0)),
                 str(patterns.get('bigeminy', 0)), str(patterns.get('trigeminy', 0)),
-                str(total), _snapshot_pct(total, summary.get('total_beats', 0))]
+                str(total), _snapshot_pct(total, _report_total_beats)]
 
     overview_data = [
         ['Rhythm', 'Min HR', 'Avg HR', 'Max HR', 'Single', 'Couplets', 'Triplets', 'Runs',
@@ -1665,59 +1670,75 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         _row['sve'] += int(_metric.get('sve_beats', 0) or 0)
         _row['pauses'] += int(_metric.get('pauses', 0) or 0)
 
+    # Replace the legacy chunk beat/ectopy totals with the detector's
+    # timestamped whole-recording beats when available.  This is the same
+    # source used by the Full Disclosure strip and the overview VE/SVE rows.
+    if locals().get('_grid_beats_from_detector'):
+        for _row in _hourly_stats.values():
+            _row['beats'] = _row['ve'] = _row['sve'] = 0
+            for _key in ('ve_single', 've_couplet', 've_triplet', 've_run', 've_bigeminy', 've_trigeminy',
+                         'sve_single', 'sve_couplet', 'sve_triplet', 'sve_run', 'sve_bigeminy', 'sve_trigeminy'):
+                _row[_key] = 0
+        _prev_detector_code = None
+        for _b in _grid_beats:
+            try:
+                _ts = float(_b.get('timestamp', 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            _hour = int(_ts // 3600)
+            _row = _hourly_stats.setdefault(_hour, {
+                'beats': 0, 'hr_min': [], 'hr_avg': [], 'hr_max': [],
+                've': 0, 'sve': 0, 'pauses': 0,
+            })
+            _row['beats'] += 1
+            _code = str(_b.get('short_code', '') or '')
+            if _code == 'V':
+                _row['ve'] += 1
+            elif _code == 'S':
+                _row['sve'] += 1
+            if _code in ('V', 'S'):
+                _prefix = 've_' if _code == 'V' else 'sve_'
+                _pattern = str(_b.get('rhythm_pattern', '') or '').lower()
+                _first_episode = _code != _prev_detector_code
+                if 'run' in _pattern:
+                    if _first_episode: _row[_prefix + 'run'] += 1
+                elif 'trigeminy' in _pattern or 'quadrigeminy' in _pattern:
+                    _row[_prefix + 'trigeminy'] += 1
+                elif 'bigeminy' in _pattern:
+                    _row[_prefix + 'bigeminy'] += 1
+                elif 'couplet' in _pattern:
+                    if _first_episode: _row[_prefix + 'couplet'] += 1
+                elif 'triplet' in _pattern:
+                    if _first_episode: _row[_prefix + 'triplet'] += 1
+                else:
+                    _row[_prefix + 'single'] += 1
+            _prev_detector_code = _code
+
     _detail_rows = [[
-        'Start time', 'Beats', 'HR', '', '',
-        'VE premature', '', '', '', '', '',
-        'SVE premature', '', '', '', '', '', 'Pause\n(>2.0s)'
+        'Hourly time', 'Beats',
+        'VE premature', '', '', '', '', '', '', '',
+        'SVE premature', '', '', '', '', '', '', '', 'Pause\n(>2.0s)'
     ], [
-        '', '', 'Min', 'Avg', 'Max',
-        'Single', 'Couplets', 'Triplets', 'Runs', 'Total', '%',
-        'Single', 'Couplets', 'Triplets', 'Runs', 'Total', '%', ''
+        '', '',
+        'Single', 'Couplets', 'Triplets', 'Runs', 'Bigeminy', 'Trigeminy', 'Total', '%',
+        'Single', 'Couplets', 'Triplets', 'Runs', 'Bigeminy', 'Trigeminy', 'Total', '%', ''
     ]]
     _detail_hours = max(1, int(np.ceil(float(summary.get('duration_sec', 0) or 0) / 3600.0)))
-    # HR per hour: the Full Disclosure strip's beat pairs that start in the
-    # hour, worked out as page 1's Heart Rate panel (_hr_min_avg_max). Was:
-    # the live 5 s chunks' hr_min / hr_mean / hr_max -- a beat the live pass
-    # put in the wrong place gave "Max 303" on 2026-11-12_16-19-27, where
-    # the strip's highest is 201. The live values stay the fallback when
-    # the strip's beats could not be found.
-    _fd_hr_pairs = locals().get('_fd_hr_pairs') or []
-    _hour_hr = {}
-    if _fd_hr_pairs:
-        _pairs_by_hour = {}
-        for _pair in _fd_hr_pairs:
-            _pairs_by_hour.setdefault(int(_pair[0] // 3600), []).append(_pair)
-        _hour_hr = {_h: _hr_min_avg_max(_p) for _h, _p in _pairs_by_hour.items()}
     for _hour in range(_detail_hours):
         _row = _hourly_stats.get(_hour, {})
-        if _fd_hr_pairs:
-            _hh = _hour_hr.get(_hour)
-            _mins = [_hh['min']] if _hh else []
-            _avgs = [_hh['avg']] if _hh else []
-            _maxs = [_hh['max']] if _hh else []
-        else:
-            _mins = _row.get('hr_min', [])
-            _avgs = _row.get('hr_avg', [])
-            _maxs = _row.get('hr_max', [])
         _ve_count = int(_row.get('ve', 0) or 0)
         _sve_count = int(_row.get('sve', 0) or 0)
         _detail_rows.append([
             _format_system_time(session_dir, _hour * 3600),
             str(_row.get('beats', 0)),
-            f"{min(_mins):.0f}" if _mins else '--',
-            f"{sum(_avgs) / len(_avgs):.0f}" if _avgs else '--',
-            f"{max(_maxs):.0f}" if _maxs else '--',
-            '0', '0', '0', '0', str(_ve_count),
+            str(_row.get('ve_single', 0)), str(_row.get('ve_couplet', 0)), str(_row.get('ve_triplet', 0)), str(_row.get('ve_run', 0)),
+            str(_row.get('ve_bigeminy', 0)), str(_row.get('ve_trigeminy', 0)), str(_ve_count),
             _snapshot_pct(_ve_count, _row.get('beats', 0)),
-            '0', '0', '0', '0', str(_sve_count),
+            str(_row.get('sve_single', 0)), str(_row.get('sve_couplet', 0)), str(_row.get('sve_triplet', 0)), str(_row.get('sve_run', 0)),
+            str(_row.get('sve_bigeminy', 0)), str(_row.get('sve_trigeminy', 0)), str(_sve_count),
             _snapshot_pct(_sve_count, _row.get('beats', 0)),
             str(_row.get('pauses', 0)),
         ])
-    # Keep the sheet visually filled like a clinical statistic form while
-    # retaining real rows at the top for the actual recording duration.
-    for _ in range(max(0, 24 - _detail_hours)):
-        _detail_rows.append([''] * 18)
-
     # Widened to use the full page width (was 169mm of the 180mm available
     # inside the 15mm margins) and given bigger font/padding so the hourly
     # grid reads clearly instead of looking cramped.
@@ -1726,29 +1747,29 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         # Fits the 180 mm frame; each column at least as wide as its header
         # in 7.5 pt bold plus the 3 pt side padding ("Couplets" 11.3 mm,
         # "Triplets" 9.6 mm, "Single" 7.9 mm were cut off at 8.5-9.6 mm).
-        colWidths=[14.5*mm, 9.5*mm, 7.5*mm, 7.5*mm, 7.5*mm,
-                   10.2*mm, 13.6*mm, 11.8*mm, 8.8*mm, 8.5*mm, 8.4*mm,
-                   10.2*mm, 13.6*mm, 11.8*mm, 8.8*mm, 8.5*mm, 8.4*mm, 10.8*mm],
+        colWidths=[16.0*mm, 9.0*mm,
+                   8.0*mm, 10.0*mm, 9.0*mm, 7.0*mm, 10.0*mm, 10.0*mm, 8.0*mm, 7.0*mm,
+                   8.0*mm, 10.0*mm, 9.0*mm, 7.0*mm, 10.0*mm, 10.0*mm, 8.0*mm, 7.0*mm, 10.0*mm],
         repeatRows=2,
     )
     _detail_table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 1), GRAY),
         ('TEXTCOLOR', (0, 0), (-1, 1), DARK),
         ('FONTNAME', (0, 0), (-1, 1), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 7.5),
+        ('FONTSIZE', (0, 0), (-1, 1), 6.2),
+        ('FONTSIZE', (0, 2), (-1, -1), 7.0),
         ('GRID', (0, 0), (-1, -1), 0.4, BORDER),
         ('SPAN', (0, 0), (0, 1)),
         ('SPAN', (1, 0), (1, 1)),
-        ('SPAN', (2, 0), (4, 0)),
-        ('SPAN', (5, 0), (10, 0)),
-        ('SPAN', (11, 0), (16, 0)),
-        ('SPAN', (17, 0), (17, 1)),
+        ('SPAN', (2, 0), (9, 0)),
+        ('SPAN', (10, 0), (17, 0)),
+        ('SPAN', (18, 0), (18, 1)),
         ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ('ROWBACKGROUNDS', (0, 2), (-1, -1), [colors.white, GRAY]),
-        ('PADDING', (0, 0), (-1, -1), 4.5),
-        ('LEFTPADDING', (0, 0), (-1, -1), 3),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 3),
+        ('PADDING', (0, 0), (-1, -1), 2.5),
+        ('LEFTPADDING', (0, 0), (-1, -1), 2),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 2),
     ]))
     story.append(Spacer(1, 4*mm))
     story.append(_detail_table)
