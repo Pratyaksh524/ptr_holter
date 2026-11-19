@@ -1648,16 +1648,28 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
 
     # Detailed hourly statistics sheet. This mirrors the reference Holter
     # statistic layout: HR min/average/max plus VE/SVE breakdown and pauses.
+    # Every hour's row comes from _new_hour_row, with every key the table
+    # reads. Was: two literal dicts without the VE / SVE pattern keys -- an
+    # hour with PVC / PAC beats but no live 5 s chunk (no live data at all:
+    # Dummy_72h, 2026-11-16_14-56-18; or an hour the live pass missed) got a
+    # row without 've_single', and its first PVC raised KeyError: the PDF
+    # failed and a .txt report was written instead.
+    _hour_count_keys = ['beats', 've', 'sve'] + [
+        _p + _k for _p in ('ve_', 'sve_')
+        for _k in ('single', 'couplet', 'triplet', 'run', 'bigeminy', 'trigeminy')]
+
+    def _new_hour_row():
+        _r = {_k: 0 for _k in _hour_count_keys}
+        _r.update({'hr_min': [], 'hr_avg': [], 'hr_max': [], 'pauses': 0})
+        return _r
+
     _hourly_stats = {}
     for _metric in _report_metrics:
         try:
             _hour = int(float(_metric.get('t', 0.0) or 0.0) // 3600)
         except (TypeError, ValueError):
             continue
-        _row = _hourly_stats.setdefault(_hour, {
-            'beats': 0, 'hr_min': [], 'hr_avg': [], 'hr_max': [],
-            've': 0, 'sve': 0, 'pauses': 0,
-        })
+        _row = _hourly_stats.setdefault(_hour, _new_hour_row())
         _row['beats'] += int(_metric.get('beat_count', _metric.get('n_beats', 0)) or 0)
         for _key, _field in (('hr_min', 'hr_min'), ('hr_avg', 'hr_mean'), ('hr_max', 'hr_max')):
             try:
@@ -1671,13 +1683,12 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         _row['pauses'] += int(_metric.get('pauses', 0) or 0)
 
     # Replace the legacy chunk beat/ectopy totals with the detector's
-    # timestamped whole-recording beats when available.  This is the same
-    # source used by the Full Disclosure strip and the overview VE/SVE rows.
+    # timestamped whole-recording beats when available -- the same beats as
+    # the overview VE/SVE rows (the Full Disclosure strip finds its own beats
+    # for its RR / HR numbers; the two counts can differ).
     if locals().get('_grid_beats_from_detector'):
         for _row in _hourly_stats.values():
-            _row['beats'] = _row['ve'] = _row['sve'] = 0
-            for _key in ('ve_single', 've_couplet', 've_triplet', 've_run', 've_bigeminy', 've_trigeminy',
-                         'sve_single', 'sve_couplet', 'sve_triplet', 'sve_run', 'sve_bigeminy', 'sve_trigeminy'):
+            for _key in _hour_count_keys:
                 _row[_key] = 0
         _prev_detector_code = None
         for _b in _grid_beats:
@@ -1686,10 +1697,7 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
             except (TypeError, ValueError):
                 continue
             _hour = int(_ts // 3600)
-            _row = _hourly_stats.setdefault(_hour, {
-                'beats': 0, 'hr_min': [], 'hr_avg': [], 'hr_max': [],
-                've': 0, 'sve': 0, 'pauses': 0,
-            })
+            _row = _hourly_stats.setdefault(_hour, _new_hour_row())
             _row['beats'] += 1
             _code = str(_b.get('short_code', '') or '')
             if _code == 'V':
@@ -1715,7 +1723,7 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
             _prev_detector_code = _code
 
     _detail_rows = [[
-        'Hourly time', 'Beats',
+        'Hourly\ntime', 'Beats',
         'VE premature', '', '', '', '', '', '', '',
         'SVE premature', '', '', '', '', '', '', '', 'Pause\n(>2.0s)'
     ], [
@@ -1724,12 +1732,51 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         'Single', 'Couplets', 'Triplets', 'Runs', 'Bigeminy', 'Trigeminy', 'Total', '%', ''
     ]]
     _detail_hours = max(1, int(np.ceil(float(summary.get('duration_sec', 0) or 0) / 3600.0)))
+    # One row per hour of the recording: row k starts k hours after the
+    # recording start (the Full Disclosure strip's first second), up to the
+    # hour the recording ends in. An hour without beats (no data there:
+    # leads off, no signal) shows its time and blank cells -- was a row of
+    # zeros, read as "data, nothing found".
+    # The start is the recording index's (as every other report time); a
+    # recording without recording_index.json takes the .ecgh header's -- the
+    # strip's own start -- not elapsed time ("00:00:00", 2026-11-04_11-08-19).
+    _hour_start = _report_recording_start_time(session_dir)
+    if not _hour_start:
+        try:
+            from .file_format import ECGHFileReader
+            _hour_rd = ECGHFileReader(os.path.join(session_dir, 'recording.ecgh'))
+            try:
+                _hour_start = float(_hour_rd.start_time) or None
+            finally:
+                _hour_rd.close()
+        except Exception:
+            _hour_start = None
+
+    # The last row's hour usually ends early, at the recording's end: it then
+    # shows "start -" over its end time (as Full Disclosure's "Recording:
+    # 12:01:08 - 13:27:59": start + duration), so the time its beats cover
+    # is on the row. A full hour shows its start only.
+    _rec_duration = float(summary.get('duration_sec', 0) or 0)
+
+    def _hour_label(_h):
+        def _clock(_sec):
+            if _hour_start:
+                return datetime.fromtimestamp(_hour_start + _sec).strftime('%H:%M:%S')
+            return _format_system_time(session_dir, _sec)
+        _label = _clock(_h * 3600)
+        if 0 < _rec_duration < (_h + 1) * 3600:
+            _label += ' -\n' + _clock(_rec_duration)
+        return _label
+
     for _hour in range(_detail_hours):
         _row = _hourly_stats.get(_hour, {})
+        if not int(_row.get('beats', 0) or 0):
+            _detail_rows.append([_hour_label(_hour)] + [''] * 18)
+            continue
         _ve_count = int(_row.get('ve', 0) or 0)
         _sve_count = int(_row.get('sve', 0) or 0)
         _detail_rows.append([
-            _format_system_time(session_dir, _hour * 3600),
+            _hour_label(_hour),
             str(_row.get('beats', 0)),
             str(_row.get('ve_single', 0)), str(_row.get('ve_couplet', 0)), str(_row.get('ve_triplet', 0)), str(_row.get('ve_run', 0)),
             str(_row.get('ve_bigeminy', 0)), str(_row.get('ve_trigeminy', 0)), str(_ve_count),
@@ -1744,12 +1791,16 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     # grid reads clearly instead of looking cramped.
     _detail_table = Table(
         _detail_rows,
-        # Fits the 180 mm frame; each column at least as wide as its header
-        # in 7.5 pt bold plus the 3 pt side padding ("Couplets" 11.3 mm,
-        # "Triplets" 9.6 mm, "Single" 7.9 mm were cut off at 8.5-9.6 mm).
-        colWidths=[16.0*mm, 9.0*mm,
-                   8.0*mm, 10.0*mm, 9.0*mm, 7.0*mm, 10.0*mm, 10.0*mm, 8.0*mm, 7.0*mm,
-                   8.0*mm, 10.0*mm, 9.0*mm, 7.0*mm, 10.0*mm, 10.0*mm, 8.0*mm, 7.0*mm, 10.0*mm],
+        # The whole 180 mm frame: each column is its widest text (header in
+        # 6.2 pt bold, value in 7 pt; the time column's "13:01:08 -" of a
+        # last, partial hour) plus the 1.5 pt side padding, and the 10.8 mm
+        # left over shared equally -- every text has ~0.8 mm clear on each
+        # side. Was 173 mm with "Couplets", "Triplets", "Bigeminy",
+        # "Trigeminy" wider than their columns ("BigeminyTrigeminy" ran
+        # together). 19 columns at a bigger font do not fit a portrait page.
+        colWidths=[12.7*mm, 8.5*mm,
+                   8.2*mm, 11.0*mm, 9.5*mm, 7.1*mm, 11.5*mm, 12.1*mm, 7.1*mm, 8.6*mm,
+                   8.2*mm, 11.0*mm, 9.5*mm, 7.1*mm, 11.5*mm, 12.1*mm, 7.1*mm, 8.6*mm, 8.6*mm],
         repeatRows=2,
     )
     _detail_table.setStyle(TableStyle([
@@ -1768,8 +1819,8 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ('ROWBACKGROUNDS', (0, 2), (-1, -1), [colors.white, GRAY]),
         ('PADDING', (0, 0), (-1, -1), 2.5),
-        ('LEFTPADDING', (0, 0), (-1, -1), 2),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 2),
+        ('LEFTPADDING', (0, 0), (-1, -1), 1.5),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 1.5),
     ]))
     story.append(Spacer(1, 4*mm))
     story.append(_detail_table)
