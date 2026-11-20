@@ -63,24 +63,33 @@ def _savgol_11_3(x: np.ndarray) -> np.ndarray:
 # Detection takes ~50s on a 23-minute recording and was being run again by
 # every caller (AF panel on load, Full Disclosure on open, report). Results
 # are cached in memory for this process and on disk next to the recording,
-# keyed on the recording file's size/mtime and a hash of the ecg package's
-# source, so any change to the recording or to detection code recomputes.
+# keyed on the recording file's size/mtime and a hash of the detection code,
+# so any change to the recording or to detection code recomputes.
 _CACHE_FILENAME = 'auto_segments_cache.json'
 _memory_cache: Dict[str, List[Dict[str, Any]]] = {}
 _code_fingerprint_value: Optional[str] = None
 
 
 def _code_fingerprint() -> str:
-    """Hash of every .py file of the ecg package (cache_fingerprint.
-    ecg_tree_fingerprint). A frozen build has no .py files: there it is the
-    hash of the sources the build was made from, shipped with it
-    (cache_fingerprint.frozen_build_fingerprint), so a closed and reopened
-    exe reuses the saved result. '' when neither can be read: the disk cache
-    is then skipped, since nothing would say whether a saved result is stale."""
+    """Hash of the code the auto segments and the PVC / PAC beats depend on:
+    this file and ectopic_beats_detector.py and every ecg file they import,
+    lazy imports included (cache_fingerprint.code_fingerprint; 24 of the 81
+    files on 2026-11-19 -- no report, UI or panel file). Was the hash of
+    every .py file of the package (ecg_tree_fingerprint): a change to the
+    report or the UI threw these results away and every recording was
+    analysed again on its next opening (~7 min for 87 min of recording).
+    A frozen build has no .py files: there it is the hash of the sources the
+    build was made from, shipped with it (cache_fingerprint.
+    frozen_build_fingerprint), so a closed and reopened exe reuses the saved
+    result. '' when neither can be read: the disk cache is then skipped,
+    since nothing would say whether a saved result is stale."""
     global _code_fingerprint_value
     if _code_fingerprint_value is None:
-        from .cache_fingerprint import ecg_tree_fingerprint, frozen_build_fingerprint
-        _code_fingerprint_value = ecg_tree_fingerprint() or frozen_build_fingerprint()
+        from .cache_fingerprint import code_fingerprint
+        here = os.path.dirname(os.path.abspath(__file__))
+        _code_fingerprint_value = code_fingerprint([
+            os.path.join(here, 'auto_segment_arrthymia_detection.py'),
+            os.path.join(here, 'ectopic_beats_detector.py')])
     return _code_fingerprint_value
 
 

@@ -44,6 +44,7 @@ from ..holter_helpers import (
 )
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas
+from ..recording_analysis import is_analysed
 
 # 10. HOLTER RECORDINGS PANEL
 class HolterRecordManagementPanel(QWidget):
@@ -142,7 +143,10 @@ class HolterRecordManagementPanel(QWidget):
             actions.addWidget(btn)
         layout.addWidget(toolbar)
 
-        cols = ["Name","Age","Gender","Record Time","Duration","Channel","Import Time","Status","Reporter","Conclusion"]
+        # "Analysis": whether every analysis of the recording is saved
+        # (recording_analysis.is_analysed) -- a new live recording or an
+        # imported one is "Not analyzed" until the user opens it and says Yes.
+        cols = ["Record Name","Age","Gender","Record Time","Duration","Channel","Import Time","Recording Status","Analysis","Reporter","Conclusion"]
         self._table = QTableWidget(0, len(cols))
         self._table.setHorizontalHeaderLabels(cols)
         header = self._table.horizontalHeader()
@@ -150,7 +154,7 @@ class HolterRecordManagementPanel(QWidget):
         header.setHighlightSections(False)
         header.setFixedHeight(36)
         # Name and Conclusion take the free width; the short columns stay compact.
-        _fixed_widths = {1: 60, 2: 80, 3: 160, 4: 100, 5: 72, 6: 160, 7: 120, 8: 96}
+        _fixed_widths = {1: 60, 2: 80, 3: 160, 4: 100, 5: 72, 6: 160, 7: 120, 8: 140, 9: 96}
         for col in range(len(cols)):
             if col in _fixed_widths:
                 header.setSectionResizeMode(col, QHeaderView.Fixed)
@@ -300,7 +304,8 @@ class HolterRecordManagementPanel(QWidget):
             except Exception:
                 pass
 
-            row_values = [p_name, age, gender, rec_time, dur_str, "12", rec_time, "Completed", "System", "-"]
+            analysis = "Analyzed" if is_analysed(session_dir) else "Not analyzed"
+            row_values = [p_name, age, gender, rec_time, dur_str, "12", rec_time, "Completed", analysis, "System", "-"]
             if query and not any(query in str(v).lower() for v in row_values): continue
             rows.append((row_values, session_dir))
 
@@ -352,14 +357,17 @@ class HolterRecordManagementPanel(QWidget):
             if value.strip().lower() in ("", "unknown"):
                 return "Unknown patient", UI_MUTED, False, False
             return value, COL_GREEN, True, False
-        if col in (1, 2, 9) and empty:  # Age, Gender, Conclusion not filled in
+        if col in (1, 2, 10) and empty:  # Age, Gender, Conclusion not filled in
             return "—", "#5F708A", False, False
         if col == 4 and empty:  # Duration unknown
             return "—", "#5F708A", False, False
         if col == 7:  # Status
             ok = value.strip().lower() == "completed"
             return f"●  {value}", UI_SUCCESS if ok else UI_WARNING, True, False
-        if col == 8:  # Reporter
+        if col == 8:  # Analysis
+            ok = value.strip().lower() == "analyzed"
+            return f"●  {value}", UI_SUCCESS if ok else UI_WARNING, True, False
+        if col == 9:  # Reporter
             return value, UI_MUTED, False, False
         return value, UI_TEXT, False, False
 
@@ -547,7 +555,20 @@ class HolterRecordManagementPanel(QWidget):
             return
         shutil.copytree(src, dest)
         self.refresh_records()
-        self.session_selected.emit(dest)
+        # Not opened: the imported recording stays in the list, "Not
+        # analyzed" until the user double-clicks it and agrees to analyse it
+        # (was session_selected.emit(dest): it opened straight away).
+        self._select_session_row(dest)
+
+    def _select_session_row(self, session_dir: str):
+        """Select (and scroll to) the row of `session_dir`, when it is listed."""
+        for r in range(self._table.rowCount()):
+            item = self._table.item(r, 0)
+            if item and os.path.normpath(item.data(Qt.UserRole) or "") == os.path.normpath(session_dir):
+                self._table.selectRow(r)
+                self._table.scrollToItem(item)
+                self._sync_selected_session()
+                return
 
     def _export_session(self):
         src = self._selected_path()

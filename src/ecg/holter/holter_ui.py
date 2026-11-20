@@ -1419,7 +1419,7 @@ class HolterMainWindow(QDialog):
         if session_path and os.path.isdir(session_path):
             if os.path.normpath(session_path) != os.path.normpath(self.session_dir or ""):
                 try:
-                    self.load_completed_session(session_path)
+                    self._open_recording(session_path)
                 except Exception:
                     import traceback
                     traceback.print_exc()
@@ -2192,7 +2192,8 @@ class HolterMainWindow(QDialog):
         self._record_mgmt_panel = HolterRecordManagementPanel(
             output_dir=_resolve_recordings_dir(self.session_dir)
         )
-        self._record_mgmt_panel.session_selected.connect(self.load_completed_session)
+        # double-click and Import open through the analysis popup
+        self._record_mgmt_panel.session_selected.connect(self._open_recording)
         if self.session_dir:
             self._record_mgmt_panel.set_active_session(self.session_dir)
         _recordings_tab_idx = self._tabs.addTab(self._record_mgmt_panel, _make_icon("RECORDINGS"), "RECORDINGS")
@@ -2702,7 +2703,53 @@ class HolterMainWindow(QDialog):
 
             QMessageBox.information(self, "Recording Complete",
                                     f"Comprehensive ECG Analysis recording saved to:\n{summary.get('session_dir', '')}")
-            self.load_completed_session(summary.get('session_dir', ''), summary.get('patient_info', {}))
+            # not opened: it waits in the recordings list, "Not analyzed"
+            self._show_new_recording_in_list(summary.get('session_dir', ''))
+
+    def _open_recording(self, session_dir: str, patient_info: dict = None):
+        """Open a recording the user picked (recordings list double-click,
+        View). Analysed (recording_analysis.is_analysed) -> it opens. Not
+        analysed -> "This recording is not analyzed. Would you like to
+        analyse it?": Yes runs every analysis ("Analysing recording... N%"
+        popup) and then opens it; No leaves the user on the recordings list.
+        Was load_completed_session straight away: the analyses then started
+        on background threads, and a report preview opened meanwhile ran them
+        all a second time."""
+        from .recording_analysis import is_analysed, open_when_analysed
+        if not session_dir:
+            return
+
+        def open_it():
+            self.load_completed_session(session_dir, patient_info)
+            panel = self._recordings_panel()
+            if panel is not None:
+                panel.refresh_records()          # its Analysis column now reads "Analyzed"
+
+        if is_analysed(session_dir):
+            open_it()
+            return
+        answer = _show_message_box(
+            self, QMessageBox.Question, "Recording not analyzed",
+            "This recording is not analyzed.\nWould you like to analyse it?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer != QMessageBox.Yes:
+            self._focus_tab("RECORDINGS")
+            return
+        open_when_analysed(self, session_dir, open_it)
+
+    def _show_new_recording_in_list(self, session_dir: str):
+        """A recording that has just been saved (live recording stopped) is
+        shown in the recordings list, selected and "Not analyzed" -- not
+        opened: the user opens it by double-click and decides there whether
+        to analyse it (_open_recording)."""
+        panel = self._recordings_panel()
+        if panel is None:
+            return
+        panel.output_dir = _resolve_recordings_dir(session_dir)
+        panel.refresh_records()
+        if hasattr(panel, '_select_session_row'):
+            panel._select_session_row(session_dir)
+        self._focus_tab("RECORDINGS")
 
     def _build_report_preview(self):
         """PREVIEW tab asked for a preview: build the same PDF as Generate
