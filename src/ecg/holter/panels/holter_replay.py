@@ -177,7 +177,7 @@ class HolterReplayPanel(QWidget):
         lorenz_filter_row.setSpacing(4)
         lorenz_filter_row.setContentsMargins(0, 4, 0, 4)
         self._lorenz_class_btns = {}
-        for key, lbl in [("all", "All"), ("N", "N"), ("S", "S"), ("V", "V"), ("P", "P"), ("AF", "AF"), ("X", "X"), ("Other", "Other")]:
+        for key, lbl in [("all", "All"), ("N", "N"), ("S", "S"), ("V", "V"), ("P", "P"), ("AF", "AF"), ("X", "X"), ("U", "Unidentified")]:
             b = QPushButton(lbl)
             b.setCheckable(True)
             b.setToolTip(f"Show {lbl} beats" if key != "all" else "Show all beats")
@@ -1006,9 +1006,16 @@ class HolterReplayPanel(QWidget):
             t = self._replay_engine.seek_to_event(ev_type, direction)
             self.seek_requested.emit(t)
 
-    def update_lorenz(self, metrics_list: list):
-        """Update the Lorenz/scatter plot from all individual RR data."""
+    def update_lorenz(self, metrics_list: list, session_dir: str = None):
+        """Update the Lorenz/scatter plot. Points and their classes come from
+        the recording's saved PVC / PAC beats and auto segments
+        (lorenz_beats: one point per beat, paired with the real next beat,
+        classes N / S / V / P / AF / X / U / Other); the live chunks' RRs
+        below are kept for the overview table, and for the plot only when
+        those results are not saved."""
         self._last_metrics_list = list(metrics_list or [])
+        if session_dir is not None:
+            self._lorenz_session_dir = session_dir
         rr_all = []
         rr_points = []
         for m in metrics_list:
@@ -1052,7 +1059,22 @@ class HolterReplayPanel(QWidget):
         filtered_classes = [p[2] for p in filtered_points if p[1] > 200]
         plot_rr = filtered_rr if len(filtered_rr) >= 2 else rr_n
         plot_classes = filtered_classes if len(filtered_rr) >= 2 else rr_n_classes
-        if len(plot_rr) >= 2:
+        from ..lorenz_beats import lorenz_points, plot_data
+        beat_points = lorenz_points(getattr(self, '_lorenz_session_dir', None))
+        if beat_points is not None:
+            xs, ys, classes, pts, rng, empty_text = plot_data(beat_points, self._class_filter)
+            if xs:
+                self._lorenz_canvas.set_data(xs, ys, x_range=rng, y_range=rng, beat_classes=classes,
+                                             rr_points=pts)
+            else:
+                self._lorenz_canvas.set_data([], [], rr_points=[], empty_text=empty_text)
+            # the RR / HR trend shows the same beats as the plot
+            filtered_points = [(p[0], p[1], p[2]) for p in pts]
+            rr_points = filtered_points
+            plot_rr = []
+        if beat_points is not None:
+            pass      # plotted above
+        elif len(plot_rr) >= 2:
             rr_x = plot_rr[:-1]
             rr_y = plot_rr[1:]
             plot_beat_classes = plot_classes[:-1]  # use the first beat's class for each point

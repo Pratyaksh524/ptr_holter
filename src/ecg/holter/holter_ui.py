@@ -2099,7 +2099,7 @@ class HolterMainWindow(QDialog):
             self._replay_panel.seek_requested.connect(self._on_seek_requested)
         self._replay_panel.section_requested.connect(self._on_workspace_section_requested)
         self._replay_panel.playback_state_changed.connect(self._set_record_browser_enabled)
-        self._replay_panel.update_lorenz(self._metrics_list)
+        self._replay_panel.update_lorenz(self._metrics_list, session_dir=self.session_dir)
         self._replay_panel.update_summary(self._summary)
         self._tabs.addTab(self._replay_panel, _make_icon("REPLAY"), "REPLAY")
         self._lorenz_panel = self._replay_panel
@@ -2123,7 +2123,7 @@ class HolterMainWindow(QDialog):
 
         # Lorenz
         self._lorenz_tab_panel = HolterLorenzPanel(replay_engine=self._replay_engine)
-        self._lorenz_tab_panel.update_from_metrics(self._metrics_list)
+        self._lorenz_tab_panel.update_from_metrics(self._metrics_list, session_dir=self.session_dir)
         self._lorenz_tab_panel.seek_requested.connect(self._on_seek_requested)
         self._tabs.addTab(self._lorenz_tab_panel, _make_icon("LORENZ"), "LORENZ")
 
@@ -2563,7 +2563,7 @@ class HolterMainWindow(QDialog):
         if hasattr(self, '_hrv_panel'):
             self._hrv_panel.update_hrv(self._metrics_list, self._summary)
         if hasattr(self, '_replay_panel'):
-            self._replay_panel.update_lorenz(self._metrics_list)
+            self._replay_panel.update_lorenz(self._metrics_list, session_dir=self.session_dir)
             self._replay_panel.update_summary(self._summary)
             # During live recording (no replay engine), push current live ECG frame
             if not self._replay_engine and self._live_source is not None:
@@ -2583,7 +2583,7 @@ class HolterMainWindow(QDialog):
         if hasattr(self, '_hist_panel'):
             self._hist_panel.update_from_metrics(self._metrics_list)
         if hasattr(self, '_lorenz_tab_panel'):
-            self._lorenz_tab_panel.update_from_metrics(self._metrics_list)
+            self._lorenz_tab_panel.update_from_metrics(self._metrics_list, session_dir=self.session_dir)
         if hasattr(self, '_af_panel'):
             if self._replay_engine:
                 try:

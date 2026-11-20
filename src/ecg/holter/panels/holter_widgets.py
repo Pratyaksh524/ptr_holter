@@ -772,7 +772,12 @@ class LorenzCanvas(QWidget):
         self.setContextMenuPolicy(Qt.DefaultContextMenu)
 
     # ---------------------------------------------------------------- data
-    def set_data(self, x, y, x_range=None, y_range=None, beat_classes=None, rr_points=None):
+    def set_data(self, x, y, x_range=None, y_range=None, beat_classes=None, rr_points=None,
+                 empty_text=None):
+        """`empty_text`: what an empty plot says (e.g. "No ventricular
+        beats" for a filter with no beat of its class); "No RR data" when
+        not given."""
+        self._empty_text = empty_text or "No RR data"
         self._x = list(x)
         self._y = list(y)
         self._beat_classes = list(beat_classes) if beat_classes is not None else []
@@ -872,7 +877,8 @@ class LorenzCanvas(QWidget):
         attr_menu.setEnabled(has_sel)
         for cls_label, cls_code in [("Normal (N)", "N"), ("Supraventricular (S)", "S"),
                                     ("Ventricular (V)", "V"), ("Paced (P)", "P"),
-                                    ("AF / AFl", "AF"), ("Other", "Other"), ("Artifact (X)", "X")]:
+                                    ("AF / AFl", "AF"), ("Other", "Other"), ("Artifact (X)", "X"),
+                                    ("Unidentified (U)", "U")]:
             a = attr_menu.addAction(cls_label)
             a.triggered.connect(lambda checked=False, c=cls_code: self._reclassify(c))
 
@@ -1048,7 +1054,7 @@ class LorenzCanvas(QWidget):
 
         if not self._x or not self._y:
             painter.setPen(QPen(QColor(COL_GREEN_DRK)))
-            painter.drawText(self.rect(), Qt.AlignCenter, "No RR data")
+            painter.drawText(self.rect(), Qt.AlignCenter, getattr(self, "_empty_text", "No RR data"))
             painter.end()
             return
 
@@ -1127,12 +1133,16 @@ class LorenzCanvas(QWidget):
             "P":     QColor(0, 229, 255, 255),
             "AF":    QColor(255, 215, 0, 255),
             "X":     QColor(136, 136, 136, 255),
-            "Other": QColor(0, 210, 21, 255),
+            "U":     QColor(200, 120, 255, 255),     # Unidentified (noise)
+            # its own colour: as green as N, "Other" read as normal beats
+            "Other": QColor(255, 255, 255, 255),
         }
         xs, ys = self._get_plot_xy()
         r = self._pixel_size
         for i, (xv, yv) in enumerate(zip(xs, ys)):
-            beat_class = self._beat_classes[i] if i < len(self._beat_classes) else "Other"
+            # A plot given no classes (the OVERVIEW scatter) stays all green,
+            # as before "Other" got its own colour: no class is not "Other".
+            beat_class = self._beat_classes[i] if i < len(self._beat_classes) else "N"
             color = color_map.get(beat_class, color_map["Other"])
             px, py = to_px(xv, yv)
             if i in self._selected_indices:
@@ -1218,7 +1228,9 @@ class LorenzCanvas(QWidget):
             "N": QColor(0, 210, 21, 220), "S": QColor(255, 51, 51, 220),
             "V": QColor(255, 153, 0, 220), "P": QColor(0, 229, 255, 220),
             "AF": QColor(255, 215, 0, 220), "X": QColor(136, 136, 136, 220),
-            "Other": QColor(0, 210, 21, 220),
+            "U": QColor(200, 120, 255, 220),
+            # its own colour: as green as N, "Other" read as normal beats
+            "Other": QColor(255, 255, 255, 220),
         }
 
         for seg_idx, seg in enumerate(segments):

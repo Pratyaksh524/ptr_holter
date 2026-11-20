@@ -106,7 +106,7 @@ class HolterLorenzPanel(QWidget):
             ("P", "P"),
             ("AF", "AF"),
             ("X", "X"),
-            ("Other", "Other"),
+            ("U", "Unidentified"),
         ]:
             btn = QPushButton(lbl)
             btn.setCheckable(True)
@@ -246,10 +246,17 @@ class HolterLorenzPanel(QWidget):
             self._fit_to_height()
         return super().eventFilter(obj, event)
 
-    def update_from_metrics(self, metrics_list, duration_sec=None):
+    def update_from_metrics(self, metrics_list, duration_sec=None, session_dir=None):
+        """Points and classes from the recording's saved PVC / PAC beats and
+        auto segments (lorenz_beats, as the REPLAY Lorenz); the live chunks'
+        RRs below only when those results are not saved."""
         self._metrics_list = list(metrics_list or [])
         if duration_sec:
             self.duration_sec = duration_sec
+        if session_dir is not None:
+            self._lorenz_session_dir = session_dir
+        from ..lorenz_beats import lorenz_points
+        self._beat_points = lorenz_points(getattr(self, '_lorenz_session_dir', None))
             
         pts = []
         rr_all = []
@@ -294,7 +301,10 @@ class HolterLorenzPanel(QWidget):
         start_epoch = None
         if self._metrics_list:
             start_epoch = self._metrics_list[0].get('timestamp')
-            
+
+        if self._beat_points is not None:
+            # the trend shows the same beats as the plot
+            pts = [(p[0], p[1]) for p in self._beat_points]
         self.rr_trend_canvas.set_points(pts, start_epoch)
         self._pts = pts
         self._rr_all = rr_all
@@ -314,6 +324,17 @@ class HolterLorenzPanel(QWidget):
         rr_all = getattr(self, "_rr_all", [])
         rr_classes = getattr(self, "_rr_classes", [])
         filt = getattr(self, "_current_filter", "all")
+
+        beat_points = getattr(self, "_beat_points", None)
+        if beat_points is not None:
+            from ..lorenz_beats import plot_data
+            xs, ys, classes, points, rng, empty_text = plot_data(beat_points, filt)
+            if xs:
+                self.lorenz_canvas.set_data(xs, ys, x_range=rng, y_range=rng,
+                                            beat_classes=classes, rr_points=points)
+            else:
+                self.lorenz_canvas.set_data([], [], rr_points=[], empty_text=empty_text)
+            return
 
         if not rr_all:
             self.lorenz_canvas.set_data([], [])
