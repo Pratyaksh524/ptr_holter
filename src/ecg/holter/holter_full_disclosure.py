@@ -42,11 +42,17 @@ try:
                         TOOL_RULER, TOOL_CALIPER, TOOL_MAGNIFY, TOOL_SELECT)
     from .holter_ui import ECGStripCanvas, MagnifierOverlay
     from .panels.holter_widgets import apply_artifact_wiggle_from_recording, StableBeatTimes
+    from .auto_segment_edits import (LABEL_GROUPS, LABEL_COLORS, apply_auto_segments_with_edits,
+                                     apply_edits_to_segments, edited_segments_for, load_edits,
+                                     save_edits, set_label)
 except ImportError:
     from ecg.holter.theme import (COL_BLACK, COL_DARK, COL_GREEN, COL_GREEN_DRK, COL_WHITE, COL_GRID_MAJOR, COL_GRID_MINOR,
                                    TOOL_RULER, TOOL_CALIPER, TOOL_MAGNIFY, TOOL_SELECT)
     from ecg.holter.holter_ui import ECGStripCanvas, MagnifierOverlay
     from ecg.holter.panels.holter_widgets import apply_artifact_wiggle_from_recording, StableBeatTimes
+    from ecg.holter.auto_segment_edits import (LABEL_GROUPS, LABEL_COLORS, apply_auto_segments_with_edits,
+                                               apply_edits_to_segments, edited_segments_for, load_edits,
+                                               save_edits, set_label)
 
 try:
     from utils.settings_manager import SettingsManager
@@ -316,6 +322,12 @@ class SegmentOverlay(QWidget):
         self._drag_start_x = None
         self._drag_end_x   = None
         self._segments     = []   # list of {start_x, end_x, start_sec, end_sec, label, color, start_time_str, end_time_str}
+        # Where the last paint drew each auto segment's label and its menu
+        # arrow (overlay = canvas frame coordinates): [{'label_rect',
+        # 'arrow_rect', 'seg'}] -- HolterFullDisclosureDialog.eventFilter
+        # hit-tests clicks (the arrow opens the relabel menu) and tooltips
+        # against them, since this overlay lets the mouse through.
+        self._label_hits   = []
 
     def set_drag(self, start_x, end_x):
         self._drag_start_x = start_x
@@ -327,15 +339,19 @@ class SegmentOverlay(QWidget):
         self._drag_end_x   = None
         self.update()
 
-    def add_segment(self, start_x, end_x, start_sec, end_sec, label, color, start_time_str='', end_time_str='', auto=False, true_mid_x=None, layer=0):
+    def add_segment(self, start_x, end_x, start_sec, end_sec, label, color, start_time_str='', end_time_str='', auto=False, true_mid_x=None, layer=0,
+                    edited=False, original_label=''):
         # layer: text row for this segment's label/times. Rhythm segments use
         # row 0; bundle branch blocks (drawn alongside a rhythm over the same
         # time) use row 1, above row 0, so the two sets of text never overlap.
+        # edited / original_label: an auto segment whose label a doctor
+        # changed (auto_segment_edits) -- dashed border, pencil mark.
         self._segments.append({
             'start_x': start_x, 'end_x': end_x,
             'start_sec': start_sec, 'end_sec': end_sec, 'auto': bool(auto),
             'label': label, 'color': color, 'start_time_str': start_time_str, 'end_time_str': end_time_str,
             'true_mid_x': true_mid_x, 'layer': int(layer),
+            'edited': bool(edited), 'original_label': original_label or '',
         })
         self.update()
 
@@ -363,6 +379,8 @@ class SegmentOverlay(QWidget):
                 painter.setPen(QPen(QColor("#FFFFFF"), 1, Qt.DashLine))
                 painter.drawRect(x1, 0, x2 - x1, h - 1)
 
+        self._label_hits = []
+
         # 2. Finalized labeled segments
         # Drawn in left-to-right pixel order (not insertion order) so the
         # collision guard below -- which only ever looks at the PREVIOUS
@@ -385,9 +403,11 @@ class SegmentOverlay(QWidget):
             except Exception:
                 c = QColor("#FFFF00")
             is_auto = bool(seg.get('auto', False))
+            is_edited = is_auto and bool(seg.get('edited', False))
             painter.fillRect(sx, 0, ex - sx, h,
                              QColor(c.red(), c.green(), c.blue(), 38 if is_auto else 55))
-            painter.setPen(QPen(c, 1, Qt.SolidLine))
+            # a doctor's relabel: dashed border (the machine's own: solid)
+            painter.setPen(QPen(c, 1, Qt.DashLine if is_edited else Qt.SolidLine))
             painter.drawRect(sx, 0, ex - sx, h - 1)
 
             # Prefer the segment's true time-midpoint (see
@@ -397,6 +417,8 @@ class SegmentOverlay(QWidget):
             true_mid_x = seg.get('true_mid_x')
             mid_x = true_mid_x if true_mid_x is not None else (sx + ex) // 2
             lbl = seg.get('label', '')
+            if is_edited:
+                lbl = lbl + " ✎"        # pencil: changed by the doctor
             start_sec = seg.get('start_sec', 0)
             end_sec = seg.get('end_sec', 0)
             start_time_str = seg.get('start_time_str', '')
@@ -423,7 +445,10 @@ class SegmentOverlay(QWidget):
             time_w = painter.fontMetrics().horizontalAdvance(time_str) if time_str else 0
 
             spacer_w = 4 if time_str else 0
-            total_w = lbl_w + spacer_w + time_w
+            # an auto segment's label ends with a small down arrow: the
+            # relabel menu (HolterFullDisclosureDialog._show_relabel_menu)
+            arrow_w = 12 if is_auto else 0
+            total_w = lbl_w + spacer_w + time_w + (4 + arrow_w if arrow_w else 0)
 
             # The label always draws -- never hidden. It used to be hidden
             # whenever it didn't fit the segment's pixel width or would
@@ -470,6 +495,25 @@ class SegmentOverlay(QWidget):
                 painter.setFont(t_font)
                 painter.setPen(QPen(QColor("#FFFFFF")))
                 painter.drawText(start_text_x + lbl_w + spacer_w, text_y, time_str)
+
+            if arrow_w:
+                ax = start_text_x + lbl_w + spacer_w + time_w + 4
+                arrow_rect = QRect(ax, text_y - 10, arrow_w, 12)
+                painter.setPen(QPen(QColor(255, 255, 255, 140), 1))
+                painter.setBrush(QColor(0, 0, 0, 120))
+                painter.drawRoundedRect(arrow_rect, 2, 2)
+                from PyQt5.QtCore import QPointF
+                from PyQt5.QtGui import QPolygonF
+                cx, cy = arrow_rect.center().x() + 0.5, arrow_rect.center().y() + 1.0
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor("#FFFFFF"))
+                painter.drawPolygon(QPolygonF([QPointF(cx - 3.5, cy - 2), QPointF(cx + 3.5, cy - 2), QPointF(cx, cy + 2.5)]))
+                painter.setBrush(Qt.NoBrush)
+                self._label_hits.append({
+                    'label_rect': QRect(start_text_x, text_y - 12, total_w, 16),
+                    'arrow_rect': arrow_rect.adjusted(-3, -3, 3, 3),
+                    'seg': seg,
+                })
 
             last_label_right_edges[layer] = start_text_x + total_w
 
@@ -808,7 +852,7 @@ class HolterFullDisclosureDialog(QDialog):
             cached = get_cached_detection(reader_path) if reader_path else None
             if cached is not None or not reader_path:
                 self._snapshot_state("Auto Arrhythmia Detection")
-                added = apply_auto_segments_to_engine(self._engine, segments=cached)
+                added = apply_auto_segments_with_edits(self._engine, segments=cached)
                 if added is not None:
                     print(f"[Full Disclosure] Added {added} automatic rhythm regions.")
                 self._auto_marking_visible = True
@@ -845,7 +889,7 @@ class HolterFullDisclosureDialog(QDialog):
         try:
             from .auto_segment_arrthymia_detection import apply_auto_segments_to_engine
             self._snapshot_state("Auto Arrhythmia Detection")
-            added = apply_auto_segments_to_engine(self._engine, segments=segments)
+            added = apply_auto_segments_with_edits(self._engine, segments=segments)
             if added is not None:
                 print(f"[Full Disclosure] Added {added} automatic rhythm regions.")
         except Exception as e:
@@ -908,6 +952,10 @@ class HolterFullDisclosureDialog(QDialog):
         RR / HR numbers inside them, and repaint. Display only -- nothing
         here touches auto-marking, the segment overlay or the events."""
         spans = []
+        try:   # a doctor's relabel to / from VFib moves where the numbers hide
+            segments = apply_edits_to_segments(segments, os.path.dirname(self._engine.ecgh_path))
+        except Exception:
+            pass
         for seg in segments or []:
             if str(seg.get('label', '')) == 'Ventricular Fibrillation':
                 try:
@@ -976,7 +1024,7 @@ class HolterFullDisclosureDialog(QDialog):
                 # self._engine._structured_events from earlier in this same
                 # app run (if any) is still shown; otherwise the user can
                 # just click the button again to redo detection.
-                added = apply_auto_segments_to_engine(self._engine, segments=cached)
+                added = apply_auto_segments_with_edits(self._engine, segments=cached)
                 if added is not None:
                     print(f"[Full Disclosure] Restored {added} automatic rhythm regions from a prior session.")
             # If any auto segments were deleted in this session, keep them deleted
@@ -1675,6 +1723,26 @@ class HolterFullDisclosureDialog(QDialog):
             return super().eventFilter(obj, event)
         
         # ----------------------------------------------------------------
+        # AUTO SEGMENT LABEL: its small arrow opens the relabel menu;
+        # hovering the label shows its times and whether a doctor changed
+        # it. Hit-tested against where the overlay last drew them (the
+        # overlay itself lets the mouse through to the strips).
+        # ----------------------------------------------------------------
+        if event.type() in (QEvent.MouseButtonPress, QEvent.ToolTip) and hasattr(self, '_segment_overlay'):
+            pos = obj.mapTo(self._canvas_frame, event.pos()) if obj in self._canvases else event.pos()
+            hit = self._auto_label_hit(pos)
+            if event.type() == QEvent.MouseButtonPress:
+                if hit is not None and event.button() == Qt.LeftButton and hit['arrow_rect'].contains(pos):
+                    self._show_relabel_menu(hit['seg'], event.globalPos())
+                    return True
+            else:
+                from PyQt5.QtWidgets import QToolTip
+                if hit is not None:
+                    QToolTip.showText(event.globalPos(), self._auto_segment_tooltip(hit['seg']), obj)
+                    return True
+                QToolTip.hideText()
+
+        # ----------------------------------------------------------------
         # RIGHT CLICK
         # ----------------------------------------------------------------
         if event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
@@ -2277,12 +2345,20 @@ class HolterFullDisclosureDialog(QDialog):
             'engine_metrics': copy.deepcopy(getattr(self._engine, '_metrics', None)),
             'structured_events': copy.deepcopy(getattr(self._engine, '_structured_events', None)),
             'deleted_auto_segments': del_auto_snapshot,
+            'relabeled_auto_segments': self._saved_relabels(),
         }
         self._undo_stack.append(snapshot)
         if len(self._undo_stack) > self._UNDO_STACK_LIMIT:
             self._undo_stack.pop(0)
         if hasattr(self, 'btn_undo'):
             self.btn_undo.setEnabled(True)
+
+    def _saved_relabels(self):
+        """The doctor's saved auto segment label changes (for undo)."""
+        try:
+            return load_edits(os.path.dirname(self._engine.ecgh_path))
+        except Exception:
+            return []
 
     def _persist_segment_annotations(self):
         """Overwrite manual_segments.json with the current in-memory list."""
@@ -2327,6 +2403,12 @@ class HolterFullDisclosureDialog(QDialog):
                         os.remove(del_path)
             except Exception as e:
                 print(f"[Full Disclosure] Error restoring deleted_auto_segments on undo: {e}")
+
+        if 'relabeled_auto_segments' in snapshot:
+            try:
+                save_edits(os.path.dirname(self._engine.ecgh_path), snapshot['relabeled_auto_segments'])
+            except Exception as e:
+                print(f"[Full Disclosure] Error restoring relabeled_auto_segments on undo: {e}")
 
         # Undoing the "Auto Arrhythmia Detection" click itself additionally
         # hides all non-manual rhythm marking again (plain wave, no tint, no
@@ -2546,6 +2628,136 @@ class HolterFullDisclosureDialog(QDialog):
         self._seg_dragging = False
         if hasattr(self, '_segment_overlay'):
             self._segment_overlay.clear_drag()
+
+    # ------------------------------------------------------------------
+    # Relabel an auto segment (the doctor's decision; auto_segment_edits)
+    # ------------------------------------------------------------------
+    def _auto_label_hit(self, pos):
+        """The auto segment label (or its arrow) drawn at `pos` (canvas
+        frame coordinates), or None."""
+        for hit in reversed(getattr(self._segment_overlay, '_label_hits', []) or []):
+            if hit['arrow_rect'].contains(pos) or hit['label_rect'].contains(pos):
+                return hit
+        return None
+
+    def _auto_segment_tooltip(self, seg) -> str:
+        """Label, start - end system time, duration, and who set the label."""
+        reader_start = getattr(getattr(self._engine, '_reader', None), 'start_time', None)
+        s_sec, e_sec = float(seg.get('start_sec', 0.0)), float(seg.get('end_sec', 0.0))
+
+        def clock(t):
+            if reader_start:
+                return datetime.fromtimestamp(reader_start + t).strftime('%H:%M:%S')
+            return self._engine._sec_to_hms(t)
+        dur = max(0.0, e_sec - s_sec)
+        dur_str = f"{int(dur // 3600):02d}:{int(dur % 3600 // 60):02d}:{int(dur % 60):02d}"
+        if seg.get('edited'):
+            who = f"Auto \u2192 changed by the doctor (was: {seg.get('original_label') or '?'})"
+        else:
+            who = "Auto"
+        return (f"{seg.get('label', '')}\n{clock(s_sec)} \u2013 {clock(e_sec)}   ({dur_str})\n{who}"
+                f"\nClick \u25BE to change the label")
+
+    @staticmethod
+    def _color_dot_icon(color: str):
+        from PyQt5.QtGui import QIcon, QPixmap
+        pm = QPixmap(12, 12)
+        pm.fill(QColor(0, 0, 0, 0))
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(color))
+        p.drawEllipse(1, 1, 10, 10)
+        p.end()
+        return QIcon(pm)
+
+    def _show_relabel_menu(self, seg, global_pos):
+        """The auto segment's arrow: every label grouped as in clinical
+        reports, each with the colour it is drawn in, the current one ticked;
+        "Delete segment" below."""
+        from PyQt5.QtWidgets import QMenu, QWidgetAction
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: #0D1117; color: {COL_WHITE};
+                border: 1px solid #00CC66; border-radius: 6px; padding: 4px;
+                font-size: 12px;
+            }}
+            QMenu::item {{ padding: 5px 26px 5px 10px; border-radius: 4px; }}
+            QMenu::item:selected {{ background-color: #1F2A37; }}
+            QMenu::separator {{ height: 1px; background: #30363D; margin: 4px 6px; }}
+        """)
+        current = str(seg.get('label', ''))
+        for group, items in LABEL_GROUPS:
+            head = QLabel(group)
+            head.setStyleSheet("color:#8B949E; font-size:10px; font-weight:bold; "
+                               "letter-spacing:1px; padding:6px 10px 2px 10px; background:transparent;")
+            head_act = QWidgetAction(menu)
+            head_act.setDefaultWidget(head)
+            head_act.setEnabled(False)
+            menu.addAction(head_act)
+            for label, color in items:
+                text = f"{label}   \u2713" if label == current else label
+                act = menu.addAction(self._color_dot_icon(color), text)
+                act.triggered.connect(lambda _checked=False, new=label: self._relabel_auto_segment(seg, new))
+        menu.addSeparator()
+        del_act = menu.addAction("Delete segment")
+        del_act.triggered.connect(lambda: self._delete_segment(seg))
+        menu.exec_(global_pos)
+
+    def _relabel_auto_segment(self, seg, new_label: str):
+        """Give the drawn auto segment `seg` the label `new_label` over its
+        same start and end: saved with the recording (auto_segment_edits --
+        the report, AF ANALYSIS, EVENTS, Template and Lorenz read it) and
+        applied to this engine's auto events at once. Undo restores both."""
+        old = str(seg.get('label', ''))
+        if not new_label or new_label == old:
+            return
+        s_sec, e_sec = float(seg.get('start_sec', 0.0)), float(seg.get('end_sec', 0.0))
+        self._snapshot_state(f"Change label to {new_label}")
+        old_l = old.strip().lower()
+
+        def overlaps(a, b):
+            return min(e_sec, b) - max(s_sec, a) > 0
+
+        # saved: the detector segments this drawn region is made of
+        try:
+            reader_path = getattr(getattr(self._engine, '_reader', None), 'path', None)
+            session_dir = os.path.dirname(self._engine.ecgh_path)
+            parts = [x for x in (edited_segments_for(reader_path) or [])
+                     if str(x.get('label', '')).strip().lower() == old_l
+                     and overlaps(float(x['start_sec']), float(x['end_sec']))]
+            set_label(session_dir, parts, new_label)
+        except Exception as e:
+            print(f"[Full Disclosure] Could not save the new label: {e}")
+
+        # on screen: this engine's auto events of the region
+        for ev in getattr(self._engine, '_structured_events', []) or []:
+            if str(ev.get('source', '')) != 'Auto' or ev.get('end_timestamp') is None:
+                continue
+            if str(ev.get('label', ev.get('type', ''))).strip().lower() != old_l:
+                continue
+            ev_start = float(ev.get('timestamp', 0.0) or 0.0)
+            ev_end = float(ev.get('end_timestamp', ev_start) or ev_start)
+            if not overlaps(ev_start, ev_end):
+                continue
+            original = ev.get('original_label') or ev.get('label', ev.get('type', ''))
+            ev['label'] = ev['type'] = new_label
+            ev['color'] = LABEL_COLORS.get(new_label, ev.get('color'))
+            if new_label.strip().lower() == str(original).strip().lower():
+                ev.pop('edited', None)
+                ev.pop('original_label', None)
+            else:
+                ev['edited'] = True
+                ev['original_label'] = original
+        print(f"[Full Disclosure] Auto segment {s_sec:.1f}-{e_sec:.1f} s relabelled '{old}' -> '{new_label}'")
+        self._event_index_dirty = True
+        self._update_canvases(self._current_start)
+        self._refresh_segment_overlay()
+        try:
+            self._update_time_and_arrhythmia_labels(self._current_start, self._current_start + self._window_sec)
+        except Exception:
+            pass
 
     def _delete_segment(self, segment):
         """Remove a finalized segment (manual or auto-detected) from annotations and the overlay."""
@@ -3922,13 +4134,18 @@ class HolterFullDisclosureDialog(QDialog):
             if end_sec <= start_sec:
                 continue
             group = bundle_branch_block_regions if bundle_branch_block_match else regions
+            # a doctor's relabel (auto_segment_edits) marks the drawn region
+            info = {'edited': bool(ev.get('edited')), 'original_label': str(ev.get('original_label', '') or '')}
             if group and group[-1][2][0] == match[0] and start_sec <= group[-1][1] + 0.5:
-                group[-1] = (group[-1][0], max(group[-1][1], end_sec), match)
+                prev_info = group[-1][3]
+                merged_info = {'edited': prev_info['edited'] or info['edited'],
+                               'original_label': prev_info['original_label'] or info['original_label']}
+                group[-1] = (group[-1][0], max(group[-1][1], end_sec), match, merged_info)
             else:
-                group.append((start_sec, end_sec, match))
+                group.append((start_sec, end_sec, match, info))
 
         bundle_branch_block_names = {value[0] for value in bundle_branch_block_targets.values()}
-        for start_sec, end_sec, match in regions + bundle_branch_block_regions:
+        for start_sec, end_sec, match, info in regions + bundle_branch_block_regions:
             # Clip only for drawing; retain the true event times in the overlay metadata.
             draw_start = max(start_sec, ref._start_sec)
             draw_end = min(end_sec, ref_end)
@@ -3964,6 +4181,7 @@ class HolterFullDisclosureDialog(QDialog):
                 sx, ex, start_sec, end_sec, match[0], match[1],
                 start_time, end_time, auto=True, true_mid_x=true_mid_x,
                 layer=1 if match[0] in bundle_branch_block_names else 0,
+                edited=info['edited'], original_label=info['original_label'],
             )
 
     def _scroll_throttle_interval(self):

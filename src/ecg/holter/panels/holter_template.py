@@ -1229,7 +1229,9 @@ class HolterBeatTemplatePanel(QWidget):
             return None
         cached = get_cached_detection(path)
         if cached is not None:
-            return cached
+            # with the doctor's label changes (auto_segment_edits)
+            from ..auto_segment_edits import apply_edits_to_segments
+            return apply_edits_to_segments(cached, os.path.dirname(os.path.abspath(path)))
         if getattr(self, "_segments_pending_path", None) != path:
             self._segments_pending_path = path
 

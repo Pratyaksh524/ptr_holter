@@ -260,12 +260,14 @@ class HolterAFPanel(QWidget):
             if self._auto_segments_pending_for is not engine:
                 try:
                     from ..auto_segment_arrthymia_detection import (
-                        apply_auto_segments_to_engine, detect_arrhythmias_async, get_cached_detection,
+                        detect_arrhythmias_async, get_cached_detection,
                     )
+                    # with the doctor's label changes (auto_segment_edits)
+                    from ..auto_segment_edits import apply_auto_segments_with_edits as _apply_with_edits
                     path = getattr(getattr(engine, "_reader", None), "path", None)
                     cached = get_cached_detection(path) if path else None
                     if cached is not None or not path:
-                        apply_auto_segments_to_engine(engine, segments=cached)
+                        _apply_with_edits(engine, segments=cached)
                         self._auto_segments_ready_for = engine
                     else:
                         self._auto_segments_pending_for = engine
@@ -273,7 +275,7 @@ class HolterAFPanel(QWidget):
                         def _on_ready(segs, eng=engine):
                             if self._replay_engine is not eng:
                                 return
-                            apply_auto_segments_to_engine(eng, segments=segs)
+                            _apply_with_edits(eng, segments=segs)
                             self._auto_segments_ready_for = eng
                             self._auto_segments_pending_for = None
                             self._refresh_af_events()

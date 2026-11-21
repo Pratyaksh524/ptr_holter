@@ -20,6 +20,7 @@ here). The class of beat n, first rule that holds:
   N      a normal beat (detector 'N') anywhere else (sinus rhythm, sinus
          brady / tachy, AV blocks, BBB: their QRS is the conducted one)
   Other  anything else (a 'Q' beat the detector could not classify)
+"Other" points are left out of the plots (and the RR trend) altogether.
 Results are read from the saved analysis (recording_analysis); None when it
 is not there, and the plots then keep their old live-chunk points.
 """
@@ -67,8 +68,10 @@ def lorenz_points(session_dir: str) -> Optional[List[Tuple[float, float, float, 
     try:
         from .auto_segment_arrthymia_detection import get_cached_asystole, get_cached_detection
         from .ectopic_beats_detector import get_cached_ectopic_beats
+        from .auto_segment_edits import apply_edits_to_segments
         beats = get_cached_ectopic_beats(path)
-        segments = get_cached_detection(path)
+        # the doctor's label changes count (auto_segment_edits)
+        segments = apply_edits_to_segments(get_cached_detection(path), session_dir)
         asystole = get_cached_asystole(path) or []
     except Exception as e:
         print(f"[Lorenz] Could not read the saved beats: {e}")
@@ -111,7 +114,13 @@ def lorenz_points(session_dir: str) -> Optional[List[Tuple[float, float, float, 
         rr_next = (times[n + 1] - times[n]) * 1000.0
         if rr <= 0 or rr_next <= 0:
             continue
-        points.append((times[n], rr, rr_next, classify(beats[n])))
+        cls = classify(beats[n])
+        if cls == 'Other':
+            # not shown (VFib waves, beats the detector could not classify):
+            # no button for them and their white cloud hid the real beats.
+            # The other points keep their real next beat (the times above).
+            continue
+        points.append((times[n], rr, rr_next, cls))
     return points
 
 

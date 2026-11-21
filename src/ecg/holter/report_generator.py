@@ -90,7 +90,9 @@ def _load_auto_segment_events(session_dir: str) -> List[Dict[str, object]]:
             return False
 
         from .ischemia_detection import ST_LABELS
-        for segment in detect_arrhythmias(reader):
+        from .auto_segment_edits import apply_edits_to_segments
+        # with the doctor's label changes (auto_segment_edits)
+        for segment in apply_edits_to_segments(detect_arrhythmias(reader), session_dir):
             start_sec = float(segment.get('start_sec', 0.0) or 0.0)
             end_sec = float(segment.get('end_sec', 0.0) or 0.0)
             rhythm_lbl = str(segment.get('detected_rhythm', segment.get('label', 'Event')))
@@ -112,6 +114,8 @@ def _load_auto_segment_events(session_dir: str) -> List[Dict[str, object]]:
                 'duration': max(0.0, end_sec - start_sec),
                 'source': 'Auto',
                 'confidence': 1.0,
+                'edited': bool(segment.get('edited')),
+                'original_label': segment.get('original_label', ''),
             })
         return events
     except Exception as exc:
@@ -568,7 +572,7 @@ def _build_timeline_events(session_dir: str,
                 'sort_ts': s_t,
                 'label': f"Auto segment marked ({lbl})",
                 'event_type': lbl,
-                'source': 'Auto'
+                'source': 'Auto (Edited)' if seg.get('edited') else 'Auto'
             })
             if e_t > s_t + 0.1:
                 timeline_events.append({
@@ -576,7 +580,7 @@ def _build_timeline_events(session_dir: str,
                     'sort_ts': e_t,
                     'label': f"Auto segment marked end ({lbl})",
                     'event_type': lbl,
-                    'source': 'Auto'
+                    'source': 'Auto (Edited)' if seg.get('edited') else 'Auto'
                 })
             continue
 
@@ -604,7 +608,7 @@ def _build_timeline_events(session_dir: str,
             'sort_ts': s_t,
             'label': f"Auto segment marked ({lbl})",
             'event_type': lbl,
-            'source': 'Auto'
+            'source': 'Auto (Edited)' if seg.get('edited') else 'Auto'
         })
         if e_t > s_t + 0.1:
             timeline_events.append({
@@ -612,7 +616,7 @@ def _build_timeline_events(session_dir: str,
                 'sort_ts': e_t,
                 'label': f"Auto segment marked end ({lbl})",
                 'event_type': lbl,
-                'source': 'Auto'
+                'source': 'Auto (Edited)' if seg.get('edited') else 'Auto'
             })
 
     # 5b. Asystole events (independent flatline detector -- see
@@ -1072,7 +1076,8 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
                     # whether or not "Auto Arrhythmia Detection" was clicked:
                     # the HR / RR below must leave noise out either way
                     from .auto_segment_arrthymia_detection import get_cached_detection
-                    _grid_segments = get_cached_detection(_ecgh) or []
+                    from .auto_segment_edits import apply_edits_to_segments
+                    _grid_segments = apply_edits_to_segments(get_cached_detection(_ecgh), session_dir) or []
                 finally:
                     try:
                         _rd.close()
