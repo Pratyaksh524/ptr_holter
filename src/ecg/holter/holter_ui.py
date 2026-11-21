@@ -2728,11 +2728,18 @@ class HolterMainWindow(QDialog):
         if is_analysed(session_dir):
             open_it()
             return
-        answer = _show_message_box(
-            self, QMessageBox.Question, "Recording not analyzed",
-            "This recording is not analyzed.\nWould you like to analyse it?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-        if answer != QMessageBox.Yes:
+        from .recording_analysis import ask_to_analyse
+        name = os.path.basename(os.path.normpath(session_dir))
+        try:
+            import json
+            with open(os.path.join(session_dir, "patient.json"), "r", encoding="utf-8") as f:
+                pdata = json.load(f)
+            saved = str(pdata.get('name') or pdata.get('patient_name') or '').strip()
+            if saved and saved.lower() != 'unknown':
+                name = saved
+        except Exception:
+            pass
+        if not ask_to_analyse(self, name):
             self._focus_tab("RECORDINGS")
             return
         open_when_analysed(self, session_dir, open_it)

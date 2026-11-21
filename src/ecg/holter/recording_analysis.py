@@ -222,6 +222,79 @@ def run_analysis(session_dir: str, progress: Optional[_Progress] = None) -> None
     _write_done(session_dir)
 
 
+def ask_to_analyse(parent, name: str = '') -> bool:
+    """"This recording is not analyzed. Would you like to analyse it?" in the
+    app's dark style (as the "Analysing recording" and "Generating Report"
+    popups): True for Yes. Was the plain Windows message box."""
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
+
+    dialog = QDialog(parent, Qt.Dialog | Qt.FramelessWindowHint)
+    dialog.setObjectName("analyseAsk")
+    dialog.setAttribute(Qt.WA_StyledBackground, True)
+    dialog.setFixedWidth(440)
+    dialog.setWindowModality(Qt.WindowModal)
+    dialog.setStyleSheet("""
+        QDialog#analyseAsk {
+            background: #0D1117;
+            border: 1px solid #00CC66;
+            border-radius: 12px;
+        }
+        QDialog#analyseAsk QLabel { background: transparent; border: none; }
+        QDialog#analyseAsk QPushButton {
+            min-width: 96px; padding: 8px 18px; border-radius: 8px;
+            font-size: 13px; font-weight: bold;
+        }
+        QPushButton#analyseYes {
+            background: #00CC66; color: #0D1117; border: 1px solid #00CC66;
+        }
+        QPushButton#analyseYes:hover { background: #33DD88; border-color: #33DD88; }
+        QPushButton#analyseNo {
+            background: #161B22; color: #FFFFFF; border: 1px solid #444C56;
+        }
+        QPushButton#analyseNo:hover { background: #21262D; border-color: #8B949E; }
+    """)
+    layout = QVBoxLayout(dialog)
+    layout.setContentsMargins(28, 22, 28, 22)
+    layout.setSpacing(10)
+
+    header = QHBoxLayout()
+    dot = QLabel("●")
+    dot.setStyleSheet("color:#F59E0B; font-size:13px;")
+    header.addWidget(dot)
+    title = QLabel("Recording not analyzed")
+    title.setStyleSheet("color:#FFFFFF; font-size:15px; font-weight:bold; letter-spacing:0.5px;")
+    header.addWidget(title)
+    header.addStretch()
+    layout.addLayout(header)
+
+    if name:
+        rec = QLabel(name)
+        rec.setStyleSheet("color:#00FF00; font-size:12px; font-weight:bold;")
+        layout.addWidget(rec)
+    text = QLabel("This recording is not analyzed.\nWould you like to analyse it?")
+    text.setStyleSheet("color:#C9D1D9; font-size:13px;")
+    text.setWordWrap(True)
+    layout.addWidget(text)
+    layout.addSpacing(6)
+
+    buttons = QHBoxLayout()
+    buttons.addStretch()
+    no_btn = QPushButton("No")
+    no_btn.setObjectName("analyseNo")
+    no_btn.setCursor(Qt.PointingHandCursor)
+    no_btn.clicked.connect(dialog.reject)
+    yes_btn = QPushButton("Yes")
+    yes_btn.setObjectName("analyseYes")
+    yes_btn.setCursor(Qt.PointingHandCursor)
+    yes_btn.setDefault(True)
+    yes_btn.clicked.connect(dialog.accept)
+    buttons.addWidget(no_btn)
+    buttons.addWidget(yes_btn)
+    layout.addLayout(buttons)
+    return dialog.exec_() == QDialog.Accepted
+
+
 def open_when_analysed(parent, session_dir: str, on_ready: Callable[[], None]) -> None:
     """Call on_ready() (which opens the recording) once every analysis of the
     recording is saved: at once when it already is, else after the

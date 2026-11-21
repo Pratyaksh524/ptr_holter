@@ -223,6 +223,7 @@ class HolterAFPanel(QWidget):
     def set_replay_engine(self, engine):
         self._replay_engine = engine
         self._auto_segments_ready_for = None
+        self._shown_af_start = None      # another recording: its first episode is selected
         self._refresh_af_events()
 
     def update_from_metrics(self, metrics_list: list, duration_sec: float = 0):
@@ -358,8 +359,26 @@ class HolterAFPanel(QWidget):
                     if j == 0:
                         item.setData(Qt.UserRole, start_sec)
                     self._af_table.setItem(i, j, item)
+            self._select_af_row_after_refresh(segments)
         else:
             self._no_items_lbl.show()
+            self._shown_af_start = None
+
+    def _select_af_row_after_refresh(self, segments):
+        """After the table is filled: the episode whose waves are on the
+        right stays selected when it is still listed; otherwise (the tab's
+        first fill, another recording) the first episode is selected and its
+        waves are loaded -- was nothing selected and the right side showing
+        whatever second the replay stood on (at 13:54:02, 1 s before the
+        first AF of 2026-11-12_13-54-02, it only looked like AF)."""
+        shown = getattr(self, "_shown_af_start", None)
+        if shown is not None:
+            for i, seg in enumerate(segments):
+                if abs(float(seg["start_sec"]) - shown) < 1e-6:
+                    self._af_table.selectRow(i)
+                    return
+        self._af_table.selectRow(0)
+        self._on_af_row_clicked(0, 0)
 
     def _on_af_row_clicked(self, row: int, _col: int):
         if row < 0 or row >= len(self._af_rows):
@@ -373,11 +392,21 @@ class HolterAFPanel(QWidget):
             end_sec = min(float(getattr(engine, "duration_sec", start_sec + 10.0)), start_sec + 10.0)
             data = reader.read_range(start_sec, end_sec)
             if isinstance(data, np.ndarray) and data.ndim == 2 and data.shape[1] > 0:
-                self.set_replay_frame(data)
+                self._show_frame(data)
+                self._shown_af_start = start_sec
         except Exception as e:
             print(f"[HolterAFPanel] Error loading AF strip: {e}")
 
     def set_replay_frame(self, data):
+        """The replay's current frame (HolterMainWindow._broadcast_replay_frame).
+        Ignored while an AF episode's waves are shown (_shown_af_start): the
+        replay frame arriving after the tab opened replaced the selected
+        episode's waves with whatever second the replay stood on."""
+        if getattr(self, "_shown_af_start", None) is not None:
+            return
+        self._show_frame(data)
+
+    def _show_frame(self, data):
         if data is None or data.shape[0] < 1: return
         N = data.shape[1]
         fs = 500.0
