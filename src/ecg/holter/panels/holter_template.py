@@ -660,18 +660,60 @@ def _build_template_rows(metrics_list, segments=None, reader=None, ectopic_beats
     return out
 
 # 8. HOLTER TEMPLATE PANEL (template gallery)
+# -- TEMPLATE look: one colour per beat class, as the Lorenz plots draw them --
+_TEMPLATE_CLASS_COLORS = {"all": "#2F80ED", "N": "#00D215", "S": "#FF3333", "V": "#FF9900", "P": "#00E5FF",
+                          "AF": "#FFD700", "X": "#888888", "Other": "#9AAECB", "unidentified": "#C878FF"}
+
+
+def _template_class_color(label: str) -> str:
+    """The colour of a template label ("AF", "AFL", "Tachy", "Unidentified" ...)
+    by its class (_template_filter_key, as the filter buttons group them)."""
+    text = str(label or "").strip()
+    if text == "Unidentified":
+        return _TEMPLATE_CLASS_COLORS["unidentified"]
+    code = _template_filter_key(text)
+    if code in ("F", "Q"):
+        code = "AF"
+    return _TEMPLATE_CLASS_COLORS.get(code, _TEMPLATE_CLASS_COLORS["Other"])
+
+
+def _template_filter_style(active: bool, color: str) -> str:
+    """A filter button: tinted with its class colour when on."""
+    c = QColor(color)
+    if active:
+        return (f"QPushButton{{background:rgba({c.red()},{c.green()},{c.blue()},60);color:#FFFFFF;"
+                f"border:1px solid {color};border-radius:7px;padding:3px 10px;font-size:11px;font-weight:bold;}}")
+    return ("QPushButton{background:#13213A;color:#C9D4E5;border:1px solid #243552;border-radius:7px;"
+            "padding:3px 10px;font-size:11px;font-weight:bold;}"
+            f"QPushButton:hover{{border:1px solid {color};color:#FFFFFF;}}")
+
+
+def _template_dot_icon(color: str):
+    from PyQt5.QtGui import QIcon
+    pm = QPixmap(10, 10)
+    pm.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor(color))
+    painter.drawEllipse(1, 1, 8, 8)
+    painter.end()
+    return QIcon(pm)
+
+
 class _TemplateMetricCard(QFrame):
     def __init__(self, title: str, value: str = "", accent: str = COL_GREEN, parent=None):
         super().__init__(parent)
         self.setObjectName("tpMetricCard")
-        self.setStyleSheet(f"QFrame#tpMetricCard{{background:{UI_PANEL};border:1px solid {UI_BORDER};border-left:3px solid {UI_ACCENT};border-radius:8px;}}")
+        self.setStyleSheet(f"QFrame#tpMetricCard{{background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};border-left:3px solid {accent};border-radius:8px;}}")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setContentsMargins(12, 7, 12, 7)
         layout.setSpacing(2)
-        lbl = QLabel(title)
-        lbl.setStyleSheet(f"color:{UI_MUTED};font-size:10px;font-weight:700;border:none;background:transparent;")
+        lbl = QLabel(title.upper())
+        lbl.setStyleSheet(f"color:{UI_MUTED};font-size:9px;font-weight:700;letter-spacing:1px;border:none;background:transparent;")
         self.value = QLabel(value)
-        self.value.setStyleSheet(f"color:{UI_TEXT};font-size:16px;font-weight:800;border:none;background:transparent;")
+        self.value.setTextFormat(Qt.AutoText)       # Beat distribution shows coloured class chips
+        self.value.setStyleSheet(f"color:{UI_TEXT};font-size:17px;font-weight:800;border:none;background:transparent;")
         layout.addWidget(lbl)
         layout.addWidget(self.value)
 
@@ -1042,16 +1084,20 @@ class HolterBeatTemplatePanel(QWidget):
         stats.setHorizontalSpacing(8)
         stats.setVerticalSpacing(8)
         self._stat_cards = {
-            "total": _TemplateMetricCard("Total beats", "0", COL_TEXT),
-            "templates": _TemplateMetricCard("Templates", "0", COL_TEXT),
+            "total": _TemplateMetricCard("Total beats", "0", "#8B9BB4"),
+            "templates": _TemplateMetricCard("Templates", "0", "#2F80ED"),
             # beats on the Unidentified card(s) (was "Unconfirmed": cards not viewed)
-            "unidentified": _TemplateMetricCard("Unidentified", "0", UI_WARNING),
-            "beat_distribution": _TemplateMetricCard("Beat distribution", "N: 0", UI_TEXT),
+            "unidentified": _TemplateMetricCard("Unidentified", "0", _TEMPLATE_CLASS_COLORS["unidentified"]),
+            "beat_distribution": _TemplateMetricCard("Beat distribution", "N: 0", "#16C172"),
         }
         stats.addWidget(self._stat_cards["total"], 0, 0)
         stats.addWidget(self._stat_cards["templates"], 0, 1)
         stats.addWidget(self._stat_cards["unidentified"], 0, 2)
         stats.addWidget(self._stat_cards["beat_distribution"], 0, 3)
+        stats.setColumnStretch(0, 1)
+        stats.setColumnStretch(1, 1)
+        stats.setColumnStretch(2, 1)
+        stats.setColumnStretch(3, 3)       # the class chips need the room
         layout.addLayout(stats)
 
         filter_row = QHBoxLayout()
@@ -1088,7 +1134,10 @@ class HolterBeatTemplatePanel(QWidget):
                 "unidentified": "Show the Unidentified template (signal with no readable P / QRS / T)",
             }.get(key, text))
             btn.setFixedHeight(28)
-            btn.setStyleSheet(_style_filter_btn(active=(key == "all")))
+            btn.setCursor(Qt.PointingHandCursor)
+            if key != "all":
+                btn.setIcon(_template_dot_icon(_TEMPLATE_CLASS_COLORS.get(key, "#FFFFFF")))
+            btn.setStyleSheet(_template_filter_style(key == "all", _TEMPLATE_CLASS_COLORS.get(key, "#FFFFFF")))
             btn.clicked.connect(lambda checked=False, k=key: self._set_filter(k))
             self._filter_buttons[key] = btn
             filter_row.addWidget(btn)
@@ -1229,7 +1278,9 @@ class HolterBeatTemplatePanel(QWidget):
             return None
         cached = get_cached_detection(path)
         if cached is not None:
-            return cached
+            # with the doctor's label changes (auto_segment_edits)
+            from ..auto_segment_edits import apply_edits_to_segments
+            return apply_edits_to_segments(cached, os.path.dirname(os.path.abspath(path)))
         if getattr(self, "_segments_pending_path", None) != path:
             self._segments_pending_path = path
 
@@ -1329,7 +1380,23 @@ class HolterBeatTemplatePanel(QWidget):
             value = int(label_totals.get(key, 0) or 0)
             if value > 0:
                 dist_parts.append(f"{key}: {value:,}")
-        self._stat_cards["beat_distribution"].value.setText("  ".join(dist_parts) if dist_parts else "No beat classes")
+        # the class chips in their class colours (same names and order as before)
+        chips = []
+        for part in dist_parts:
+            name, _, num = part.partition(": ")
+            chips.append(f"<span style='color:{_template_class_color(name)};'>&#9679;</span>&nbsp;"
+                         f"<span style='color:#C9D4E5;font-weight:700;'>{name}</span>&nbsp;"
+                         f"<span style='color:#FFFFFF;font-weight:800;'>{num}</span>")
+        self._stat_cards["beat_distribution"].value.setText(
+            "&nbsp;&nbsp;&nbsp;".join(chips) if chips else "No beat classes")
+        # each filter button shows how many beats it holds (the rows _filtered_rows would give)
+        _names = {"all": "All", "unidentified": "Unidentified"}
+        _saved_filter = self._current_filter
+        for _k, _btn in getattr(self, "_filter_buttons", {}).items():
+            self._current_filter = _k
+            _n = sum(int(r.get("count", 0) or 0) for r in self._filtered_rows())
+            _btn.setText(f"{_names.get(_k, _k)}  {_n:,}")
+        self._current_filter = _saved_filter
 
     def _set_selected_keys(self, keys):
         ordered = []
@@ -1440,7 +1507,7 @@ class HolterBeatTemplatePanel(QWidget):
             for k, btn in self._filter_buttons.items():
                 is_active = (k == key)
                 btn.setChecked(is_active)
-                btn.setStyleSheet(_style_filter_btn(active=is_active))
+                btn.setStyleSheet(_template_filter_style(is_active, _TEMPLATE_CLASS_COLORS.get(k, "#FFFFFF")))
             self._refresh_stats()
             self._render_cards()
         except Exception as e:
@@ -1901,8 +1968,10 @@ class HolterBeatTemplatePanel(QWidget):
 
             for idx, row in enumerate(filtered):
                 label = str(row.get("label", "N") or "N").strip() or "N"
-                label_code = label[:1].upper() if label else "N"
-                accent = {"N": "#2D9CDB", "V": "#F2994A", "S": "#E2B93B", "F": "#7F8C8D", "Q": "#B06CFD", "R": "#A97FFF", "O": "#F2C94C", "P": "#56CCF2", "X": "#EB5757"}.get(label_code, UI_BORDER)
+                # every card the same plain border (was a colour by the label's
+                # first letter: V orange, Other yellow, N blue ...); hover and
+                # selection still light it blue
+                accent = UI_BORDER
                 card = TemplateCardWidget(accent=accent)
                 rr = row.get("rr", []) or []
                 qrs = row.get("qrs", []) or []

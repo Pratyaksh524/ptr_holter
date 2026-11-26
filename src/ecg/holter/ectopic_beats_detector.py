@@ -202,11 +202,12 @@ _async_jobs: Dict[str, Any] = {}
 # cache
 #
 # The result is the detector's code (this file, pqrst_measure,
-# analysis_pipeline, the filters, ... -- the whole ecg package) applied to the
-# recording AND to its auto segments (the no-QRS / VT / no-PAC spans below).
-# The segment detection's own cache key already pins all of that: the file
-# (path, size, mtime), a hash of every .py file of the ecg package, and the
-# patient's age (it moves the SVT bound, so the segments), plus the clinical
+# analysis_pipeline, the filters, ... -- every ecg file it imports) applied to
+# the recording AND to its auto segments (the no-QRS / VT / no-PAC spans
+# below). The segment detection's own cache key already pins all of that: the
+# file (path, size, mtime), a hash of the code of both detectors and every
+# file they import (auto_segment_arrthymia_detection._code_fingerprint), and
+# the patient's age (it moves the SVT bound, so the segments), plus the clinical
 # configuration (signal-quality limit, QRS validator, mains notch: read by the
 # QRS measurement here; it is YAML, not code). So the key here is that key,
 # not a second list of files that could drift. A saved entry also

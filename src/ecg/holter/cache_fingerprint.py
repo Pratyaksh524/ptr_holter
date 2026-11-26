@@ -52,8 +52,11 @@ def ecg_tree_fingerprint(ecg_dir: str = _ECG_DIR) -> str:
     """sha1 over every .py file of the ecg package -- its path relative to
     `ecg_dir`, then its content, directories and files in sorted order,
     __pycache__ left out; '' when there is none to read (a frozen build).
-    The auto segment and PVC / PAC caches key with it; build_exe.py runs it
-    on the sources and ships the value (frozen_build_fingerprint)."""
+    build_exe.py runs it on the sources and ships the value
+    (frozen_build_fingerprint), which every code_fingerprint returns in the
+    frozen build. (The auto segment and PVC / PAC caches keyed with it until
+    2026-11-19; they use code_fingerprint now, so a report or UI change no
+    longer throws them away.)"""
     h = hashlib.sha1()
     n_files = 0
     for root, dirs, files in os.walk(ecg_dir):

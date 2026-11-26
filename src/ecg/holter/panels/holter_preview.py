@@ -119,10 +119,14 @@ class _ElidedLabel(QLabel):
 class HolterInsightPanel(QFrame):
     """PREVIEW tab: the Comprehensive ECG Analysis PDF report of the open
     recording, page by page, exactly as "Generate Report" / PRINT would save
-    it. The preview is built automatically (in the system temp folder, never
-    in the recording folder) whenever the tab is shown and the recording's
-    data has changed since the last build; saving stays with Generate
-    Report / PRINT."""
+    it. The preview is built automatically (in the system temp folder)
+    whenever the tab is shown and the recording's data has changed since the
+    last build. The last preview is also kept in the recording folder
+    (report_preview.pdf, with the data state it was built from in
+    report_preview_key.json) and shown at once -- after opening another
+    recording or restarting the app -- while that data is unchanged
+    (_show_saved_preview). Saving a report stays with Generate Report /
+    PRINT."""
 
     preview_requested = pyqtSignal()   # owner builds a preview PDF, then calls show_preview()
     generate_requested = pyqtSignal()  # kept for older wiring; not emitted
@@ -233,10 +237,14 @@ class HolterInsightPanel(QFrame):
 
     def refresh(self, force: bool = False):
         """Build a new preview if the recording's data changed since the
-        shown PDF was built (or always, with force)."""
+        shown PDF was built (or always, with force). The last preview saved
+        with the recording (_save_to_recording) is shown instead of a build
+        when it was built from the data the recording has now."""
         if not self._session_dir:
             return
         if not force and self._pdf_path and self._built_key == self._state_key():
+            return
+        if not force and not self._building and self._show_saved_preview():
             return
         if self._building:
             self._rebuild_after = True
@@ -257,6 +265,7 @@ class HolterInsightPanel(QFrame):
         # file in the recording folder.
         self._built_key = self._state_key()
         self.load_pdf(path, kind='preview')
+        self._save_to_recording(path)
         if self._rebuild_after:
             self._rebuild_after = False
             QTimer.singleShot(0, self.refresh)
@@ -301,18 +310,94 @@ class HolterInsightPanel(QFrame):
         self._needs_render = True
         if self.isVisible():
             self._render()
+        if kind == 'saved':
+            self._save_to_recording(path)
+
+    # -- the last preview, kept with the recording -----------------------------
+    # The preview PDF used to live only in the temp folder and in this panel's
+    # memory: opening another recording or restarting the app built it again
+    # (5.7 s for 87 min of recording once analysed; longer for 24 h). The last
+    # one built (or saved by Generate Report / PRINT -- the same content) is
+    # kept in the recording folder with the data state it was built from
+    # (_state_key, as JSON); the PREVIEW tab shows it at once while that state
+    # is unchanged -- any edit, marking, "Auto Arrhythmia Detection" click or
+    # undo, re-analysis or patient-details change writes a data file there, so
+    # the key differs and a new preview is built.
+    _SAVED_PDF = 'report_preview.pdf'
+    _SAVED_KEY = 'report_preview_key.json'
+
+    def _key_text(self, key) -> str:
+        sd, patient, files = key
+        return json.dumps([os.path.normcase(os.path.abspath(sd)), patient, [list(f) for f in files]])
+
+    def _save_to_recording(self, pdf_path: str):
+        """Keep `pdf_path` (just shown, up to date) in the recording folder
+        with the data state it was built from."""
+        sd = self._session_dir
+        if not sd or not self._built_key or not os.path.isfile(pdf_path):
+            return
+        target = os.path.join(sd, self._SAVED_PDF)
+        key_path = os.path.join(sd, self._SAVED_KEY)
+        try:
+            if os.path.normcase(os.path.abspath(pdf_path)) != os.path.normcase(os.path.abspath(target)):
+                shutil.copyfile(pdf_path, target + '.tmp')
+                os.replace(target + '.tmp', target)
+            with open(key_path + '.tmp', 'w', encoding='utf-8') as f:
+                f.write(self._key_text(self._built_key))
+            os.replace(key_path + '.tmp', key_path)
+        except OSError as e:
+            print(f"[Preview] Could not keep the preview with the recording: {e}")
+            for p in (target + '.tmp', key_path + '.tmp'):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+    def _show_saved_preview(self) -> bool:
+        """Show the preview kept with the recording when it was built from
+        the data the recording has now; False when there is none or it is
+        out of date. A copy in the temp folder is shown, so the kept file is
+        never held open by the viewer when the next preview replaces it."""
+        sd = self._session_dir
+        target = os.path.join(sd, self._SAVED_PDF) if sd else ''
+        try:
+            with open(os.path.join(sd, self._SAVED_KEY), 'r', encoding='utf-8') as f:
+                saved_key = f.read()
+        except (OSError, TypeError):
+            return False
+        key = self._state_key()
+        if saved_key != self._key_text(key) or not os.path.isfile(target):
+            return False
+        try:
+            import tempfile
+            out_dir = os.path.join(tempfile.gettempdir(), 'holter_report_preview')
+            os.makedirs(out_dir, exist_ok=True)
+            shown = os.path.join(out_dir, f"{os.path.basename(os.path.normpath(sd))}_kept_{time.time_ns()}.pdf")
+            shutil.copyfile(target, shown)
+        except OSError:
+            return False
+        self._built_key = key
+        self.load_pdf(shown, kind='preview')
+        if self._pdf_path != shown:
+            return False
+        built = datetime.fromtimestamp(os.path.getmtime(target)).strftime("%Y-%m-%d %H:%M:%S")
+        n = len(self._page_sizes)
+        self._info.setText(f"Preview built {built} (data unchanged since)   •   {n} page{'s' if n != 1 else ''}"
+                           f"   •   use Generate Report or Print to save")
+        return True
 
     # -- internals -------------------------------------------------------------
     def _state_key(self):
         """What a preview depends on: the patient details and every data file
         of the recording (name, size, mtime) -- edits, deletions and
         re-analysis all rewrite one of them. Report images / PDFs that a
-        build itself writes there are left out."""
+        build itself writes there, and the kept preview's own key file, are
+        left out."""
         files = []
         sd = self._session_dir
         try:
             for f in sorted(os.listdir(sd)):
-                if f.lower().endswith(('.png', '.pdf', '.txt')):
+                if f.lower().endswith(('.png', '.pdf', '.txt', '.tmp')) or f == self._SAVED_KEY:
                     continue
                 st = os.stat(os.path.join(sd, f))
                 files.append((f, st.st_size, int(st.st_mtime)))

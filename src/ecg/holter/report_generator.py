@@ -90,7 +90,9 @@ def _load_auto_segment_events(session_dir: str) -> List[Dict[str, object]]:
             return False
 
         from .ischemia_detection import ST_LABELS
-        for segment in detect_arrhythmias(reader):
+        from .auto_segment_edits import apply_edits_to_segments
+        # with the doctor's label changes (auto_segment_edits)
+        for segment in apply_edits_to_segments(detect_arrhythmias(reader), session_dir):
             start_sec = float(segment.get('start_sec', 0.0) or 0.0)
             end_sec = float(segment.get('end_sec', 0.0) or 0.0)
             rhythm_lbl = str(segment.get('detected_rhythm', segment.get('label', 'Event')))
@@ -112,6 +114,8 @@ def _load_auto_segment_events(session_dir: str) -> List[Dict[str, object]]:
                 'duration': max(0.0, end_sec - start_sec),
                 'source': 'Auto',
                 'confidence': 1.0,
+                'edited': bool(segment.get('edited')),
+                'original_label': segment.get('original_label', ''),
             })
         return events
     except Exception as exc:
@@ -347,30 +351,45 @@ def first_confirmed_nsr_beat(reader, t_from: float, t_to: float):
 _FD_BEATS_CACHE = 'full_disclosure_beats_cache.json'
 
 
-def _full_disclosure_beat_times(session_dir: str) -> Optional[List[float]]:
+def _fd_beats_key(session_dir: str) -> Optional[str]:
+    """The key full_disclosure_beats_cache.json is saved under: the file
+    (size / time), the strip's beat-finding code (panels/holter_widgets.py
+    and every ecg file it imports) and the clinical configuration; None when
+    the file or the code cannot be read (no disk cache then)."""
+    ecgh = os.path.join(session_dir, 'recording.ecgh')
+    try:
+        from .cache_fingerprint import clinical_config_fingerprint, code_fingerprint
+        st = os.stat(ecgh)
+        code = code_fingerprint([os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              'panels', 'holter_widgets.py')])
+        if code:
+            return (f"fd_beats|{os.path.abspath(ecgh)}|{st.st_size}|{st.st_mtime_ns}|{code}"
+                    f"|cfg={clinical_config_fingerprint()}")
+    except Exception:
+        pass
+    return None
+
+
+def _full_disclosure_beat_times(session_dir: str, compute: bool = True) -> Optional[List[float]]:
     """R-peak times (s) of the whole recording exactly as the Full Disclosure
     strip finds them for its RR / HR numbers (panels.holter_widgets.
     StableBeatTimes: fixed 10 s chunks, so the same beats whatever the
     scroll). The report's Heart Rate figures come from these, so a Min /
     Max / Avg on page 1 or in the hourly table is one the strip prints.
 
-    Saved next to the recording (full_disclosure_beats_cache.json), keyed
-    like the auto segment cache (file size / time, code fingerprint) plus the
-    clinical configuration: a 24 h recording takes about 2 min (12 ms per
-    10 s chunk), and a reopened report must not pay that again. None when the
-    recording cannot be read."""
+    Saved next to the recording (full_disclosure_beats_cache.json), keyed by
+    the file (size / time), the strip's beat-finding code (panels/
+    holter_widgets.py and every ecg file it imports -- not the arrhythmia
+    detection's: these beats do not come from it) and the clinical
+    configuration: a 24 h recording takes about 2 min (12 ms per 10 s
+    chunk), and a reopened report must not pay that again. None when the
+    recording cannot be read -- or, with compute=False, when there is no
+    saved result for the current file and code (recording_analysis asks so
+    to know whether a recording still needs analysing)."""
     ecgh = os.path.join(session_dir, 'recording.ecgh')
     if not os.path.exists(ecgh):
         return None
-    key = None
-    try:
-        from .auto_segment_arrthymia_detection import _cache_key, _code_fingerprint
-        from .cache_fingerprint import clinical_config_fingerprint
-        seg_key = _cache_key(ecgh)
-        if seg_key and _code_fingerprint():
-            key = f"fd_beats|{seg_key}|cfg={clinical_config_fingerprint()}"
-    except Exception:
-        key = None
+    key = _fd_beats_key(session_dir)
     cache_path = os.path.join(session_dir, _FD_BEATS_CACHE)
     if key:
         try:
@@ -380,6 +399,8 @@ def _full_disclosure_beat_times(session_dir: str) -> Optional[List[float]]:
                 return [float(t) for t in saved['beats']]
         except (OSError, ValueError, TypeError):
             pass
+    if not compute:
+        return None
     try:
         from .file_format import ECGHFileReader
         from .panels.holter_widgets import StableBeatTimes
@@ -551,7 +572,7 @@ def _build_timeline_events(session_dir: str,
                 'sort_ts': s_t,
                 'label': f"Auto segment marked ({lbl})",
                 'event_type': lbl,
-                'source': 'Auto'
+                'source': 'Auto (Edited)' if seg.get('edited') else 'Auto'
             })
             if e_t > s_t + 0.1:
                 timeline_events.append({
@@ -559,7 +580,7 @@ def _build_timeline_events(session_dir: str,
                     'sort_ts': e_t,
                     'label': f"Auto segment marked end ({lbl})",
                     'event_type': lbl,
-                    'source': 'Auto'
+                    'source': 'Auto (Edited)' if seg.get('edited') else 'Auto'
                 })
             continue
 
@@ -587,7 +608,7 @@ def _build_timeline_events(session_dir: str,
             'sort_ts': s_t,
             'label': f"Auto segment marked ({lbl})",
             'event_type': lbl,
-            'source': 'Auto'
+            'source': 'Auto (Edited)' if seg.get('edited') else 'Auto'
         })
         if e_t > s_t + 0.1:
             timeline_events.append({
@@ -595,7 +616,7 @@ def _build_timeline_events(session_dir: str,
                 'sort_ts': e_t,
                 'label': f"Auto segment marked end ({lbl})",
                 'event_type': lbl,
-                'source': 'Auto'
+                'source': 'Auto (Edited)' if seg.get('edited') else 'Auto'
             })
 
     # 5b. Asystole events (independent flatline detector -- see
@@ -1055,7 +1076,8 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
                     # whether or not "Auto Arrhythmia Detection" was clicked:
                     # the HR / RR below must leave noise out either way
                     from .auto_segment_arrthymia_detection import get_cached_detection
-                    _grid_segments = get_cached_detection(_ecgh) or []
+                    from .auto_segment_edits import apply_edits_to_segments
+                    _grid_segments = apply_edits_to_segments(get_cached_detection(_ecgh), session_dir) or []
                 finally:
                     try:
                         _rd.close()

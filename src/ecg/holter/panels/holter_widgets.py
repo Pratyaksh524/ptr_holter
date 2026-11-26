@@ -604,12 +604,13 @@ class HolterRRTrendCanvas(QWidget):
     def _nearest_index(self, x_pos: int):
         if not self._points:
             return None
-        rect = self.rect().adjusted(42, 18, -12, 30)
+        # the same plot area and time axis as paintEvent
+        rect = self.rect().adjusted(46, 22, -14, -20)
         if rect.width() <= 0:
             return 0
         xs = [p[0] for p in self._points]
         lo = 0.0
-        hi = 12.0 * 60.0 * 60.0
+        hi = max(60.0, max(xs))
         span = max(hi - lo, 1e-9)
         best = None
         best_dist = None
@@ -626,9 +627,10 @@ class HolterRRTrendCanvas(QWidget):
         painter.fillRect(self.rect(), QColor(COL_BLACK))
         painter.setRenderHint(QPainter.Antialiasing, True)
 
-        # Keep the trend comparable across recordings and modes. The replay
-        # chart uses seconds on X, milliseconds (RR) or BPM (HR) on Y.
-        rect = self.rect().adjusted(42, 18, -12, 30)
+        # Seconds on X, milliseconds (RR) or BPM (HR) on Y. The plot area
+        # stays inside the widget (was adjusted(..., +30): its bottom 30 px
+        # and the time labels were drawn below the widget, out of sight).
+        rect = self.rect().adjusted(46, 22, -14, -20)
         painter.setPen(QPen(QColor("#243242"), 1))
         painter.drawRect(rect)
 
@@ -649,8 +651,11 @@ class HolterRRTrendCanvas(QWidget):
             painter.end()
             return
 
+        # X: the recording's own span -- was a fixed 0-12 h, so a 15 min
+        # recording sat squeezed in the left 2% of the chart. Y stays fixed
+        # (0-3000 ms / 0-300 bpm) so recordings remain comparable.
         x_lo = 0.0
-        x_hi = 12.0 * 60.0 * 60.0
+        x_hi = max(60.0, max(p[0] for p in self._points))
         y_lo = 0.0
         y_hi = 300.0 if mode == "HR" else 3000.0
 
@@ -663,20 +668,33 @@ class HolterRRTrendCanvas(QWidget):
         # the recording contains only a short or low-variation segment.
         painter.setFont(QFont("Segoe UI", 8))
         painter.setPen(QPen(QColor("#B0BEC5"), 1))
-        y_ticks = np.arange(y_lo, y_hi + 75.0, 75.0) if mode == "HR" else (0.0, 1500.0, 3000.0)
+        y_ticks = np.arange(y_lo, y_hi + 75.0, 75.0) if mode == "HR" else (0.0, 1000.0, 2000.0, 3000.0)
         for value in y_ticks:
             _, py = map_xy(x_lo, value)
+            painter.setPen(QPen(QColor(255, 255, 255, 18), 1))          # faint grid line
+            painter.drawLine(rect.left(), py, rect.right(), py)
+            painter.setPen(QPen(QColor("#B0BEC5"), 1))
             painter.drawLine(rect.left() - 4, py, rect.left(), py)
-            label = f"{int(value)}"
-            painter.drawText(4, py + 4, label)
+            painter.drawText(4, py + 4, f"{int(value)}")
 
-        x_ticks = [(0.0, "0h"), (3.0 * 3600.0, "3h"),
-                   (6.0 * 3600.0, "6h"), (9.0 * 3600.0, "9h"),
-                   (12.0 * 3600.0, "12h")]
-        for value, label in x_ticks:
-            px, _ = map_xy(value, y_lo)
+        # time ticks: a round step giving 4-8 ticks over the span, labelled
+        # as elapsed time (m:ss under 1 h, h:mm above)
+        span = x_hi - x_lo
+        step = next((st for st in (10, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200)
+                     if span / st <= 8), 86400)
+        t_tick = 0.0
+        while t_tick <= x_hi + 1e-6:
+            px, _ = map_xy(t_tick, y_lo)
+            painter.setPen(QPen(QColor(255, 255, 255, 18), 1))
+            painter.drawLine(px, rect.top(), px, rect.bottom())
+            painter.setPen(QPen(QColor("#B0BEC5"), 1))
             painter.drawLine(px, rect.bottom(), px, rect.bottom() + 4)
-            painter.drawText(px - 10, rect.bottom() + 17, label)
+            if span < 3600:
+                label = f"{int(t_tick // 60)}:{int(t_tick % 60):02d}"
+            else:
+                label = f"{int(t_tick // 3600)}h{int(t_tick % 3600 // 60):02d}"
+            painter.drawText(px - 14, rect.bottom() + 16, label)
+            t_tick += step
 
         painter.setPen(QPen(QColor(COL_GREEN_MID), 2))
         for i in range(1, len(self._points)):
@@ -696,7 +714,7 @@ class HolterRRTrendCanvas(QWidget):
                 painter.drawEllipse(px - 2, py - 2, 4, 4)
 
         painter.setPen(QPen(QColor("#B0BEC5")))
-        painter.drawText(rect.right() - 38, rect.bottom() + 17, "Time")
+        painter.drawText(rect.right() - 30, rect.top() - 6, "Time")
 
 
 HRTrendCanvas = HolterRRTrendCanvas
@@ -772,7 +790,12 @@ class LorenzCanvas(QWidget):
         self.setContextMenuPolicy(Qt.DefaultContextMenu)
 
     # ---------------------------------------------------------------- data
-    def set_data(self, x, y, x_range=None, y_range=None, beat_classes=None, rr_points=None):
+    def set_data(self, x, y, x_range=None, y_range=None, beat_classes=None, rr_points=None,
+                 empty_text=None):
+        """`empty_text`: what an empty plot says (e.g. "No ventricular
+        beats" for a filter with no beat of its class); "No RR data" when
+        not given."""
+        self._empty_text = empty_text or "No RR data"
         self._x = list(x)
         self._y = list(y)
         self._beat_classes = list(beat_classes) if beat_classes is not None else []
@@ -872,7 +895,8 @@ class LorenzCanvas(QWidget):
         attr_menu.setEnabled(has_sel)
         for cls_label, cls_code in [("Normal (N)", "N"), ("Supraventricular (S)", "S"),
                                     ("Ventricular (V)", "V"), ("Paced (P)", "P"),
-                                    ("AF / AFl", "AF"), ("Other", "Other"), ("Artifact (X)", "X")]:
+                                    ("AF / AFl", "AF"), ("Other", "Other"), ("Artifact (X)", "X"),
+                                    ("Unidentified (U)", "U")]:
             a = attr_menu.addAction(cls_label)
             a.triggered.connect(lambda checked=False, c=cls_code: self._reclassify(c))
 
@@ -1048,7 +1072,7 @@ class LorenzCanvas(QWidget):
 
         if not self._x or not self._y:
             painter.setPen(QPen(QColor(COL_GREEN_DRK)))
-            painter.drawText(self.rect(), Qt.AlignCenter, "No RR data")
+            painter.drawText(self.rect(), Qt.AlignCenter, getattr(self, "_empty_text", "No RR data"))
             painter.end()
             return
 
@@ -1127,12 +1151,16 @@ class LorenzCanvas(QWidget):
             "P":     QColor(0, 229, 255, 255),
             "AF":    QColor(255, 215, 0, 255),
             "X":     QColor(136, 136, 136, 255),
-            "Other": QColor(0, 210, 21, 255),
+            "U":     QColor(200, 120, 255, 255),     # Unidentified (noise)
+            # its own colour: as green as N, "Other" read as normal beats
+            "Other": QColor(255, 255, 255, 255),
         }
         xs, ys = self._get_plot_xy()
         r = self._pixel_size
         for i, (xv, yv) in enumerate(zip(xs, ys)):
-            beat_class = self._beat_classes[i] if i < len(self._beat_classes) else "Other"
+            # A plot given no classes (the OVERVIEW scatter) stays all green,
+            # as before "Other" got its own colour: no class is not "Other".
+            beat_class = self._beat_classes[i] if i < len(self._beat_classes) else "N"
             color = color_map.get(beat_class, color_map["Other"])
             px, py = to_px(xv, yv)
             if i in self._selected_indices:
@@ -1218,7 +1246,9 @@ class LorenzCanvas(QWidget):
             "N": QColor(0, 210, 21, 220), "S": QColor(255, 51, 51, 220),
             "V": QColor(255, 153, 0, 220), "P": QColor(0, 229, 255, 220),
             "AF": QColor(255, 215, 0, 220), "X": QColor(136, 136, 136, 220),
-            "Other": QColor(0, 210, 21, 220),
+            "U": QColor(200, 120, 255, 220),
+            # its own colour: as green as N, "Other" read as normal beats
+            "Other": QColor(255, 255, 255, 220),
         }
 
         for seg_idx, seg in enumerate(segments):

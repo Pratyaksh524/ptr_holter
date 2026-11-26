@@ -46,6 +46,18 @@ from ..holter_helpers import (
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas
 
+def _episode_avg_hr(beat_times, start_sec: float, end_sec: float) -> Optional[float]:
+    """Average HR (bpm) of an episode from the Full Disclosure beats inside it:
+    beat-to-beat pairs counted / the time they span (as the report's HR)."""
+    import bisect
+    i = bisect.bisect_left(beat_times, start_sec)
+    j = bisect.bisect_right(beat_times, end_sec)
+    inside = beat_times[i:j]
+    if len(inside) < 2 or inside[-1] <= inside[0]:
+        return None
+    return 60.0 * (len(inside) - 1) / (inside[-1] - inside[0])
+
+
 # 12. HOLTER AF ANALYSIS PANEL
 class HolterAFPanel(QWidget):
     def __init__(self, parent=None, session_dir: str = ""):
@@ -96,11 +108,40 @@ class HolterAFPanel(QWidget):
         title_row.addWidget(self._count_badge)
         left_layout.addLayout(title_row)
 
-        cols = ["Start time", "Duration", "Type"]
+        # Summary of the listed episodes (same sums as the report's
+        # Atrial Fibrillation / Flutter box: total, longest, burden).
+        stats = QGridLayout()
+        stats.setHorizontalSpacing(8)
+        stats.setVerticalSpacing(8)
+        self._af_stats = {}
+        for i, (key, lbl) in enumerate([("count", "AF / AFL"), ("total", "TOTAL TIME"),
+                                        ("longest", "LONGEST"), ("burden", "BURDEN")]):
+            tile = QFrame()
+            tile.setObjectName("afStatTile")
+            tile.setStyleSheet(f"QFrame#afStatTile{{background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};"
+                               f"border-radius:8px;}}")
+            tile_l = QVBoxLayout(tile)
+            tile_l.setContentsMargins(12, 6, 12, 6)
+            tile_l.setSpacing(1)
+            cap = QLabel(lbl)
+            cap.setStyleSheet(f"color:{UI_MUTED};font-size:9px;font-weight:700;letter-spacing:1px;"
+                              f"border:none;background:transparent;")
+            val = QLabel("--")
+            val.setStyleSheet(f"color:{UI_TEXT};font-size:16px;font-weight:bold;border:none;background:transparent;")
+            tile_l.addWidget(cap)
+            tile_l.addWidget(val)
+            stats.addWidget(tile, 0, i)
+            self._af_stats[key] = val
+        left_layout.addLayout(stats)
+
+        cols = ["#", "Start time", "Duration", "Type", "Avg HR", "Source"]
         self._af_table = QTableWidget(0, len(cols))
         self._af_table.setHorizontalHeaderLabels(cols)
-        self._af_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self._af_table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        hdr = self._af_table.horizontalHeader()
+        for c, mode in enumerate([QHeaderView.ResizeToContents, QHeaderView.Stretch, QHeaderView.ResizeToContents,
+                                  QHeaderView.Stretch, QHeaderView.ResizeToContents, QHeaderView.ResizeToContents]):
+            hdr.setSectionResizeMode(c, mode)
+        hdr.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._af_table.setAlternatingRowColors(True)
         self._af_table.setShowGrid(False)
         self._af_table.setStyleSheet(_table_style())
@@ -130,6 +171,11 @@ class HolterAFPanel(QWidget):
         for lbl in ["Prev Event", "Next Event", "Remove All", "Remove"]:
             btn = QPushButton(lbl)
             btn.setStyleSheet(_style_btn())
+            btn.setCursor(Qt.PointingHandCursor)
+            if lbl == "Prev Event":
+                btn.clicked.connect(lambda _=False: self._step_episode(-1))
+            elif lbl == "Next Event":
+                btn.clicked.connect(lambda _=False: self._step_episode(1))
             nav_row.addWidget(btn, 1)
         left_layout.addLayout(nav_row)
         layout.addWidget(left, 2)
@@ -145,7 +191,16 @@ class HolterAFPanel(QWidget):
 
         ecg_ttl = QLabel("12-Lead ECG")
         ecg_ttl.setStyleSheet(_card_title_style())
-        right_layout.addWidget(ecg_ttl)
+        ttl_row = QHBoxLayout()
+        ttl_row.setSpacing(8)
+        ttl_row.addWidget(ecg_ttl)
+        ttl_row.addStretch(1)
+        self._episode_chip = QLabel("")
+        self._episode_chip.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:bold;background:{UI_PANEL_ALT};"
+                                         f"border:1px solid {UI_BORDER};border-radius:6px;padding:3px 10px;")
+        self._episode_chip.hide()
+        ttl_row.addWidget(self._episode_chip)
+        right_layout.addLayout(ttl_row)
 
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
@@ -222,7 +277,13 @@ class HolterAFPanel(QWidget):
 
     def set_replay_engine(self, engine):
         self._replay_engine = engine
+        # the folder of the recording the engine plays: the panel is built
+        # once, and session_dir from then was another (or no) recording's
+        path = getattr(getattr(engine, "_reader", None), "path", None)
+        if path:
+            self.session_dir = os.path.dirname(os.path.abspath(path))
         self._auto_segments_ready_for = None
+        self._shown_af_start = None      # another recording: its first episode is selected
         self._refresh_af_events()
 
     def update_from_metrics(self, metrics_list: list, duration_sec: float = 0):
@@ -259,12 +320,14 @@ class HolterAFPanel(QWidget):
             if self._auto_segments_pending_for is not engine:
                 try:
                     from ..auto_segment_arrthymia_detection import (
-                        apply_auto_segments_to_engine, detect_arrhythmias_async, get_cached_detection,
+                        detect_arrhythmias_async, get_cached_detection,
                     )
+                    # with the doctor's label changes (auto_segment_edits)
+                    from ..auto_segment_edits import apply_auto_segments_with_edits as _apply_with_edits
                     path = getattr(getattr(engine, "_reader", None), "path", None)
                     cached = get_cached_detection(path) if path else None
                     if cached is not None or not path:
-                        apply_auto_segments_to_engine(engine, segments=cached)
+                        _apply_with_edits(engine, segments=cached)
                         self._auto_segments_ready_for = engine
                     else:
                         self._auto_segments_pending_for = engine
@@ -272,7 +335,7 @@ class HolterAFPanel(QWidget):
                         def _on_ready(segs, eng=engine):
                             if self._replay_engine is not eng:
                                 return
-                            apply_auto_segments_to_engine(eng, segments=segs)
+                            _apply_with_edits(eng, segments=segs)
                             self._auto_segments_ready_for = eng
                             self._auto_segments_pending_for = None
                             self._refresh_af_events()
@@ -292,7 +355,8 @@ class HolterAFPanel(QWidget):
             start_sec = float(ev.get("timestamp", 0.0) or 0.0)
             end_sec = float(ev.get("end_timestamp", start_sec) or start_sec)
             if end_sec > start_sec:
-                segments.append({"start_sec": start_sec, "end_sec": end_sec, "type": af_type})
+                segments.append({"start_sec": start_sec, "end_sec": end_sec, "type": af_type,
+                                 "source": "Auto (Edited)" if ev.get("edited") else "Auto"})
         return segments
 
     def _load_manual_af_segments(self) -> list:
@@ -313,7 +377,8 @@ class HolterAFPanel(QWidget):
                     start_sec = float(seg.get("start_sec", 0.0) or 0.0)
                     end_sec = float(seg.get("end_sec", start_sec) or start_sec)
                     if end_sec > start_sec:
-                        segments.append({"start_sec": start_sec, "end_sec": end_sec, "type": af_type})
+                        segments.append({"start_sec": start_sec, "end_sec": end_sec, "type": af_type,
+                                         "source": "Manual"})
         except Exception as e:
             print(f"[HolterAFPanel] Error loading manual segments: {e}")
         return segments
@@ -342,6 +407,8 @@ class HolterAFPanel(QWidget):
 
         self._af_table.setRowCount(len(segments))
         self._count_badge.setText(f"{len(segments)} episode" + ("" if len(segments) == 1 else "s"))
+        self._update_af_stats(segments)
+        beat_times = self._full_disclosure_beats() if segments else None
         if segments:
             self._no_items_lbl.hide()
             for i, seg in enumerate(segments):
@@ -352,14 +419,100 @@ class HolterAFPanel(QWidget):
                 else:
                     start_str = _sec_to_hms(start_sec)
                 duration_str = _sec_to_hms(duration_sec)
-                for j, val in enumerate([start_str, duration_str, seg["type"]]):
+                hr = _episode_avg_hr(beat_times, start_sec, seg["end_sec"]) if beat_times else None
+                source = seg.get("source", "Auto")
+                for j, val in enumerate([str(i + 1), start_str, duration_str, seg["type"],
+                                         f"{hr:.0f} bpm" if hr else "--", source]):
                     item = QTableWidgetItem(val)
-                    item.setForeground(QColor(COL_WHITE))
-                    if j == 0:
+                    muted = j == 0 or (j == 5 and source == "Auto") or (j == 4 and not hr)
+                    item.setForeground(QColor(UI_MUTED if muted else COL_WHITE))
+                    if j == 1:
                         item.setData(Qt.UserRole, start_sec)
                     self._af_table.setItem(i, j, item)
+            self._select_af_row_after_refresh(segments)
         else:
             self._no_items_lbl.show()
+            self._shown_af_start = None
+            self._episode_chip.hide()
+
+    def _update_af_stats(self, segments):
+        """The tiles: AF / AFL episodes, their total and longest time, and
+        the burden (total / recording) -- "--" with no episode, as the
+        report's "-"."""
+        n_af = sum(1 for s in segments if s["type"] == "Atrial Fibrillation")
+        n_afl = sum(1 for s in segments if s["type"] == "Atrial Flutter")
+        durations = [max(0.0, s["end_sec"] - s["start_sec"]) for s in segments]
+        engine = self._replay_engine
+        rec = self._duration_sec or float(getattr(engine, "duration_sec", 0.0) or 0.0)
+        self._af_stats["count"].setText(f"{n_af} / {n_afl}")
+        if durations:
+            total = sum(durations)
+            self._af_stats["total"].setText(_sec_to_hms(total))
+            self._af_stats["longest"].setText(_sec_to_hms(max(durations)))
+            self._af_stats["burden"].setText(f"{100.0 * total / rec:.2f}%" if rec > 0 else "--")
+        else:
+            for key in ("total", "longest", "burden"):
+                self._af_stats[key].setText("--")
+
+    def _full_disclosure_beats(self):
+        """The Full Disclosure strip's beat times (s) saved with the
+        recording's analysis; None when they are not saved (Avg HR "--")."""
+        if not self.session_dir:
+            return None
+        try:
+            from ..report_generator import _full_disclosure_beat_times
+            return _full_disclosure_beat_times(self.session_dir, compute=False)
+        except Exception as e:
+            print(f"[HolterAFPanel] Full Disclosure beats unavailable: {e}")
+            return None
+
+    def _step_episode(self, step: int):
+        """Prev / Next Event: the episode before / after the selected one
+        (the first when none is), its waves on the right."""
+        n = len(self._af_rows)
+        if not n:
+            return
+        rows = self._af_table.selectionModel().selectedRows()
+        cur = rows[0].row() if rows else -1
+        new = 0 if cur < 0 else max(0, min(n - 1, cur + step))
+        self._af_table.selectRow(new)
+        self._on_af_row_clicked(new, 0)
+
+    def _update_episode_chip(self, row: int):
+        """Over the 12 leads, which episode the waves are from: 'Episode 2
+        of 3 . Atrial Flutter . 13:56:26 -> 13:57:01 . first 10 s shown'."""
+        if row < 0 or row >= len(self._af_rows):
+            self._episode_chip.hide()
+            return
+        seg = self._af_rows[row]
+        start = self._recording_start_timestamp()
+
+        def at(sec):
+            if start:
+                return datetime.fromtimestamp(start + sec).strftime('%H:%M:%S')
+            return _sec_to_hms(sec)
+        shown = min(10.0, seg["end_sec"] - seg["start_sec"])
+        self._episode_chip.setText(f"Episode {row + 1} of {len(self._af_rows)}  \u00b7  {seg['type']}  \u00b7  "
+                                   f"{at(seg['start_sec'])} \u2192 {at(seg['end_sec'])}  \u00b7  "
+                                   f"first {shown:.0f} s shown")
+        self._episode_chip.show()
+
+    def _select_af_row_after_refresh(self, segments):
+        """After the table is filled: the episode whose waves are on the
+        right stays selected when it is still listed; otherwise (the tab's
+        first fill, another recording) the first episode is selected and its
+        waves are loaded -- was nothing selected and the right side showing
+        whatever second the replay stood on (at 13:54:02, 1 s before the
+        first AF of 2026-11-12_13-54-02, it only looked like AF)."""
+        shown = getattr(self, "_shown_af_start", None)
+        if shown is not None:
+            for i, seg in enumerate(segments):
+                if abs(float(seg["start_sec"]) - shown) < 1e-6:
+                    self._af_table.selectRow(i)
+                    self._update_episode_chip(i)
+                    return
+        self._af_table.selectRow(0)
+        self._on_af_row_clicked(0, 0)
 
     def _on_af_row_clicked(self, row: int, _col: int):
         if row < 0 or row >= len(self._af_rows):
@@ -373,11 +526,22 @@ class HolterAFPanel(QWidget):
             end_sec = min(float(getattr(engine, "duration_sec", start_sec + 10.0)), start_sec + 10.0)
             data = reader.read_range(start_sec, end_sec)
             if isinstance(data, np.ndarray) and data.ndim == 2 and data.shape[1] > 0:
-                self.set_replay_frame(data)
+                self._show_frame(data)
+                self._shown_af_start = start_sec
+                self._update_episode_chip(row)
         except Exception as e:
             print(f"[HolterAFPanel] Error loading AF strip: {e}")
 
     def set_replay_frame(self, data):
+        """The replay's current frame (HolterMainWindow._broadcast_replay_frame).
+        Ignored while an AF episode's waves are shown (_shown_af_start): the
+        replay frame arriving after the tab opened replaced the selected
+        episode's waves with whatever second the replay stood on."""
+        if getattr(self, "_shown_af_start", None) is not None:
+            return
+        self._show_frame(data)
+
+    def _show_frame(self, data):
         if data is None or data.shape[0] < 1: return
         N = data.shape[1]
         fs = 500.0

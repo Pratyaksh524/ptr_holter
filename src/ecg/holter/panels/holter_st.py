@@ -46,6 +46,53 @@ from ..holter_helpers import (
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas, HolterRRTrendCanvas, HRTrendCanvas, TendencyCanvas
 
+def _seg_btn_style(active: bool) -> str:
+    """One button of a segmented toggle (its group frame draws the outline)."""
+    if active:
+        return (f"QPushButton{{background:{UI_ACCENT};color:#FFFFFF;border:none;border-radius:6px;"
+                "padding:4px 14px;font-size:12px;font-weight:bold;}")
+    return (f"QPushButton{{background:transparent;color:{UI_MUTED};border:none;border-radius:6px;"
+            "padding:4px 14px;font-size:12px;font-weight:bold;}"
+            f"QPushButton:hover{{color:{UI_TEXT};background:#1A2C49;}}")
+
+
+def _seg_group(object_name: str, buttons) -> QFrame:
+    """A rounded frame holding `buttons` side by side (a segmented toggle)."""
+    group = QFrame()
+    group.setObjectName(object_name)
+    group.setStyleSheet(f"QFrame#{object_name}{{background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};"
+                        f"border-radius:8px;}}")
+    lay = QHBoxLayout(group)
+    lay.setContentsMargins(3, 3, 3, 3)
+    lay.setSpacing(2)
+    for b in buttons:
+        b.setCursor(Qt.PointingHandCursor)
+        b.setFixedHeight(26)
+        lay.addWidget(b)
+    return group
+
+
+def _caption(text: str) -> QLabel:
+    c = QLabel(text)
+    c.setStyleSheet(f"color:{UI_MUTED};font-size:9px;font-weight:700;letter-spacing:1px;"
+                    f"background:transparent;border:none;")
+    return c
+
+
+def _vline() -> QFrame:
+    line = QFrame()
+    line.setFixedWidth(1)
+    line.setStyleSheet(f"background:{UI_BORDER};border:none;")
+    return line
+
+
+_VIEW_HINTS = {
+    "ST": "Left: 12 leads at the replay position  \u00b7  Right: ST of the whole recording",
+    "T": "Left: 12 leads at the replay position  \u00b7  Right: T wave of the whole recording",
+    "TEND_CHART": "Click the HR graph or a trend to open that moment  \u00b7  drag I / J / K on the strip",
+}
+
+
 # 13. HOLTER ST TENDENCY PANEL
 class HolterSTPanel(QWidget):
     def __init__(self, parent=None, replay_engine=None):
@@ -94,22 +141,25 @@ class HolterSTPanel(QWidget):
 
         # Mode row (always visible)
         mode_row = QHBoxLayout()
+        mode_row.setSpacing(10)
         self._tend_chart_btn = QPushButton("Tend chart")
-        self._tend_chart_btn.setStyleSheet(_style_btn())
+        self._tend_chart_btn.setStyleSheet(_seg_btn_style(False))
         self._st_btn = QPushButton("ST")
-        self._st_btn.setStyleSheet(_style_active_btn())
+        self._st_btn.setStyleSheet(_seg_btn_style(True))
         self._st_btn.setFixedWidth(50)
         self._t_btn = QPushButton("T")
-        self._t_btn.setStyleSheet(_style_btn())
-        self._t_btn.setFixedWidth(40)
-        
+        self._t_btn.setStyleSheet(_seg_btn_style(False))
+        self._t_btn.setFixedWidth(50)
+
         self._tend_chart_btn.clicked.connect(lambda: self._set_view_mode("TEND_CHART"))
         self._st_btn.clicked.connect(lambda: self._set_view_mode("ST"))
         self._t_btn.clicked.connect(lambda: self._set_view_mode("T"))
 
-        mode_row.addWidget(self._tend_chart_btn)
-        mode_row.addWidget(self._st_btn)
-        mode_row.addWidget(self._t_btn)
+        mode_row.addWidget(_seg_group("stModeGroup", [self._tend_chart_btn, self._st_btn, self._t_btn]))
+        # what the current view shows (changes with the toggle)
+        self._mode_hint = QLabel(_VIEW_HINTS["ST"])
+        self._mode_hint.setStyleSheet(f"color:{UI_MUTED};font-size:11px;background:transparent;border:none;")
+        mode_row.addWidget(self._mode_hint)
         mode_row.addStretch()
         main_layout.addLayout(mode_row)
 
@@ -207,6 +257,7 @@ class HolterSTPanel(QWidget):
                 btn = QPushButton(lbl)
                 btn.setStyleSheet(_style_btn())
                 btn.setFixedHeight(30)
+                btn.setCursor(Qt.PointingHandCursor)
                 nav_row.addWidget(btn, 1)
         left_layout.addLayout(nav_row)
         normal_layout.addWidget(left, 3)
@@ -283,9 +334,16 @@ class HolterSTPanel(QWidget):
         tend_layout.setContentsMargins(0,0,0,0)
         tend_layout.setSpacing(4)
         
-        # Tend chart toolbar
-        toolbar = QHBoxLayout()
-        
+        # Tend chart toolbar: one card -- SCAN | I / J / K | ST THRESHOLD
+        toolbar_card = QFrame()
+        toolbar_card.setObjectName("stTendToolbar")
+        toolbar_card.setStyleSheet(f"QFrame#stTendToolbar{{background:{UI_PANEL};border:1px solid {UI_BORDER};"
+                                   f"border-radius:8px;}}")
+        toolbar = QHBoxLayout(toolbar_card)
+        toolbar.setContentsMargins(10, 6, 10, 6)
+        toolbar.setSpacing(6)
+        toolbar.addWidget(_caption("SCAN"))
+
         self._tend_start_btn = QPushButton("Start")
         self._tend_start_btn.setStyleSheet(_style_btn())
         self._tend_start_btn.setFixedHeight(32)
@@ -310,6 +368,13 @@ class HolterSTPanel(QWidget):
         self._tend_auto_update_btn.setFixedHeight(32)
         self._tend_auto_update_btn.clicked.connect(self._tend_on_toggle_auto_update)
         toolbar.addWidget(self._tend_auto_update_btn)
+        toolbar.addSpacing(6)
+        toolbar.addWidget(_vline())
+        toolbar.addSpacing(6)
+        toolbar.addWidget(_caption("I / J / K"))
+        # Default belongs with the markers it resets
+        toolbar.removeWidget(self._tend_default_btn)
+        toolbar.addWidget(self._tend_default_btn)
         
         self._tend_adjust_k_btn = QPushButton("Adjust K by HR")
         self._tend_adjust_k_btn.setCheckable(True)
@@ -319,8 +384,11 @@ class HolterSTPanel(QWidget):
         self._tend_adjust_k_btn.clicked.connect(self._tend_on_toggle_adjust_k)
         toolbar.addWidget(self._tend_adjust_k_btn)
         
+        toolbar.addSpacing(6)
+        toolbar.addWidget(_vline())
+        toolbar.addSpacing(6)
         threshold_lbl = QLabel("ST Threshold (mV):")
-        threshold_lbl.setStyleSheet(f"color:{UI_MUTED};font-weight:bold;background:transparent;padding-left:6px;")
+        threshold_lbl.setStyleSheet(f"color:{UI_MUTED};font-weight:bold;background:transparent;border:none;")
         toolbar.addWidget(threshold_lbl)
         self._tend_threshold_spin = QDoubleSpinBox()
         self._tend_threshold_spin.setRange(0.01, 1.0)
@@ -333,7 +401,11 @@ class HolterSTPanel(QWidget):
         toolbar.addWidget(self._tend_threshold_spin)
         
         toolbar.addStretch()
-        tend_layout.addLayout(toolbar)
+        for b in (self._tend_start_btn, self._tend_confirm_btn, self._tend_default_btn,
+                  self._tend_auto_update_btn, self._tend_adjust_k_btn):
+            b.setCursor(Qt.PointingHandCursor)
+        tend_layout.setSpacing(8)
+        tend_layout.addWidget(toolbar_card)
         
         # Tend chart main content
         main_content = QHBoxLayout()
@@ -341,59 +413,75 @@ class HolterSTPanel(QWidget):
         # Left: HR graph + ECG strip
         left_panel = QWidget()
         left_panel_layout = QVBoxLayout(left_panel)
+        left_panel_layout.setContentsMargins(0, 0, 0, 0)
+        left_panel_layout.setSpacing(8)
         
         # HR graph
         hr_frame = QFrame()
         hr_frame.setObjectName("stHrCard")
-        hr_frame.setStyleSheet(f"QFrame#stHrCard{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:8px;}}")
+        hr_frame.setStyleSheet(_card_style("QFrame#stHrCard"))
         hr_layout = QVBoxLayout(hr_frame)
+        hr_layout.setContentsMargins(10, 10, 10, 10)
+        hr_layout.setSpacing(6)
         self._tend_hr_title = QLabel("Entire HR Graph")
         self._tend_hr_title.setStyleSheet(_card_title_style())
         self._tend_hr_title.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         hr_layout.addWidget(self._tend_hr_title)
         self._tend_hr_canvas = HRTrendCanvas()
         self._tend_hr_canvas.clicked.connect(self._tend_on_hr_canvas_clicked)
-        hr_layout.addWidget(self._tend_hr_canvas)
+        hr_layout.addWidget(self._tend_hr_canvas, 1)
         left_panel_layout.addWidget(hr_frame, 1)
         
         # ECG strip with I/J/K markers
         ecg_frame = QFrame()
         ecg_frame.setObjectName("stEcgCard")
-        ecg_frame.setStyleSheet(f"QFrame#stEcgCard{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:8px;}}")
+        ecg_frame.setStyleSheet(_card_style("QFrame#stEcgCard"))
         ecg_layout = QVBoxLayout(ecg_frame)
+        ecg_layout.setContentsMargins(10, 10, 10, 10)
+        ecg_layout.setSpacing(6)
         self._tend_ecg_title = QLabel("ECG Strip (drag I/J/K markers)")
         self._tend_ecg_title.setStyleSheet(_card_title_style())
         self._tend_ecg_title.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         ecg_layout.addWidget(self._tend_ecg_title)
+        marker_legend = QLabel("I: baseline before the QRS  \u00b7  J: J point (end of QRS)  \u00b7  "
+                               "K: ST measuring point  \u00b7  T: T wave")
+        marker_legend.setWordWrap(True)
+        marker_legend.setStyleSheet(f"color:{UI_MUTED};font-size:10px;background:transparent;border:none;")
+        ecg_layout.addWidget(marker_legend)
         self._tend_ecg_strip = STTMarkerCanvas(height=200)
         self._tend_ecg_strip.markerMoved.connect(self._tend_on_marker_moved)
-        ecg_layout.addWidget(self._tend_ecg_strip)
-        left_panel_layout.addWidget(ecg_frame, 1)
+        ecg_layout.addWidget(self._tend_ecg_strip, 1)
+        # its own height (the strip is a fixed 200 px); the HR graph takes the rest
+        left_panel_layout.addWidget(ecg_frame, 0)
         
         main_content.addWidget(left_panel, 1)
         
         # Right: Tendency charts
-        right_panel = QWidget()
+        right_panel = QFrame()
+        right_panel.setObjectName("stTrendCard")
+        right_panel.setStyleSheet(_card_style("QFrame#stTrendCard"))
         right_panel_layout = QVBoxLayout(right_panel)
-        
+        right_panel_layout.setContentsMargins(10, 10, 10, 10)
+        right_panel_layout.setSpacing(8)
+
         mode_row_tend = QHBoxLayout()
-        self._tend_st_mode_btn = QPushButton("ST")
-        self._tend_st_mode_btn.setStyleSheet(_style_active_btn())
-        self._tend_t_mode_btn = QPushButton("T")
-        self._tend_t_mode_btn.setStyleSheet(_style_btn())
-        for btn in [self._tend_st_mode_btn, self._tend_t_mode_btn]:
-            btn.setFixedHeight(32)
-            mode_row_tend.addWidget(btn)
-        mode_row_tend.addStretch()
-        right_panel_layout.addLayout(mode_row_tend)
-        
         self._tend_tendency_title = QLabel("ST Trends")
         self._tend_tendency_title.setStyleSheet(_card_title_style())
-        right_panel_layout.addWidget(self._tend_tendency_title)
-        
+        mode_row_tend.addWidget(self._tend_tendency_title)
+        mode_row_tend.addStretch()
+        self._tend_st_mode_btn = QPushButton("ST")
+        self._tend_st_mode_btn.setStyleSheet(_seg_btn_style(True))
+        self._tend_t_mode_btn = QPushButton("T")
+        self._tend_t_mode_btn.setStyleSheet(_seg_btn_style(False))
+        for btn in [self._tend_st_mode_btn, self._tend_t_mode_btn]:
+            btn.setFixedWidth(50)
+        mode_row_tend.addWidget(_seg_group("stTendModeGroup", [self._tend_st_mode_btn, self._tend_t_mode_btn]))
+        right_panel_layout.addLayout(mode_row_tend)
+
         self._tend_tendency_scroll = QScrollArea()
         self._tend_tendency_scroll.setWidgetResizable(True)
-        self._tend_tendency_scroll.setStyleSheet(f"QScrollArea{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:6px;}}")
+        self._tend_tendency_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._tend_tendency_scroll.setStyleSheet(scroll_css)
         
         self._tend_tendency_content = QWidget()
         self._tend_tendency_layout = QVBoxLayout(self._tend_tendency_content)
@@ -404,13 +492,11 @@ class HolterSTPanel(QWidget):
         lead_names_tend = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
         self._tend_tendency_canvases = []
         for name in lead_names_tend:
-            lbl = QLabel(f"Lead {name}")
-            lbl.setStyleSheet(f"color:{COL_GREEN};font-size:10px;border:none;background:transparent;")
-            self._tend_tendency_layout.addWidget(lbl)
             canvas = TendencyCanvas(height=70)
             canvas.set_threshold(self._tend_st_threshold_mv)
-            canvas.clicked.connect(lambda idx=len(self._tend_tendency_canvases), c=canvas: self._tend_on_tendency_clicked(idx, c))
-            self._tend_tendency_layout.addWidget(canvas)
+            # the signal carries the index of the clicked point
+            canvas.clicked.connect(lambda idx, c=canvas: self._tend_on_tendency_clicked(idx, c))
+            self._tend_tendency_layout.addWidget(_lead_block(name, canvas, "stTendLeadBlock"))
             self._tend_tendency_canvases.append(canvas)
         
         self._tend_tendency_scroll.setWidget(self._tend_tendency_content)
@@ -434,23 +520,24 @@ class HolterSTPanel(QWidget):
         self._current_view_mode = mode
         
         # Update button styles
-        self._tend_chart_btn.setStyleSheet(_style_btn())
-        self._st_btn.setStyleSheet(_style_btn())
-        self._t_btn.setStyleSheet(_style_btn())
-        
+        self._tend_chart_btn.setStyleSheet(_seg_btn_style(False))
+        self._st_btn.setStyleSheet(_seg_btn_style(False))
+        self._t_btn.setStyleSheet(_seg_btn_style(False))
+        self._mode_hint.setText(_VIEW_HINTS.get(mode, ""))
+
         if mode == "TEND_CHART":
-            self._tend_chart_btn.setStyleSheet(_style_active_btn())
+            self._tend_chart_btn.setStyleSheet(_seg_btn_style(True))
             self._main_stack.setCurrentIndex(1)
             self._tend_update_hr_graph()
             self._tend_update_tendency_graphs()
             if self._replay_engine:
                 self._tend_update_ecg_strip()
         elif mode == "ST":
-            self._st_btn.setStyleSheet(_style_active_btn())
+            self._st_btn.setStyleSheet(_seg_btn_style(True))
             self._main_stack.setCurrentIndex(0)
             self._set_tendency_mode("ST")
         elif mode == "T":
-            self._t_btn.setStyleSheet(_style_active_btn())
+            self._t_btn.setStyleSheet(_seg_btn_style(True))
             self._main_stack.setCurrentIndex(0)
             self._set_tendency_mode("T")
 
@@ -527,35 +614,43 @@ class HolterSTPanel(QWidget):
     def _tend_set_mode(self, mode):
         self._tend_current_tendency_mode = mode
         if mode == "ST":
-            self._tend_st_mode_btn.setStyleSheet(_style_active_btn())
-            self._tend_t_mode_btn.setStyleSheet(_style_btn())
+            self._tend_st_mode_btn.setStyleSheet(_seg_btn_style(True))
+            self._tend_t_mode_btn.setStyleSheet(_seg_btn_style(False))
             self._tend_tendency_title.setText("ST Trends")
         else:
-            self._tend_t_mode_btn.setStyleSheet(_style_active_btn())
-            self._tend_st_mode_btn.setStyleSheet(_style_btn())
+            self._tend_t_mode_btn.setStyleSheet(_seg_btn_style(True))
+            self._tend_st_mode_btn.setStyleSheet(_seg_btn_style(False))
             self._tend_tendency_title.setText("T Trends")
         self._tend_update_tendency_graphs()
         
     def _tend_update_hr_graph(self):
-        hr_vals = [m.get('hr_mean', 0) for m in self._metrics]
-        self._tend_hr_canvas.set_data(hr_vals)
+        """HR of every chunk at its own time (s) on the bpm scale -- was the
+        chunk number on the time axis (178 chunks of a 14:51 recording read
+        0:00-2:30) and the 0-3000 RR scale (HR a flat line at the bottom)."""
+        points = [(float(m.get('t', i) or 0.0), float(m.get('hr_mean', 0) or 0.0))
+                  for i, m in enumerate(self._metrics)]
+        self._tend_hr_canvas.set_mode("HR")
+        self._tend_hr_canvas.set_points(points)
         self._tend_hr_canvas.set_current_index(self._tend_current_metric_index)
         
     def _tend_update_tendency_graphs(self):
+        # each value at its chunk's time (s), as the HR graph above
         if self._tend_scan_results:
+            times = [float(res.get('t_sec', i) or 0.0) for i, res in enumerate(self._tend_scan_results)]
             st_vals = [res['st_mv'] for res in self._tend_scan_results]
             t_vals = [res['t_mv'] for res in self._tend_scan_results]
         else:
+            times = [float(m.get('t', i) or 0.0) for i, m in enumerate(self._metrics)]
             st_vals = [m.get('st_mv', 0.0) for m in self._metrics]
             t_vals = [m.get('t_mv', 0.0) for m in self._metrics]
-            
+
         for i, canvas in enumerate(self._tend_tendency_canvases):
             if self._tend_current_tendency_mode == "ST":
                 canvas.set_tendency_mode("ST")
-                canvas.set_data(st_vals)
+                canvas.set_points(list(zip(times, st_vals)))
             else:
                 canvas.set_tendency_mode("T")
-                canvas.set_data(t_vals)
+                canvas.set_points(list(zip(times, t_vals)))
             canvas.set_current_index(self._tend_current_metric_index)
                 
     def _tend_update_ecg_strip(self):
@@ -690,10 +785,12 @@ class HolterSTPanel(QWidget):
             self._replay_engine.seek(t_sec)
             self._tend_update_ecg_strip()
             
-    def _tend_on_tendency_clicked(self, lead_idx, canvas):
-        idx = canvas.get_clicked_index()
-        if idx is not None:
-            self._tend_on_hr_canvas_clicked(idx)
+    def _tend_on_tendency_clicked(self, index, canvas):
+        """A click on a lead's trend opens that point (the canvas's clicked
+        signal carries its index) -- was the canvas's current point
+        (get_clicked_index), so a click on a trend went nowhere new."""
+        if index is not None and 0 <= int(index) < len(self._metrics):
+            self._tend_on_hr_canvas_clicked(int(index))
             
     def _tend_on_marker_moved(self, marker_name, pos_samples):
         if not self._replay_engine:

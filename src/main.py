@@ -244,7 +244,12 @@ class ComprehensiveMainWindow(QMainWindow):
         ws = HolterMainWindow(parent=self, session_dir="", patient_info={}, writer=None, live_source=None)
         try:
             latest = _find_latest_completed_session(_resolve_recordings_dir(""))
-            if latest:
+            # The newest recording is preloaded behind the recordings list only
+            # when it is already analysed; one that is not opens like any
+            # other, by double-click, through the "Analysing recording" popup
+            # (recording_analysis) -- not here, before the user picked it.
+            from ecg.holter.recording_analysis import is_analysed
+            if latest and is_analysed(latest):
                 ws.load_completed_session(latest)
         except Exception as e:
             print(f"[Comprehensive] could not load latest session: {e}")

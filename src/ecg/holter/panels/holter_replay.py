@@ -4,6 +4,7 @@ import gc
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import time
@@ -50,6 +51,65 @@ from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, Magni
 
 # 6. HOLTER REPLAY PANEL
 from ..ischemia_detection import ST_DEPRESSION, ST_ELEVATION, T_INVERSION, format_st_summary
+
+# -- REPLAY look: KPI tiles, segmented toggles, class-coloured filters --------
+# Colours of the Lorenz classes, as LorenzCanvas draws the dots.
+_CLASS_COLORS = {"all": "#2F80ED", "N": "#00D215", "S": "#FF3333", "V": "#FF9900", "P": "#00E5FF",
+                 "AF": "#FFD700", "X": "#888888", "U": "#C878FF"}
+# Accent of each summary tile: heart rate green, VE orange, SVE red, pauses
+# amber, HRV blue, the rest neutral.
+_KPI_ACCENTS = {"duration": "#8B9BB4", "total_beats": "#8B9BB4", "avg_hr": "#16C172", "max_hr": "#16C172",
+                "min_hr": "#16C172", "pauses": "#F59E0B", "ve": "#FF9900", "sve": "#FF3333",
+                "sdnn": "#4DA3FF", "rmssd": "#4DA3FF"}
+
+
+def _seg_style(active: bool) -> str:
+    """One button of a segmented toggle (the group frame draws the outline)."""
+    if active:
+        return ("QPushButton{background:#2F80ED;color:#FFFFFF;border:none;border-radius:6px;"
+                "padding:4px 14px;font-size:12px;font-weight:bold;}")
+    return ("QPushButton{background:transparent;color:#9AAECB;border:none;border-radius:6px;"
+            "padding:4px 14px;font-size:12px;font-weight:bold;}"
+            "QPushButton:hover{color:#E6EDF7;background:#1A2C49;}")
+
+
+def _seg_group(buttons):
+    """A rounded frame holding `buttons` side by side as one segmented toggle."""
+    frame = QFrame()
+    frame.setObjectName("rpSeg")
+    frame.setStyleSheet("QFrame#rpSeg{background:#13213A;border:1px solid #243552;border-radius:8px;}")
+    lay = QHBoxLayout(frame)
+    lay.setContentsMargins(3, 3, 3, 3)
+    lay.setSpacing(2)
+    for b in buttons:
+        b.setCursor(Qt.PointingHandCursor)
+        lay.addWidget(b)
+    return frame
+
+
+def _class_filter_style(active: bool, color: str) -> str:
+    """A Lorenz class button: tinted with its class colour when on."""
+    c = QColor(color)
+    if active:
+        return (f"QPushButton{{background:rgba({c.red()},{c.green()},{c.blue()},60);color:#FFFFFF;"
+                f"border:1px solid {color};border-radius:7px;padding:3px 9px;font-size:11px;font-weight:bold;}}")
+    return ("QPushButton{background:#13213A;color:#C9D4E5;border:1px solid #243552;border-radius:7px;"
+            "padding:3px 9px;font-size:11px;font-weight:bold;}"
+            f"QPushButton:hover{{border:1px solid {color};color:#FFFFFF;}}")
+
+
+def _dot_icon(color: str):
+    from PyQt5.QtGui import QIcon, QPixmap, QPainter as _QP
+    pm = QPixmap(10, 10)
+    pm.fill(QColor(0, 0, 0, 0))
+    painter = _QP(pm)
+    painter.setRenderHint(_QP.Antialiasing)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor(color))
+    painter.drawEllipse(1, 1, 8, 8)
+    painter.end()
+    return QIcon(pm)
+
 
 class HolterReplayPanel(QWidget):
     playback_state_changed = pyqtSignal(bool)
@@ -105,22 +165,26 @@ class HolterReplayPanel(QWidget):
         summary_frame.setStyleSheet(_card_style("QFrame#rpSummaryCard"))
         summary_frame.setMinimumHeight(76)
         summary_layout = QHBoxLayout(summary_frame)
-        summary_layout.setContentsMargins(12, 6, 12, 6)
-        summary_layout.setSpacing(0)
+        summary_layout.setContentsMargins(10, 8, 10, 8)
+        summary_layout.setSpacing(8)
         self._summary_labels = {}
+        # one tile per figure, its accent by kind (_KPI_ACCENTS)
         for key, title in [("duration","Duration"),("total_beats","Total Beats"),("avg_hr","Avg HR"),("max_hr","Max HR"),("min_hr","Min HR"),("pauses","Pauses"),("ve","VE Beats"),("sve","SVE Beats"),("sdnn","SDNN"),("rmssd","rMSSD")]:
-            col = QVBoxLayout()
-            col.setContentsMargins(12, 0, 12, 0)
-            col.setSpacing(2)
-            t = QLabel(title)
-            t.setStyleSheet(f"color:{UI_MUTED};font-size:9px;font-weight:700;border:none;background:transparent;")
+            tile = QFrame()
+            tile.setObjectName("rpKpi")
+            tile.setStyleSheet(f"QFrame#rpKpi{{background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};"
+                               f"border-left:3px solid {_KPI_ACCENTS.get(key, UI_MUTED)};border-radius:8px;}}")
+            col = QVBoxLayout(tile)
+            col.setContentsMargins(12, 6, 10, 6)
+            col.setSpacing(1)
+            t = QLabel(title.upper())
+            t.setStyleSheet(f"color:{UI_MUTED};font-size:9px;font-weight:700;letter-spacing:1px;border:none;background:transparent;")
             v = QLabel("-")
-            v.setStyleSheet(f"color:{UI_TEXT};font-size:13px;font-weight:700;border:none;background:transparent;")
+            v.setStyleSheet(f"color:{UI_TEXT};font-size:16px;font-weight:700;border:none;background:transparent;")
             col.addWidget(t)
             col.addWidget(v)
             self._summary_labels[key] = v
-            summary_layout.addLayout(col)
-        summary_layout.addStretch()
+            summary_layout.addWidget(tile, 1)
         layout.addWidget(summary_frame)
 
         #    HR trend mini-chart (40h-48h of data at a glance)   
@@ -137,16 +201,19 @@ class HolterReplayPanel(QWidget):
         self._btn_goto_time = QPushButton("Goto Time")
         self._btn_rr = QPushButton("RR")
         self._btn_hr = QPushButton("HR")
-        for b in [self._btn_time_whole, self._btn_time_share, self._btn_goto_time]:
-            b.setFixedHeight(30)
-            b.setStyleSheet(_style_btn(UI_PANEL_ALT, UI_MUTED, "#1A2C49"))
-            time_row.addWidget(b)
+        for b in [self._btn_time_whole, self._btn_time_share, self._btn_rr, self._btn_hr]:
+            b.setFixedHeight(26)
+            b.setStyleSheet(_seg_style(False))
+        time_row.addWidget(_seg_group([self._btn_time_whole, self._btn_time_share]))
+        self._btn_goto_time.setFixedHeight(32)
+        self._btn_goto_time.setCursor(Qt.PointingHandCursor)
+        self._btn_goto_time.setStyleSheet(_style_btn(UI_PANEL_ALT, UI_TEXT, "#1A2C49"))
+        time_row.addWidget(self._btn_goto_time)
         time_row.addStretch()
-        for b in [self._btn_rr, self._btn_hr]:
-            b.setFixedHeight(28)
-            b.setFixedWidth(52)
-            b.setStyleSheet(_style_btn(UI_PANEL_ALT, UI_MUTED, "#1A2C49"))
-            time_row.addWidget(b)
+        trend_lbl = QLabel("TREND")
+        trend_lbl.setStyleSheet(f"color:{UI_MUTED};font-size:9px;font-weight:700;letter-spacing:1px;border:none;background:transparent;")
+        time_row.addWidget(trend_lbl)
+        time_row.addWidget(_seg_group([self._btn_rr, self._btn_hr]))
         layout.addLayout(time_row)
         self._btn_time_whole.clicked.connect(lambda: self._set_time_scope("whole"))
         self._btn_time_share.clicked.connect(lambda: self._set_time_scope("share"))
@@ -177,12 +244,15 @@ class HolterReplayPanel(QWidget):
         lorenz_filter_row.setSpacing(4)
         lorenz_filter_row.setContentsMargins(0, 4, 0, 4)
         self._lorenz_class_btns = {}
-        for key, lbl in [("all", "All"), ("N", "N"), ("S", "S"), ("V", "V"), ("P", "P"), ("AF", "AF"), ("X", "X"), ("Other", "Other")]:
+        for key, lbl in [("all", "All"), ("N", "N"), ("S", "S"), ("V", "V"), ("P", "P"), ("AF", "AF"), ("X", "X"), ("U", "Unidentified")]:
             b = QPushButton(lbl)
             b.setCheckable(True)
             b.setToolTip(f"Show {lbl} beats" if key != "all" else "Show all beats")
             b.setFixedHeight(28)
-            b.setStyleSheet(_style_filter_btn(active=(key == "all"), fg=COL_GREEN if key != "all" else UI_TEXT))
+            b.setCursor(Qt.PointingHandCursor)
+            if key != "all":
+                b.setIcon(_dot_icon(_CLASS_COLORS.get(key, "#FFFFFF")))
+            b.setStyleSheet(_class_filter_style(key == "all", _CLASS_COLORS.get(key, "#FFFFFF")))
             b.clicked.connect(lambda checked=False, k=key: self._set_lorenz_class_filter(k))
             self._lorenz_class_btns[key] = b
             lorenz_filter_row.addWidget(b)
@@ -379,19 +449,29 @@ class HolterReplayPanel(QWidget):
         ctrl_row.setSpacing(7)
 
         self._play_btn = QPushButton("Play")
-        self._play_btn.setStyleSheet(_style_btn())
-        self._play_btn.setFixedHeight(30)
-        self._play_btn.setMinimumWidth(100)
+        self._play_btn.setStyleSheet(
+            "QPushButton{background:#16A34A;color:#FFFFFF;border:1px solid #22C55E;border-radius:8px;"
+            "padding:6px 18px;font-size:13px;font-weight:bold;}"
+            "QPushButton:hover{background:#22C55E;}")
+        self._play_btn.setFixedHeight(32)
+        self._play_btn.setMinimumWidth(110)
+        self._play_btn.setCursor(Qt.PointingHandCursor)
         self._play_btn.clicked.connect(self._toggle_playback)
         ctrl_row.addWidget(self._play_btn)
 
+        speed_lbl_w = QLabel("SPEED")
+        speed_lbl_w.setStyleSheet(f"color:{UI_MUTED};font-size:9px;font-weight:700;letter-spacing:1px;border:none;background:transparent;")
+        ctrl_row.addSpacing(6)
+        ctrl_row.addWidget(speed_lbl_w)
+        self._speed_btns = {}
         for speed_lbl in ["0.5x", "1x", "2x", "4x"]:
             btn = QPushButton(speed_lbl)
-            btn.setStyleSheet(_style_btn())
-            btn.setFixedHeight(30)
-            btn.setMinimumWidth(56)
+            btn.setStyleSheet(_seg_style(speed_lbl == "1x"))
+            btn.setFixedHeight(26)
+            btn.setMinimumWidth(48)
             btn.clicked.connect(lambda _, s=speed_lbl: self._set_speed(s))
-            ctrl_row.addWidget(btn)
+            self._speed_btns[speed_lbl] = btn
+        ctrl_row.addWidget(_seg_group(list(self._speed_btns.values())))
         sep = QLabel("|")
         sep.setStyleSheet(f"color:{UI_BORDER};background:transparent;border:none;")
         ctrl_row.addWidget(sep)
@@ -423,7 +503,7 @@ class HolterReplayPanel(QWidget):
         toolbar.setObjectName("rpToolbar")
         toolbar.setStyleSheet(_card_style("QFrame#rpToolbar"))
         toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(5, 4, 5, 4)
+        toolbar_layout.setContentsMargins(10, 6, 10, 6)
         toolbar_layout.setSpacing(5)
         self._tool_btns = {}
         tool_min_widths = {
@@ -444,9 +524,9 @@ class HolterReplayPanel(QWidget):
                 background: {UI_PANEL_ALT};
                 color: {UI_TEXT};
                 border: 1px solid {UI_BORDER};
-                border-radius: 6px;
-                padding: 5px 10px;
-                font-size: 10px;
+                border-radius: 7px;
+                padding: 5px 11px;
+                font-size: 11px;
                 font-weight: 600;
             }}
             QPushButton:hover {{
@@ -460,25 +540,41 @@ class HolterReplayPanel(QWidget):
                 border: 1px solid #5EA4FF;
             }}
         """
-        for tool in ["Patient information", "Full Disc.", "Goto Template"]:
-            tbtn = QPushButton(tool)
-            tbtn.setStyleSheet(tool_button_style)
-            tbtn.setMinimumHeight(32)
-            tbtn.setMinimumWidth(tool_min_widths.get(tool, 110))
-            tbtn.clicked.connect(lambda _, t=tool, b=tbtn: self._set_tool_mode(t, b))
-            toolbar_layout.addWidget(tbtn)
-            self._tool_btns[tool] = tbtn
-        for tool in ["Measuring Ruler", "Parallel Ruler", "Magnifying Glass", "Gain Settings",
-                     "Paper speed:25mm/s", "Add Event(space)", "Adjust strip position", "Strip Length:10s"]:
-            tbtn = QPushButton(tool)
-            tbtn.setStyleSheet(tool_button_style)
-            tbtn.setMinimumHeight(32)
-            tbtn.setMinimumWidth(tool_min_widths.get(tool, 110))
-            if tool == "Gain Settings":
-                tbtn.setText("Gain: 10mm/mV")
-            tbtn.clicked.connect(lambda _, t=tool, b=tbtn: self._set_tool_mode(t, b))
-            toolbar_layout.addWidget(tbtn)
-            self._tool_btns[tool] = tbtn
+        # grouped by what they do, a caption over each group
+        tool_groups = [
+            ("NAVIGATE", ["Patient information", "Full Disc.", "Goto Template"]),
+            ("MEASURE", ["Measuring Ruler", "Parallel Ruler", "Magnifying Glass"]),
+            ("DISPLAY", ["Gain Settings", "Paper speed:25mm/s", "Strip Length:10s", "Adjust strip position"]),
+            ("EVENTS", ["Add Event(space)"]),
+        ]
+        for g_index, (group_name, tools) in enumerate(tool_groups):
+            if g_index:
+                sep_line = QFrame()
+                sep_line.setFixedWidth(1)
+                sep_line.setStyleSheet(f"background:{UI_BORDER};border:none;")
+                toolbar_layout.addSpacing(4)
+                toolbar_layout.addWidget(sep_line)
+                toolbar_layout.addSpacing(4)
+            group_box = QVBoxLayout()
+            group_box.setSpacing(2)
+            caption = QLabel(group_name)
+            caption.setStyleSheet(f"color:{UI_MUTED};font-size:8px;font-weight:700;letter-spacing:1px;border:none;background:transparent;")
+            group_box.addWidget(caption)
+            group_row = QHBoxLayout()
+            group_row.setSpacing(5)
+            for tool in tools:
+                tbtn = QPushButton(tool)
+                tbtn.setStyleSheet(tool_button_style)
+                tbtn.setMinimumHeight(30)
+                tbtn.setMinimumWidth(tool_min_widths.get(tool, 110))
+                tbtn.setCursor(Qt.PointingHandCursor)
+                if tool == "Gain Settings":
+                    tbtn.setText("Gain: 10mm/mV")
+                tbtn.clicked.connect(lambda _, t=tool, b=tbtn: self._set_tool_mode(t, b))
+                group_row.addWidget(tbtn)
+                self._tool_btns[tool] = tbtn
+            group_box.addLayout(group_row)
+            toolbar_layout.addLayout(group_box)
         self._tool_btns["Gain Settings"].setToolTip(
             "Cycle gain (5/10/20/40 mm/mV equivalent) to improve waveform visibility."
         )
@@ -599,8 +695,8 @@ class HolterReplayPanel(QWidget):
 
     def _set_time_scope(self, scope: str):
         self._time_scope = scope
-        self._btn_time_whole.setStyleSheet(_style_active_btn() if scope == "whole" else _style_btn(UI_PANEL_ALT, UI_MUTED, "#1A2C49"))
-        self._btn_time_share.setStyleSheet(_style_active_btn() if scope == "share" else _style_btn(UI_PANEL_ALT, UI_MUTED, "#1A2C49"))
+        self._btn_time_whole.setStyleSheet(_seg_style(scope == "whole"))
+        self._btn_time_share.setStyleSheet(_seg_style(scope == "share"))
         self._strip_length_sec = 10.0 if scope == "whole" else 3.6
         if getattr(self, "_replay_engine", None):
             try:
@@ -637,34 +733,47 @@ class HolterReplayPanel(QWidget):
 
     def _set_rr_mode(self, mode: str):
         self._rr_mode = mode
-        self._btn_rr.setStyleSheet(_style_active_btn() if mode == "RR" else _style_btn(UI_PANEL_ALT, UI_MUTED, "#1A2C49"))
-        self._btn_hr.setStyleSheet(_style_active_btn() if mode == "HR" else _style_btn(UI_PANEL_ALT, UI_MUTED, "#1A2C49"))
+        self._btn_rr.setStyleSheet(_seg_style(mode == "RR"))
+        self._btn_hr.setStyleSheet(_seg_style(mode == "HR"))
         if hasattr(self, '_hr_trend_canvas'):
             self._hr_trend_canvas.set_mode(mode)
         if self._last_metrics_list:
             self.update_lorenz(self._last_metrics_list)
 
-    def _build_info_table(self, rows):
-        table = QTableWidget(len(rows), 2)
-        table.setHorizontalHeaderLabels(["Field", "Value"])
-        table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setStretchLastSection(True)
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        table.setEditTriggers(QTableWidget.NoEditTriggers)
-        table.setSelectionMode(QAbstractItemView.NoSelection)
-        table.setFocusPolicy(Qt.NoFocus)
-        table.setStyleSheet(_table_style())
-        table.setAlternatingRowColors(True)
-        for row, (label, value) in enumerate(rows):
-            label_item = QTableWidgetItem(str(label))
-            label_item.setForeground(QColor(UI_MUTED))
-            value_item = QTableWidgetItem(str(value))
-            value_item.setForeground(QColor(UI_TEXT))
-            table.setItem(row, 0, label_item)
-            table.setItem(row, 1, value_item)
-        table.resizeRowsToContents()
-        return table
+    @staticmethod
+    def _info_card(caption: str, rows, columns: int = 1) -> QFrame:
+        """A card of "label  value" rows (`columns` pairs side by side) for the
+        Patient Information dialog. A value that says nothing ("", "-",
+        "Select" -- the patient form's empty choice) shows a muted dash."""
+        card = QFrame()
+        card.setObjectName("piCard")
+        card.setStyleSheet(f"QFrame#piCard{{background:{UI_PANEL};border:1px solid {UI_BORDER};"
+                           f"border-radius:8px;}}")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(14, 10, 14, 12)
+        lay.setSpacing(8)
+        cap = QLabel(caption)
+        cap.setStyleSheet(f"color:{UI_MUTED};font-size:9px;font-weight:700;letter-spacing:1px;")
+        lay.addWidget(cap)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(8)
+        for i, (label, value) in enumerate(rows):
+            r, c = divmod(i, columns)
+            name = QLabel(str(label))
+            name.setStyleSheet(f"color:{UI_MUTED};font-size:11px;")
+            text = str(value if value is not None else "").strip()
+            empty = text in ("", "-", "Select", "None")
+            val = QLabel("\u2014" if empty else text)
+            val.setWordWrap(True)
+            val.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            val.setStyleSheet(f"color:{UI_MUTED if empty else UI_TEXT};font-size:13px;"
+                              f"font-weight:{400 if empty else 700};")
+            grid.addWidget(name, r, c * 2, Qt.AlignLeft | Qt.AlignTop)
+            grid.addWidget(val, r, c * 2 + 1)
+            grid.setColumnStretch(c * 2 + 1, 1)
+        lay.addLayout(grid)
+        return card
 
     def _show_patient_information(self):
         summary = dict(getattr(self, "_summary", {}) or {})
@@ -728,9 +837,14 @@ class HolterReplayPanel(QWidget):
             ("Study Duration", fmt_duration(summary.get("duration_sec", 0))),
         ]
 
+        # The recording's start / end for the STUDY card (as the window header)
+        rec_start, rec_end = _get_recording_start_end_times(session_dir, float(summary.get("duration_sec", 0) or 0))
+        if rec_start == "Unknown":
+            rec_start = rec_end = "-"
+
         dlg = QDialog(self)
         dlg.setWindowTitle("Patient Information")
-        dlg.setMinimumSize(760, 620)
+        dlg.setMinimumWidth(640)
         dlg.setStyleSheet(f"""
             QDialog {{
                 background: {UI_BG};
@@ -761,36 +875,49 @@ class HolterReplayPanel(QWidget):
         outer.setContentsMargins(16, 16, 16, 16)
         outer.setSpacing(12)
 
-        title = QLabel("Patient Information")
+        # Header: the patient's initials in a circle, the name, the recording
+        fields = dict(patient_rows)
+        name = str(fields.get("Patient Name", "") or "").strip()
+        words = [w for w in re.split(r"[^A-Za-z0-9]+", name) if w and name != "-"]
+        initials = "".join(w[0] for w in words[:2]).upper() or "?"
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        badge = QLabel(initials)
+        badge.setFixedSize(48, 48)
+        badge.setAlignment(Qt.AlignCenter)
+        badge.setStyleSheet(f"color:{UI_TEXT};font-size:16px;font-weight:700;background:{UI_PANEL_ALT};"
+                            f"border:1px solid {UI_BORDER};border-radius:24px;")
+        head.addWidget(badge)
+        head_text = QVBoxLayout()
+        head_text.setSpacing(2)
+        title = QLabel(name if name and name != "-" else "Patient Information")
         title.setStyleSheet(f"font-size:18px;font-weight:700;color:{UI_TEXT};")
-        outer.addWidget(title)
-
+        head_text.addWidget(title)
         subtitle = QLabel(f"Selected recording: {session_name}")
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet(f"color:{UI_MUTED};font-size:12px;")
-        outer.addWidget(subtitle)
+        head_text.addWidget(subtitle)
+        head.addLayout(head_text, 1)
+        outer.addLayout(head)
 
-        patient_box = QGroupBox("Patient Details")
-        patient_box.setStyleSheet(f"""
-            QGroupBox {{
-                color: {UI_TEXT};
-                font-weight: 700;
-                border: 1px solid {UI_BORDER};
-                border-radius: 8px;
-                margin-top: 12px;
-                padding-top: 16px;
-                background: {UI_PANEL};
-            }}
-        """)
-        patient_layout = QVBoxLayout(patient_box)
-        patient_layout.setContentsMargins(10, 16, 10, 10)
-        patient_layout.addWidget(self._build_info_table(patient_rows))
-        outer.addWidget(patient_box)
+        # The fields as cards (same fields as before; Start / End added to STUDY)
+        top = QHBoxLayout()
+        top.setSpacing(12)
+        top.addWidget(self._info_card("PATIENT", [
+            ("Patient Name", fields.get("Patient Name")), ("Age", fields.get("Age")),
+            ("Gender", fields.get("Gender"))]), 1)
+        top.addWidget(self._info_card("STUDY", [
+            ("Start", rec_start), ("End", rec_end), ("Study Duration", fields.get("Study Duration"))]), 1)
+        outer.addLayout(top)
+        outer.addWidget(self._info_card("REFERRAL & CONTACT", [
+            ("Doctor", fields.get("Doctor")), ("Email", fields.get("Email")),
+            ("Phone", fields.get("Phone")), ("Organisation", fields.get("Organisation"))], columns=2))
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         close_btn = QPushButton("Close")
         close_btn.setFixedSize(94, 32)
+        close_btn.setCursor(Qt.PointingHandCursor)
         close_btn.setStyleSheet(_style_btn())
         close_btn.clicked.connect(dlg.accept)
         btn_row.addWidget(close_btn)
@@ -983,6 +1110,8 @@ class HolterReplayPanel(QWidget):
             self._play_btn.setText("Pause")
 
     def _set_speed(self, text: str):
+        for _lbl, _btn in getattr(self, "_speed_btns", {}).items():
+            _btn.setStyleSheet(_seg_style(_lbl == text))
         if self._replay_engine:
             try:
                 self._replay_engine.set_speed(float(text.replace("x", "")))
@@ -997,7 +1126,7 @@ class HolterReplayPanel(QWidget):
         for btn_key, btn in self._lorenz_class_btns.items():
             is_active = (btn_key == key)
             btn.setChecked(is_active)
-            btn.setStyleSheet(_style_filter_btn(active=is_active, fg=COL_GREEN if not is_active else UI_TEXT))
+            btn.setStyleSheet(_class_filter_style(is_active, _CLASS_COLORS.get(btn_key, "#FFFFFF")))
         if self._last_metrics_list:
             self.update_lorenz(self._last_metrics_list)
 
@@ -1006,9 +1135,16 @@ class HolterReplayPanel(QWidget):
             t = self._replay_engine.seek_to_event(ev_type, direction)
             self.seek_requested.emit(t)
 
-    def update_lorenz(self, metrics_list: list):
-        """Update the Lorenz/scatter plot from all individual RR data."""
+    def update_lorenz(self, metrics_list: list, session_dir: str = None):
+        """Update the Lorenz/scatter plot. Points and their classes come from
+        the recording's saved PVC / PAC beats and auto segments
+        (lorenz_beats: one point per beat, paired with the real next beat,
+        classes N / S / V / P / AF / X / U / Other); the live chunks' RRs
+        below are kept for the overview table, and for the plot only when
+        those results are not saved."""
         self._last_metrics_list = list(metrics_list or [])
+        if session_dir is not None:
+            self._lorenz_session_dir = session_dir
         rr_all = []
         rr_points = []
         for m in metrics_list:
@@ -1052,7 +1188,29 @@ class HolterReplayPanel(QWidget):
         filtered_classes = [p[2] for p in filtered_points if p[1] > 200]
         plot_rr = filtered_rr if len(filtered_rr) >= 2 else rr_n
         plot_classes = filtered_classes if len(filtered_rr) >= 2 else rr_n_classes
-        if len(plot_rr) >= 2:
+        from ..lorenz_beats import lorenz_points, plot_data
+        beat_points = lorenz_points(getattr(self, '_lorenz_session_dir', None))
+        if beat_points is not None:
+            # each class button shows how many beats it holds
+            from collections import Counter as _Counter
+            _counts = _Counter(p[3] for p in beat_points)
+            _names = {"all": "All", "U": "Unidentified"}
+            for _k, _b in self._lorenz_class_btns.items():
+                _n = len(beat_points) if _k == "all" else _counts.get(_k, 0)
+                _b.setText(f"{_names.get(_k, _k)}  {_n}")
+            xs, ys, classes, pts, rng, empty_text = plot_data(beat_points, self._class_filter)
+            if xs:
+                self._lorenz_canvas.set_data(xs, ys, x_range=rng, y_range=rng, beat_classes=classes,
+                                             rr_points=pts)
+            else:
+                self._lorenz_canvas.set_data([], [], rr_points=[], empty_text=empty_text)
+            # the RR / HR trend shows the same beats as the plot
+            filtered_points = [(p[0], p[1], p[2]) for p in pts]
+            rr_points = filtered_points
+            plot_rr = []
+        if beat_points is not None:
+            pass      # plotted above
+        elif len(plot_rr) >= 2:
             rr_x = plot_rr[:-1]
             rr_y = plot_rr[1:]
             plot_beat_classes = plot_classes[:-1]  # use the first beat's class for each point

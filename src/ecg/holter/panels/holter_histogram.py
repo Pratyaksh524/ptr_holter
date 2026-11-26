@@ -47,6 +47,16 @@ from ..holter_helpers import (
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas
 
 # 11. HOLTER HISTOGRAM PANEL
+def _rank_btn_style(active: bool) -> str:
+    """One button of the ranking toggle (its group frame draws the outline)."""
+    if active:
+        return (f"QPushButton{{background:{UI_ACCENT};color:#FFFFFF;border:none;border-radius:6px;"
+                "padding:4px 14px;font-size:12px;font-weight:bold;}")
+    return (f"QPushButton{{background:transparent;color:{UI_MUTED};border:none;border-radius:6px;"
+            "padding:4px 14px;font-size:12px;font-weight:bold;}"
+            f"QPushButton:hover{{color:{UI_TEXT};background:#1A2C49;}}")
+
+
 class HolterHistogramPanel(QWidget):
     seek_requested = pyqtSignal(float)
 
@@ -97,14 +107,24 @@ class HolterHistogramPanel(QWidget):
 
         btn_row = QHBoxLayout()
         self._rank_buttons = {}
+        # one segmented toggle (a rounded frame holding the four buttons)
+        rank_group = QFrame()
+        rank_group.setObjectName("hgRankGroup")
+        rank_group.setStyleSheet(f"QFrame#hgRankGroup{{background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};border-radius:8px;}}")
+        rank_lay = QHBoxLayout(rank_group)
+        rank_lay.setContentsMargins(3, 3, 3, 3)
+        rank_lay.setSpacing(2)
         for lbl, mode in [("RRI Ranking", "rri"), ("Time Ranking", "time"),
                           ("Prematurity Ranking", "prematurity"), ("Similarity Ranking", "similarity")]:
             btn = QPushButton(lbl)
             btn.setCheckable(True)
-            btn.setStyleSheet(_style_btn())
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(26)
+            btn.setStyleSheet(_rank_btn_style(False))
             btn.clicked.connect(lambda _, m=mode: self._set_rank_mode(m))
             self._rank_buttons[mode] = btn
-            btn_row.addWidget(btn)
+            rank_lay.addWidget(btn)
+        btn_row.addWidget(rank_group)
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -113,16 +133,20 @@ class HolterHistogramPanel(QWidget):
         layout.addWidget(self._hist_canvas, 1)
         self._selected_info = QLabel("Selected: none")
         self._selected_info.setStyleSheet(
-            f"color:{UI_MUTED};font-size:11px;font-weight:bold;border:none;background:transparent;padding:2px 2px;"
+            f"color:{UI_MUTED};font-size:11px;font-weight:bold;background:{UI_PANEL_ALT};"
+            f"border:1px solid {UI_BORDER};border-radius:6px;padding:4px 10px;"
         )
-        layout.addWidget(self._selected_info)
+        self._selected_info.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        layout.addWidget(self._selected_info, 0, Qt.AlignLeft)
 
 
         stats_frame = QFrame()
         stats_frame.setObjectName("hgStatsCard")
         stats_frame.setStyleSheet(_card_style("QFrame#hgStatsCard"))
         stats_layout = QGridLayout(stats_frame)
-        stats_layout.setContentsMargins(10, 6, 10, 6)
+        stats_layout.setContentsMargins(10, 8, 10, 8)
+        stats_layout.setHorizontalSpacing(8)
+        stats_layout.setVerticalSpacing(8)
         self._hist_stats = {}
         for i, (key, lbl) in enumerate([("nns","NNs"),("mean_nn","Mean NN"),
                                          ("sdnn","SDNN"),("sdann","SDANN"),
@@ -130,12 +154,19 @@ class HolterHistogramPanel(QWidget):
                                          ("triidx","TRIIDX"),("sdnnidx","SDNNIDX")]):
             col = i % 4
             row = i // 4
-            l = QLabel(f"{lbl}:")
-            l.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:bold;border:none;background:transparent;")
+            tile = QFrame()
+            tile.setObjectName("hgStatTile")
+            tile.setStyleSheet(f"QFrame#hgStatTile{{background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};border-radius:8px;}}")
+            tile_lay = QVBoxLayout(tile)
+            tile_lay.setContentsMargins(12, 6, 12, 6)
+            tile_lay.setSpacing(1)
+            l = QLabel(lbl)       # HRV names keep their own case (rMSSD, pNN50, NNs)
+            l.setStyleSheet(f"color:{UI_MUTED};font-size:10px;font-weight:700;border:none;background:transparent;")
             v = QLabel("?")
-            v.setStyleSheet(f"color:{UI_TEXT};font-size:13px;font-weight:bold;border:none;background:transparent;")
-            stats_layout.addWidget(l, row*2, col)
-            stats_layout.addWidget(v, row*2+1, col)
+            v.setStyleSheet(f"color:{UI_TEXT};font-size:16px;font-weight:bold;border:none;background:transparent;")
+            tile_lay.addWidget(l)
+            tile_lay.addWidget(v)
+            stats_layout.addWidget(tile, row, col)
             self._hist_stats[key] = v
         layout.addWidget(stats_frame)
 
@@ -148,7 +179,7 @@ class HolterHistogramPanel(QWidget):
         for key, btn in getattr(self, "_rank_buttons", {}).items():
             active = key == mode
             btn.setChecked(active)
-            btn.setStyleSheet(_style_active_btn() if active else _style_btn())
+            btn.setStyleSheet(_rank_btn_style(active))
         self._draw()
     
     def _on_type_changed(self, text):

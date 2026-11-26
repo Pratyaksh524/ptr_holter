@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (
 from ..holter_helpers import (
     UI_ACCENT, UI_ACCENT_HOVER, UI_BG, UI_BORDER, UI_CARD, UI_MUTED,
     UI_PANEL, UI_PANEL_ALT, UI_SUCCESS, UI_TEXT, UI_WARNING, _style_btn, _style_active_btn,
-    _card_style,
+    _card_style, _format_system_time, _sec_to_hms,
 )
 
 LEADS = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
@@ -180,6 +180,7 @@ class HolterRecordSettingsPanel(QWidget):
         info_lbl = QLabel(f"Recording duration: {self._duration_hours:g} hours | Session: {self._session_name}")
         info_lbl.setStyleSheet(f"font-size: 12px; color: {UI_MUTED}; background: transparent; border: none;")
         header_layout.addWidget(info_lbl)
+        self._info_lbl = info_lbl   # set_recording_info puts the opened recording here
 
         main_layout.addWidget(header_card)
 
@@ -302,6 +303,19 @@ class HolterRecordSettingsPanel(QWidget):
         self._sidebar_list.currentRowChanged.connect(self._stacked_widget.setCurrentIndex)
         self._sidebar_list.setCurrentRow(0)
 
+    def set_recording_info(self, session_dir: str, duration_sec: float):
+        """The header's recording line for the opened recording:
+        "Recording: 13:54:02 -> 14:08:54 (00:14:51) | Session: <folder>" --
+        was the window's default "24 hours | Current session"."""
+        name = os.path.basename(os.path.normpath(session_dir)) if session_dir else "Current session"
+        dur = float(duration_sec or 0.0)
+        if session_dir and dur > 0:
+            span = (f"{_format_system_time(session_dir, 0.0)} \u2192 {_format_system_time(session_dir, dur)}"
+                    f" ({_sec_to_hms(dur)})")
+            self._info_lbl.setText(f"Recording: {span}  |  Session: {name}")
+        else:
+            self._info_lbl.setText(f"Recording duration: {self._duration_hours:g} hours | Session: {name}")
+
     def _group_style(self) -> str:
         return f"""
             QGroupBox {{
@@ -343,7 +357,7 @@ class HolterRecordSettingsPanel(QWidget):
         grid_gain = QGridLayout(group_gain)
         grid_gain.setContentsMargins(14, 16, 14, 14)
         grid_gain.setHorizontalSpacing(24)
-        grid_gain.setVerticalSpacing(10)
+        grid_gain.setVerticalSpacing(8)
 
         self._gain_radios = {}
         self._invert_checks = {}
@@ -356,16 +370,30 @@ class HolterRecordSettingsPanel(QWidget):
         for col, val in enumerate(GAIN_VALUES):
             lbl_val_hdr = QLabel(f"{val} mm/mV")
             lbl_val_hdr.setStyleSheet(_rs_col_header_style())
+            lbl_val_hdr.setAlignment(Qt.AlignCenter)
+            lbl_val_hdr.setMinimumWidth(110)
             grid_gain.addWidget(lbl_val_hdr, 0, col + 1)
 
         lbl_inv_hdr = QLabel("Invert")
         lbl_inv_hdr.setStyleSheet(_rs_col_header_style())
+        lbl_inv_hdr.setAlignment(Qt.AlignCenter)
+        lbl_inv_hdr.setMinimumWidth(90)
         grid_gain.addWidget(lbl_inv_hdr, 0, len(GAIN_VALUES) + 1)
+        lbl_lead_hdr.setMinimumWidth(80)
+        # the columns keep their width; the spare width goes to an empty last column
+        grid_gain.setColumnStretch(len(GAIN_VALUES) + 2, 1)
 
         # Rows for I, II, III, aVR, aVL, aVF, V1, V2, V3, V4, V5, V6, All
         self._gain_btn_groups = {}  # per-row QButtonGroup for correct mutual exclusion
         for row_idx, lead in enumerate(ALL_ROWS, start=1):
-            lbl_lead = QLabel(lead)
+            if lead == "All":
+                # a rule above the "All" row: it sets every lead at once
+                rule = QFrame()
+                rule.setFixedHeight(1)
+                rule.setStyleSheet(f"background:{UI_BORDER};border:none;")
+                grid_gain.addWidget(rule, row_idx, 0, 1, len(GAIN_VALUES) + 2)
+                row_idx += 1
+            lbl_lead = QLabel("All leads" if lead == "All" else lead)
             lbl_lead.setStyleSheet(f"font-weight: 700; color: {UI_TEXT}; font-size: 12px;")
             grid_gain.addWidget(lbl_lead, row_idx, 0)
 
@@ -375,7 +403,9 @@ class HolterRecordSettingsPanel(QWidget):
 
             self._gain_radios[lead] = []
             for col_idx, val in enumerate(GAIN_VALUES):
-                r = ClickableRadioButton(val)
+                # no text: the column header already says "N mm/mV"
+                r = ClickableRadioButton("")
+                r.setToolTip(f"{lead}: {val} mm/mV")
                 r.setAutoExclusive(False)   # managed by QButtonGroup instead
                 r.setStyleSheet(_rs_choice_style())
                 r.setCursor(Qt.PointingHandCursor)
@@ -383,13 +413,14 @@ class HolterRecordSettingsPanel(QWidget):
                 if lead != "All" and val == "10":
                     r.setChecked(True)
                 btn_grp.addButton(r, col_idx)
-                grid_gain.addWidget(r, row_idx, col_idx + 1)
+                grid_gain.addWidget(r, row_idx, col_idx + 1, Qt.AlignCenter)
                 self._gain_radios[lead].append(r)
 
             chk_invert = QCheckBox("")
+            chk_invert.setToolTip(f"{lead}: invert")
             chk_invert.setStyleSheet(_rs_choice_style())
             chk_invert.setCursor(Qt.PointingHandCursor)
-            grid_gain.addWidget(chk_invert, row_idx, len(GAIN_VALUES) + 1)
+            grid_gain.addWidget(chk_invert, row_idx, len(GAIN_VALUES) + 1, Qt.AlignCenter)
             self._invert_checks[lead] = chk_invert
 
         # --- "All" row logic ---
@@ -603,6 +634,13 @@ class HolterRecordSettingsPanel(QWidget):
         left_grid.setRowStretch(8, 1)
 
         body_row.addWidget(left_widget)
+        # a thin rule between the parameters and the age table
+        body_row.addSpacing(16)
+        sep = QFrame()
+        sep.setFixedWidth(1)
+        sep.setStyleSheet(f"background:{UI_BORDER};border:none;")
+        body_row.addWidget(sep)
+        body_row.addSpacing(16)
 
         # ---- RIGHT: age-based Tachycardia / Bradycardia HR table ----
         right_widget = QWidget()
@@ -681,6 +719,9 @@ class HolterRecordSettingsPanel(QWidget):
 
         right_grid.setRowStretch(len(age_rows) + 1, 1)
         body_row.addWidget(right_widget)
+        # both tables at their own width; the spare width stays on the right
+        # (was spread over their columns: each value far from its label)
+        body_row.addStretch(1)
 
         clin_card_lay.addLayout(body_row)
         layout.addWidget(clin_card)
@@ -925,7 +966,7 @@ class HolterRecordSettingsPanel(QWidget):
         dn_grid.addWidget(self._spin_day_end, 0, 3)
 
         h_day = QLabel("H")
-        h_day.setStyleSheet(f"color:{UI_ACCENT}; font-size:13px; font-weight:700;")
+        h_day.setStyleSheet(f"color:{UI_MUTED}; font-size:12px; font-weight:700;")   # the unit, as "ms" / "Hz"
         dn_grid.addWidget(h_day, 0, 4)
 
         # Night row
@@ -952,7 +993,7 @@ class HolterRecordSettingsPanel(QWidget):
         dn_grid.addWidget(self._spin_night_end, 1, 3)
 
         h_night = QLabel("H")
-        h_night.setStyleSheet(f"color:{UI_ACCENT}; font-size:13px; font-weight:700;")
+        h_night.setStyleSheet(f"color:{UI_MUTED}; font-size:12px; font-weight:700;")   # the unit, as "ms" / "Hz"
         dn_grid.addWidget(h_night, 1, 4)
 
         dn_grid.setRowStretch(2, 1)
@@ -1065,6 +1106,9 @@ class HolterRecordSettingsPanel(QWidget):
             # Default to 10 mm/mV (index 1 in GAIN_VALUES)
             self._gain_radios[lead][1].setChecked(True)
             self._invert_checks[lead].setChecked(False)
+        # the "All leads" invert too: left ticked, every lead stayed inverted
+        # after "Settings have been reset to default values"
+        self._invert_checks["All"].setChecked(False)
 
         self._combo_width.setCurrentText("14")
 

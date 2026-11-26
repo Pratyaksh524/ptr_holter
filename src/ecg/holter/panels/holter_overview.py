@@ -434,13 +434,54 @@ class HolterExpertReviewPanel(QWidget):
             ("QRS Axis", format_axis_summary(summary.get('qrs_axis'), multiline=True)),
             ("Axis Deviation", format_axis_events(summary.get('qrs_axis'), multiline=True)),
         ]
-        self._overview.setRowCount(len(rows))
-        for i, (k, v) in enumerate(rows):
-            self._overview.setRowHeight(i, max(24, 18 * (str(v).count("\n") + 1) + 8))
+        # The rows in groups, a plain section header over each (same rows,
+        # same values, same order as before; no new colours)
+        sections = (
+            ("BEATS", ("Total", "X Total")),
+            ("HEART RATE", ("AVG HR", "Max HR", "Min HR", "Sinus Max HR", "Sinus Min HR",
+                            "During of Tachy.", "During of Brady.")),
+            ("ECTOPY", ("V Total", "S Total")),
+            ("AF / AFL", ("AVG HR of Af/AF", "Duration of Af/AF")),
+            ("PACING", ("Paced Beats", "Pacing AVG HR", "Pacing Max HR", "Pacing Min HR")),
+            ("RR / PAUSE", ("Longest RR", "RRI (\u22652.0s)")),
+            ("ST / T", ("T Inversion", "ST Elevation", "ST Depression")),
+            ("QRS AXIS", ("QRS Axis", "Axis Deviation")),
+        )
+        section_before = {names[0]: title for title, names in sections}
+        table_rows = []
+        for k, v in rows:
+            if k in section_before:
+                table_rows.append((None, section_before[k]))
+            table_rows.append((k, v))
+        self._overview.clearSpans()
+        self._overview.setRowCount(len(table_rows))
+        from PyQt5.QtGui import QFont as _QFont
+        value_font = _QFont()
+        value_font.setBold(True)
+        head_font = _QFont()
+        head_font.setBold(True)
+        head_font.setPointSizeF(7.5)
+        head_font.setLetterSpacing(_QFont.AbsoluteSpacing, 1.0)
+        stripe = 0
+        for i, (k, v) in enumerate(table_rows):
+            if k is None:                       # a section header row
+                hi = QTableWidgetItem(v)
+                hi.setFont(head_font)
+                hi.setForeground(QColor(UI_MUTED))
+                hi.setBackground(QColor(UI_BG))
+                self._overview.setItem(i, 0, hi)
+                self._overview.setItem(i, 1, None)
+                self._overview.setSpan(i, 0, 1, 2)
+                self._overview.setRowHeight(i, 22)
+                stripe = 0
+                continue
+            self._overview.setRowHeight(i, max(26, 18 * (str(v).count("\n") + 1) + 8))
             ki = QTableWidgetItem(k)
             vi = QTableWidgetItem(v)
             vi.setToolTip(v)
-            bg_col = QColor(UI_PANEL) if i % 2 == 0 else QColor(UI_PANEL_ALT)
+            vi.setFont(value_font)
+            bg_col = QColor(UI_PANEL) if stripe % 2 == 0 else QColor(UI_PANEL_ALT)
+            stripe += 1
             ki.setBackground(bg_col)
             vi.setBackground(bg_col)
             ki.setForeground(QColor(UI_MUTED))
