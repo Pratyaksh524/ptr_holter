@@ -4,6 +4,7 @@ import gc
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import time
@@ -739,27 +740,40 @@ class HolterReplayPanel(QWidget):
         if self._last_metrics_list:
             self.update_lorenz(self._last_metrics_list)
 
-    def _build_info_table(self, rows):
-        table = QTableWidget(len(rows), 2)
-        table.setHorizontalHeaderLabels(["Field", "Value"])
-        table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setStretchLastSection(True)
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        table.setEditTriggers(QTableWidget.NoEditTriggers)
-        table.setSelectionMode(QAbstractItemView.NoSelection)
-        table.setFocusPolicy(Qt.NoFocus)
-        table.setStyleSheet(_table_style())
-        table.setAlternatingRowColors(True)
-        for row, (label, value) in enumerate(rows):
-            label_item = QTableWidgetItem(str(label))
-            label_item.setForeground(QColor(UI_MUTED))
-            value_item = QTableWidgetItem(str(value))
-            value_item.setForeground(QColor(UI_TEXT))
-            table.setItem(row, 0, label_item)
-            table.setItem(row, 1, value_item)
-        table.resizeRowsToContents()
-        return table
+    @staticmethod
+    def _info_card(caption: str, rows, columns: int = 1) -> QFrame:
+        """A card of "label  value" rows (`columns` pairs side by side) for the
+        Patient Information dialog. A value that says nothing ("", "-",
+        "Select" -- the patient form's empty choice) shows a muted dash."""
+        card = QFrame()
+        card.setObjectName("piCard")
+        card.setStyleSheet(f"QFrame#piCard{{background:{UI_PANEL};border:1px solid {UI_BORDER};"
+                           f"border-radius:8px;}}")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(14, 10, 14, 12)
+        lay.setSpacing(8)
+        cap = QLabel(caption)
+        cap.setStyleSheet(f"color:{UI_MUTED};font-size:9px;font-weight:700;letter-spacing:1px;")
+        lay.addWidget(cap)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(8)
+        for i, (label, value) in enumerate(rows):
+            r, c = divmod(i, columns)
+            name = QLabel(str(label))
+            name.setStyleSheet(f"color:{UI_MUTED};font-size:11px;")
+            text = str(value if value is not None else "").strip()
+            empty = text in ("", "-", "Select", "None")
+            val = QLabel("\u2014" if empty else text)
+            val.setWordWrap(True)
+            val.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            val.setStyleSheet(f"color:{UI_MUTED if empty else UI_TEXT};font-size:13px;"
+                              f"font-weight:{400 if empty else 700};")
+            grid.addWidget(name, r, c * 2, Qt.AlignLeft | Qt.AlignTop)
+            grid.addWidget(val, r, c * 2 + 1)
+            grid.setColumnStretch(c * 2 + 1, 1)
+        lay.addLayout(grid)
+        return card
 
     def _show_patient_information(self):
         summary = dict(getattr(self, "_summary", {}) or {})
@@ -823,9 +837,14 @@ class HolterReplayPanel(QWidget):
             ("Study Duration", fmt_duration(summary.get("duration_sec", 0))),
         ]
 
+        # The recording's start / end for the STUDY card (as the window header)
+        rec_start, rec_end = _get_recording_start_end_times(session_dir, float(summary.get("duration_sec", 0) or 0))
+        if rec_start == "Unknown":
+            rec_start = rec_end = "-"
+
         dlg = QDialog(self)
         dlg.setWindowTitle("Patient Information")
-        dlg.setMinimumSize(760, 620)
+        dlg.setMinimumWidth(640)
         dlg.setStyleSheet(f"""
             QDialog {{
                 background: {UI_BG};
@@ -856,36 +875,49 @@ class HolterReplayPanel(QWidget):
         outer.setContentsMargins(16, 16, 16, 16)
         outer.setSpacing(12)
 
-        title = QLabel("Patient Information")
+        # Header: the patient's initials in a circle, the name, the recording
+        fields = dict(patient_rows)
+        name = str(fields.get("Patient Name", "") or "").strip()
+        words = [w for w in re.split(r"[^A-Za-z0-9]+", name) if w and name != "-"]
+        initials = "".join(w[0] for w in words[:2]).upper() or "?"
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        badge = QLabel(initials)
+        badge.setFixedSize(48, 48)
+        badge.setAlignment(Qt.AlignCenter)
+        badge.setStyleSheet(f"color:{UI_TEXT};font-size:16px;font-weight:700;background:{UI_PANEL_ALT};"
+                            f"border:1px solid {UI_BORDER};border-radius:24px;")
+        head.addWidget(badge)
+        head_text = QVBoxLayout()
+        head_text.setSpacing(2)
+        title = QLabel(name if name and name != "-" else "Patient Information")
         title.setStyleSheet(f"font-size:18px;font-weight:700;color:{UI_TEXT};")
-        outer.addWidget(title)
-
+        head_text.addWidget(title)
         subtitle = QLabel(f"Selected recording: {session_name}")
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet(f"color:{UI_MUTED};font-size:12px;")
-        outer.addWidget(subtitle)
+        head_text.addWidget(subtitle)
+        head.addLayout(head_text, 1)
+        outer.addLayout(head)
 
-        patient_box = QGroupBox("Patient Details")
-        patient_box.setStyleSheet(f"""
-            QGroupBox {{
-                color: {UI_TEXT};
-                font-weight: 700;
-                border: 1px solid {UI_BORDER};
-                border-radius: 8px;
-                margin-top: 12px;
-                padding-top: 16px;
-                background: {UI_PANEL};
-            }}
-        """)
-        patient_layout = QVBoxLayout(patient_box)
-        patient_layout.setContentsMargins(10, 16, 10, 10)
-        patient_layout.addWidget(self._build_info_table(patient_rows))
-        outer.addWidget(patient_box)
+        # The fields as cards (same fields as before; Start / End added to STUDY)
+        top = QHBoxLayout()
+        top.setSpacing(12)
+        top.addWidget(self._info_card("PATIENT", [
+            ("Patient Name", fields.get("Patient Name")), ("Age", fields.get("Age")),
+            ("Gender", fields.get("Gender"))]), 1)
+        top.addWidget(self._info_card("STUDY", [
+            ("Start", rec_start), ("End", rec_end), ("Study Duration", fields.get("Study Duration"))]), 1)
+        outer.addLayout(top)
+        outer.addWidget(self._info_card("REFERRAL & CONTACT", [
+            ("Doctor", fields.get("Doctor")), ("Email", fields.get("Email")),
+            ("Phone", fields.get("Phone")), ("Organisation", fields.get("Organisation"))], columns=2))
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         close_btn = QPushButton("Close")
         close_btn.setFixedSize(94, 32)
+        close_btn.setCursor(Qt.PointingHandCursor)
         close_btn.setStyleSheet(_style_btn())
         close_btn.clicked.connect(dlg.accept)
         btn_row.addWidget(close_btn)

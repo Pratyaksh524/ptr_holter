@@ -4,7 +4,7 @@ A new recording (live recording stopped, or imported) waits in the recordings
 list, its "Analysis" column "Not analyzed" (is_analysed). The user opens it
 by double-click (or View): analysed, it opens at once; not analysed,
 holter_ui._open_recording asks "This recording is not analyzed. Would you
-like to analyse it?" -- No stays on the list, Yes calls open_when_analysed():
+like to analyse it?" -- Not now stays on the list, Analyse calls open_when_analysed():
 the "Analysing recording... N%" popup runs every signal-only analysis, in
 one fixed order, and the recording opens at 100%. analysis_done.json then
 marks it analysed for its file, code, patient age and configuration.
@@ -222,69 +222,144 @@ def run_analysis(session_dir: str, progress: Optional[_Progress] = None) -> None
     _write_done(session_dir)
 
 
-def ask_to_analyse(parent, name: str = '') -> bool:
+def _expected_minutes_text(duration_sec: float) -> str:
+    """How long the analysis takes, from _STEPS (measured on the development
+    PC): "under a minute" / "about N min" / "about N h M min"."""
+    sec = sum(rate for _, rate in _STEPS) * max(0.0, float(duration_sec or 0.0))
+    if sec < 60:
+        return "under a minute"
+    minutes = int(round(sec / 60.0))
+    if minutes < 60:
+        return f"about {minutes} min"
+    return f"about {minutes // 60} h {minutes % 60:02d} min"
+
+
+def ask_to_analyse(parent, name: str = '', session_dir: str = '') -> bool:
     """"This recording is not analyzed. Would you like to analyse it?" in the
-    app's dark style (as the "Analysing recording" and "Generating Report"
-    popups): True for Yes. Was the plain Windows message box."""
+    app's own theme (navy panel, blue accent -- the colours of the other
+    Holter dialogs): the recording (patient `name`, start -> end and length
+    read from `session_dir`) in a card, what the analysis does and about how
+    long it takes; True for Analyse. Was the plain Windows message box, then
+    a GitHub-dark box with a green border and a green Yes."""
+    from datetime import datetime
     from PyQt5.QtCore import Qt
-    from PyQt5.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
+    from PyQt5.QtWidgets import QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
+    from .holter_helpers import (UI_ACCENT, UI_ACCENT_HOVER, UI_BORDER, UI_MUTED, UI_PANEL,
+                                 UI_PANEL_ALT, UI_TEXT, UI_WARNING)
+
+    # the recording's start / end / length (header of the file)
+    rec_start = rec_end = length = ''
+    duration = 0.0
+    if session_dir and os.path.exists(_ecgh(session_dir)):
+        try:
+            from .file_format import ECGHFileReader
+            rd = ECGHFileReader(_ecgh(session_dir))
+            try:
+                duration = float(rd.duration_sec)
+                t0 = float(rd.start_time or 0.0)
+            finally:
+                rd.close()
+            if t0 > 0:
+                a, b = datetime.fromtimestamp(t0), datetime.fromtimestamp(t0 + duration)
+                rec_start = a.strftime('%Y-%m-%d %H:%M:%S')
+                rec_end = b.strftime('%H:%M:%S' if a.date() == b.date() else '%Y-%m-%d %H:%M:%S')
+            sec = int(duration)
+            length = (f"{sec // 3600}h {sec % 3600 // 60:02d}m {sec % 60:02d}s" if sec >= 3600
+                      else f"{sec // 60}m {sec % 60:02d}s")
+        except Exception as e:
+            print(f"[Analysis] Could not read the recording header: {e}")
 
     dialog = QDialog(parent, Qt.Dialog | Qt.FramelessWindowHint)
     dialog.setObjectName("analyseAsk")
     dialog.setAttribute(Qt.WA_StyledBackground, True)
-    dialog.setFixedWidth(440)
+    dialog.setFixedWidth(470)
     dialog.setWindowModality(Qt.WindowModal)
-    dialog.setStyleSheet("""
-        QDialog#analyseAsk {
-            background: #0D1117;
-            border: 1px solid #00CC66;
+    dialog.setStyleSheet(f"""
+        QDialog#analyseAsk {{
+            background: {UI_PANEL};
+            border: 1px solid {UI_BORDER};
             border-radius: 12px;
-        }
-        QDialog#analyseAsk QLabel { background: transparent; border: none; }
-        QDialog#analyseAsk QPushButton {
-            min-width: 96px; padding: 8px 18px; border-radius: 8px;
+        }}
+        QDialog#analyseAsk QLabel {{ background: transparent; border: none; }}
+        QDialog#analyseAsk QPushButton {{
+            min-width: 104px; padding: 8px 18px; border-radius: 8px;
             font-size: 13px; font-weight: bold;
-        }
-        QPushButton#analyseYes {
-            background: #00CC66; color: #0D1117; border: 1px solid #00CC66;
-        }
-        QPushButton#analyseYes:hover { background: #33DD88; border-color: #33DD88; }
-        QPushButton#analyseNo {
-            background: #161B22; color: #FFFFFF; border: 1px solid #444C56;
-        }
-        QPushButton#analyseNo:hover { background: #21262D; border-color: #8B949E; }
+        }}
+        QPushButton#analyseYes {{
+            background: {UI_ACCENT}; color: #FFFFFF; border: 1px solid {UI_ACCENT};
+        }}
+        QPushButton#analyseYes:hover {{ background: {UI_ACCENT_HOVER}; border-color: {UI_ACCENT_HOVER}; }}
+        QPushButton#analyseNo {{
+            background: transparent; color: {UI_TEXT}; border: 1px solid {UI_BORDER};
+        }}
+        QPushButton#analyseNo:hover {{ background: {UI_PANEL_ALT}; border-color: #3A5378; }}
     """)
     layout = QVBoxLayout(dialog)
-    layout.setContentsMargins(28, 22, 28, 22)
-    layout.setSpacing(10)
+    layout.setContentsMargins(24, 22, 24, 20)
+    layout.setSpacing(14)
 
+    # header: an icon, the title and one line under it
     header = QHBoxLayout()
-    dot = QLabel("●")
-    dot.setStyleSheet("color:#F59E0B; font-size:13px;")
-    header.addWidget(dot)
+    header.setSpacing(12)
+    icon = QLabel("!")
+    icon.setFixedSize(36, 36)
+    icon.setAlignment(Qt.AlignCenter)
+    icon.setStyleSheet(f"color:{UI_WARNING}; font-size:18px; font-weight:800; background:{UI_PANEL_ALT};"
+                       f"border:1px solid {UI_BORDER}; border-radius:18px;")
+    header.addWidget(icon, 0, Qt.AlignTop)
+    head_text = QVBoxLayout()
+    head_text.setSpacing(2)
     title = QLabel("Recording not analyzed")
-    title.setStyleSheet("color:#FFFFFF; font-size:15px; font-weight:bold; letter-spacing:0.5px;")
-    header.addWidget(title)
-    header.addStretch()
+    title.setStyleSheet(f"color:{UI_TEXT}; font-size:16px; font-weight:700;")
+    head_text.addWidget(title)
+    sub = QLabel("This recording is not analyzed. Would you like to analyse it?")
+    sub.setWordWrap(True)
+    sub.setStyleSheet(f"color:{UI_MUTED}; font-size:12px;")
+    head_text.addWidget(sub)
+    header.addLayout(head_text, 1)
     layout.addLayout(header)
 
-    if name:
-        rec = QLabel(name)
-        rec.setStyleSheet("color:#00FF00; font-size:12px; font-weight:bold;")
-        layout.addWidget(rec)
-    text = QLabel("This recording is not analyzed.\nWould you like to analyse it?")
-    text.setStyleSheet("color:#C9D1D9; font-size:13px;")
-    text.setWordWrap(True)
-    layout.addWidget(text)
-    layout.addSpacing(6)
+    # the recording, so the user sees which one it is
+    rows = [("Patient", name)] if name else []
+    if rec_start:
+        rows.append(("Recorded", f"{rec_start}  \u2192  {rec_end}"))
+    if length:
+        rows.append(("Length", length))
+    if rows:
+        card = QFrame()
+        card.setObjectName("analyseRec")
+        card.setStyleSheet(f"QFrame#analyseRec {{ background:{UI_PANEL_ALT}; border:1px solid {UI_BORDER};"
+                           f"border-radius:8px; }}")
+        grid = QGridLayout(card)
+        grid.setContentsMargins(14, 10, 14, 10)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(6)
+        for r, (label, value) in enumerate(rows):
+            k = QLabel(label)
+            k.setStyleSheet(f"color:{UI_MUTED}; font-size:11px;")
+            v = QLabel(str(value))
+            v.setStyleSheet(f"color:{UI_TEXT}; font-size:12px; font-weight:700;")
+            grid.addWidget(k, r, 0)
+            grid.addWidget(v, r, 1)
+        grid.setColumnStretch(1, 1)
+        layout.addWidget(card)
+
+    # what happens, and about how long
+    what = QLabel("Arrhythmia segments, PVC / PAC beats, ST / QRS axis and Full Disclosure beats "
+                  "are found once and saved; the recording then opens."
+                  + (f"  Takes {_expected_minutes_text(duration)}." if duration > 0 else ""))
+    what.setWordWrap(True)
+    what.setStyleSheet(f"color:{UI_MUTED}; font-size:11px;")
+    layout.addWidget(what)
 
     buttons = QHBoxLayout()
+    buttons.setSpacing(10)
     buttons.addStretch()
-    no_btn = QPushButton("No")
+    no_btn = QPushButton("Not now")
     no_btn.setObjectName("analyseNo")
     no_btn.setCursor(Qt.PointingHandCursor)
     no_btn.clicked.connect(dialog.reject)
-    yes_btn = QPushButton("Yes")
+    yes_btn = QPushButton("Analyse")
     yes_btn.setObjectName("analyseYes")
     yes_btn.setCursor(Qt.PointingHandCursor)
     yes_btn.setDefault(True)
@@ -339,16 +414,18 @@ def open_when_analysed(parent, session_dir: str, on_ready: Callable[[], None]) -
     dialog.setAttribute(Qt.WA_StyledBackground, True)
     dialog.setFixedSize(420, 110)
     dialog.setWindowModality(Qt.WindowModal)
-    dialog.setStyleSheet("""
-        QDialog#analysisProgress {
-            background: #0D1117;
-            border: 1px solid #00CC66;
+    from .holter_helpers import UI_BORDER, UI_PANEL, UI_TEXT
+    # the colours of the "Recording not analyzed" dialog before it
+    dialog.setStyleSheet(f"""
+        QDialog#analysisProgress {{
+            background: {UI_PANEL};
+            border: 1px solid {UI_BORDER};
             border-radius: 12px;
-        }
-        QDialog#analysisProgress QLabel {
+        }}
+        QDialog#analysisProgress QLabel {{
             background: transparent; border: none;
-            color: #FFFFFF; font-size: 16px; font-weight: bold;
-        }
+            color: {UI_TEXT}; font-size: 16px; font-weight: bold;
+        }}
     """)
     layout = QVBoxLayout(dialog)
     layout.setContentsMargins(28, 22, 28, 22)

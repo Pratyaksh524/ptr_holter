@@ -101,14 +101,40 @@ class HolterEditStripsPanel(QWidget):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(8, 8, 8, 8)
         left_layout.setSpacing(8)
+        ev_head = QHBoxLayout()
         ev_title = QLabel("Event List")
         ev_title.setStyleSheet(_card_title_style())
-        left_layout.addWidget(ev_title)
+        ev_head.addWidget(ev_title)
+        ev_head.addStretch(1)
+        self._ev_count_badge = QLabel("0 events")
+        self._ev_count_badge.setStyleSheet(f"color:{UI_TEXT};font-size:11px;font-weight:700;background:{UI_PANEL_ALT};"
+                                           f"border:1px solid {UI_BORDER};border-radius:10px;padding:2px 10px;")
+        ev_head.addWidget(self._ev_count_badge)
+        left_layout.addLayout(ev_head)
+        # event-type filter (as in EVENTS): each name with its count
+        self._type_filter = QComboBox()
+        self._type_filter.setCursor(Qt.PointingHandCursor)
+        self._type_filter.setStyleSheet(f"""
+            QComboBox {{
+                background:{UI_PANEL_ALT}; color:{UI_TEXT};
+                border:1px solid {UI_BORDER}; padding:4px 8px; border-radius:6px; font-size:11px;
+            }}
+            QComboBox:hover {{ border:1px solid {UI_ACCENT}; }}
+            QComboBox QAbstractItemView {{
+                background:{UI_PANEL}; color:{UI_TEXT}; border:1px solid {UI_BORDER};
+                selection-background-color:#1E3A5F; selection-color:{UI_TEXT}; outline:0;
+            }}
+        """)
+        self._type_filter.currentIndexChanged.connect(lambda _i: self._apply_type_filter())
+        left_layout.addWidget(self._type_filter)
 
         cols = ["Event name", "Start Time", "Chan.", "Print Len."]
         self._ev_table = QTableWidget(0, len(cols))
         self._ev_table.setHorizontalHeaderLabels(cols)
-        self._ev_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        # the name takes the spare width (was cut to "Sinus ..."); the short
+        # columns fit their text
+        self._ev_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._ev_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self._ev_table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._ev_table.setStyleSheet(
             _table_style() +
@@ -129,14 +155,30 @@ class HolterEditStripsPanel(QWidget):
         self._ev_table.setSelectionBehavior(QTableWidget.SelectRows)
         self._ev_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._ev_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._ev_table.verticalHeader().setDefaultSectionSize(28)
+        self._ev_table.setCursor(Qt.PointingHandCursor)
         self._ev_table.cellClicked.connect(self._on_event_clicked)
         left_layout.addWidget(self._ev_table, 1)
 
+        # Empty state, centred over the table (kept centred on resize).
+        self._no_items_lbl = QLabel("No events")
+        self._no_items_lbl.setParent(self._ev_table.viewport())
+        self._no_items_lbl.setAlignment(Qt.AlignCenter)
+        self._no_items_lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._no_items_lbl.setStyleSheet(f"color:{UI_MUTED};font-size:12px;font-style:italic;padding:8px;"
+                                         f"border:none;background:transparent;")
+        self._ev_table.viewport().installEventFilter(self)
+
         nav_row = QHBoxLayout()
+        nav_row.setSpacing(6)
         for lbl in ["Prev", "Next", "Remove All", "Remove"]:
             btn = QPushButton(lbl)
             btn.setStyleSheet(_es_danger_btn_style() if lbl.startswith("Remove") else _style_btn())
             btn.setCursor(Qt.PointingHandCursor)
+            if lbl == "Prev":
+                btn.clicked.connect(lambda _=False: self._step_event(-1))
+            elif lbl == "Next":
+                btn.clicked.connect(lambda _=False: self._step_event(1))
             nav_row.addWidget(btn)
         left_layout.addLayout(nav_row)
 
@@ -150,7 +192,8 @@ class HolterEditStripsPanel(QWidget):
         )
         sf_layout = QGridLayout(stats_frame)
         sf_layout.setContentsMargins(10, 8, 10, 8)
-        sf_layout.setSpacing(6)
+        sf_layout.setHorizontalSpacing(8)
+        sf_layout.setVerticalSpacing(6)
         for i, (key, label) in enumerate([
             ("hr", "Avg HR"),
             ("max_hr", "HR Max"),
@@ -162,13 +205,21 @@ class HolterEditStripsPanel(QWidget):
             ("user_ev", "User Event"),
         ]):
             row, col = divmod(i, 2)
-            l = QLabel(f"{label}:")
-            l.setStyleSheet(f"color:{UI_MUTED};font-size:10px;font-weight:bold;letter-spacing:0.5px;border:none;background:transparent;")
+            l = QLabel(label)
+            l.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:bold;border:none;background:transparent;")
             v = QLabel("-")
+            v.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             v.setStyleSheet(f"color:{UI_TEXT};font-size:12px;font-weight:bold;border:none;background:transparent;")
-            sf_layout.addWidget(l, row * 2, col)
-            sf_layout.addWidget(v, row * 2 + 1, col)
+            sf_layout.addWidget(l, row, col * 3)
+            sf_layout.addWidget(v, row, col * 3 + 1)
             self._stat_labels[key] = v
+        # a thin rule between the two columns
+        col_rule = QFrame()
+        col_rule.setFixedWidth(1)
+        col_rule.setStyleSheet(f"background:{UI_BORDER};border:none;")
+        sf_layout.addWidget(col_rule, 0, 2, 4, 1)
+        sf_layout.setColumnStretch(1, 1)
+        sf_layout.setColumnStretch(4, 1)
         left_layout.addWidget(stats_frame)
         layout.addWidget(left, 2)
 
@@ -180,15 +231,28 @@ class HolterEditStripsPanel(QWidget):
         center_layout.setContentsMargins(8, 8, 8, 8)
         center_layout.setSpacing(8)
 
-        # Tool buttons
+        strips_ttl = QLabel("Heart Rate Strips")
+        strips_ttl.setStyleSheet(_card_title_style())
+        center_layout.addWidget(strips_ttl)
+
+        # Tool buttons, in groups
         tool_row = QHBoxLayout()
-        for icon in ["Refresh", "Menu", "Prev", "Next", "<<", ">>", "Up", "Down", "End"]:
-            btn = QPushButton(icon)
-            btn.setStyleSheet(_es_tool_btn_style())
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setFixedHeight(28)
-            btn.setMinimumWidth(36)
-            tool_row.addWidget(btn)
+        tool_row.setSpacing(4)
+        for g, group in enumerate([["Refresh", "Menu"], ["Prev", "Next"], ["<<", ">>"], ["Up", "Down", "End"]]):
+            if g:
+                sep = QFrame()
+                sep.setFixedSize(1, 20)
+                sep.setStyleSheet(f"background:{UI_BORDER};border:none;")
+                tool_row.addSpacing(4)
+                tool_row.addWidget(sep)
+                tool_row.addSpacing(4)
+            for icon in group:
+                btn = QPushButton(icon)
+                btn.setStyleSheet(_es_tool_btn_style())
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.setFixedHeight(28)
+                btn.setMinimumWidth(36)
+                tool_row.addWidget(btn)
         tool_row.addStretch()
         center_layout.addLayout(tool_row)
 
@@ -238,7 +302,8 @@ class HolterEditStripsPanel(QWidget):
 
             strips = []
             for _ in range(3):
-                strip = ECGStripCanvas(height=40)
+                # no lead_name: a strip named "I" prints the RR numbers over itself
+                strip = ECGStripCanvas(height=56)
                 strip.setStyleSheet("border:1px solid #444444;")
                 fl.addWidget(strip)
                 strips.append(strip)
@@ -257,6 +322,11 @@ class HolterEditStripsPanel(QWidget):
         thumb_grid.setColumnStretch(0, 1)
         thumb_grid.setColumnStretch(1, 1)
         center_layout.addLayout(thumb_grid)
+        strips_hint = QLabel("Click a tile to open that moment: Replay moves there and the Detailed View "
+                             "shows its 12 leads.")
+        strips_hint.setWordWrap(True)
+        strips_hint.setStyleSheet(f"color:{UI_MUTED};font-size:11px;background:transparent;border:none;")
+        center_layout.addWidget(strips_hint)
         center_layout.addStretch()
         layout.addWidget(center, 4)
 
@@ -280,11 +350,11 @@ class HolterEditStripsPanel(QWidget):
         )
         self._detail_value = QLabel("-- bpm")
         self._detail_value.setStyleSheet(
-            f"color:{UI_SUCCESS};font-size:26px;font-weight:bold;border:none;background:transparent;"
+            f"color:{UI_TEXT};font-size:26px;font-weight:bold;border:none;background:transparent;"
         )
         self._detail_time = QLabel("-")
         self._detail_time.setStyleSheet(
-            f"color:{UI_WARNING};font-size:11px;font-weight:bold;border:none;background:transparent;"
+            f"color:{UI_MUTED};font-size:12px;font-weight:bold;border:none;background:transparent;"
         )
         self._detail_note = QLabel("Click any tile to expand the matching strip view here.")
         self._detail_note.setStyleSheet(
@@ -299,9 +369,10 @@ class HolterEditStripsPanel(QWidget):
 
         main_frame = QFrame()
         main_frame.setObjectName("esMainCard")
-        main_frame.setStyleSheet(f"QFrame#esMainCard{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:8px;}}")
+        main_frame.setStyleSheet(_card_style("QFrame#esMainCard"))
         ml = QVBoxLayout(main_frame)
-        ml.setContentsMargins(8, 8, 8, 8)
+        ml.setContentsMargins(10, 10, 10, 10)
+        ml.setSpacing(8)
 
         self._detail_header_lbl = QLabel("Detailed View")
         self._detail_header_lbl.setStyleSheet(_card_title_style())
@@ -311,22 +382,39 @@ class HolterEditStripsPanel(QWidget):
         
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setStyleSheet("QScrollArea { border: none; background: transparent; }")
-        
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setStyleSheet(
+            f"QScrollArea{{background:{COL_BLACK};border:1px solid {UI_BORDER};border-radius:6px;}}"
+            f"QScrollBar:vertical{{background:{UI_PANEL};width:10px;margin:0;border:none;}}"
+            f"QScrollBar::handle:vertical{{background:{UI_BORDER};min-height:24px;border-radius:5px;margin:2px;}}"
+            f"QScrollBar::handle:vertical:hover{{background:#3A5378;}}"
+            f"QScrollBar::add-line,QScrollBar::sub-line{{width:0;height:0;}}")
+
         scroll_content = QWidget()
         scroll_content.setStyleSheet("background: transparent;")
         scroll_layout = QVBoxLayout(scroll_content)
-        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setContentsMargins(6, 6, 6, 6)
         scroll_layout.setSpacing(6)
-        
-        lead_names = ["Lead I", "Lead II", "Lead III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
-        
+
+        lead_names = ["Lead I", "Lead II", "Lead III", "Lead aVR", "Lead aVL", "Lead aVF",
+                      "Lead V1", "Lead V2", "Lead V3", "Lead V4", "Lead V5", "Lead V6"]
+
         for name in lead_names:
+            # one block per lead: the name on a slim header line, the strip under it
+            block = QFrame()
+            block.setObjectName("esLeadBlock")
+            block.setStyleSheet(f"QFrame#esLeadBlock{{background:transparent;border:none;"
+                                f"border-bottom:1px solid {UI_BORDER};}}")
+            block_l = QVBoxLayout(block)
+            block_l.setContentsMargins(0, 0, 0, 4)
+            block_l.setSpacing(2)
             lbl = QLabel(name)
-            lbl.setStyleSheet(f"color:{COL_GREEN};border:none;font-weight:bold;background:transparent;")
+            lbl.setStyleSheet(f"color:{COL_GREEN};font-size:11px;font-weight:bold;background:transparent;"
+                              f"border:none;border-left:2px solid {COL_GREEN};padding:0px 6px;")
+            block_l.addWidget(lbl)
             strip = ECGStripCanvas(height=95)
-            scroll_layout.addWidget(lbl)
-            scroll_layout.addWidget(strip)
+            block_l.addWidget(strip)
+            scroll_layout.addWidget(block)
             self._main_strips.append(strip)
             
         scroll_layout.addStretch()
@@ -335,13 +423,30 @@ class HolterEditStripsPanel(QWidget):
 
         right_layout.addWidget(main_frame, 1)
 
-        self._mini_lbl = QLabel("Lead II")
-        self._mini_lbl.setStyleSheet(f"color:{COL_GREEN};border:none;font-weight:bold;background:transparent;")
-        right_layout.addWidget(self._mini_lbl)
+        # Lead II rhythm strip in its own box (as in ST TENDENCY / AF ANALYSIS)
+        rhythm_box = QFrame()
+        rhythm_box.setObjectName("esRhythmBox")
+        rhythm_box.setStyleSheet(f"QFrame#esRhythmBox{{background:{UI_PANEL_ALT};border:1px solid {UI_BORDER};"
+                                 f"border-radius:6px;}}")
+        rhythm_l = QVBoxLayout(rhythm_box)
+        rhythm_l.setContentsMargins(8, 6, 8, 8)
+        rhythm_l.setSpacing(4)
+        self._mini_lbl = QLabel("Rhythm Strip  \u00b7  Lead II")
+        self._mini_lbl.setStyleSheet(_card_title_style())
+        rhythm_l.addWidget(self._mini_lbl)
 
         self._mini = ECGStripCanvas(height=40, color="#00AA00")
-        right_layout.addWidget(self._mini)
+        rhythm_l.addWidget(self._mini)
+        right_layout.addWidget(rhythm_box)
         layout.addWidget(right, 5)
+
+    def _card_time_text(self, card) -> str:
+        """The tile's moment as system time with the elapsed time:
+        "13:59:02 (00:05:00)" -- was the elapsed time alone."""
+        ts = float(card.get("timestamp", 0.0) or 0.0)
+        if ts > 0:
+            return f"{_format_system_time(self._session_dir, ts)} ({card.get('time') or _sec_to_hms(ts)})"
+        return card.get("time") or "-"
 
     def _format_bpm(self, value: float) -> str:
         if value and value > 0:
@@ -352,6 +457,82 @@ class HolterEditStripsPanel(QWidget):
         if row < len(self._events):
             self._ev_table.selectRow(row)
             self.seek_requested.emit(self._events[row]['timestamp'])
+
+    def eventFilter(self, obj, event):
+        # Keep the empty-state text centred over the table's viewport.
+        lbl = getattr(self, "_no_items_lbl", None)
+        if lbl is not None and obj is self._ev_table.viewport() and event.type() == QEvent.Resize:
+            lbl.setGeometry(obj.rect())
+        return super().eventFilter(obj, event)
+
+    def _rebuild_type_filter(self):
+        """The Type list: "All events (n)" and each event name with its count
+        (arrhythmia names first, then the sinus / normal ones); keeps the
+        chosen name while it is still listed."""
+        current = self._type_filter.currentData() if self._type_filter.count() else None
+        counts: Dict[str, int] = {}
+        for ev in self._events:
+            name = str(ev.get('label', ''))
+            counts[name] = counts.get(name, 0) + 1
+
+        def order(name):
+            low = name.lower()
+            return (1 if ('sinus' in low or 'normal' in low) else 0, low)
+        self._type_filter.blockSignals(True)
+        self._type_filter.clear()
+        self._type_filter.addItem(f"All events ({len(self._events):,})", None)
+        for name in sorted(counts, key=order):
+            self._type_filter.addItem(f"{name} ({counts[name]:,})", name)
+        idx = self._type_filter.findData(current) if current is not None else 0
+        self._type_filter.setCurrentIndex(max(0, idx))
+        self._type_filter.blockSignals(False)
+        self._apply_type_filter()
+
+    def _apply_type_filter(self):
+        """Show only the rows of the chosen event name (all for "All events");
+        the badge says how many rows show."""
+        name = self._type_filter.currentData()
+        shown = 0
+        for row, ev in enumerate(self._events):
+            hide = name is not None and str(ev.get('label', '')) != name
+            self._ev_table.setRowHidden(row, hide)
+            shown += 0 if hide else 1
+        total = len(self._events)
+        if name is None:
+            self._ev_count_badge.setText(f"{total:,} event" + ("" if total == 1 else "s"))
+        else:
+            self._ev_count_badge.setText(f"{shown:,} of {total:,}")
+        self._no_items_lbl.setVisible(shown == 0)
+        self._no_items_lbl.setText("No events" if total == 0 else "No events of this type")
+        self._no_items_lbl.setGeometry(self._ev_table.viewport().rect())
+        row = self._selected_row()
+        if row >= 0 and self._ev_table.isRowHidden(row):
+            self._ev_table.clearSelection()
+
+    def _visible_rows(self) -> List[int]:
+        return [r for r in range(len(self._events)) if not self._ev_table.isRowHidden(r)]
+
+    def _selected_row(self) -> int:
+        selection = self._ev_table.selectionModel()
+        if selection:
+            rows = selection.selectedRows()
+            if rows:
+                return int(rows[0].row())
+        return -1
+
+    def _step_event(self, step: int):
+        """Prev / Next: the shown row before / after the selected one (the
+        first when none is) -- opened as a click on it does."""
+        rows = self._visible_rows()
+        if not rows:
+            return
+        row = self._selected_row()
+        if row < 0 or row not in rows:
+            new = rows[0]
+        else:
+            new = rows[max(0, min(len(rows) - 1, rows.index(row) + step))]
+        self._ev_table.scrollToItem(self._ev_table.item(new, 0))
+        self._on_event_clicked(new, 0)
 
     def _build_focus_cards(self):
         summary = self._summary or {}
@@ -410,37 +591,92 @@ class HolterEditStripsPanel(QWidget):
                 "value": _metric_value("sinus_max_hr", "max_hr"),
                 "time": _metric_time("sinus_max_hr", "max_hr"),
                 "timestamp": _metric_timestamp("sinus_max_hr", "max_hr"),
-                "note": "Highest heart rate from sinus-like beats.",
+                "note": "Highest heart rate in sinus rhythm.",
             },
             "smin_hr": {
                 "title": "Sinus Min HR",
                 "value": _metric_value("sinus_min_hr", "min_hr"),
                 "time": _metric_time("sinus_min_hr", "min_hr"),
                 "timestamp": _metric_timestamp("sinus_min_hr", "min_hr"),
-                "note": "Lowest heart rate from sinus-like beats.",
+                "note": "Lowest heart rate in sinus rhythm.",
             },
         }
+        # The values above are the live 5 s chunks' (a chunk's mean HR, and
+        # "sinus" by its live labels: Sinus Min 50 bpm at 14:08:42 on
+        # 2026-11-12_13-54-02, inside Ventricular Fibrillation). hr_focus
+        # gives the saved analysis's: Max / Min the report's page-1 HR (Full
+        # Disclosure beats), Sinus Max / Min sinus N-N beats only. Each
+        # replaces its live value when its source is saved.
+        if self._session_dir:
+            try:
+                from ..hr_focus import hr_focus_points
+                points = hr_focus_points(self._session_dir)
+            except Exception as e:
+                print(f"[HolterEditStrips] HR focus unavailable: {e}")
+                points = {}
+            for key, focus_key in (("max_hr", "max_hr"), ("min_hr", "min_hr"),
+                                   ("smax_hr", "sinus_max_hr"), ("smin_hr", "sinus_min_hr")):
+                point = points.get(focus_key)
+                if point:
+                    bpm, t_sec = point
+                    self._focus_cards[key].update({"value": float(bpm), "timestamp": float(t_sec),
+                                                   "time": _sec_to_hms(float(t_sec))})
 
     def _refresh_focus_tiles(self):
         for key, widget in self._tile_widgets.items():
             card = self._focus_cards.get(key, {})
             widget["hr"].setText(f"HR: {self._format_bpm(card.get('value', 0.0))}")
-            widget["time"].setText(card.get("time") or "-")
+            widget["time"].setText(self._card_time_text(card))
             widget["frame"].setStyleSheet(
                 self._tile_style_active if key == self._selected_focus_key else self._tile_style_normal
             )
+
+    def _load_tile_strips(self, window_sec: float = 10.0):
+        """Every card's three strips (leads I, II, III): `window_sec` around
+        the card's own moment, read from the recording -- were the replay's
+        current frame in all four cards (the same waves in each: a click on
+        Min HR put its waves in the Max HR card too)."""
+        path = os.path.join(self._session_dir, "recording.ecgh") if self._session_dir else ""
+        reader = None
+        try:
+            if path and os.path.exists(path):
+                from ..file_format import ECGHFileReader
+                reader = ECGHFileReader(path)
+            for key, widget in self._tile_widgets.items():
+                card = self._focus_cards.get(key, {})
+                ts = float(card.get("timestamp", 0.0) or 0.0)
+                data = None
+                if reader is not None and ts > 0:
+                    t0 = max(0.0, ts - window_sec / 2.0)
+                    t1 = min(float(reader.duration_sec), t0 + window_sec)
+                    try:
+                        data = reader.read_range(t0, t1)
+                    except Exception as e:
+                        print(f"[HolterEditStrips] Could not read the {key} strip: {e}")
+                for lead, strip in enumerate(widget["strips"]):
+                    if data is not None and getattr(data, "ndim", 0) == 2 and lead < data.shape[0] and data.shape[1] > 0:
+                        n = data.shape[1]
+                        strip.set_data(np.linspace(0, n / float(reader.fs), n), data[lead].copy())
+                    else:
+                        strip.set_data([], [])
+        finally:
+            if reader is not None:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
 
     def _update_detail_panel(self, key: str):
         card = self._focus_cards.get(key) or self._focus_cards.get("max_hr") or {}
         title = card.get("title", "Heart Rate Detail")
         value = card.get("value", 0.0)
-        time_str = card.get("time") or "-"
+        time_str = self._card_time_text(card)
         note = card.get("note", "")
         self._detail_title.setText(title)
         self._detail_value.setText(self._format_bpm(value))
         self._detail_time.setText(time_str)
         self._detail_note.setText(note or "Click a tile to expand the matching strip view here.")
-        self._detail_header_lbl.setText(f"Detailed View  -  {title}  -  {time_str}")
+        self._detail_header_lbl.setText(f"Detailed View  \u00b7  {title}  \u00b7  {time_str}")
 
     def _select_focus_tile(self, tile_key: str, emit_seek: bool = True):
         if tile_key not in self._focus_cards:
@@ -471,11 +707,14 @@ class HolterEditStripsPanel(QWidget):
             t_str = _format_system_time(self._session_dir, ev['timestamp'])
             for j, val in enumerate([ev['label'], t_str, "12", "7s"]):
                 item = QTableWidgetItem(val)
-                item.setForeground(QColor(UI_TEXT))
+                # name and time in full colour; the per-row constants muted
+                item.setForeground(QColor(UI_TEXT if j < 2 else UI_MUTED))
                 self._ev_table.setItem(i, j, item)
+        self._rebuild_type_filter()
         if self._selected_focus_key not in self._focus_cards:
             self._selected_focus_key = "max_hr"
         self._refresh_focus_tiles()
+        self._load_tile_strips()
         self._update_detail_panel(self._selected_focus_key)
         s = self._summary
         max_card = self._focus_cards.get("max_hr", {})
@@ -503,14 +742,8 @@ class HolterEditStripsPanel(QWidget):
         all_beats = metrics_dict.get('all_beats', []) if metrics_dict else []
         
         if N > 0:
-            # Update thumbnails (cycle through CH1, CH2, CH3 if available)
-            for i, strip in enumerate(self._thumb_frames):
-                ch_idx = i % 3
-                if ch_idx < data.shape[0]:
-                    strip.set_data(x, data[ch_idx].copy(), beat_annotations=all_beats, start_sec=start_sec)
-                else:
-                    strip.set_data(x, data[0].copy(), beat_annotations=all_beats, start_sec=start_sec)
-            
+            # The cards keep their own moment's strips (_load_tile_strips);
+            # the replay's frame goes to the detailed view and the rhythm strip.
             # Update large main strips
             if hasattr(self, "_main_strips"):
                 for idx, strip in enumerate(self._main_strips):

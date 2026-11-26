@@ -109,6 +109,26 @@ class HolterEditEventPanel(QWidget):
         ev_title.setStyleSheet(_card_title_style())
         ev_head.addWidget(ev_title)
         ev_head.addStretch(1)
+        type_lbl = QLabel("Type")
+        type_lbl.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:bold;background:transparent;border:none;")
+        ev_head.addWidget(type_lbl)
+        # event-type filter (as in EVENTS): each name with its count
+        self._type_filter = QComboBox()
+        self._type_filter.setMinimumWidth(180)
+        self._type_filter.setCursor(Qt.PointingHandCursor)
+        self._type_filter.setStyleSheet(f"""
+            QComboBox {{
+                background:{UI_PANEL_ALT}; color:{UI_TEXT};
+                border:1px solid {UI_BORDER}; padding:4px 8px; border-radius:6px; font-size:11px;
+            }}
+            QComboBox:hover {{ border:1px solid {UI_ACCENT}; }}
+            QComboBox QAbstractItemView {{
+                background:{UI_PANEL}; color:{UI_TEXT}; border:1px solid {UI_BORDER};
+                selection-background-color:#1E3A5F; selection-color:{UI_TEXT}; outline:0;
+            }}
+        """)
+        self._type_filter.currentIndexChanged.connect(lambda _i: self._apply_type_filter())
+        ev_head.addWidget(self._type_filter)
         self._ev_count_badge = _badge()
         ev_head.addWidget(self._ev_count_badge)
         left_layout.addLayout(ev_head)
@@ -144,6 +164,15 @@ class HolterEditEventPanel(QWidget):
         self._ev_table.setCursor(Qt.PointingHandCursor)
         self._ev_table.cellClicked.connect(self._on_click)
         left_layout.addWidget(self._ev_table, 1)
+
+        # Empty state, centred over the table (kept centred on resize).
+        self._no_items_lbl = QLabel("No events")
+        self._no_items_lbl.setParent(self._ev_table.viewport())
+        self._no_items_lbl.setAlignment(Qt.AlignCenter)
+        self._no_items_lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._no_items_lbl.setStyleSheet(f"color:{UI_MUTED};font-size:12px;font-style:italic;padding:8px;"
+                                         f"border:none;background:transparent;")
+        self._ev_table.viewport().installEventFilter(self)
 
         # Stats: "name ..... value" rows in two columns
         stats_title = QLabel("Summary")
@@ -195,19 +224,37 @@ class HolterEditEventPanel(QWidget):
         ecg_l.setContentsMargins(10, 8, 10, 10)
         ecg_l.setSpacing(8)
 
-        # Title, then the tool buttons on their own row under it
+        # Title with the selected event on the right, then the tool buttons
+        # on their own row under it, in groups
+        ttl_row = QHBoxLayout()
+        ttl_row.setSpacing(8)
         ecg_ttl = QLabel("12-Lead ECG")
         ecg_ttl.setStyleSheet(_card_title_style())
-        ecg_l.addWidget(ecg_ttl)
+        ttl_row.addWidget(ecg_ttl)
+        ttl_row.addStretch(1)
+        self._event_chip = QLabel("")
+        self._event_chip.setStyleSheet(f"color:{UI_MUTED};font-size:11px;font-weight:bold;background:{UI_PANEL_ALT};"
+                                       f"border:1px solid {UI_BORDER};border-radius:6px;padding:3px 10px;")
+        self._event_chip.hide()
+        ttl_row.addWidget(self._event_chip)
+        ecg_l.addLayout(ttl_row)
         tool_row = QHBoxLayout()
         tool_row.setSpacing(4)
-        for icon in ["Refresh", "Menu", "Prev", "Next", "<<", ">>", "Up", "Down"]:
-            btn = QPushButton(icon)
-            btn.setStyleSheet(_ee_tool_btn_style())
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setFixedHeight(28)
-            btn.setMinimumWidth(36)
-            tool_row.addWidget(btn)
+        for g, group in enumerate([["Refresh", "Menu"], ["Prev", "Next"], ["<<", ">>"], ["Up", "Down"]]):
+            if g:
+                sep = QFrame()
+                sep.setFixedSize(1, 20)
+                sep.setStyleSheet(f"background:{UI_BORDER};border:none;")
+                tool_row.addSpacing(4)
+                tool_row.addWidget(sep)
+                tool_row.addSpacing(4)
+            for icon in group:
+                btn = QPushButton(icon)
+                btn.setStyleSheet(_ee_tool_btn_style())
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.setFixedHeight(28)
+                btn.setMinimumWidth(36)
+                tool_row.addWidget(btn)
         tool_row.addStretch(1)
         ecg_l.addLayout(tool_row)
 
@@ -228,8 +275,8 @@ class HolterEditEventPanel(QWidget):
         leads_layout.setContentsMargins(6, 6, 6, 6)
         leads_layout.setSpacing(6)
         self._ch_strips = []
-        _all_lead_names = ["Lead I", "Lead II", "Lead III", "aVR", "aVL", "aVF",
-                           "V1", "V2", "V3", "V4", "V5", "V6"]
+        _all_lead_names = ["Lead I", "Lead II", "Lead III", "Lead aVR", "Lead aVL", "Lead aVF",
+                           "Lead V1", "Lead V2", "Lead V3", "Lead V4", "Lead V5", "Lead V6"]
         for name in _all_lead_names:
             # One block per lead: name on a slim header line, the strip under it.
             block = QFrame()
@@ -332,6 +379,10 @@ class HolterEditEventPanel(QWidget):
                 btn = QPushButton(lbl)
                 btn.setStyleSheet(_ee_danger_btn_style() if lbl.startswith("Remove") else _style_btn())
                 btn.setCursor(Qt.PointingHandCursor)
+                if lbl == "Prev Event":
+                    btn.clicked.connect(lambda _=False: self._step_event(-1))
+                elif lbl == "Next Event":
+                    btn.clicked.connect(lambda _=False: self._step_event(1))
                 nav_row.addWidget(btn, 1)
         right_layout.addLayout(nav_row)
         layout.addWidget(right, 2)
@@ -354,7 +405,8 @@ class HolterEditEventPanel(QWidget):
             t_str = _format_system_time(self._session_dir, ev['timestamp'])
             for j, val in enumerate([ev['label'], t_str, "12", "7s", source, f"{conf:.2f}"]):
                 item = QTableWidgetItem(val)
-                item.setForeground(QColor(UI_TEXT))
+                # name and time in full colour; the per-row constants muted
+                item.setForeground(QColor(UI_TEXT if j < 2 else UI_MUTED))
                 if j == 0:
                     item.setData(Qt.UserRole, {
                         "beat_id": str(ev.get("beat_id", ev.get("template_label", ev.get("label", "")))),
@@ -365,6 +417,9 @@ class HolterEditEventPanel(QWidget):
                         "source": source,
                     })
                 self._ev_table.setItem(i, j, item)
+        self._selected_payload = {}
+        self._event_chip.hide()
+        self._rebuild_type_filter()
         s = summary
         for key, fmt in [("hr",f"{s.get('avg_hr',0):.0f} bpm"),
                           ("max_hr",f"{s.get('max_hr',0):.0f} bpm"),
@@ -388,12 +443,109 @@ class HolterEditEventPanel(QWidget):
                 self._selected_payload = dict(payload)
                 self._annot_event_id.setText(str(payload.get("beat_id", "")))
                 self._annot_auto.setText(str(payload.get("auto_label", "")))
-                self._annot_clin.setCurrentText(str(payload.get("clinician_label", "")))
+                # a label the list does not have leaves it empty -- setCurrentText
+                # kept the previous event's choice (it went into that annotation)
+                clin = self._annot_clin.findText(str(payload.get("clinician_label", "")))
+                self._annot_clin.setCurrentIndex(clin if clin >= 0 else 0)
                 self._annot_conf.setValue(float(payload.get("confidence", 0.0) or 0.0))
+                t_sec = float(payload.get('timestamp', 0.0) or 0.0)
                 self._annot_editor.setPlainText(
                     f"Source: {payload.get('source', '')}\n"
-                    f"Timestamp: {_sec_to_hms(float(payload.get('timestamp', 0.0) or 0.0))}"
+                    f"Timestamp: {_format_system_time(self._session_dir, t_sec)} ({_sec_to_hms(t_sec)})"
                 )
+                self._show_event_chip(row)
+
+    def eventFilter(self, obj, event):
+        # Keep the empty-state text centred over the table's viewport.
+        lbl = getattr(self, "_no_items_lbl", None)
+        if lbl is not None and obj is self._ev_table.viewport() and event.type() == QEvent.Resize:
+            lbl.setGeometry(obj.rect())
+        return super().eventFilter(obj, event)
+
+    def _rebuild_type_filter(self):
+        """The Type list: "All events (n)" and each event name with its count
+        (arrhythmia names first, then the sinus / normal ones); keeps the
+        chosen name while it is still listed."""
+        current = self._type_filter.currentData() if self._type_filter.count() else None
+        counts: Dict[str, int] = {}
+        for ev in self._events:
+            name = str(ev.get('label', ''))
+            counts[name] = counts.get(name, 0) + 1
+
+        def order(name):
+            low = name.lower()
+            return (1 if ('sinus' in low or 'normal' in low) else 0, low)
+        self._type_filter.blockSignals(True)
+        self._type_filter.clear()
+        self._type_filter.addItem(f"All events ({len(self._events):,})", None)
+        for name in sorted(counts, key=order):
+            self._type_filter.addItem(f"{name} ({counts[name]:,})", name)
+        idx = self._type_filter.findData(current) if current is not None else 0
+        self._type_filter.setCurrentIndex(max(0, idx))
+        self._type_filter.blockSignals(False)
+        self._apply_type_filter()
+
+    def _apply_type_filter(self):
+        """Show only the rows of the chosen event name (all for "All events");
+        the badge says how many rows show."""
+        name = self._type_filter.currentData()
+        shown = 0
+        for row, ev in enumerate(self._events):
+            hide = name is not None and str(ev.get('label', '')) != name
+            self._ev_table.setRowHidden(row, hide)
+            shown += 0 if hide else 1
+        total = len(self._events)
+        if name is None:
+            self._ev_count_badge.setText(f"{total:,} event" + ("" if total == 1 else "s"))
+        else:
+            self._ev_count_badge.setText(f"{shown:,} of {total:,}")
+        self._no_items_lbl.setVisible(shown == 0)
+        self._no_items_lbl.setText("No events" if total == 0 else "No events of this type")
+        self._no_items_lbl.setGeometry(self._ev_table.viewport().rect())
+        row = self._selected_row()
+        if row >= 0 and self._ev_table.isRowHidden(row):
+            self._ev_table.clearSelection()
+            self._event_chip.hide()
+        elif row >= 0:
+            self._show_event_chip(row)
+
+    def _visible_rows(self) -> List[int]:
+        return [r for r in range(len(self._events)) if not self._ev_table.isRowHidden(r)]
+
+    def _selected_row(self) -> int:
+        selection = self._ev_table.selectionModel()
+        if selection:
+            rows = selection.selectedRows()
+            if rows:
+                return int(rows[0].row())
+        return -1
+
+    def _step_event(self, step: int):
+        """Prev / Next Event: the shown row before / after the selected one
+        (the first when none is) -- opened as a click on it does."""
+        rows = self._visible_rows()
+        if not rows:
+            return
+        row = self._selected_row()
+        if row < 0 or row not in rows:
+            new = rows[0]
+        else:
+            new = rows[max(0, min(len(rows) - 1, rows.index(row) + step))]
+        self._ev_table.scrollToItem(self._ev_table.item(new, 0))
+        self._on_click(new, 0)
+
+    def _show_event_chip(self, row: int):
+        """Over the 12 leads, which event they show: 'Event 3 of 124 .
+        Normal Sinus Rhythm . 13:54:12'."""
+        if row < 0 or row >= len(self._events):
+            self._event_chip.hide()
+            return
+        ev = self._events[row]
+        rows = self._visible_rows()
+        pos = rows.index(row) + 1 if row in rows else row + 1
+        t = _format_system_time(self._session_dir, float(ev.get('timestamp', 0.0) or 0.0))
+        self._event_chip.setText(f"Event {pos:,} of {len(rows):,}  \u00b7  {ev.get('label', '')}  \u00b7  {t}")
+        self._event_chip.show()
 
     def set_session_dir(self, session_dir: str):
         self._session_dir = session_dir or ""

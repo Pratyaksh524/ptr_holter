@@ -2168,7 +2168,9 @@ class HolterMainWindow(QDialog):
 
         # Report Table
         self._report_table_panel = HolterReportTablePanel()
-        self._report_table_panel.update_from_metrics(self._metrics_list)
+        self._report_table_panel.update_from_metrics(
+            self._metrics_list, session_dir=self.session_dir,
+            duration_sec=(self._summary or {}).get('duration_sec', 0))
         self._tabs.addTab(self._report_table_panel, _make_icon("REPORT TABLE"), "REPORT TABLE")
 
         # Expert Review (OVERVIEW tab) already added as first tab above
@@ -2176,7 +2178,7 @@ class HolterMainWindow(QDialog):
 
         # HRV Analysis
         self._hrv_panel = HolterHRVPanel()
-        self._hrv_panel.update_hrv(self._metrics_list, self._summary)
+        self._hrv_panel.update_hrv(self._metrics_list, self._summary, session_dir=self.session_dir)
         self._tabs.addTab(self._hrv_panel, _make_icon("HRV"), "HRV")
 
         # Record settings
@@ -2186,6 +2188,8 @@ class HolterMainWindow(QDialog):
             session_name=session_name
         )
         self._record_settings_panel.settings_changed.connect(self._on_record_settings_changed)
+        self._record_settings_panel.set_recording_info(
+            self.session_dir, (self._summary or {}).get('duration_sec', 0))
         self._tabs.addTab(self._record_settings_panel, _make_icon("RECORD SETTINGS"), "RECORD SETTINGS")
 
         # Record browser
@@ -2561,7 +2565,7 @@ class HolterMainWindow(QDialog):
         if hasattr(self, '_expert_panel'):
             self._expert_panel.update_from_metrics(self._metrics_list, self._summary)
         if hasattr(self, '_hrv_panel'):
-            self._hrv_panel.update_hrv(self._metrics_list, self._summary)
+            self._hrv_panel.update_hrv(self._metrics_list, self._summary, session_dir=self.session_dir)
         if hasattr(self, '_replay_panel'):
             self._replay_panel.update_lorenz(self._metrics_list, session_dir=self.session_dir)
             self._replay_panel.update_summary(self._summary)
@@ -2592,9 +2596,17 @@ class HolterMainWindow(QDialog):
                     pass
             self._af_panel.update_from_metrics(self._metrics_list, self._summary.get('duration_sec', 0))
         if hasattr(self, '_st_panel'):
+            # the opened recording's engine: the panel kept the one the window
+            # was built with (another recording's, or none)
+            self._st_panel.set_replay_engine(self._replay_engine)
             self._st_panel.update_from_metrics(self._metrics_list)
         if hasattr(self, '_report_table_panel'):
-            self._report_table_panel.update_from_metrics(self._metrics_list)
+            self._report_table_panel.update_from_metrics(
+                self._metrics_list, session_dir=self.session_dir,
+                duration_sec=(self._summary or {}).get('duration_sec', 0))
+        if hasattr(self, '_record_settings_panel'):
+            self._record_settings_panel.set_recording_info(
+                self.session_dir, (self._summary or {}).get('duration_sec', 0))
         events = self._build_linked_events()
         if hasattr(self, '_events_panel'):
             self._events_panel.set_session_dir(self.session_dir)
@@ -2710,8 +2722,8 @@ class HolterMainWindow(QDialog):
         """Open a recording the user picked (recordings list double-click,
         View). Analysed (recording_analysis.is_analysed) -> it opens. Not
         analysed -> "This recording is not analyzed. Would you like to
-        analyse it?": Yes runs every analysis ("Analysing recording... N%"
-        popup) and then opens it; No leaves the user on the recordings list.
+        analyse it?": Analyse runs every analysis ("Analysing recording... N%"
+        popup) and then opens it; Not now leaves the user on the recordings list.
         Was load_completed_session straight away: the analyses then started
         on background threads, and a report preview opened meanwhile ran them
         all a second time."""
@@ -2739,7 +2751,7 @@ class HolterMainWindow(QDialog):
                 name = saved
         except Exception:
             pass
-        if not ask_to_analyse(self, name):
+        if not ask_to_analyse(self, name, session_dir):
             self._focus_tab("RECORDINGS")
             return
         open_when_analysed(self, session_dir, open_it)
