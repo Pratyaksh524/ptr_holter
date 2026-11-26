@@ -604,12 +604,13 @@ class HolterRRTrendCanvas(QWidget):
     def _nearest_index(self, x_pos: int):
         if not self._points:
             return None
-        rect = self.rect().adjusted(42, 18, -12, 30)
+        # the same plot area and time axis as paintEvent
+        rect = self.rect().adjusted(46, 22, -14, -20)
         if rect.width() <= 0:
             return 0
         xs = [p[0] for p in self._points]
         lo = 0.0
-        hi = 12.0 * 60.0 * 60.0
+        hi = max(60.0, max(xs))
         span = max(hi - lo, 1e-9)
         best = None
         best_dist = None
@@ -626,9 +627,10 @@ class HolterRRTrendCanvas(QWidget):
         painter.fillRect(self.rect(), QColor(COL_BLACK))
         painter.setRenderHint(QPainter.Antialiasing, True)
 
-        # Keep the trend comparable across recordings and modes. The replay
-        # chart uses seconds on X, milliseconds (RR) or BPM (HR) on Y.
-        rect = self.rect().adjusted(42, 18, -12, 30)
+        # Seconds on X, milliseconds (RR) or BPM (HR) on Y. The plot area
+        # stays inside the widget (was adjusted(..., +30): its bottom 30 px
+        # and the time labels were drawn below the widget, out of sight).
+        rect = self.rect().adjusted(46, 22, -14, -20)
         painter.setPen(QPen(QColor("#243242"), 1))
         painter.drawRect(rect)
 
@@ -649,8 +651,11 @@ class HolterRRTrendCanvas(QWidget):
             painter.end()
             return
 
+        # X: the recording's own span -- was a fixed 0-12 h, so a 15 min
+        # recording sat squeezed in the left 2% of the chart. Y stays fixed
+        # (0-3000 ms / 0-300 bpm) so recordings remain comparable.
         x_lo = 0.0
-        x_hi = 12.0 * 60.0 * 60.0
+        x_hi = max(60.0, max(p[0] for p in self._points))
         y_lo = 0.0
         y_hi = 300.0 if mode == "HR" else 3000.0
 
@@ -663,20 +668,33 @@ class HolterRRTrendCanvas(QWidget):
         # the recording contains only a short or low-variation segment.
         painter.setFont(QFont("Segoe UI", 8))
         painter.setPen(QPen(QColor("#B0BEC5"), 1))
-        y_ticks = np.arange(y_lo, y_hi + 75.0, 75.0) if mode == "HR" else (0.0, 1500.0, 3000.0)
+        y_ticks = np.arange(y_lo, y_hi + 75.0, 75.0) if mode == "HR" else (0.0, 1000.0, 2000.0, 3000.0)
         for value in y_ticks:
             _, py = map_xy(x_lo, value)
+            painter.setPen(QPen(QColor(255, 255, 255, 18), 1))          # faint grid line
+            painter.drawLine(rect.left(), py, rect.right(), py)
+            painter.setPen(QPen(QColor("#B0BEC5"), 1))
             painter.drawLine(rect.left() - 4, py, rect.left(), py)
-            label = f"{int(value)}"
-            painter.drawText(4, py + 4, label)
+            painter.drawText(4, py + 4, f"{int(value)}")
 
-        x_ticks = [(0.0, "0h"), (3.0 * 3600.0, "3h"),
-                   (6.0 * 3600.0, "6h"), (9.0 * 3600.0, "9h"),
-                   (12.0 * 3600.0, "12h")]
-        for value, label in x_ticks:
-            px, _ = map_xy(value, y_lo)
+        # time ticks: a round step giving 4-8 ticks over the span, labelled
+        # as elapsed time (m:ss under 1 h, h:mm above)
+        span = x_hi - x_lo
+        step = next((st for st in (10, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200)
+                     if span / st <= 8), 86400)
+        t_tick = 0.0
+        while t_tick <= x_hi + 1e-6:
+            px, _ = map_xy(t_tick, y_lo)
+            painter.setPen(QPen(QColor(255, 255, 255, 18), 1))
+            painter.drawLine(px, rect.top(), px, rect.bottom())
+            painter.setPen(QPen(QColor("#B0BEC5"), 1))
             painter.drawLine(px, rect.bottom(), px, rect.bottom() + 4)
-            painter.drawText(px - 10, rect.bottom() + 17, label)
+            if span < 3600:
+                label = f"{int(t_tick // 60)}:{int(t_tick % 60):02d}"
+            else:
+                label = f"{int(t_tick // 3600)}h{int(t_tick % 3600 // 60):02d}"
+            painter.drawText(px - 14, rect.bottom() + 16, label)
+            t_tick += step
 
         painter.setPen(QPen(QColor(COL_GREEN_MID), 2))
         for i in range(1, len(self._points)):
@@ -696,7 +714,7 @@ class HolterRRTrendCanvas(QWidget):
                 painter.drawEllipse(px - 2, py - 2, 4, 4)
 
         painter.setPen(QPen(QColor("#B0BEC5")))
-        painter.drawText(rect.right() - 38, rect.bottom() + 17, "Time")
+        painter.drawText(rect.right() - 30, rect.top() - 6, "Time")
 
 
 HRTrendCanvas = HolterRRTrendCanvas

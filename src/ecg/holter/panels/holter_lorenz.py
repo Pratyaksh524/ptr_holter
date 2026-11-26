@@ -41,6 +41,7 @@ from ..holter_helpers import (
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
     _style_active_btn, _style_btn, _style_filter_btn, _table_style, _template_filter_key,
+    _overview_table_style,
 )
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas, HolterRRTrendCanvas, HRTrendCanvas
@@ -76,9 +77,18 @@ class HolterLorenzPanel(QWidget):
         mid_splitter = QSplitter(Qt.Horizontal)
         
         # Left side of mid splitter: Lorenz Plot + Buttons
-        lorenz_container = QWidget()
+        lorenz_container = QFrame()
+        lorenz_container.setObjectName("lzLorenzCard")
+        lorenz_container.setStyleSheet(f"QFrame#lzLorenzCard{{background:{UI_PANEL};border:1px solid {UI_BORDER};"
+                                       f"border-radius:8px;}}")
         l_layout = QVBoxLayout(lorenz_container)
-        l_layout.setContentsMargins(0, 0, 0, 0)
+        l_layout.setContentsMargins(8, 8, 8, 8)
+        l_layout.setSpacing(6)
+        lz_title = QLabel("RR SCATTER (LORENZ)")
+        lz_title.setStyleSheet(f"color:{UI_TEXT};font-size:12px;font-weight:800;letter-spacing:1px;"
+                               f"background:transparent;border:none;border-left:3px solid {COL_GREEN};"
+                               f"padding:2px 8px;")
+        l_layout.addWidget(lz_title)
         
         self.lorenz_canvas = LorenzCanvas()
         self.lorenz_canvas.beats_selected.connect(self._on_beats_selected)
@@ -93,9 +103,10 @@ class HolterLorenzPanel(QWidget):
         l_layout.addWidget(self.lorenz_canvas, 1)
 
         # Filter buttons matching the Template tab
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(4)
-        btn_row.setContentsMargins(0, 4, 0, 4)
+        btn_row = QGridLayout()
+        btn_row.setHorizontalSpacing(4)
+        btn_row.setVerticalSpacing(4)
+        btn_row.setContentsMargins(0, 2, 0, 2)
         self._filter_btns = {}
         self._current_filter = "all"
         for key, lbl in [
@@ -114,11 +125,35 @@ class HolterLorenzPanel(QWidget):
             btn.setToolTip(f"Filter by {lbl}")
             btn.setFixedHeight(28)
             btn.setStyleSheet(_style_filter_btn(active=(key == "all")))
+            btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda checked=False, k=key: self._set_lorenz_filter(k))
             self._filter_btns[key] = btn
-            btn_row.addWidget(btn)
+            _i = len(self._filter_btns) - 1
+            btn_row.addWidget(btn, _i // 4, _i % 4)
         l_layout.addLayout(btn_row)
-        l_layout.addStretch(0)
+
+        # beats per class (plain text: the space under the buttons was empty)
+        cls_title = QLabel("BEAT CLASSES")
+        cls_title.setStyleSheet(f"color:{UI_MUTED};font-size:9px;font-weight:700;letter-spacing:1px;"
+                                f"background:transparent;border:none;padding:6px 2px 0 2px;")
+        l_layout.addWidget(cls_title)
+        self._class_table = QTableWidget(0, 3)
+        self._class_table.setHorizontalHeaderLabels(["Class", "Beats", "%"])
+        self._class_table.verticalHeader().setVisible(False)
+        self._class_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self._class_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self._class_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self._class_table.horizontalHeader().setFixedHeight(26)
+        self._class_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._class_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self._class_table.setFocusPolicy(Qt.NoFocus)
+        self._class_table.setShowGrid(False)
+        self._class_table.setStyleSheet(_overview_table_style())
+        l_layout.addWidget(self._class_table, 1)
+        hint = QLabel("Drag on the plot to select beats \u00b7 right-click for options")
+        hint.setStyleSheet(f"color:{UI_MUTED};font-size:10px;background:transparent;border:none;")
+        hint.setWordWrap(True)
+        l_layout.addWidget(hint)
         self._lorenz_container = lorenz_container
         lorenz_container.installEventFilter(self)  # splitter drags resize it alone
 
@@ -255,8 +290,9 @@ class HolterLorenzPanel(QWidget):
             self.duration_sec = duration_sec
         if session_dir is not None:
             self._lorenz_session_dir = session_dir
-        from ..lorenz_beats import lorenz_points
+        from ..lorenz_beats import lorenz_points, CLASS_NAMES
         self._beat_points = lorenz_points(getattr(self, '_lorenz_session_dir', None))
+        self._update_class_counts(CLASS_NAMES)
             
         pts = []
         rr_all = []
@@ -310,6 +346,42 @@ class HolterLorenzPanel(QWidget):
         self._rr_all = rr_all
         self._rr_classes = rr_classes
         self._apply_lorenz_filter()
+
+    def _update_class_counts(self, class_names):
+        """Each filter button shows its beat count; the table lists them with
+        their share (the points the plot shows; plain labels when there are
+        none saved)."""
+        points = getattr(self, "_beat_points", None)
+        names = {"all": "All", "U": "Unidentified"}
+        table = getattr(self, "_class_table", None)
+        if points is None:
+            for k, b in self._filter_btns.items():
+                b.setText(names.get(k, k))
+            if table is not None:
+                table.setRowCount(0)
+            return
+        from collections import Counter
+        counts = Counter(p[3] for p in points)
+        total = len(points)
+        for k, b in self._filter_btns.items():
+            n = total if k == "all" else counts.get(k, 0)
+            b.setText(f"{names.get(k, k)}  {n:,}")
+        if table is None:
+            return
+        order = [k for k in ("N", "S", "V", "P", "AF", "X", "U") if counts.get(k)]
+        table.setRowCount(len(order) + 1)
+        full = {"N": "Normal (sinus)", "S": "Supraventricular", "V": "Ventricular", "P": "Paced",
+                "AF": "AF / Atrial flutter", "X": "Artifact", "U": "Unidentified"}
+        rows = [(full.get(k, class_names.get(k, k)) + f" ({k})", counts[k]) for k in order] + [("Total", total)]
+        for r, (name, n) in enumerate(rows):
+            pct = f"{100.0 * n / total:.1f}" if total else "0.0"
+            for c, text in enumerate((name, f"{n:,}", pct)):
+                item = QTableWidgetItem(text)
+                item.setForeground(QColor(UI_TEXT if c else UI_MUTED))
+                if r == len(rows) - 1:
+                    f = item.font(); f.setBold(True); item.setFont(f)
+                table.setItem(r, c, item)
+            table.setRowHeight(r, 24)
 
     def _set_lorenz_filter(self, key: str):
         self._current_filter = key
