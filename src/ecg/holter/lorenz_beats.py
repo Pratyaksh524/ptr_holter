@@ -10,13 +10,16 @@ The beats are the PVC / PAC detector's (ectopic_beats_detector -- the same
 beats as the report's VE / SVE, the Template cards and Full Disclosure), not
 the live 5 s chunks' labels (a healthy human recording read 124 S there, 13
 here). The class of beat n, first rule that holds:
+  P      a paced beat (detector 'P': a pacing spike made it) -- before the
+         segment rules: the pacing spikes themselves made the segment
+         detector read a paced rhythm as Unidentified (muscle noise) or AF
+         (2026-11-27_14-23-01 / 14-38-41)
   U      inside an auto "Unidentified" segment (no readable QRS: noise)
   X      inside an auto "Artifact" segment or an Asystole span
   Other  inside an auto Ventricular Fibrillation segment (waves, not beats)
   V      a PVC (detector 'V') or a beat of an auto Ventricular Tachycardia
   S      a PAC (detector 'S') or a beat of an auto SVT segment
   AF     a beat of an auto Atrial Fibrillation / Atrial Flutter segment
-  P      a paced beat (detector 'P' -- no detector gives it yet)
   N      a normal beat (detector 'N') anywhere else (sinus rhythm, sinus
          brady / tachy, AV blocks, BBB: their QRS is the conducted one)
   Other  anything else (a 'Q' beat the detector could not classify)
@@ -89,6 +92,8 @@ def lorenz_points(session_dir: str) -> Optional[List[Tuple[float, float, float, 
     def classify(b) -> str:
         t = float(b.get('timestamp', 0.0) or 0.0)
         lab = str(b.get('label', 'N'))
+        if lab == 'P':
+            return 'P'
         if _inside(t, u_spans):
             return 'U'
         if _inside(t, x_spans):
@@ -101,8 +106,6 @@ def lorenz_points(session_dir: str) -> Optional[List[Tuple[float, float, float, 
             return 'S'
         if _inside(t, af_spans):
             return 'AF'
-        if lab == 'P':
-            return 'P'
         if lab == 'N':
             return 'N'
         return 'Other'
