@@ -80,6 +80,10 @@ V V V V as a run instead of N N V N N V (trigeminy).
   - PACs ('S'): a second pass over the N beats, _classify_pacs (early,
     abruptly, with the dominant QRS shape and a P stretch unlike the
     dominant beats'; not in AF / Flutter / AV block segments).
+  - Paced beats ('P', with 'pace' 'V' / 'A' / 'AV'): _label_paced, before
+    the PAC pass -- a beat made by a pacemaker pulse, found by its pacing
+    spike (see 'paced beats' below). A spike the beat finder took for a
+    beat (an atrial spike, one with no capture) is taken out of the beats.
 
   Scored against cardiologist annotations (first 5 min of each record):
   INCART 12-lead and MIT-BIH (2 leads; the other 10 are mixes of them, so
@@ -336,8 +340,9 @@ def get_cached_ectopic_beats(path: Optional[str]) -> Optional[List[Dict[str, Any
 
 
 def detect_ectopic_beats(reader, segments: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
-    """Every beat of the recording: {'timestamp' (s), 'label' 'N'|'V'|'S'|'Q',
-    'rr_ms', 'qrs_ms'}. Cached per file, segments and code. `segments` (the
+    """Every beat of the recording: {'timestamp' (s), 'label' 'N'|'V'|'S'|'Q'|'P',
+    'rr_ms', 'qrs_ms'}, a paced beat ('P') also 'pace' ('V' ventricular, 'A'
+    atrial, 'AV' both). Cached per file, segments and code. `segments` (the
     auto segment detection) is fetched when not given and the reader has a
     path; when given they must be that detection's (a saved result made with
     other spans is not reused)."""
@@ -752,8 +757,9 @@ def _classify_pacs(out: List[Dict[str, Any]], corrs: List[Optional[float]], segm
     Fibrillation / Flutter, AV blocks, Sinus / plain Tachycardia and
     Bradycardia, SVT: the RR is irregular by itself there, or the segment is
     a rhythm of its own, not PACs; from PAC_SEGMENT_MARGIN_SEC before its
-    start), beats right after a gap or a 'Q', and the first beats until two
-    normal RRs are known -- also again after such a segment.
+    start), beats right after a gap, a 'Q' or a paced beat ('P': the rate
+    there is the pacemaker's), and the first beats until two normal RRs are
+    known -- also again after such a segment.
     The running normal RR takes N beats that do not follow an S or a V
     (not the pause after an ectopic beat)."""
     no_pac = [(float(x['start_sec']), float(x['end_sec'])) for x in (segments or [])
@@ -767,7 +773,7 @@ def _classify_pacs(out: List[Dict[str, Any]], corrs: List[Optional[float]], segm
     prev_label, prev_rr = None, None
     for k, b in enumerate(out):
         rr, lbl, c, ts = b.get('rr_ms'), b.get('label'), corrs[k], float(b['timestamp'])
-        if rr is None or rr > RESTART_GAP_SEC * 1000.0 or lbl == 'Q':
+        if rr is None or rr > RESTART_GAP_SEC * 1000.0 or lbl in ('Q', 'P'):
             ref, run = [], []
             prev_label, prev_rr = lbl, rr
             continue
@@ -862,6 +868,383 @@ def _classify_pacs(out: List[Dict[str, Any]], corrs: List[Optional[float]], segm
                 ref.append(rr)
                 ref = ref[-LOCAL_RR_BEATS:]
         prev_label, prev_rr = lbl, rr
+
+
+# ---------------------------------------------------------------------------
+# paced beats
+#
+# A paced beat is made by a pacemaker pulse: the pacing spike (the pulse,
+# ~0.5-2 ms) and right after it the chamber's response. Rule based, two
+# ways of seeing the spike:
+#   1. find_pacing_spikes -- a spike as this device records it (500 Hz,
+#      12 bit, 200 counts per mV). The simulator's paced rhythms (TV Paced:
+#      2026-11-27_14-23-01, -14-38-41; atrial paced runs inside
+#      2026-11-12_13-54-02 at 14:06:20 and 2026-10-31_17-55-39 at 17:58:57)
+#      jump ~10 mV in one sample on every recorded lead at once (most reach
+#      the ADC rail), are at their full height within 1-2 samples and over
+#      within ~12 ms (with an opposite-side recharge at times), the signal
+#      flat right up to the jump, and come again within the pacing interval.
+#      Each test (PACE_* below) is there for something else that jumps 1 mV
+#      in a sample: a tall sharp human QRS (MIT-BIH 101, 113, 115, 209,
+#      212, 220: rising for samples before the jump, most of its height
+#      still to come), a clipped lead coming off the rail, the first cycle
+#      of a mains burst, the Q notch of a QRS whose R goes to the rail, and
+#      lone glitches (1-2 per recording). Over the 177 device recordings
+#      and all 48 MIT-BIH records only the four paced ones keep spikes.
+#      Each spike is read by what follows it: a QRS within PACE_CAPTURE_SEC
+#      = ventricular capture ('V'; with an 'A' spike PACE_CONDUCT_SEC before
+#      it, AV sequential); no QRS there but one (or a 'V' spike)
+#      PACE_CONDUCT_SEC later = atrial pacing ('A'); nothing = no capture
+#      ('none').
+#   2. _narrow_spike_before -- a spike recorded smaller and wider: the
+#      MIT-BIH paced records (102, 104, 107, 217: 360 Hz tape) show it as a
+#      narrow peak (0.3-2 mV, ~8-12 ms wide at half height) just before the
+#      wide paced QRS, the signal quiet before it -- in front of 41% of their
+#      7028 paced beats (none in front of 95% of 217's: no spike to see
+#      there), and of ~20 of the ~100 000 other beats of all 48 records
+#      (4-8 per record, scattered). So it makes beats paced only where many
+#      such beats (PACE_MIN_TEMPLATE_BEATS) share one wide QRS shape (the
+#      paced template); then every wide beat that is not premature and has
+#      its own spike, or the paced shape (a spike lost under noise or the
+#      tape does not change the paced QRS), is paced. Runs after (1) on
+#      every recording.
+# Only a pacing spike makes a beat paced: a recording without them is
+# labelled exactly as before. The RR between paced beats is no help on its
+# own: on the MIT-BIH paced records the RR before a paced beat varies as
+# much as sinus (IQR 42 ms, tape speed), so a fixed pacing interval cannot
+# be relied on.
+# ---------------------------------------------------------------------------
+PACE_LEADS = ('I', 'II', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6')  # the recorded leads (the others are sums of I and II)
+PACE_JUMP_MV = 1.0            # a spike changes this much in one sample ...
+PACE_JUMP_LEADS = 3           # ... on at least this many recorded leads at once (+-1 sample)
+PACE_RISE_SEC = 0.004         # ... is at PACE_RISE_FRACTION of its height this soon after its onset (the
+PACE_RISE_FRACTION = 0.7      # sample its rise starts from; device spikes: the whole height in 1-2
+                              # samples. A tall sharp QRS can also jump 1 mV in a sample -- MIT-BIH 101,
+                              # 113, 115, 209, 212, 220 -- but its rise began samples earlier and most
+                              # of its height comes later)
+PACE_RETURN_SEC = 0.010       # ... and is back under half its height within this
+PACE_ALONE_SEC = 0.025        # ... and, until this long after its onset, does not come back to half its
+                              # height on the same side: one pulse, not the first cycle of a 50 / 60 Hz
+                              # burst (its next peak 17-20 ms later; 2026-11-02_17-23-21 at 39.5 s) ...
+PACE_SETTLE_SEC = 0.016       # ... and from this long after its onset to PACE_ALONE_SEC stays within half
+                              # its height of the level before it on either side: the pulse, with its
+                              # opposite-side recharge (2026-10-31_17-55-39: rail to rail in 12 ms), is
+                              # over -- not the Q notch of a tall QRS whose R is still at the rail
+                              # (2026-11-04_11-08-46 at 46.4 s)
+PACE_QUIET_SEC = 0.035        # this stretch before a spike's onset ...
+PACE_QUIET_FRACTION = 0.15    # ... changes per sample by at most this x the spike's own step (device
+                              # spikes: flat up to the jump; mains / muscle: steep all along), and is
+                              # not at the ADC rail (a clipped lead jumping off the rail is no spike:
+                              # 2026-10-29_16-36-56, 2026-11-05_12-16-28)
+PACE_REF_SEC = (0.035, 0.010)     # the level before a spike (20 ms mean: the spike itself not in it)
+PACE_MERGE_SEC = 0.010        # steps closer together than this are one spike
+PACE_PAIR_SEC = 2.0           # a spike counts only with another one this close: a pacemaker that paces
+                              # paces again within its lower-rate interval (30/min and up). The spike-
+                              # like artifacts left on the non-paced device recordings are lone ones, 1-2
+                              # per recording, >= 3 s apart (a single paced beat between the patient's
+                              # own beats is missed by this)
+PACE_CAPTURE_SEC = (0.030, 0.120)  # a ventricular capture: its QRS is in this window after the spike ...
+PACE_CAPTURE_MV = 0.5         # ... at least this far from the level before the spike (20 ms mean: mains out)
+PACE_CONDUCT_SEC = (0.10, 0.35)    # an atrial spike: a QRS, or the ventricular spike, this long after it
+PACE_V_SHARE = 0.5            # a capture's deflection >= this x the one PACE_CONDUCT_SEC later: the QRS is
+                              # right after the spike. Measured (max over the recorded leads): ventricular
+                              # 5.9 mV then 5.9; atrial 0.8 (its P wave) then 6.4 (the QRS); none 0.07 / 0.08
+PACE_BEAT_TOL_SEC = 0.025     # a beat this close to a spike was taken at the spike
+PACE_NARROW_LEADS = ('II', 'V1', 'V5', 'I')  # where (2) looks
+PACE_NARROW_MS = 12.0         # (2): width at half prominence at most
+PACE_NARROW_MIN_MV = 0.3      # (2): prominence at least
+PACE_NARROW_WINDOW_SEC = (0.150, 0.030)  # (2): from this long before the R peak to this long after
+PACE_NARROW_QUIET_SEC = (0.035, 0.010)   # (2): quiet stretch before the peak (from, to: seconds before
+                                         # it; the peak's own ~5 ms rise not in it), by PACE_QUIET_FRACTION
+PACE_NARROW_SWING_SEC = 0.020 # (2): within this after the peak the signal goes at most
+PACE_NARROW_SWING = 2.0       # this x the peak's height past the level before it on the other side.
+                              # The narrow r of an rS QRS drops straight into its deep S (INCART I73:
+                              # 7x its height within 20 ms, every beat); a paced spike's tail stays
+                              # near the level (MIT-BIH 102 / 104: none past 1x)
+PACE_MIN_TEMPLATE_BEATS = 15  # (2): spiked wide beats of one shape needed for a paced template
+PACE_TEMPLATE_CORR = 0.90     # (2): the shape of a paced beat against the paced template
+PACE_NOT_PREMATURE = 0.90     # (2): a paced beat's RR >= this x the spiked beats' median (a PVC comes early)
+
+
+def _mean20(x: np.ndarray, fs: float) -> np.ndarray:
+    """Rows of x averaged over 20 ms (one 50 Hz cycle; 60 Hz mostly)."""
+    w = max(1, int(round(0.020 * fs)))
+    k = np.ones(w) / w
+    return np.vstack([np.convolve(r, k, mode='same') for r in x])
+
+
+def _spike_at(y: np.ndarray, dy: np.ndarray, k: int, rise: int, ret: int, quiet: int,
+              settle: int, alone: int) -> bool:
+    """Does lead y (dy = its sample-to-sample steps) show a pacing spike
+    with the jump dy[k] in it (find_pacing_spikes)? Its onset is the sample
+    its rise starts from (at most `rise` - 1 samples before the jump); from
+    there PACE_RISE_FRACTION of its height within `rise` samples, back under
+    half its height within `ret` of its top, not at half again on the same
+    side until `alone` samples after the onset and within half of the level
+    before it on either side from `settle` to `alone` samples after it, and
+    the `quiet` samples before the onset flat and off the ADC rail."""
+    step = float(dy[k])
+    sgn = np.sign(step)
+    small = PACE_QUIET_FRACTION * abs(step)
+    on = k
+    while on > k - rise + 1 and sgn * dy[on - 1] > small:
+        on -= 1                                  # the rise began a sample earlier
+    if on < quiet + 1 or on + 2 * ret + 2 > len(y) or on + alone + 1 > len(y):
+        return False
+    pre = y[on - quiet:on + 1]
+    if np.any((pre <= ADC_RAIL_LO) | (pre >= ADC_RAIL_HI)):
+        return False                             # from the rail: a clipped lead, not a spike
+    if float(np.max(np.abs(dy[on - quiet:on]))) > small:
+        return False                             # mains / muscle, or a QRS rising for longer
+    base = y[on]
+    top_seg = y[on + 1:on + 2 + ret]
+    top_i = int(np.argmax(sgn * (top_seg - base)))
+    height = abs(float(top_seg[top_i]) - base)
+    if float(np.max(sgn * (y[on + 1:on + 1 + rise] - base))) < PACE_RISE_FRACTION * height:
+        return False                             # most of its height still to come: a QRS
+    after = sgn * (y[on + 1 + top_i:on + 2 + top_i + ret] - base)
+    under = np.where(after < 0.5 * height)[0]
+    if under.size == 0:
+        return False                             # a step (square wave, electrode), not a spike
+    end = on + 1 + top_i + int(under[0])         # first sample back under half
+    later = sgn * (y[end + 1:on + alone + 1] - base)
+    if later.size and float(np.max(later)) >= 0.5 * height:
+        return False                             # a second peak: a burst
+    tail = np.abs(y[on + settle:on + alone + 1] - base)
+    return not (tail.size and float(np.max(tail)) >= 0.5 * height)     # not over yet: a QRS
+
+
+def find_pacing_spikes(reader) -> List[Dict[str, Any]]:
+    """Pacing spikes of the whole recording as this device records them
+    ('paced beats' above, way 1): [{'t' (s), 'kind' 'V' | 'A' | 'none',
+    'after_a' (a 'V' with an 'A' spike PACE_CONDUCT_SEC before it)}] in time
+    order; a spike with no other one within PACE_PAIR_SEC is left out. From
+    the signal alone: for the beat labels here, and for any rule that must
+    not read a spike as a beat or as noise."""
+    from .analysis_pipeline import ADC_COUNTS_PER_MV
+    fs = float(reader.fs)
+    names = list(reader.lead_names)
+    total = float(reader.duration_sec)
+    rec = [names.index(n) for n in PACE_LEADS if n in names] or list(range(len(names)))
+    jump = PACE_JUMP_MV * ADC_COUNTS_PER_MV
+    level = PACE_CAPTURE_MV * ADC_COUNTS_PER_MV
+    ret = max(1, int(round(PACE_RETURN_SEC * fs)))
+    rise = max(1, int(round(PACE_RISE_SEC * fs)))
+    quiet = int(round(PACE_QUIET_SEC * fs))
+    alone = int(round(PACE_ALONE_SEC * fs))
+    settle = int(round(PACE_SETTLE_SEC * fs))
+    r0, r1 = int(round(PACE_REF_SEC[0] * fs)), int(round(PACE_REF_SEC[1] * fs))
+    merge = max(1, int(round(PACE_MERGE_SEC * fs)))
+    c0, c1 = int(round(PACE_CAPTURE_SEC[0] * fs)), int(round(PACE_CAPTURE_SEC[1] * fs))
+    a0, a1 = int(round(PACE_CONDUCT_SEC[0] * fs)), int(round(PACE_CONDUCT_SEC[1] * fs))
+    pad = PACE_CONDUCT_SEC[1] + max(PACE_QUIET_SEC, PACE_REF_SEC[0]) + 0.05
+    found = []                     # (t, captured, something later)
+    t = 0.0
+    while t < total:
+        te = min(t + PIECE_SEC, total)
+        ps, pe = max(0.0, t - pad), min(total, te + pad)
+        data = reader.read_range(ps, pe)
+        if data is not None and data.shape[1] > quiet + a1 + ret + 2:
+            x = np.asarray(data, dtype=float)[rec]
+            d = np.diff(x, axis=1)                       # d[:, k] = x[:, k + 1] - x[:, k]
+            big = np.abs(d) >= jump
+            near = big.copy()
+            near[:, 1:] |= big[:, :-1]
+            near[:, :-1] |= big[:, 1:]
+            cand = np.where((near.sum(axis=0) >= PACE_JUMP_LEADS) & big.any(axis=0))[0]
+            sm = None
+            last = -10 * merge
+            f0 = int(ps * fs)                            # read_range's first sample
+            for k in cand:
+                if k - last < merge or k < max(quiet + rise, r0) or k + 1 + a1 >= x.shape[1]:
+                    continue
+                # a spike on at least one of the jumping leads (muscle noise
+                # can cover the others: 2026-11-27_14-38-41 at 365 s)
+                if not any(_spike_at(x[lead], d[lead], k, rise, ret, quiet, settle, alone)
+                           for lead in np.where(big[:, k])[0]):
+                    continue
+                last = k
+                s_ = k + 1
+                ts = (f0 + s_) / fs
+                if not (t <= ts < te):
+                    continue
+                if sm is None:
+                    sm = _mean20(x, fs)
+                ref = np.median(sm[:, s_ - r0:s_ - r1], axis=1)[:, None]
+                now = float(np.max(np.abs(sm[:, s_ + c0:s_ + c1] - ref)))
+                then = float(np.max(np.abs(sm[:, s_ + a0:s_ + a1] - ref)))
+                # the QRS right after the spike, not only a P wave before a
+                # later QRS (atrial pacing: P 0.8 mV, QRS 6.4 mV 200 ms on)
+                captured = now >= level and now >= PACE_V_SHARE * then
+                found.append((ts, captured, then >= level))
+        t += PIECE_SEC
+    times = [f[0] for f in found]
+    out = []
+    for i, (ts, captured, later) in enumerate(found):
+        if not ((i > 0 and ts - times[i - 1] <= PACE_PAIR_SEC)
+                or (i + 1 < len(times) and times[i + 1] - ts <= PACE_PAIR_SEC)):
+            continue                     # a lone spike: an artifact, not pacing
+        kind = 'V' if captured else ('A' if later else 'none')
+        out.append({'t': round(ts, 4), 'kind': kind, 'after_a': False})
+    for i, sp in enumerate(out):
+        if sp['kind'] != 'V':
+            continue
+        for j in range(i - 1, -1, -1):
+            dt = sp['t'] - out[j]['t']
+            if dt > PACE_CONDUCT_SEC[1]:
+                break
+            if out[j]['kind'] == 'A' and dt >= PACE_CONDUCT_SEC[0]:
+                sp['after_a'] = True
+                break
+    return out
+
+
+def _narrow_spike_before(x: np.ndarray, r: int, fs: float) -> bool:
+    """A pacing spike recorded small and wide ('paced beats' above, way 2) in
+    front of the beat whose R peak is sample r of the raw leads x (rows): on
+    one lead, a peak at most PACE_NARROW_MS wide at half its prominence
+    (>= PACE_NARROW_MIN_MV), from PACE_NARROW_WINDOW_SEC before r to after
+    it, with PACE_NARROW_QUIET_SEC before it quiet (steepest step <=
+    PACE_QUIET_FRACTION x its own) and no swing past PACE_NARROW_SWING x its
+    height to the other side within PACE_NARROW_SWING_SEC after it."""
+    from scipy.signal import find_peaks, peak_widths
+    from .analysis_pipeline import ADC_COUNTS_PER_MV
+    a, b = r - int(PACE_NARROW_WINDOW_SEC[0] * fs), r + int(PACE_NARROW_WINDOW_SEC[1] * fs)
+    q0, q1 = int(round(PACE_NARROW_QUIET_SEC[0] * fs)), int(round(PACE_NARROW_QUIET_SEC[1] * fs))
+    swing = max(1, int(round(PACE_NARROW_SWING_SEC * fs)))
+    lo, hi = a - q0 - 2, b + max(int(0.04 * fs), swing + 1)
+    if lo < 0 or hi > x.shape[1]:
+        return False
+    prom = PACE_NARROW_MIN_MV * ADC_COUNTS_PER_MV
+    max_w = PACE_NARROW_MS / 1000.0 * fs
+    for row in x:
+        seg = np.asarray(row[lo:hi], dtype=float)
+        ds = np.abs(np.diff(seg))
+        for pol in (1.0, -1.0):
+            y = pol * seg
+            pk, _ = find_peaks(y, prominence=prom)
+            if pk.size == 0:
+                continue
+            widths = peak_widths(y, pk, rel_height=0.5)[0]
+            for pk_i, w in zip(pk, widths):
+                if w > max_w or not (a - lo <= pk_i <= b - lo) or pk_i < q0 + 1:
+                    continue
+                own = float(ds[max(0, pk_i - 5):pk_i + 2].max())
+                quiet = float(ds[pk_i - q0:pk_i - q1].max())
+                if not (own > 0 and quiet <= PACE_QUIET_FRACTION * own):
+                    continue
+                level = float(np.median(y[pk_i - q0:pk_i - q1]))
+                height = float(y[pk_i]) - level
+                if float(np.min(y[pk_i:pk_i + swing + 1])) - level < -PACE_NARROW_SWING * height:
+                    continue                 # the r of an rS QRS, not a spike
+                return True
+    return False
+
+
+def _label_paced(reader, out, corrs, pcorrs, feats, pieces, fs):
+    """Paced beats in the main loop's beats `out` (feats / pieces alongside,
+    one entry per beat): label 'P' and 'pace' ('V' / 'A' / 'AV'), and the
+    spikes the beat finder took for beats taken out (an atrial spike, a
+    spike with no capture, the second reading of a paced complex) -- the
+    next beat's RR is then measured from the beat before. Returns the new
+    (out, corrs, pcorrs). See 'paced beats' above."""
+    if not out:
+        return out, corrs, pcorrs
+    t_beats = np.array([float(b['timestamp']) for b in out])
+    real = [not b.get('_not_beat') for b in out]
+    drop = set()
+
+    def beats_in(t0, t1):
+        lo, hi = int(np.searchsorted(t_beats, t0)), int(np.searchsorted(t_beats, t1, side='right'))
+        return [i for i in range(lo, hi) if real[i] and i not in drop]
+
+    try:
+        spikes = find_pacing_spikes(reader)
+    except Exception as e:
+        print(f"[Ectopic beats] pacing spike search error: {e}")
+        spikes = []
+    tol = PACE_BEAT_TOL_SEC
+    # ventricular captures first, so an atrial spike's QRS search below
+    # sees which beat is already the V spike's
+    for sp in spikes:
+        if sp['kind'] != 'V':
+            continue
+        own = beats_in(sp['t'] - tol, sp['t'] + PACE_CAPTURE_SEC[1])
+        if own:
+            out[own[0]]['label'] = 'P'
+            out[own[0]]['pace'] = 'AV' if sp['after_a'] else 'V'
+            drop.update(own[1:])                 # the same complex read twice
+    for sp in spikes:
+        if sp['kind'] == 'V':
+            continue
+        drop.update(beats_in(sp['t'] - tol, sp['t'] + tol))   # the spike itself: no heartbeat
+        if sp['kind'] == 'A':
+            nxt = beats_in(sp['t'] + PACE_CONDUCT_SEC[0], sp['t'] + PACE_CONDUCT_SEC[1])
+            if nxt and out[nxt[0]].get('pace') is None:
+                out[nxt[0]]['label'] = 'P'
+                out[nxt[0]]['pace'] = 'A'
+
+    # way 2: spiked wide beats of one shape (the beats way 1 made paced
+    # count among them, and keep their pace)
+    names = list(reader.lead_names)
+    total = float(reader.duration_sec)
+    rows = [names.index(n) for n in PACE_NARROW_LEADS if n in names]
+    wide = [k for k, b in enumerate(out)
+            if real[k] and k not in drop and b.get('qrs_ms') is not None and b['qrs_ms'] >= WIDE_QRS_MS]
+    spiked = []
+    raw_piece, raw = None, None
+    for k in wide:
+        pi = feats[k][2]
+        if pi != raw_piece:
+            ps = pieces[pi][0]
+            data = reader.read_range(ps, min(total, ps + PIECE_SEC + 2 * PAD_SEC))
+            raw_piece, raw = pi, (None if data is None else np.asarray(data, dtype=float)[rows])
+        if raw is not None and rows and _narrow_spike_before(raw, feats[k][4], fs):
+            spiked.append(k)
+    if len(spiked) >= PACE_MIN_TEMPLATE_BEATS:
+        def shape_of(k):
+            f = feats[k]
+            return _shape(pieces[f[2]][1], f[3], fs, pieces[f[2]][2])
+
+        def corr_of(k, tpl):
+            f = feats[k]
+            return _corr(pieces[f[2]][1], f[3], tpl, fs, pieces[f[2]][2])
+        pool = spiked[::max(1, len(spiked) // 200)]
+        shapes = [v for v in (shape_of(k) for k in pool) if v is not None]
+        if shapes:
+            m = np.nan_to_num(np.array(shapes))
+            tpl = m[int(np.argmax(np.einsum('ilw,jlw->ij', m, m).sum(axis=1)))].copy()
+            members = [k for k in spiked if corr_of(k, tpl) >= PACE_TEMPLATE_CORR]
+            rrs = [out[k]['rr_ms'] for k in members if out[k].get('rr_ms')]
+            if len(members) >= PACE_MIN_TEMPLATE_BEATS and rrs:
+                paced_rr = float(np.median(rrs))
+                spiked_set = set(spiked)
+                for k in wide:
+                    if out[k]['label'] == 'P':
+                        continue                 # way 1's: its pace ('AV', ...) stays
+                    rr = out[k].get('rr_ms')
+                    # a paced recording: a beat with its own spike, or of the
+                    # paced shape (its spike lost), that is not premature
+                    if (rr is None or rr >= PACE_NOT_PREMATURE * paced_rr) \
+                            and (k in spiked_set or corr_of(k, tpl) >= PACE_TEMPLATE_CORR):
+                        out[k]['label'] = 'P'
+                        out[k]['pace'] = 'V'
+
+    if not drop:
+        return out, corrs, pcorrs
+    new_out, new_c, new_p = [], [], []
+    prev_t = None
+    for k, b in enumerate(out):
+        if k in drop:
+            continue
+        if real[k]:
+            if prev_t is not None:
+                b['rr_ms'] = round((float(b['timestamp']) - prev_t) * 1000.0, 1)
+            prev_t = float(b['timestamp'])
+        new_out.append(b)
+        new_c.append(corrs[k])
+        new_p.append(pcorrs[k])
+    return new_out, new_c, new_p
 
 
 def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
@@ -1347,6 +1730,9 @@ def _detect_uncached(reader, segments) -> List[Dict[str, Any]]:
         r0, r1 = out[i].get('rr_ms'), out[i + 1].get('rr_ms')
         if r0 is not None and r1 is not None and abs(r0 + r1 - nrr) <= SPLIT_RR_FRACTION * nrr:
             out[i]['label'] = 'Q'
+    # Paced beats (and the pacing spikes taken for beats out) before the
+    # PAC pass, which restarts at a paced beat.
+    out, corrs, pcorrs = _label_paced(reader, out, corrs, pcorrs, feats, pieces, fs)
     _classify_pacs(out, corrs, segments, pcorrs)
     # T waves of a V (see the main loop) are dropped -- when that V is still
     # V. One the repeat test put back to N was no PVC, so what followed it

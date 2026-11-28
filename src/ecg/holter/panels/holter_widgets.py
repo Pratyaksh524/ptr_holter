@@ -58,9 +58,11 @@ except ImportError:
     gaussian_lowpass = None
 
 try:
-    # Baseline-drift (DFT) filter shared with the 12-lead dashboard.
-    from ...ecg_filters import apply_dft_filter
+    # Existing morphology-preserving AC cleaner for the visible waveform only.
+    from ...ecg_filters import apply_ac_filter_multi, apply_ac_third_harmonic_multi, apply_dft_filter
 except ImportError:
+    apply_ac_filter_multi = None
+    apply_ac_third_harmonic_multi = None
     apply_dft_filter = None
 
 try:
@@ -191,6 +193,9 @@ def _display_filtered(raw, fs, lead_in, n):
     """The strip's own display filtering (ECGStripCanvas.set_data) on a
     padded read: 50/60 Hz notch, 0.5 Hz high-pass, 3-point median, 25 Hz
     Gaussian; returns the n samples starting at lead_in."""
+    # Keep this helper on the original display-filter path. It is also used
+    # by artifact-wiggle detection and StableBeatTimes; changing it would
+    # change artifact/unidentified markings and displayed beat labels.
     x = _remove_mains(np.asarray(raw, dtype=float), fs)
     if apply_dft_filter is not None:
         x = np.asarray(apply_dft_filter(x, fs, "0.5"), dtype=float)
@@ -1496,10 +1501,21 @@ class ECGStripCanvas(QWidget):
                 if raw_data.size > 30 and (apply_dft_filter is not None or make_notch is not None):
                     fs = float(self._fs or 500)
                     padded, lead_in = self._padded_raw(raw_data, fs)
-                    # Mains removal for display: the recording file holds the
-                    # raw serial samples (the acquisition-page AC notch only
-                    # filters the live trace), and the 25 Hz Gaussian
-                    # below still passes ~13% of 50 Hz.
+                    # Preserve the old filtered input for artifact/unidentified
+                    # marking and StableBeatTimes. Only the separate display
+                    # copy receives the stronger interpolated AC cleanup.
+                    marking_padded = np.asarray(_remove_mains(padded, fs), dtype=float)
+                    # Run the adaptive cleaner on the un-notched display copy;
+                    # pre-notching it would hide the tone that the adaptive
+                    # phase/slip tracker needs to measure.
+                    padded = np.asarray(padded, dtype=float)
+                    if apply_ac_filter_multi is not None:
+                        padded = apply_ac_filter_multi(padded, fs, "50")
+                    if apply_ac_third_harmonic_multi is not None:
+                        # Keep the original display filter order intact and
+                        # add harmonic cleanup before its existing median
+                        # smoother, which can otherwise fold 150 Hz into 50 Hz.
+                        padded = apply_ac_third_harmonic_multi(padded, fs, "50")
                     padded = _remove_mains(padded, fs)
                     # Baseline wander removal (on in Full Disclosure): the
                     # two-stage median baseline is taken out here, before
@@ -1508,6 +1524,7 @@ class ECGStripCanvas(QWidget):
                     # judged on the strip WITHOUT this step, so the "A" marks
                     # stay where they were before the filter was added.
                     padded_no_bw = padded
+                    marking_no_bw = marking_padded
                     if getattr(self, '_baseline_filter_on', False):
                         try:
                             from ...holter.two_stage_median_baseline_filter import remove_baseline_wander
@@ -1519,11 +1536,14 @@ class ECGStripCanvas(QWidget):
                             padded = padded_no_bw
                     if apply_dft_filter is not None:
                         padded = np.asarray(apply_dft_filter(padded, fs, "0.5"), dtype=float)
-                        if padded_no_bw is not padded and getattr(self, '_baseline_filter_on', False):
-                            padded_no_bw = np.asarray(apply_dft_filter(padded_no_bw, fs, "0.5"), dtype=float)
+                        marking_no_bw = np.asarray(apply_dft_filter(marking_no_bw, fs, "0.5"), dtype=float)
                     display_input = np.asarray(padded, dtype=float)[lead_in:lead_in + raw_data.size]
-                    self._wiggle_input = (np.asarray(padded_no_bw, dtype=float)[lead_in:lead_in + raw_data.size] + float(np.median(raw_data))
-                                          if getattr(self, '_baseline_filter_on', False) else None)
+                    # This private input deliberately remains on the old
+                    # filtering path. The displayed waveform can be cleaner
+                    # without changing auto Artifact wiggles, Unidentified
+                    # markings, or any other existing classification logic.
+                    self._wiggle_input = (np.asarray(marking_no_bw, dtype=float)[lead_in:lead_in + raw_data.size]
+                                          + float(np.median(raw_data)))
                     # Keep the strip's own level: the high-pass removes the
                     # DC offset too, and the vertical placement below works
                     # from the signal's median.

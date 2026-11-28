@@ -28,7 +28,13 @@ from PyQt5.QtWidgets import (QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, 
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import filtfilt
 
-from ..ecg_filters import _GAUSSIAN_HALF_WIDTH_SIGMAS, _GAUSSIAN_SIGMA_AT_MINUS_3DB
+from ..ecg_filters import (
+    _GAUSSIAN_HALF_WIDTH_SIGMAS,
+    _GAUSSIAN_SIGMA_AT_MINUS_3DB,
+    apply_ac_filter_multi,
+    apply_ac_third_harmonic_multi,
+    reset_mains_freq_cache,
+)
 from ..enhanced_filter import make_notch
 from .file_format import LEAD_NAMES
 
@@ -134,6 +140,11 @@ class DeviceAcquisition(QObject):
 
         if self.is_running or self._worker is not None:
             return
+        # The mains frequency belongs to this acquisition session. Clearing
+        # the display filter's cache prevents a previous wire/session from
+        # supplying a stale phase/frequency estimate; no analysis state is
+        # involved.
+        reset_mains_freq_cache()
         self._worker = DeviceStartWorker(port or None, self.baudrate, self.reader, self)
         self._worker.version_ready.connect(self._on_version)
         self._worker.serial_ready.connect(lambda s: self.device_info.emit(self._version, s))
@@ -453,6 +464,15 @@ class Live12LeadPlotter(QWidget):
             return
         window = self._latest(n_ctx)
         if n_ctx > 15:
+            # Use the existing morphology-preserving, interpolated AC cleaner
+            # on the display copy only. It tracks mains phase/frequency and
+            # sample slips; the raw packet still goes to the recorder and all
+            # analysis/marking paths remain unchanged.
+            window = apply_ac_filter_multi(window, FS, "50")
+            # Add third-harmonic cancellation before the existing median
+            # smoother; otherwise a 150 Hz component can fold into visible
+            # 50 Hz ripple. This remains display-only.
+            window = apply_ac_third_harmonic_multi(window, FS, "50")
             window = remove_mains(window)
         if self._filter_on:
             sig = dft_filter_gaussian(window)
