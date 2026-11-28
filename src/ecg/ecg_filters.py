@@ -1281,6 +1281,55 @@ def apply_ac_filter_multi(signals: np.ndarray, sampling_rate: float, ac_filter: 
         return signals
 
 
+def apply_ac_third_harmonic_multi(signals: np.ndarray, sampling_rate: float,
+                                  ac_filter: str) -> np.ndarray:
+    """Remove a mains third harmonic from a display-only lead block.
+
+    ``apply_ac_filter_multi`` already removes the fundamental and the guarded
+    second harmonic.  Some acquisition paths also contain a strong third
+    harmonic (150 Hz for 50 Hz mains).  It must be removed before the existing
+    3-point median display smoother: that nonlinear smoother can fold the
+    remaining 150 Hz component into a visible 50 Hz ripple.
+
+    The fitted tone is amplitude-gated per lead, so clean QRS high-frequency
+    content is not subtracted.  Callers use this only on a display copy; raw
+    recording and analysis paths are intentionally unaffected.
+    """
+    if ac_filter == "off" or not ac_filter:
+        return signals
+    try:
+        ac_text = str(ac_filter).strip().lower()
+        match = re.search(r"(\d+(?:\.\d+)?)", ac_text)
+        mains_hz = float(match.group(1)) if match else float(ac_filter)
+        nyquist = sampling_rate / 2.0
+        work = np.asarray(signals, dtype=float)
+        if mains_hz <= 0 or mains_hz >= nyquist or work.ndim != 2 or work.shape[1] < 4:
+            return signals
+
+        measured = _cached_mains_freq(mains_hz) or mains_hz
+        harmonic = measured * 3.0
+        if harmonic >= nyquist:
+            return work
+
+        slips = _shared_sample_slips(work, sampling_rate, mains_hz)
+        tone = _mains_tone_multi(
+            work,
+            sampling_rate,
+            harmonic,
+            exact=True,
+            slips=slips,
+            min_amplitude=_MAINS_FIT_MIN_AMPLITUDE,
+        )
+        gate = np.sqrt(2.0) * tone.std(axis=1) >= _MAINS_FIT_MIN_AMPLITUDE
+        if np.any(gate):
+            work = work.copy()
+            work[gate] = work[gate] - tone[gate]
+        return work
+    except Exception as e:
+        print(f" Error applying AC third-harmonic filter ({ac_filter}Hz) to lead block: {e}")
+        return signals
+
+
 def _gaussian_lowpass_multi(signals: np.ndarray, sampling_rate: float, cutoff_freq: float) -> np.ndarray:
     """_gaussian_lowpass for a (L, n) block: one reflect-pad, one matmul."""
     n = signals.shape[1]

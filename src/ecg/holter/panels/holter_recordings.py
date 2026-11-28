@@ -305,7 +305,7 @@ class HolterRecordManagementPanel(QWidget):
                 pass
 
             analysis = "Analyzed" if is_analysed(session_dir) else "Not analyzed"
-            row_values = [p_name, age, gender, rec_time, dur_str, "12", rec_time, "Completed", analysis, "System", "-"]
+            row_values = [p_name, age, gender, rec_time, dur_str, "12", rec_time, "Completed", analysis, "Device", "-"]
             if query and not any(query in str(v).lower() for v in row_values): continue
             rows.append((row_values, session_dir))
 

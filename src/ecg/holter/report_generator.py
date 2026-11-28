@@ -2407,6 +2407,13 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
             source_mtime = os.path.getmtime(ecgh_path)
             if os.path.exists(manual_beats_path):
                 source_mtime = max(source_mtime, os.path.getmtime(manual_beats_path))
+            # The page image cache must be invalidated when report rendering
+            # code changes; otherwise an already-generated continuation page
+            # could keep the old repeated Full Disclosure title.
+            try:
+                source_mtime = max(source_mtime, os.path.getmtime(__file__))
+            except OSError:
+                pass
             
             # Iterate by pages
             for page_idx in range(int(np.ceil(n_chunks / rows_per_page))):
@@ -2415,7 +2422,12 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
                 actual_rows = end_chunk - start_chunk
                 
                 # Scale height dynamically so short recordings don't create huge blank spaces
-                fig_height = 10.5 * (max(1, actual_rows) / rows_per_page)
+                # Every disclosure page uses the same physical canvas.  A
+                # continuation page can contain fewer rows (for example one
+                # final minute), but that row must retain the same height as
+                # a row on a full page instead of being scaled to 1/30 of the
+                # figure and then scaled down again in the PDF.
+                fig_height = 10.5
 
                 chart_path = os.path.join(session_dir, f'full_disclosure_page_{page_idx}.png')
                 # Full-disclosure rendering is expensive. Reuse a page image
@@ -2423,17 +2435,29 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
                 # generated; this makes repeated Generate Report clicks fast.
                 if (os.path.exists(chart_path)
                         and os.path.getmtime(chart_path) >= source_mtime):
-                    story.append(Image(chart_path, width=190*mm, height=250*mm *
-                                       (max(1, actual_rows) / rows_per_page)))
+                    # Cached disclosure pages use the same full-page canvas as
+                    # newly rendered pages.  The unused rows are blank, but a
+                    # final one-row page must not be scaled down in the PDF.
+                    story.append(Image(chart_path, width=190*mm, height=250*mm))
                     if page_idx < int(np.ceil(n_chunks / rows_per_page)) - 1:
                         story.append(PageBreak())
                     continue
                 
-                fig, axes = plt.subplots(actual_rows, 1, figsize=(8.27, fig_height), gridspec_kw={'hspace': 0.0})
-                if actual_rows == 1: axes = [axes]
+                # Keep a 30-row grid on every page.  On a continuation page
+                # only the rows backed by data are drawn; the remaining axes
+                # stay blank.  This preserves the exact strip height and
+                # waveform width used by the first disclosure page.
+                fig, axes = plt.subplots(rows_per_page, 1,
+                                         figsize=(8.27, fig_height),
+                                         gridspec_kw={'hspace': 0.0})
+                axes = list(np.atleast_1d(axes))
                 
-                # Title
-                fig.suptitle("Full Disclosure(Lead II)", fontsize=14, fontweight='bold', y=0.98 if actual_rows > 5 else 1.1)
+                # The Full Disclosure heading belongs to the first report
+                # page only. Continuation pages contain waveform rows only so
+                # the heading cannot overlap the first waveform row.
+                if page_idx == 0:
+                    fig.suptitle("Full Disclosure(Lead II)", fontsize=14,
+                                 fontweight='bold', y=0.98 if actual_rows > 5 else 1.1)
                 
                 for r in range(actual_rows):
                     chunk_i = start_chunk + r
@@ -2502,14 +2526,34 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
                     # Add back the ylabel so it stays visible even with axis('off')
                     ax.text(-0.01, 0.5, time_str, transform=ax.transAxes, 
                             fontsize=8, fontweight='bold', va='center', ha='right')
+
+                # Do not let unused continuation rows contribute any visual
+                # content; they simply reserve the same space as page 1.
+                for blank_ax in axes[actual_rows:]:
+                    blank_ax.axis('off')
                             
-                plt.tight_layout(rect=[0.05, 0.02, 0.98, 0.92])
-                
-                plt.savefig(chart_path, dpi=140, bbox_inches='tight')
+                if page_idx == 0:
+                    # Keep the established first-page layout, including its
+                    # title spacing and tight crop.
+                    plt.tight_layout(rect=[0.05, 0.02, 0.98, 0.92])
+                    plt.savefig(chart_path, dpi=140, bbox_inches='tight')
+                else:
+                    # A short continuation page must keep the same per-row
+                    # height as a full page.  tight_layout on a very short
+                    # figure consumes most of its height as fixed padding,
+                    # compressing the remaining waveform into a thin line.
+                    # Fixed margins preserve the waveform row geometry while
+                    # leaving the unused lower page area blank.
+                    fig.subplots_adjust(left=0.10, right=0.98,
+                                        bottom=0.02, top=0.92, hspace=0.0)
+                    plt.savefig(chart_path, dpi=140)
                 plt.close(fig)
                 
                 # Scale Image height in PDF so it aligns cleanly at the top
-                pdf_img_height = 250 * mm * (max(1, actual_rows) / rows_per_page)
+                # Keep the image at full-page height even when this page has
+                # only a partial set of rows; the unused lower area remains
+                # blank and the waveform keeps its normal row geometry.
+                pdf_img_height = 250 * mm
                 story.append(Image(chart_path, width=190*mm, height=pdf_img_height))
                 
                 if page_idx < int(np.ceil(n_chunks / rows_per_page)) - 1:
